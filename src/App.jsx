@@ -15,13 +15,11 @@ function groqHeaders() {
   };
 }
 
-/** OpenAI-compatible response: assistant message text */
 function groqAssistantText(data) {
   const c = data?.choices?.[0]?.message?.content;
   return typeof c === 'string' ? c : '';
 }
 
-/** Map app-specific roles to OpenAI-compatible chat roles */
 function toGroqChatRole(role) {
   if (role === 'orchestrator') return 'assistant';
   if (role === 'system' || role === 'user' || role === 'assistant') return role;
@@ -1654,7 +1652,6 @@ INSTRUCTIONS:
     }, 2000);
     return () => clearTimeout(timer);
   }, [messages, isLoading, currentWorkflow]);
-  // Groq (OpenAI-compatible chat completions)
   const callGroq = async (system, messages, maxTokens = 1000) => {
     const chatMessages = system
       ? [{ role: 'system', content: system }, ...messages]
