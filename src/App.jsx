@@ -4,6 +4,30 @@ import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTria
 const MANAGER_COLOURS = ['#34d399', '#60a5fa', '#a78bfa'];
 const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
+const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
+
+function groqHeaders() {
+  const key = import.meta.env.VITE_GROQ_API_KEY;
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${key}`,
+  };
+}
+
+/** OpenAI-compatible response: assistant message text */
+function groqAssistantText(data) {
+  const c = data?.choices?.[0]?.message?.content;
+  return typeof c === 'string' ? c : '';
+}
+
+/** Map app-specific roles to OpenAI-compatible chat roles */
+function toGroqChatRole(role) {
+  if (role === 'orchestrator') return 'assistant';
+  if (role === 'system' || role === 'user' || role === 'assistant') return role;
+  return 'user';
+}
+
 function guessCountry(structure) {
   const name = (structure.name || '').toLowerCase();
   if (name.includes('uk') || name.includes('united kingdom') || name.includes('britain')) return 'United Kingdom';
@@ -1539,21 +1563,23 @@ INSTRUCTIONS:
       const activeWorkflowContext = currentWorkflow
         ? `Active workflow: ${topics.find(t => t.id === currentWorkflow.topicId)?.name}, Step ${currentWorkflow.currentStep + 1}`
         : 'No active workflow';
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
+      const response = await fetch(GROQ_CHAT_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: groqHeaders(),
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
+          model: GROQ_MODEL,
           max_tokens: 200,
-          system: 'You generate short follow-up questions for pharmaceutical sales/IC conversations. Respond ONLY with a JSON array of strings, no other text. Max 3 items, max 10 words each.',
-          messages: [{
-            role: 'user',
-            content: `Recent conversation:\n${recentMessages}\n\nContext: ${activeWorkflowContext}\nKnowledge: ${knowledgeTopics}\n\nGenerate 2-3 follow-up questions: ["Q1", "Q2"]`
-          }]
+          messages: [
+            { role: 'system', content: 'You generate short follow-up questions for pharmaceutical sales/IC conversations. Respond ONLY with a JSON array of strings, no other text. Max 3 items, max 10 words each.' },
+            {
+              role: 'user',
+              content: `Recent conversation:\n${recentMessages}\n\nContext: ${activeWorkflowContext}\nKnowledge: ${knowledgeTopics}\n\nGenerate 2-3 follow-up questions: ["Q1", "Q2"]`
+            }
+          ]
         })
       });
       const data = await response.json();
-      const text = data.content?.[0]?.text?.trim();
+      const text = groqAssistantText(data)?.trim();
       if (text) {
         const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
         if (Array.isArray(parsed)) setSuggestedPrompts(parsed.slice(0, maxSuggestions));
@@ -1571,18 +1597,20 @@ INSTRUCTIONS:
       const recentMessages = conversationHistory.slice(-8).map(m =>
         `${m.role}: ${m.content.substring(0, 400)}`
       ).join('\n');
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
+      const response = await fetch(GROQ_CHAT_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: groqHeaders(),
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
+          model: GROQ_MODEL,
           max_tokens: 400,
-          system: pptxPrompts.intentDetection,
-          messages: [{ role: 'user', content: `Conversation:\n${recentMessages}` }]
+          messages: [
+            { role: 'system', content: pptxPrompts.intentDetection },
+            { role: 'user', content: `Conversation:\n${recentMessages}` }
+          ]
         })
       });
       const data = await response.json();
-      const text = data.content?.[0]?.text?.trim();
+      const text = groqAssistantText(data)?.trim();
       if (text) {
         const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
         if (parsed.offer && (parsed.summaryDeck || parsed.producedDeck)) {
@@ -1626,16 +1654,18 @@ INSTRUCTIONS:
     }, 2000);
     return () => clearTimeout(timer);
   }, [messages, isLoading, currentWorkflow]);
-  // Call Claude API helper
-  const callClaude = async (system, messages, maxTokens = 1000) => {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+  // Groq (OpenAI-compatible chat completions)
+  const callGroq = async (system, messages, maxTokens = 1000) => {
+    const chatMessages = system
+      ? [{ role: 'system', content: system }, ...messages]
+      : [...messages];
+    const res = await fetch(GROQ_CHAT_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: groqHeaders(),
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: GROQ_MODEL,
         max_tokens: maxTokens,
-        system,
-        messages
+        messages: chatMessages
       })
     });
     if (!res.ok) {
@@ -1643,8 +1673,8 @@ INSTRUCTIONS:
       throw new Error(`API error ${res.status}: ${errText.substring(0, 200)}`);
     }
     const data = await res.json();
-    if (data.error) throw new Error(`Claude error: ${data.error.message}`);
-    return data.content?.map(i => i.type === 'text' ? i.text : '').join('\n') || '';
+    if (data.error) throw new Error(`Groq error: ${data.error.message || JSON.stringify(data.error)}`);
+    return groqAssistantText(data);
   };
 
   // Build agent knowledge string
@@ -1672,7 +1702,7 @@ REQUIRES_HANDOFF: [agent_id] - [specific task for them]
 
 Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`;
 
-    return await callClaude(system, messages, 3000);
+    return await callGroq(system, messages, 3000);
   };
 
   // Orchestrator evaluation: checks if step succeeded and decides what happens next
@@ -1750,7 +1780,7 @@ ${agentResponse.substring(0, 1200)}
 Previous context:
 ${contextStr || 'None'}`;
 
-    const raw = await callClaude(system, [{ role: 'user', content: userContent }], 1200);
+    const raw = await callGroq(system, [{ role: 'user', content: userContent }], 1200);
     try {
       const clean = raw.replace(/```json|```/g, '').trim();
       return JSON.parse(clean);
@@ -1774,7 +1804,7 @@ ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 
 You have been assigned a specific sub-task by the workflow orchestrator.
 Use ## headers, tables, **bold**, emoji in your response.`;
-    return await callClaude(system, [{ role: 'user', content: task }], 2000);
+    return await callGroq(system, [{ role: 'user', content: task }], 2000);
   };
 
   // Main orchestrator - two modes: intro (workflow start) and evaluate (after each agent)
@@ -1799,7 +1829,7 @@ ${isFocused
   : `Introduce yourself briefly (1-2 sentences), state the overall goal, list the steps clearly, then hand off to the first agent. Use **bold** for step names. End with: "I'll now hand you to **${firstAgent?.name}** to begin."`
 }`;
 
-      const introResponse = await callClaude(introSystem, [{
+      const introResponse = await callGroq(introSystem, [{
         role: 'user',
         content: isFocused
           ? `The user wants to: ${userMessage}`
@@ -1968,7 +1998,7 @@ ${isFocused
   // Orchestrator wrap-up summary
   const wrapUpWorkflow = async (topic, updatedContext) => {
     const wrapSystem = `${topic.orchestrator.role}\nThe workflow is now complete. Write a brief, warm closing summary (3-5 sentences) covering what was accomplished. Mention key outputs.`;
-    const wrapSummary = await callClaude(wrapSystem, [{
+    const wrapSummary = await callGroq(wrapSystem, [{
       role: 'user',
       content: `Completed: ${topic.name}\n${updatedContext.map(c => `${c.step}: ${c.output.substring(0, 150)}`).join('\n')}`
     }], 300);
@@ -2038,7 +2068,7 @@ ${activeStruct.territories.slice(0, 20).map(t => `  ${t.id} ${t.name} | Rep: ${t
         const briefingSystem = `${topic.orchestrator.role}
 You are preparing a focused task briefing for the next specialist agent. Include only what is directly relevant to their task. Be specific and concise (3-5 sentences max).`;
         const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing.`;
-        taskBriefing = await callClaude(briefingSystem, [{ role: 'user', content: briefingPrompt }], 300);
+        taskBriefing = await callGroq(briefingSystem, [{ role: 'user', content: briefingPrompt }], 300);
       }
 
       // 2. Run agent with task briefing (first message in this step's conversation)
@@ -2202,27 +2232,30 @@ Check for mandatory rule violations and provide specific recommendations for imp
     const systemPrompt = isSummary ? pptxPrompts.summary : pptxPrompts.produced;
 
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
+      const res = await fetch(GROQ_CHAT_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: groqHeaders(),
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
+          model: GROQ_MODEL,
           max_tokens: isSummary ? 2500 : 4096,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: `Document requested: "${offer.title}"\n\n${isSummary ? 'Conversation to summarise' : 'Context (use specific details if present, invent realistic ones if missing)'}:\n${conversationSummary}\n\nIMPORTANT: Match the slide count and format to the document type requested — do not default to a long deck if something brief was asked for.` }]
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `Document requested: "${offer.title}"\n\n${isSummary ? 'Conversation to summarise' : 'Context (use specific details if present, invent realistic ones if missing)'}:\n${conversationSummary}\n\nIMPORTANT: Match the slide count and format to the document type requested — do not default to a long deck if something brief was asked for.` }
+          ]
         })
       });
       const data = await res.json();
-      console.log('PPTX API response status:', res.status, 'stop_reason:', data.stop_reason);
+      const finishReason = data?.choices?.[0]?.finish_reason;
+      console.log('PPTX API response status:', res.status, 'finish_reason:', finishReason);
 
       // Check for API-level errors
       if (data.error) throw new Error(`API error: ${data.error.message}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${JSON.stringify(data)}`);
 
-      const raw = data.content?.[0]?.text?.trim() || '';
+      const raw = groqAssistantText(data)?.trim() || '';
       console.log('PPTX raw response length:', raw.length, 'first 200:', raw.substring(0, 200));
 
-      if (!raw) throw new Error(`Empty response from API (stop_reason: ${data.stop_reason})`);
+      if (!raw) throw new Error(`Empty response from API (finish_reason: ${finishReason})`);
 
       const cleaned = raw.replace(/```json|```/g, '').trim();
 
@@ -2645,19 +2678,21 @@ Check for mandatory rule violations and provide specific recommendations for imp
   keywords: ${t.triggerKeywords.join(', ')}`)
           .join('\n\n');
 
-        const detectRes = await fetch('https://api.anthropic.com/v1/messages', {
+        const detectRes = await fetch(GROQ_CHAT_URL, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: groqHeaders(),
           body: JSON.stringify({
-            model: 'claude-sonnet-4-20250514',
+            model: GROQ_MODEL,
             max_tokens: 50,
-            system: `You detect if a user message matches one of these workflows. Respond with ONLY the workflow id or "none".\n\nWorkflows:\n${workflowList}`,
-            messages: [{ role: 'user', content: messageContent }]
+            messages: [
+              { role: 'system', content: `You detect if a user message matches one of these workflows. Respond with ONLY the workflow id or "none".\n\nWorkflows:\n${workflowList}` },
+              { role: 'user', content: messageContent }
+            ]
           })
         });
 
         const detectData = await detectRes.json();
-        const detectedId = detectData.content[0]?.text?.trim().toLowerCase();
+        const detectedId = groqAssistantText(detectData)?.trim().toLowerCase();
         
         if (detectedId && detectedId !== 'none') {
           matchedTopic = topics.find(t => t.id === detectedId);
@@ -2733,19 +2768,17 @@ Reply **"Yes"** to use the guided workflow, or **"No"** to continue chatting nor
           'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.\n\n' + knowledgeBase + '\n\n' + PILLAR_2_KNOWLEDGE)
         + fileContext;
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
+      const response = await fetch(GROQ_CHAT_URL, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: groqHeaders(),
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
+          model: GROQ_MODEL,
           max_tokens: 4000,
-          system: systemPrompt,
           messages: [
-            ...messages.filter(m => m.role !== 'system').map(m => ({ 
-              role: m.role, 
-              content: m.content 
+            { role: 'system', content: systemPrompt },
+            ...messages.filter(m => m.role !== 'system').map(m => ({
+              role: toGroqChatRole(m.role),
+              content: m.content
             })),
             { role: 'user', content: messageContent }
           ],
@@ -2753,10 +2786,7 @@ Reply **"Yes"** to use the guided workflow, or **"No"** to continue chatting nor
       });
 
       const data = await response.json();
-      const assistantMessage = data.content
-        .map(item => item.type === 'text' ? item.text : '')
-        .filter(Boolean)
-        .join('\n');
+      const assistantMessage = groqAssistantText(data);
 
       setMessages(prev => {
         const updated = [...prev, { role: 'assistant', content: assistantMessage }];
@@ -3586,17 +3616,17 @@ Reply **"Yes"** to use the guided workflow, or **"No"** to continue chatting nor
                     
                     setTimeout(async () => {
                       try {
-                        const response = await fetch('https://api.anthropic.com/v1/messages', {
+                        const response = await fetch(GROQ_CHAT_URL, {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: groqHeaders(),
                           body: JSON.stringify({
-                            model: 'claude-sonnet-4-20250514',
+                            model: GROQ_MODEL,
                             max_tokens: 1000,
                             messages: [{ role: 'user', content: performanceQuestion }]
                           })
                         });
                         const data = await response.json();
-                        const answer = data.content.map(i => i.type === 'text' ? i.text : '').filter(Boolean).join('\n');
+                        const answer = groqAssistantText(data);
                         setMessages(prev => [...prev, { role: 'assistant', content: answer, performanceContext: true }]);
                       } catch (error) {
                         setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error processing question.', performanceContext: true }]);
@@ -3617,17 +3647,17 @@ Reply **"Yes"** to use the guided workflow, or **"No"** to continue chatting nor
                     
                     setTimeout(async () => {
                       try {
-                        const response = await fetch('https://api.anthropic.com/v1/messages', {
+                        const response = await fetch(GROQ_CHAT_URL, {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: groqHeaders(),
                           body: JSON.stringify({
-                            model: 'claude-sonnet-4-20250514',
+                            model: GROQ_MODEL,
                             max_tokens: 1000,
                             messages: [{ role: 'user', content: performanceQuestion }]
                           })
                         });
                         const data = await response.json();
-                        const answer = data.content.map(i => i.type === 'text' ? i.text : '').filter(Boolean).join('\n');
+                        const answer = groqAssistantText(data);
                         setMessages(prev => [...prev, { role: 'assistant', content: answer, performanceContext: true }]);
                       } catch (error) {
                         setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error processing question.', performanceContext: true }]);
@@ -3648,17 +3678,17 @@ Reply **"Yes"** to use the guided workflow, or **"No"** to continue chatting nor
                     
                     setTimeout(async () => {
                       try {
-                        const response = await fetch('https://api.anthropic.com/v1/messages', {
+                        const response = await fetch(GROQ_CHAT_URL, {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: groqHeaders(),
                           body: JSON.stringify({
-                            model: 'claude-sonnet-4-20250514',
+                            model: GROQ_MODEL,
                             max_tokens: 1000,
                             messages: [{ role: 'user', content: performanceQuestion }]
                           })
                         });
                         const data = await response.json();
-                        const answer = data.content.map(i => i.type === 'text' ? i.text : '').filter(Boolean).join('\n');
+                        const answer = groqAssistantText(data);
                         setMessages(prev => [...prev, { role: 'assistant', content: answer, performanceContext: true }]);
                       } catch (error) {
                         setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error processing question.', performanceContext: true }]);
@@ -3684,18 +3714,20 @@ Reply **"Yes"** to use the guided workflow, or **"No"** to continue chatting nor
                 
                 setTimeout(async () => {
                   try {
-                    const response = await fetch('https://api.anthropic.com/v1/messages', {
+                    const response = await fetch(GROQ_CHAT_URL, {
                       method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
+                      headers: groqHeaders(),
                       body: JSON.stringify({
-                        model: 'claude-sonnet-4-20250514',
+                        model: GROQ_MODEL,
                         max_tokens: 1000,
-                        system: `You are analyzing performance for ${MOCK_PERFORMANCE.rep.name}. Data: ${JSON.stringify(MOCK_PERFORMANCE)}. Provide specific calculations and insights.`,
-                        messages: [{ role: 'user', content: userQuestion }]
+                        messages: [
+                          { role: 'system', content: `You are analyzing performance for ${MOCK_PERFORMANCE.rep.name}. Data: ${JSON.stringify(MOCK_PERFORMANCE)}. Provide specific calculations and insights.` },
+                          { role: 'user', content: userQuestion }
+                        ]
                       })
                     });
                     const data = await response.json();
-                    const answer = data.content.map(i => i.type === 'text' ? i.text : '').filter(Boolean).join('\n');
+                    const answer = groqAssistantText(data);
                     setMessages(prev => [...prev, { role: 'assistant', content: answer, performanceContext: true }]);
                   } catch (error) {
                     setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error processing question.', performanceContext: true }]);
@@ -4260,7 +4292,7 @@ Structure: ${activeStructure.name} | Total territories: ${allTerritories.length}
                   System Prompt Configuration
                 </h2>
                 <p className="text-sm text-blue-300/70 mb-6">
-                  Edit the system prompt sent to Claude for every conversation. Changes take effect immediately on the next message. The knowledge base content is automatically appended at runtime.
+                  Edit the system prompt sent to the model for every conversation. Changes take effect immediately on the next message. The knowledge base content is automatically appended at runtime.
                 </p>
 
                 <div className="space-y-4">
@@ -4303,7 +4335,7 @@ Structure: ${activeStructure.name} | Total territories: ${allTerritories.length}
 
                   {/* Info panel */}
                   <div className="p-4 bg-blue-500/10 border border-blue-400/20 rounded-lg">
-                    <div className="text-sm font-semibold text-blue-300 mb-2">📝 What gets sent to Claude:</div>
+                    <div className="text-sm font-semibold text-blue-300 mb-2">📝 What gets sent to the model:</div>
                     <ul className="text-xs text-slate-400 space-y-1">
                       <li>✓ Your edited system prompt above</li>
                       <li>✓ Full knowledge base content appended automatically ({documents.filter(d => d.status === 'active').length} active document{documents.filter(d => d.status === 'active').length !== 1 ? 's' : ''})</li>
