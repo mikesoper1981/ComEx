@@ -1,13 +1,15 @@
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-haiku-4-5-20251001';
 
-export default async function handler(req, res) {
-  res.setHeader('Content-Type', 'application/json');
-
+/** Vercel Node.js serverless entry: CommonJS handler (req, res). */
+module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
+    res.setHeader('Content-Type', 'application/json');
     return res.status(405).json({ error: { message: 'Method not allowed' } });
   }
+
+  res.setHeader('Content-Type', 'application/json');
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
