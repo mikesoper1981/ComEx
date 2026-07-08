@@ -175,21 +175,25 @@ function stellaBuildTabularPayload(records) {
   return { columns, rows, rowCount: rows.length };
 }
 
-// Extract text from a PDF in the browser (best-effort, capped for size).
-async function stellaExtractPdfText(file) {
+// Extract text from a PDF in the browser (best-effort). Accepts File or Blob.
+async function stellaExtractPdfText(fileOrBlob) {
   const pdfjs = await import('pdfjs-dist');
   try { pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl; } catch { /* ignore */ }
-  const buf = await file.arrayBuffer();
+  const buf = await fileOrBlob.arrayBuffer();
   const doc = await pdfjs.getDocument({ data: buf }).promise;
-  const maxPages = Math.min(doc.numPages, 40);
+  const maxPages = Math.min(doc.numPages, 120);
   let text = '';
   for (let p = 1; p <= maxPages; p++) {
     const page = await doc.getPage(p);
     const content = await page.getTextContent();
     text += content.items.map(it => (it.str || '')).join(' ') + '\n';
-    if (text.length > 80000) break;
+    if (text.length > 250000) break;
   }
   return text.trim();
+}
+
+function stellaExtractedTextPath(storagePath) {
+  return storagePath ? `${storagePath}.extracted.txt` : null;
 }
 
 // Human-readable rendering of the structured context_qa JSON for prompts.
@@ -234,6 +238,7 @@ function stellaMapRegistryRow(row) {
     type: row.file_type,
     tableName: row.table_name || null,
     storagePath: row.storage_path || null,
+    textStoragePath: row.storage_path ? stellaExtractedTextPath(row.storage_path) : null,
     storageBucket: null,
     columns: Array.isArray(row.columns) ? row.columns : [],
     rowCount: row.row_count ?? null,
@@ -1880,9 +1885,58 @@ ${isFocused
 
   const stellaRemoveStorage = async (objectPath) => {
     if (!objectPath) return;
+    const rel = objectPath.replace(/^stella\//, '');
+    const paths = [...new Set([objectPath, rel, `stella/${rel}`])];
     for (const candidate of STELLA_STORAGE_CANDIDATES) {
-      try { await supabase.storage.from(candidate.bucket).remove([objectPath]); } catch { /* ignore */ }
+      for (const p of paths) {
+        try { await supabase.storage.from(candidate.bucket).remove([p]); } catch { /* ignore */ }
+        try { await supabase.storage.from(candidate.bucket).remove([stellaResolveStoragePath(candidate, rel)]); } catch { /* ignore */ }
+      }
     }
+  };
+
+  // Download a blob from Stella storage (tries path variants across candidate buckets).
+  const stellaDownloadStorageBlob = async (objectPath) => {
+    if (!objectPath) return null;
+    const rel = objectPath.replace(/^stella\//, '');
+    const paths = [...new Set([objectPath, rel, `stella/${rel}`])];
+    for (const candidate of STELLA_STORAGE_CANDIDATES) {
+      for (const p of paths) {
+        try {
+          const { data, error } = await supabase.storage.from(candidate.bucket).download(p);
+          if (!error && data) return data;
+        } catch { /* try next */ }
+        try {
+          const { data, error } = await supabase.storage.from(candidate.bucket).download(stellaResolveStoragePath(candidate, rel));
+          if (!error && data) return data;
+        } catch { /* try next */ }
+      }
+    }
+    return null;
+  };
+
+  // Fetch full document text (extracted .txt companion, or re-extract legacy PDFs).
+  const stellaFetchDocumentText = async (fileRecord) => {
+    const textPath = fileRecord.textStoragePath || stellaExtractedTextPath(fileRecord.storagePath);
+    if (textPath) {
+      const blob = await stellaDownloadStorageBlob(textPath);
+      if (blob) {
+        const text = await blob.text();
+        if (text.trim()) return text;
+      }
+    }
+    const kind = fileRecord.fileType || fileRecord.type;
+    if (fileRecord.storagePath && kind === 'pdf') {
+      const raw = await stellaDownloadStorageBlob(fileRecord.storagePath);
+      if (raw) {
+        try { return await stellaExtractPdfText(raw); } catch { /* fall through */ }
+      }
+    }
+    if (fileRecord.storagePath && (kind === 'text' || kind === 'txt' || kind === 'md')) {
+      const raw = await stellaDownloadStorageBlob(fileRecord.storagePath);
+      if (raw) return raw.text();
+    }
+    return null;
   };
 
   // Normalize the intake agent's context_qa into the canonical shape.
@@ -2096,19 +2150,23 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
         await stellaCreateAndLoadTable(tableName, payload.columns, payload.rows);
         sampleText = JSON.stringify(records.slice(0, 30), null, 2).substring(0, 16000);
       } else {
-        // ── Document flow: upload raw file to storage + extract text ──
+        // ── Document flow: upload raw file + persist full extracted text ──
         const cleanName = sanitizeStorageName(file.name);
         const objectRelPath = `data_${Date.now()}_${cleanName}`;
+        let fullDocumentText = '';
+        if (kind === 'pdf') {
+          try { fullDocumentText = await stellaExtractPdfText(file); }
+          catch { fullDocumentText = ''; }
+          if (!fullDocumentText) fullDocumentText = `PDF document "${file.name}". Text could not be automatically extracted; please describe its contents in the intake questions.`;
+        } else {
+          fullDocumentText = await stellaReadAsText(file);
+        }
+        sampleText = fullDocumentText.substring(0, 18000);
         const up = await stellaUploadToStorage(objectRelPath, file, file.type || undefined);
         storagePath = up.objectPath;
         storageBucket = up.bucket;
-        if (kind === 'pdf') {
-          try { sampleText = await stellaExtractPdfText(file); }
-          catch { sampleText = ''; }
-          if (!sampleText) sampleText = `PDF document "${file.name}". Text could not be automatically extracted; please describe its contents in the intake questions.`;
-        } else {
-          // .txt / .md / non-array JSON
-          sampleText = (await stellaReadAsText(file)).substring(0, 18000);
+        if (fullDocumentText.trim()) {
+          await stellaUploadToStorage(`${objectRelPath}.extracted.txt`, new Blob([fullDocumentText], { type: 'text/plain' }), 'text/plain');
         }
       }
 
@@ -2155,6 +2213,7 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
         columns: mergedColumns, rowCount,
         summary, capturedContext: null,
         tableName, storagePath, storageBucket,
+        textStoragePath: storagePath ? stellaExtractedTextPath(storagePath) : null,
         intakeMessages: [{ role: 'assistant', content: assistantMsg }],
         intakeComplete: false, processing: false,
         uploadedAt: dbRow?.uploaded_at || new Date().toISOString(),
@@ -2192,6 +2251,7 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
     }
     try { if (f.tableName) await supabase.rpc('stella_drop_table', { p_table_name: f.tableName }); } catch { /* ignore */ }
     await stellaRemoveStorage(f.storagePath);
+    if (f.storagePath) await stellaRemoveStorage(stellaExtractedTextPath(f.storagePath));
     setStellaDataFiles(prev => prev.filter(x => x.id !== fileId));
     setActiveStellaDataId(prev => (prev === fileId ? null : prev));
   };
@@ -2384,7 +2444,9 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
       const cols = Array.isArray(f.columns) && f.columns.length
         ? f.columns.map(c => `    - ${c.name}${c.original && c.original !== c.name ? ` (source header: "${c.original}")` : ''} [${c.type || 'text'}]${c.description ? `: ${c.description}` : ''}`).join('\n')
         : '    (no columns — this is a document)';
-      const location = f.tableName ? `SQL table: ${f.tableName}` : `Stored document (path: ${f.storagePath || 'n/a'})`;
+      const location = f.tableName
+        ? `SQL table: ${f.tableName}`
+        : `Document (use read_document tool for full text; path: ${f.storagePath || 'n/a'})`;
       const ctx = stellaFormatContextQa(f.capturedContext).split('\n').map(l => `    ${l}`).join('\n');
       return `FILE ${i + 1}: ${f.name}\n- Type: ${f.fileType || f.type || 'file'}\n- ${location}${f.rowCount != null ? `\n- Rows: ${f.rowCount}` : ''}\n- Summary: ${f.summary || '(none)'}\n- Columns:\n${cols}\n- Interpretive context:\n${ctx}`;
     }).join('\n\n');
@@ -2393,21 +2455,25 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
     const sqlInstr = tabular.length
       ? `\nTABULAR DATA (query with tools):\n- Query tables using the \`run_sql\` tool (single SELECT only). Available tables: ${tableList}.\n- Use \`inspect_table\` to preview a table's real values/formats before writing analytical queries.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n- To combine datasets, JOIN across tables using the confirmed relationships above (or a sensible key if none is confirmed — state the assumption).\n`
       : '';
+    const docList = docs.length ? docs.map(d => `"${d.name}"`).join(', ') : '(none)';
     const docInstr = docs.length
-      ? `\nDOCUMENTS (PDF / text):\nAnswer questions about stored documents from their summary and interpretive context in the catalog above — do NOT use SQL tools for documents. Still follow the agentic workflow: plan what you need from the document context, check your reasoning against the captured intake Q&A, and verify your answer addresses the question before responding.\n`
+      ? `\nDOCUMENTS (PDF / text):\n- Full text is available via the \`read_document\` tool. Documents: ${docList}.\n- Use \`read_document\` when you need specific facts, quotes, or details from a PDF/text file — not just the summary above.\n`
+      : '';
+    const crossInstr = (tabular.length && docs.length)
+      ? `\nCROSS-SOURCE QUESTIONS:\nMany questions combine tabular data (sales, engagement metrics in SQL) with document context (policies, reports, PDFs). For these:\n1. Use \`read_document\` to pull relevant passages from PDFs/text files\n2. Use \`inspect_table\` / \`run_sql\` for quantitative data\n3. Synthesise both in your answer — explicitly connect numbers to document context\n4. Verify that findings from each source align before answering\n`
       : '';
 
-    return `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and careful reasoning (for documents), verify your findings, and explain them clearly.
+    return `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and document reading (for PDFs/text), verify your findings, and explain them clearly.
 
 ${bizText}
 DATA CATALOG (${files.length} file${files.length === 1 ? '' : 's'}):
 ${blocks || '(no files uploaded yet)'}
-${sqlInstr}${docInstr}
+${sqlInstr}${docInstr}${crossInstr}
 HOW TO WORK (be agentic):
-1. PLAN — briefly think through what the question needs and which datasets/columns or document context are relevant.
-2. INSPECT — for tabular data, use \`inspect_table\` to see real values before querying. For PDFs/text, re-read the file's summary and intake context in the catalog.
-3. EXECUTE — run analytical queries with \`run_sql\` (tabular only). For documents, reason from the captured context.
-4. VERIFY — sanity-check: do results make sense? does the answer match what was asked? If a query returns nothing or looks wrong, diagnose and try again.
+1. PLAN — briefly think through what the question needs: which tables, which documents, and how they relate.
+2. INSPECT — for tabular data, use \`inspect_table\` to preview real values. For documents, use \`read_document\` to access full text when the summary isn't enough.
+3. EXECUTE — run analytical queries with \`run_sql\` for tabular data; use \`read_document\` for document content.
+4. VERIFY — sanity-check: do results make sense? do document facts and numbers align? If a query returns nothing or looks wrong, diagnose and try again.
 5. ANSWER — only when confident, give the final plain-English answer.
 
 RULES:
@@ -2458,10 +2524,22 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         required: ['table'],
       },
     },
+    {
+      name: 'read_document',
+      description: 'Read the full text of an uploaded PDF or text document by exact file name from the data catalog. Use when you need specific details, quotes, or facts from a document — especially when combining document content with tabular SQL results.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          file_name: { type: 'string', description: 'Exact file name from the data catalog (e.g. "Q1 Engagement Report.pdf").' },
+          search_hint: { type: 'string', description: 'Optional keyword or topic to focus on when scanning a long document.' },
+        },
+        required: ['file_name'],
+      },
+    },
   ];
 
   // Execute a tool call requested by the agent; returns { text, step }.
-  const runStellaTool = async (name, input, knownTables) => {
+  const runStellaTool = async (name, input, knownTables, files) => {
     if (name === 'inspect_table') {
       const table = String(input?.table || '').trim();
       if (!knownTables.includes(table)) {
@@ -2489,12 +2567,46 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         return { text: `Query failed: ${err.message}`, step: { type: 'error', label: 'Query failed', detail: `${query}\n→ ${err.message}` } };
       }
     }
+    if (name === 'read_document') {
+      const fileName = String(input?.file_name || '').trim();
+      const hint = String(input?.search_hint || '').trim().toLowerCase();
+      const doc = (files || []).find(f => !f.tableName && f.name.toLowerCase() === fileName.toLowerCase())
+        || (files || []).find(f => !f.tableName && f.name.toLowerCase().includes(fileName.toLowerCase()));
+      if (!doc) {
+        const available = (files || []).filter(f => !f.tableName).map(f => f.name).join(', ') || '(none)';
+        return { text: `Document "${fileName}" not found. Available documents: ${available}`, step: { type: 'error', label: 'Document not found', detail: fileName } };
+      }
+      try {
+        let text = await stellaFetchDocumentText(doc);
+        if (!text || !text.trim()) {
+          return { text: `No extractable text found for "${doc.name}". Use the summary and intake context from the catalog.`, step: { type: 'error', label: `Read ${doc.name}`, detail: 'No text extracted' } };
+        }
+        const TOOL_CHAR_CAP = 55000;
+        let excerpt = text;
+        let truncated = false;
+        if (hint && text.length > 8000) {
+          const paras = text.split(/\n{2,}/);
+          const hits = paras.filter(p => p.toLowerCase().includes(hint));
+          if (hits.length) excerpt = hits.join('\n\n');
+        }
+        if (excerpt.length > TOOL_CHAR_CAP) {
+          excerpt = excerpt.slice(0, TOOL_CHAR_CAP);
+          truncated = true;
+        }
+        return {
+          text: `Full text of "${doc.name}"${hint ? ` (filtered by: ${hint})` : ''}${truncated ? ' [truncated]' : ''}:\n\n${excerpt}`,
+          step: { type: 'document', label: `Read ${doc.name}`, detail: `${excerpt.length.toLocaleString()} characters${truncated ? ' (truncated)' : ''}${hint ? ` · hint: ${hint}` : ''}` },
+        };
+      } catch (err) {
+        return { text: `Could not read "${doc.name}": ${err.message}`, step: { type: 'error', label: `Read ${doc.name}`, detail: err.message } };
+      }
+    }
     return { text: `Unknown tool: ${name}`, step: { type: 'error', label: `Unknown tool ${name}`, detail: '' } };
   };
 
   // Collapsible "How Stella worked this out" reasoning trail.
   const renderStellaSteps = (steps) => {
-    const iconFor = (t) => (t === 'query' ? '🔎' : t === 'inspect' ? '👁' : t === 'error' ? '⚠️' : '🧠');
+    const iconFor = (t) => (t === 'query' ? '🔎' : t === 'inspect' ? '👁' : t === 'document' ? '📄' : t === 'error' ? '⚠️' : '🧠');
     return (
       <details className="mt-3 bg-slate-900/50 border border-blue-400/20 rounded-lg overflow-hidden">
         <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-cyan-300/90 hover:bg-slate-800/50 flex items-center gap-2">
@@ -2564,7 +2676,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         // Execute each requested tool and feed results back.
         const toolResults = [];
         for (const tu of toolUses) {
-          const { text, step } = await runStellaTool(tu.name, tu.input, knownTables);
+          const { text, step } = await runStellaTool(tu.name, tu.input, knownTables, files);
           steps.push(step);
           toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: text });
         }
