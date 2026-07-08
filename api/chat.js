@@ -25,7 +25,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  const { system, messages, max_tokens, tools, tool_choice } = body || {};
+  const { system, messages, max_tokens, tools, tool_choice, thinking } = body || {};
 
   if (!Array.isArray(messages)) {
     return res.status(400).json({ error: { message: 'messages must be an array' } });
@@ -48,14 +48,28 @@ module.exports = async function handler(req, res) {
     if (tool_choice != null) anthropicBody.tool_choice = tool_choice;
   }
 
+  // Optional extended thinking (used by the Stella agent for a visible reasoning trail).
+  let interleaved = false;
+  if (thinking && thinking.type === 'enabled') {
+    const budget = typeof thinking.budget_tokens === 'number' ? thinking.budget_tokens : 2000;
+    // Budget must be < max_tokens; ensure headroom for the actual answer.
+    const safeBudget = Math.max(1024, Math.min(budget, maxTokens - 512));
+    anthropicBody.thinking = { type: 'enabled', budget_tokens: safeBudget };
+    interleaved = true;
+  }
+
   try {
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    };
+    // Interleaved thinking lets the model reason between tool calls (fuller trail).
+    if (interleaved) headers['anthropic-beta'] = 'interleaved-thinking-2025-05-14';
+
     const upstream = await fetch(ANTHROPIC_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
+      headers,
       body: JSON.stringify(anthropicBody),
     });
 

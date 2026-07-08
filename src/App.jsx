@@ -13,11 +13,11 @@ const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
 const CHAT_API_PATH = '/api/chat';
 
-function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice }) {
+function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice, thinking }) {
   return fetch(CHAT_API_PATH, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ system, messages, max_tokens, tools, tool_choice }),
+    body: JSON.stringify({ system, messages, max_tokens, tools, tool_choice, thinking }),
   });
 }
 
@@ -209,6 +209,31 @@ function stellaPreviewRows(rows) {
   });
   const more = rows.length > 5 ? `\n… and ${rows.length - 5} more row${rows.length - 5 === 1 ? '' : 's'}` : '';
   return preview.join('\n') + more;
+}
+
+// Observable profile of parsed tabular records: distinct counts, ranges, samples.
+// Used so the intake agent doesn't ask about facts it can directly see in the data.
+function stellaProfileRecords(records) {
+  if (!Array.isArray(records) || records.length === 0) return '';
+  const rowCount = records.length;
+  const headers = Object.keys(records[0] || {});
+  const lines = [`Total rows: ${rowCount}`, `Columns (${headers.length}): ${headers.join(', ')}`, '', 'Per-column profile:'];
+  for (const h of headers) {
+    const values = records.map(r => r?.[h]).filter(v => v !== null && v !== undefined && v !== '');
+    const distinct = new globalThis.Set(values.map(v => String(v)));
+    const nums = values.map(v => Number(String(v).replace(/[,\s%£$€]/g, ''))).filter(Number.isFinite);
+    const isNumeric = values.length > 0 && nums.length >= values.length * 0.8;
+    if (isNumeric && nums.length) {
+      const min = Math.min(...nums), max = Math.max(...nums);
+      const sum = nums.reduce((a, b) => a + b, 0);
+      lines.push(`- ${h} [numeric]: ${distinct.size} distinct, min ${min}, max ${max}, avg ${(sum / nums.length).toFixed(2)}`);
+    } else {
+      const samples = [...distinct].slice(0, 8);
+      const suffix = distinct.size > samples.length ? `, e.g. ${samples.join(', ')}…` : (samples.length ? `: ${samples.join(', ')}` : '');
+      lines.push(`- ${h} [categorical]: ${distinct.size} distinct value${distinct.size === 1 ? '' : 's'}${suffix}`);
+    }
+  }
+  return lines.join('\n');
 }
 
 // Human-readable rendering of the structured context_qa JSON for prompts.
@@ -2009,10 +2034,11 @@ ${isFocused
     reader.readAsText(file);
   });
 
-  const stellaBuildContentSummary = async ({ name, type, textSample, columns = [] }) => {
-    const system = `You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "columns": [{ "name": "exact column name", "description": "what this column represents" }],\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nIf column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. If unsure, say what you can infer and what is missing.`;
+  const stellaBuildContentSummary = async ({ name, type, textSample, columns = [], profile = '' }) => {
+    const system = `You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "columns": [{ "name": "exact column name", "description": "what this column represents" }],\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nIf column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. If unsure, say what you can infer and what is missing.\n\nCRITICAL — do NOT ask questions whose answers are already observable in the DATA PROFILE below (row counts, number of distinct territories/reps/products, column names, value ranges). You can see those directly; state them in the summary instead. Only suggest questions about MEANING and INTENT that cannot be derived from the data: what the dataset represents, the exact business meaning/units of ambiguous columns (e.g. does "rev" mean gross or net revenue in GBP?), the time period, definitions, filters, and caveats.`;
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
-    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
+    const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
     const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1000);
     const parsed = extractJsonObject(raw);
     return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', columns: [], suggestedQuestions: ['What does this data represent?', 'What time period does it cover?', 'Which metrics matter most?', 'Any definitions or filters to apply?'] };
@@ -2039,6 +2065,8 @@ Ask ONE focused question per turn. Ask 3-5 questions in total across turns, cove
 - the time period it covers
 - the key metrics / important fields and EXACTLY what they mean (e.g. a column "rev" = actual revenue in GBP)
 - how the data should be interpreted (definitions, filters, caveats)${(!isDoc && otherTabular.length) ? '\n- whether/how it relates to other uploaded datasets (propose the link in plain English for the user to confirm)' : ''}
+
+CRITICAL — NEVER ask about facts that are already visible in the DATA PROFILE below. You can directly see the row count, the number of distinct territories/reps/products, the column names, and value ranges — so do NOT ask "how many territories are there?" or similar. State what you observe, and only ask about MEANING, business intent, units, definitions, time period, and caveats that the raw data cannot reveal.${!isDoc && f.dataProfile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${f.dataProfile}` : ''}
 
 When you have enough, set "complete": true and fill "context_qa" fully.
 
@@ -2147,6 +2175,7 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
       let columns = [];
       let rowCount = null;
       let sampleText = '';
+      let dataProfile = '';
 
       // Decide flow: tabular (→ dynamic table) vs document (→ storage).
       let records = null;
@@ -2164,6 +2193,7 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
         tableName = `stella_data_${stellaNanoId()}`;
         await stellaCreateAndLoadTable(tableName, payload.columns, payload.rows);
         sampleText = JSON.stringify(records.slice(0, 30), null, 2).substring(0, 16000);
+        dataProfile = stellaProfileRecords(records);
       } else {
         // ── Document flow: upload raw file + persist full extracted text ──
         const cleanName = sanitizeStorageName(file.name);
@@ -2191,6 +2221,7 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
         type: kind,
         textSample: sampleText,
         columns: columns.map(c => ({ name: c.original || c.name })),
+        profile: dataProfile,
       });
       const summary = onboarding.summary || (isTabular ? 'Uploaded dataset.' : 'Uploaded document.');
 
@@ -2226,7 +2257,7 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
         name: file.name, type: kind, fileType: kind,
         size: rowCount != null ? `${rowCount} rows` : `${(file.size / 1024).toFixed(1)} KB`,
         columns: mergedColumns, rowCount,
-        summary, capturedContext: null,
+        summary, capturedContext: null, dataProfile,
         tableName, storagePath, storageBucket,
         textStoragePath: storagePath ? stellaExtractedTextPath(storagePath) : null,
         intakeMessages: [{ role: 'assistant', content: assistantMsg }],
@@ -2505,7 +2536,11 @@ When a chart helps, include exactly ONE chart block in your FINAL answer, EXACTL
 \`\`\`chart-stella
 {"type": "bar", "title": "...", "data": [{"label": "A", "value": 10}], "xKey": "label", "yKey": "value"}
 \`\`\`
-- Supported types: bar, line, scatter. Use xKey / yKey to name fields. Keep to <= 40 data points.
+- Simple types: bar, line, scatter, pie. Use xKey / yKey to name fields. For several bars/lines of the same kind use "yKeys": ["a","b"].
+- COMBO / DUAL-AXIS (e.g. bars with an overlaid line, or two metrics on different scales): set "type": "combo" and describe each metric in a "series" array. Each series item is {"key": "<field>", "type": "bar" | "line", "axis": "left" | "right", "name": "<label>"}. Put metrics with very different scales on opposite axes.
+  Example (revenue bars + attainment % line on a second axis):
+  {"type": "combo", "title": "Revenue vs Attainment", "xKey": "territory", "series": [{"key": "revenue", "type": "bar", "axis": "left", "name": "Revenue (£)"}, {"key": "attainment", "type": "line", "axis": "right", "name": "Attainment %"}], "data": [{"territory": "North", "revenue": 120000, "attainment": 92}]}
+- Keep to <= 40 data points.
 
 RESPONSE STYLE:
 Use ## headers, bullet points, concise explanations, and suggest useful follow-up questions.`;
@@ -2675,19 +2710,28 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
           system: systemPrompt,
           messages: convo,
           tools: STELLA_TOOLS,
-          max_tokens: 4000,
+          max_tokens: 5000,
+          thinking: { type: 'enabled', budget_tokens: 2500 },
         });
         const data = await resp.json();
         if (data.error) throw new Error(data.error.message);
 
         const content = Array.isArray(data.content) ? data.content : [];
+        const thinkingParts = content
+          .filter(b => (b.type === 'thinking' || b.type === 'redacted_thinking'))
+          .map(b => (b.type === 'redacted_thinking' ? '(internal reasoning)' : b.thinking))
+          .filter(Boolean);
         const textParts = content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
         const toolUses = content.filter(b => b.type === 'tool_use');
 
-        // Capture the agent's narrated thinking/plan for the reasoning trail
-        // whenever it produced any text this turn (planning or observations).
+        // Capture the model's actual extended-thinking reasoning for the trail.
+        thinkingParts.forEach((t, idx) => {
+          const detail = String(t).trim();
+          if (detail) steps.push({ type: 'thought', label: (round === 0 && idx === 0) ? 'Plan' : 'Reasoning', detail });
+        });
+        // Capture any narrated commentary that accompanies a tool call.
         if (textParts && toolUses.length) {
-          steps.push({ type: 'thought', label: round === 0 ? 'Plan' : 'Thinking', detail: textParts });
+          steps.push({ type: 'thought', label: 'Note', detail: textParts });
         }
 
         if (data.stop_reason !== 'tool_use' || !toolUses.length) {
@@ -2712,7 +2756,8 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
           const wrapResp = await anthropicMessagesPost({
             system: systemPrompt,
             messages: [...convo, { role: 'user', content: 'Please give your final answer now based on what you found.' }],
-            max_tokens: 3000,
+            max_tokens: 4000,
+            thinking: { type: 'enabled', budget_tokens: 2000 },
           });
           const wrapData = await wrapResp.json();
           if (!wrapData.error) finalText = anthropicAssistantText(wrapData) || finalText;

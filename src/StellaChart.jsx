@@ -1,5 +1,6 @@
 import {
   ResponsiveContainer,
+  ComposedChart,
   BarChart, Bar,
   LineChart, Line,
   ScatterChart, Scatter,
@@ -8,6 +9,8 @@ import {
 } from 'recharts';
 
 const PALETTE = ['#22d3ee', '#60a5fa', '#34d399', '#a78bfa', '#f472b6', '#fbbf24', '#fb7185'];
+const AXIS_TICK = { fill: '#94a3b8', fontSize: 12 };
+const TOOLTIP_STYLE = { background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' };
 
 // Renders a chart spec produced by the AI (chart-recharts / chart-stella blocks).
 export default function StellaChart({ spec }) {
@@ -17,7 +20,17 @@ export default function StellaChart({ spec }) {
   const xKey = spec.xKey || 'x';
   const yKey = spec.yKey || 'y';
   const yKeys = Array.isArray(spec.yKeys) ? spec.yKeys : (spec.yKeys ? [spec.yKeys] : []);
-  const valueKeys = [...(yKeys.length ? yKeys : [yKey]), spec.valueKey].filter(Boolean);
+  // Combo/multi-axis series: [{ key, type: 'bar'|'line', axis: 'left'|'right', name }]
+  const series = Array.isArray(spec.series)
+    ? spec.series.filter(s => s && s.key).map(s => ({
+        key: s.key,
+        type: String(s.type || 'bar').toLowerCase() === 'line' ? 'line' : 'bar',
+        axis: String(s.axis || 'left').toLowerCase() === 'right' ? 'right' : 'left',
+        name: s.name || s.key,
+      }))
+    : [];
+  const seriesKeys = series.map(s => s.key);
+  const valueKeys = [...new Set([...(yKeys.length ? yKeys : [yKey]), spec.valueKey, ...seriesKeys].filter(Boolean))];
   const data = (Array.isArray(spec.data) ? spec.data : [])
     .filter(d => d && typeof d === 'object')
     .map(d => {
@@ -50,30 +63,53 @@ export default function StellaChart({ spec }) {
     </div>
   );
 
+  // Combo / dual-axis chart: mix bars and lines, optional secondary Y axis.
+  if (type === 'combo' || type === 'composed' || (series.length > 0 && (type === '' || type === 'bar' || type === 'line'))) {
+    const effectiveSeries = series.length
+      ? series
+      : (yKeys.length ? yKeys : [yKey]).map(k => ({ key: k, type: type === 'line' ? 'line' : 'bar', axis: 'left', name: k }));
+    const usesRight = effectiveSeries.some(s => s.axis === 'right');
+    return wrap(
+      <ComposedChart data={data}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} />
+        <YAxis yAxisId="left" stroke="#94a3b8" tick={AXIS_TICK} />
+        {usesRight && <YAxis yAxisId="right" orientation="right" stroke="#94a3b8" tick={AXIS_TICK} />}
+        <Tooltip contentStyle={TOOLTIP_STYLE} />
+        <Legend />
+        {effectiveSeries.map((s, i) => (
+          s.type === 'line'
+            ? <Line key={s.key} yAxisId={s.axis} type="monotone" dataKey={s.key} name={s.name} stroke={PALETTE[i % PALETTE.length]} strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+            : <Bar key={s.key} yAxisId={s.axis} dataKey={s.key} name={s.name} fill={PALETTE[i % PALETTE.length]} radius={[6, 6, 0, 0]} />
+        ))}
+      </ComposedChart>
+    );
+  }
+
   if (type === 'bar') {
-    const series = yKeys.length ? yKeys : [yKey];
+    const keys = yKeys.length ? yKeys : [yKey];
     return wrap(
       <BarChart data={data}>
         <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-        <XAxis dataKey={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-        <YAxis stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-        <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
+        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} />
+        <YAxis stroke="#94a3b8" tick={AXIS_TICK} />
+        <Tooltip contentStyle={TOOLTIP_STYLE} />
         <Legend />
-        {series.map((k, i) => <Bar key={k} dataKey={k} fill={PALETTE[i % PALETTE.length]} radius={[6, 6, 0, 0]} />)}
+        {keys.map((k, i) => <Bar key={k} dataKey={k} fill={PALETTE[i % PALETTE.length]} radius={[6, 6, 0, 0]} />)}
       </BarChart>
     );
   }
 
   if (type === 'line') {
-    const series = yKeys.length ? yKeys : [yKey];
+    const keys = yKeys.length ? yKeys : [yKey];
     return wrap(
       <LineChart data={data}>
         <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-        <XAxis dataKey={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-        <YAxis stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-        <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
+        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} />
+        <YAxis stroke="#94a3b8" tick={AXIS_TICK} />
+        <Tooltip contentStyle={TOOLTIP_STYLE} />
         <Legend />
-        {series.map((k, i) => <Line key={k} type="monotone" dataKey={k} stroke={PALETTE[i % PALETTE.length]} strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />)}
+        {keys.map((k, i) => <Line key={k} type="monotone" dataKey={k} stroke={PALETTE[i % PALETTE.length]} strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />)}
       </LineChart>
     );
   }
