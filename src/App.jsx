@@ -13,11 +13,11 @@ const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
 const CHAT_API_PATH = '/api/chat';
 
-function anthropicMessagesPost({ system, messages, max_tokens }) {
+function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice }) {
   return fetch(CHAT_API_PATH, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ system, messages, max_tokens }),
+    body: JSON.stringify({ system, messages, max_tokens, tools, tool_choice }),
   });
 }
 
@@ -79,15 +79,6 @@ function extractJsonObject(text) {
     }
   }
   return null;
-}
-
-// Extract a single SELECT query from a ```sql-query (or ```sql) block.
-function stellaExtractSqlQuery(text) {
-  if (!text) return null;
-  const m = String(text).match(/```sql-query\s*([\s\S]*?)```/i) || String(text).match(/```sql\s*([\s\S]*?)```/i);
-  if (!m) return null;
-  const sql = m[1].trim();
-  return /^select\b/i.test(sql) ? sql : null;
 }
 
 // Remove any SQL blocks so they are never shown to the end user.
@@ -210,6 +201,16 @@ function stellaFormatContextQa(ctx) {
   if (Array.isArray(ctx.key_metrics) && ctx.key_metrics.length) lines.push(`Key metrics: ${ctx.key_metrics.join(', ')}`);
   else if (ctx.key_metrics) lines.push(`Key metrics: ${ctx.key_metrics}`);
   if (ctx.interpretation_notes) lines.push(`Interpretation notes: ${ctx.interpretation_notes}`);
+  if (Array.isArray(ctx.relationships) && ctx.relationships.length) {
+    lines.push('Confirmed relationships to other datasets:');
+    ctx.relationships.forEach(r => {
+      if (!r) return;
+      const target = r.related_table || r.related_file;
+      if (!target) return;
+      const join = (r.this_field && r.related_field) ? ` (join this.${r.this_field} = ${target}.${r.related_field})` : '';
+      lines.push(`  - Relates to ${target}${join}${r.note ? ` — ${r.note}` : ''}`);
+    });
+  }
   if (Array.isArray(ctx.qa_pairs) && ctx.qa_pairs.length) {
     lines.push('Intake Q&A:');
     ctx.qa_pairs.forEach(qa => { if (qa && (qa.question || qa.answer)) lines.push(`  Q: ${qa.question || ''}\n  A: ${qa.answer || ''}`); });
@@ -1897,12 +1898,22 @@ ${isFocused
         }
       }
     }
+    const relationships = Array.isArray(base.relationships)
+      ? base.relationships.filter(r => r && (r.related_file || r.related_table)).map(r => ({
+          related_file: r.related_file || '',
+          related_table: r.related_table || '',
+          this_field: r.this_field || '',
+          related_field: r.related_field || '',
+          note: r.note || '',
+        }))
+      : [];
     return {
       what_it_represents: base.what_it_represents || '',
       time_period: base.time_period || '',
       key_metrics: Array.isArray(base.key_metrics) ? base.key_metrics : (base.key_metrics ? [String(base.key_metrics)] : []),
       interpretation_notes: base.interpretation_notes || '',
       qa_pairs: qa,
+      relationships,
     };
   };
 
@@ -1942,13 +1953,23 @@ ${isFocused
   const stellaIntakeNextTurn = async (f) => {
     if (!f) return;
     const isDoc = !f.tableName;
+
+    // Other tabular datasets this file could relate to (for AI-suggested joins).
+    const otherTabular = (stellaDataFiles || []).filter(x => x.id !== f.id && x.tableName);
+    const otherFilesBlob = otherTabular.length
+      ? otherTabular.map(x => `- "${x.name}" (table ${x.tableName}) columns: ${(x.columns || []).map(c => c.name).join(', ') || '(unknown)'}`).join('\n')
+      : '(no other datasets uploaded yet)';
+    const relationshipGuidance = (!isDoc && otherTabular.length)
+      ? `\n\nRELATIONSHIPS: Other datasets already exist (listed below). Based on the column names, if this dataset looks like it could be linked to any of them, propose the likely link in PLAIN ENGLISH and ask the user to confirm it makes sense — never ask them for technical join syntax. Example: "It looks like this sales file links to your Targets file by territory — is that right?". Capture any confirmed links in context_qa.relationships.\n\nOTHER DATASETS:\n${otherFilesBlob}`
+      : '';
+
     const system = `You are the Stella Insights data intake agent. Your job is to capture the interpretive context that lets an analyst understand this ${isDoc ? 'document' : 'dataset'} correctly.
 
 Ask ONE focused question per turn. Ask 3-5 questions in total across turns, covering:
 - what the ${isDoc ? 'document contains / represents' : 'data represents'}
 - the time period it covers
 - the key metrics / important fields and EXACTLY what they mean (e.g. a column "rev" = actual revenue in GBP)
-- how the data should be interpreted (definitions, filters, caveats)
+- how the data should be interpreted (definitions, filters, caveats)${(!isDoc && otherTabular.length) ? '\n- whether/how it relates to other uploaded datasets (propose the link in plain English for the user to confirm)' : ''}
 
 When you have enough, set "complete": true and fill "context_qa" fully.
 
@@ -1962,10 +1983,11 @@ Schema:
     "time_period": "",
     "key_metrics": ["", ""],
     "interpretation_notes": "",
-    "qa_pairs": [{"question": "", "answer": ""}]
+    "qa_pairs": [{"question": "", "answer": ""}],
+    "relationships": [{"related_file": "other file name", "related_table": "its table name if known", "this_field": "column in THIS dataset", "related_field": "column in the other dataset", "note": "plain-English description the user confirmed"}]
   }
 }
-When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked and the user's answer.`;
+When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked and the user's answer, and "relationships" MUST only contain links the user explicitly confirmed (empty array if none).${relationshipGuidance}`;
 
     const colsBlob = Array.isArray(f.columns) && f.columns.length
       ? f.columns.map(c => `- ${c.name}${c.type ? ` [${c.type}]` : ''}${c.description ? `: ${c.description}` : ''}`).join('\n')
@@ -2367,32 +2389,39 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
       return `FILE ${i + 1}: ${f.name}\n- Type: ${f.fileType || f.type || 'file'}\n- ${location}${f.rowCount != null ? `\n- Rows: ${f.rowCount}` : ''}\n- Summary: ${f.summary || '(none)'}\n- Columns:\n${cols}\n- Interpretive context:\n${ctx}`;
     }).join('\n\n');
 
+    const tableList = tabular.length ? tabular.map(t => t.tableName).join(', ') : '(none)';
     const sqlInstr = tabular.length
-      ? `\nQUERYING TABULAR DATA:\nWhen you need actual data from a tabular dataset to answer a question, write a SINGLE SQL SELECT query in a block EXACTLY like this:\n\`\`\`sql-query\nSELECT ... FROM ${tabular[0].tableName} WHERE ...\n\`\`\`\n- Only SELECT statements are allowed.\n- Reference the EXACT table name(s) from the list above: ${tabular.map(t => t.tableName).join(', ')}.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n- After the query runs I will return the results to you; then interpret them for the user in plain English.\n`
+      ? `\nTABULAR DATA (query with tools):\n- Query tables using the \`run_sql\` tool (single SELECT only). Available tables: ${tableList}.\n- Use \`inspect_table\` to preview a table's real values/formats before writing analytical queries.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n- To combine datasets, JOIN across tables using the confirmed relationships above (or a sensible key if none is confirmed — state the assumption).\n`
       : '';
     const docInstr = docs.length
-      ? `\nDOCUMENTS (PDF / text):\nFor questions about the stored documents, answer directly from their summary and interpretive context above. Do NOT write SQL for documents.\n`
+      ? `\nDOCUMENTS (PDF / text):\nAnswer questions about stored documents directly from their summary and interpretive context above. Do NOT use SQL tools for documents.\n`
       : '';
 
-    return `You are Stella Insights — a Commercial Excellence data analysis assistant. You help the user understand and analyse their uploaded data, spot trends, and visualise results.
+    return `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools, verify your findings, and explain them clearly.
 
 ${bizText}
-FILES AVAILABLE TO YOU (${files.length}):
+DATA CATALOG (${files.length} file${files.length === 1 ? '' : 's'}):
 ${blocks || '(no files uploaded yet)'}
 ${sqlInstr}${docInstr}
-HOW TO ANSWER:
-- Always use the interpretive context above to understand what each column and value means (e.g. currency, units, definitions).
-- When the user asks what data you have, list the files above by name.
-- NEVER show raw SQL or raw JSON to the user — present findings in clear plain English.
-- Do not invent values or table/column names. If you can't answer from the available data, say so and ask for what's needed.
+HOW TO WORK (be agentic):
+1. PLAN — briefly think through what the question needs and which datasets/columns are relevant.
+2. INSPECT — when working with tabular data, use \`inspect_table\` first to see real values, formats, and distinct categories before committing to a query. Don't assume value formats.
+3. EXECUTE — run the analytical query/queries with \`run_sql\`. For multi-dataset questions, join across tables.
+4. VERIFY — sanity-check results: do row counts make sense? any unexpected nulls/empties? do totals reconcile? If a query returns nothing or looks wrong, diagnose and try a different approach rather than guessing.
+5. ANSWER — only when confident, give the final plain-English answer.
+
+RULES:
+- Prefer tools over assumptions. Never invent values, table names, or column names.
+- Use the interpretive context to read values correctly (currency, units, definitions).
+- If the data genuinely can't answer the question, say so plainly and suggest what's needed.
+- NEVER expose raw SQL or raw JSON to the user — only clear findings.
 
 CHARTS:
-When a chart would help, include exactly ONE chart block EXACTLY like this:
+When a chart helps, include exactly ONE chart block in your FINAL answer, EXACTLY like this:
 \`\`\`chart-stella
 {"type": "bar", "title": "...", "data": [{"label": "A", "value": 10}], "xKey": "label", "yKey": "value"}
 \`\`\`
-- Supported types: bar, line, scatter.
-- Use xKey / yKey to name the fields in your data objects. Keep to <= 40 data points.
+- Supported types: bar, line, scatter. Use xKey / yKey to name fields. Keep to <= 40 data points.
 
 RESPONSE STYLE:
 Use ## headers, bullet points, concise explanations, and suggest useful follow-up questions.`;
@@ -2409,6 +2438,80 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     return Array.isArray(data.rows) ? data.rows : [];
   };
 
+  // Tools the Stella agent can call during its investigation loop.
+  const STELLA_TOOLS = [
+    {
+      name: 'run_sql',
+      description: 'Execute a single read-only SQL SELECT against the uploaded datasets and return matching rows as JSON. Only SELECT is allowed. Use exact table and column names from the data catalog. Use JOINs to combine datasets.',
+      input_schema: {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'A single SQL SELECT statement.' } },
+        required: ['query'],
+      },
+    },
+    {
+      name: 'inspect_table',
+      description: 'Preview a dataset table (up to 8 sample rows) to understand its real values, formats and categories before writing analytical queries.',
+      input_schema: {
+        type: 'object',
+        properties: { table: { type: 'string', description: 'Exact table name from the data catalog.' } },
+        required: ['table'],
+      },
+    },
+  ];
+
+  // Execute a tool call requested by the agent; returns { text, step }.
+  const runStellaTool = async (name, input, knownTables) => {
+    if (name === 'inspect_table') {
+      const table = String(input?.table || '').trim();
+      if (!knownTables.includes(table)) {
+        return { text: `Unknown table "${table}". Available: ${knownTables.join(', ') || '(none)'}.`, step: { type: 'error', label: `Inspect ${table}`, detail: 'Unknown table' } };
+      }
+      try {
+        const rows = await stellaRunQuery(`SELECT * FROM ${table} LIMIT 8`);
+        return {
+          text: `Sample rows from ${table} (up to 8):\n${JSON.stringify(rows).slice(0, 6000)}`,
+          step: { type: 'inspect', label: `Inspected ${table}`, detail: `${rows.length} sample row${rows.length === 1 ? '' : 's'}` },
+        };
+      } catch (err) {
+        return { text: `Could not inspect ${table}: ${err.message}`, step: { type: 'error', label: `Inspect ${table}`, detail: err.message } };
+      }
+    }
+    if (name === 'run_sql') {
+      const query = String(input?.query || '').trim();
+      try {
+        const rows = await stellaRunQuery(query);
+        return {
+          text: `Rows (${rows.length}):\n${JSON.stringify(rows).slice(0, 10000)}`,
+          step: { type: 'query', label: 'Ran query', detail: query, resultCount: rows.length },
+        };
+      } catch (err) {
+        return { text: `Query failed: ${err.message}`, step: { type: 'error', label: 'Query failed', detail: `${query}\n→ ${err.message}` } };
+      }
+    }
+    return { text: `Unknown tool: ${name}`, step: { type: 'error', label: `Unknown tool ${name}`, detail: '' } };
+  };
+
+  // Collapsible "How Stella worked this out" reasoning trail.
+  const renderStellaSteps = (steps) => {
+    const iconFor = (t) => (t === 'query' ? '🔎' : t === 'inspect' ? '👁' : t === 'error' ? '⚠️' : '🧠');
+    return (
+      <details className="mb-3 bg-slate-900/50 border border-blue-400/20 rounded-lg overflow-hidden">
+        <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-cyan-300/90 hover:bg-slate-800/50 flex items-center gap-2">
+          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> How Stella worked this out ({steps.length} step{steps.length === 1 ? '' : 's'})
+        </summary>
+        <div className="px-3 pb-3 pt-1 space-y-2">
+          {steps.map((s, i) => (
+            <div key={i} className="text-[11px] text-blue-200/80">
+              <div className="font-semibold text-blue-100/90">{iconFor(s.type)} {s.label}{typeof s.resultCount === 'number' ? ` — ${s.resultCount} row${s.resultCount === 1 ? '' : 's'}` : ''}</div>
+              {s.detail && <pre className="mt-0.5 whitespace-pre-wrap text-blue-300/70 bg-slate-950/40 rounded px-2 py-1 overflow-x-auto">{s.detail}</pre>}
+            </div>
+          ))}
+        </div>
+      </details>
+    );
+  };
+
   const handleStellaChatSubmit = async (e) => {
     if (e) e.preventDefault();
     const messageContent = stellaInput.trim();
@@ -2420,40 +2523,67 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       // Always build the prompt from the freshest registry.
       const registry = await stellaReloadRegistry();
       const files = registry || stellaDataFiles;
+      const knownTables = files.filter(f => f.tableName).map(f => f.tableName);
       const systemPrompt = buildStellaSystemPrompt(files);
 
+      // Prior turns as plain strings; the agent loop uses structured content.
       const convo = [
         ...stellaMessages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
         { role: 'user', content: messageContent },
       ];
 
-      const callStella = async () => {
-        const resp = await anthropicMessagesPost({ system: systemPrompt, messages: convo, max_tokens: 4000 });
+      const steps = [];
+      let finalText = '';
+      const MAX_STEPS = 8;
+
+      for (let round = 0; round < MAX_STEPS; round++) {
+        const resp = await anthropicMessagesPost({
+          system: systemPrompt,
+          messages: convo,
+          tools: STELLA_TOOLS,
+          max_tokens: 4000,
+        });
         const data = await resp.json();
         if (data.error) throw new Error(data.error.message);
-        return anthropicAssistantText(data) || '';
-      };
 
-      // Iterative loop: run any SQL the model requests, feed results back, interpret.
-      let finalText = '';
-      for (let round = 0; round < 4; round++) {
-        const text = await callStella();
-        const sql = stellaExtractSqlQuery(text);
-        if (!sql) { finalText = text; break; }
-        convo.push({ role: 'assistant', content: text });
-        let resultBlock;
-        try {
-          const rows = await stellaRunQuery(sql);
-          const rowsJson = JSON.stringify(rows).slice(0, 12000);
-          resultBlock = `QUERY RESULTS (JSON) for the SQL you wrote:\n${rowsJson}\n\nNow answer the user's question in plain English using these results. Do not show the SQL or the raw JSON. If a chart would help, include a chart-stella block.`;
-        } catch (qErr) {
-          resultBlock = `The query could not be executed (${qErr.message}). Explain to the user that the data couldn't be retrieved and, if helpful, suggest what to check. Do not show any SQL.`;
+        const content = Array.isArray(data.content) ? data.content : [];
+        const textParts = content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+        const toolUses = content.filter(b => b.type === 'tool_use');
+
+        // Capture the agent's thinking/plan for the reasoning trail.
+        if (textParts && toolUses.length) steps.push({ type: 'thought', label: 'Reasoning', detail: textParts });
+
+        if (data.stop_reason !== 'tool_use' || !toolUses.length) {
+          finalText = textParts || finalText;
+          break;
         }
-        convo.push({ role: 'user', content: resultBlock });
-      }
-      if (!finalText) finalText = await callStella();
 
-      setStellaMessages(prev => [...prev, { role: 'assistant', content: stellaStripSqlBlocks(finalText) || finalText }]);
+        // Record the assistant turn (must include the tool_use blocks verbatim).
+        convo.push({ role: 'assistant', content });
+
+        // Execute each requested tool and feed results back.
+        const toolResults = [];
+        for (const tu of toolUses) {
+          const { text, step } = await runStellaTool(tu.name, tu.input, knownTables);
+          steps.push(step);
+          toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: text });
+        }
+        convo.push({ role: 'user', content: toolResults });
+
+        // On the last allowed round, force a plain-text final answer next.
+        if (round === MAX_STEPS - 1) {
+          const wrapResp = await anthropicMessagesPost({
+            system: systemPrompt,
+            messages: [...convo, { role: 'user', content: 'Please give your final answer now based on what you found.' }],
+            max_tokens: 3000,
+          });
+          const wrapData = await wrapResp.json();
+          if (!wrapData.error) finalText = anthropicAssistantText(wrapData) || finalText;
+        }
+      }
+
+      const cleaned = stellaStripSqlBlocks(finalText) || finalText || 'I couldn\'t find enough to answer that from the available data.';
+      setStellaMessages(prev => [...prev, { role: 'assistant', content: cleaned, steps }]);
     } catch (error) {
       setStellaMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: Unable to process request.\n\n${error?.message || 'Unknown error'}` }]);
     } finally {
@@ -3150,6 +3280,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       </div>
                       <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
                         <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
+                          {Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps)}
                           <div className="text-sm leading-relaxed">
                             {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : <MessageErrorBoundary>{formatMarkdown(message.content)}</MessageErrorBoundary>}
                           </div>

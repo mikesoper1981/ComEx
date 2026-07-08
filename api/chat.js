@@ -25,7 +25,7 @@ module.exports = async function handler(req, res) {
     }
   }
 
-  const { system, messages, max_tokens } = body || {};
+  const { system, messages, max_tokens, tools, tool_choice } = body || {};
 
   if (!Array.isArray(messages)) {
     return res.status(400).json({ error: { message: 'messages must be an array' } });
@@ -41,6 +41,11 @@ module.exports = async function handler(req, res) {
 
   if (system != null && String(system).trim() !== '') {
     anthropicBody.system = system;
+  }
+
+  if (Array.isArray(tools) && tools.length > 0) {
+    anthropicBody.tools = tools;
+    if (tool_choice != null) anthropicBody.tool_choice = tool_choice;
   }
 
   try {
