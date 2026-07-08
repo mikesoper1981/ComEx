@@ -37,6 +37,52 @@ function safeJsonParse(text) {
   try { return JSON.parse(text); } catch { return null; }
 }
 
+function extractJsonObject(text) {
+  if (!text) return null;
+  const direct = safeJsonParse(String(text).trim());
+  if (direct) return direct;
+
+  const fencedMatch = String(text).match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fencedMatch) {
+    const fenced = safeJsonParse(fencedMatch[1].trim());
+    if (fenced) return fenced;
+  }
+
+  const source = String(text);
+  const firstBrace = source.indexOf('{');
+  if (firstBrace === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = firstBrace; i < source.length; i++) {
+    const ch = source[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === '{') depth += 1;
+    if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        const candidate = source.slice(firstBrace, i + 1);
+        const parsed = safeJsonParse(candidate);
+        if (parsed) return parsed;
+      }
+    }
+  }
+  return null;
+}
+
 function sanitizeStorageName(name) {
   return String(name || 'file')
     .replace(/[^\w.\-() ]+/g, '_')
@@ -536,6 +582,7 @@ export default function CommercialExcellenceApp() {
     keyMetrics: '',
     terminology: '',
   });
+  const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
   const [knowledgeBase, setKnowledgeBase] = useState(DEFAULT_KNOWLEDGE);
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
   const [documents, setDocuments] = useState([
@@ -736,6 +783,7 @@ export default function CommercialExcellenceApp() {
   const [activityLog, setActivityLog] = useState([]);
   const [showActivityLog, setShowActivityLog] = useState(false);
   const [adminSection, setAdminSection] = useState('knowledge');
+  const [adminModule, setAdminModule] = useState('incentive'); // incentive | territory | stella
   const [editingWorkflowId, setEditingWorkflowId] = useState(null);
   const [editingTopic, setEditingTopic] = useState(null);
   const [expandedSteps, setExpandedSteps] = useState({});
@@ -1700,11 +1748,15 @@ ${isFocused
 
   const stellaSaveBusinessContext = async (next) => {
     setStellaBusinessContext(next);
+    setStellaBizSaveStatus('saving');
     try {
       const payload = new Blob([JSON.stringify(next, null, 2)], { type: 'application/json' });
       await stellaUploadToStorage('business-context.json', payload, 'application/json');
       await reloadStellaBusinessContextFromSupabase();
+      setStellaBizSaveStatus('saved');
+      setTimeout(() => setStellaBizSaveStatus('idle'), 3000);
     } catch (e) {
+      setStellaBizSaveStatus('error');
       setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not persist business context to Supabase: ${e.message}` }]);
     }
   };
@@ -1743,13 +1795,13 @@ ${isFocused
     reader.readAsText(file);
   });
 
-  const stellaBuildContentSummary = async ({ name, type, textSample }) => {
-    const system = `You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nBe precise. If unsure, say what you can infer and what is missing.`;
-    const user = `FILE:\n- name: ${name}\n- type: ${type}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
-    const raw = await callAnthropic(system, [{ role: 'user', content: user }], 800);
-    const cleaned = String(raw || '').replace(/```json|```/g, '').trim();
-    const parsed = safeJsonParse(cleaned);
-    return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', suggestedQuestions: ['What does this data represent?', 'What time period does it cover?', 'Which metrics matter most?', 'Any definitions or filters to apply?'] };
+  const stellaBuildContentSummary = async ({ name, type, textSample, columns = [] }) => {
+    const system = `You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "columns": [{ "name": "exact column name", "description": "what this column represents" }],\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nIf column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. If unsure, say what you can infer and what is missing.`;
+    const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
+    const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1000);
+    const parsed = extractJsonObject(raw);
+    return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', columns: [], suggestedQuestions: ['What does this data represent?', 'What time period does it cover?', 'Which metrics matter most?', 'Any definitions or filters to apply?'] };
   };
 
   const stellaIntakeNextTurn = async (fileId) => {
@@ -1757,21 +1809,25 @@ ${isFocused
     if (!f) return;
     const system = `You are the Stella Insights intake agent.\n\nGoal: collect enough context to interpret the dataset correctly.\nAsk 1-2 questions per turn.\nStop when you have enough and then return ONLY valid JSON with complete=true.\n\nReturn ONLY valid JSON, no markdown.\nSchema:\n{\n  "complete": true/false,\n  "assistantMessage": "what to show in the intake panel",\n  "capturedContext": {\n    "whatIsThisData": "",\n    "timePeriod": "",\n    "keyMetrics": "",\n    "grain": "",\n    "filters": "",\n    "definitions": "",\n    "dataQualityNotes": ""\n  }\n}\n\nIf complete=false, set capturedContext to null and use assistantMessage to ask follow-up questions.`;
 
-    const contextBlob = `DATASET SUMMARY:\n${f.summary || ''}\n\nKNOWN CAPTURED CONTEXT (may be empty):\n${f.capturedContext ? JSON.stringify(f.capturedContext, null, 2) : '{}'}`;
+    const colsBlob = Array.isArray(f.columns) && f.columns.length
+      ? f.columns.map(c => `- ${c.name}${c.description ? `: ${c.description}` : ''}`).join('\n')
+      : '(no columns detected)';
+    const contextBlob = `DATASET SUMMARY:\n${f.summary || ''}\n\nDETECTED COLUMNS:\n${colsBlob}\n\nKNOWN CAPTURED CONTEXT (may be empty):\n${f.capturedContext ? JSON.stringify(f.capturedContext, null, 2) : '{}'}`;
     const convo = [
       { role: 'user', content: `You are onboarding dataset: "${f.name}".\n\n${contextBlob}` },
       ...((f.intakeMessages || []).map(m => ({ role: toAnthropicRole(m.role), content: m.content }))),
     ];
 
     const raw = await callAnthropic(system, convo, 900);
-    const cleaned = String(raw || '').replace(/```json|```/g, '').trim();
-    const parsed = safeJsonParse(cleaned);
+    const parsed = extractJsonObject(raw);
     if (!parsed || typeof parsed !== 'object') {
       const fallback = { complete: false, assistantMessage: 'I had trouble parsing my own intake response. Could you tell me: what does the data represent, what time period, and which key metrics matter?', capturedContext: null };
       await stellaUpdateMeta(fileId, { intakeMessages: [...(f.intakeMessages || []), { role: 'assistant', content: fallback.assistantMessage }] });
       return;
     }
-    const assistantMessage = parsed.assistantMessage || '';
+    const assistantMessage = parsed.assistantMessage || (parsed.complete
+      ? 'Thanks — I have enough context to interpret this dataset.'
+      : 'I need a bit more context before I can analyse this dataset properly.');
     const nextIntakeMessages = [...(f.intakeMessages || []), { role: 'assistant', content: assistantMessage }];
     if (parsed.complete) {
       await stellaUpdateMeta(fileId, { capturedContext: parsed.capturedContext || {}, intakeMessages: nextIntakeMessages });
@@ -1796,6 +1852,8 @@ ${isFocused
       storagePath: null,
       metaPath: null,
       summary: '',
+      columns: [],
+      rowCountEstimate: null,
       capturedContext: null,
       intakeMessages: [],
     };
@@ -1809,10 +1867,29 @@ ${isFocused
       const saved = { ...base, storageBucket: up.bucket, storagePath: up.objectPath };
       setStellaDataFiles(prev => prev.map(f => f.id === id ? saved : f));
 
-      // Build a lightweight content sample for intake
+      // Build a lightweight content sample for intake + detect columns
       let sampleText = '';
+      let columns = [];
+      let rowCountEstimate = null;
       const lower = file.name.toLowerCase();
-      if (lower.endsWith('.csv') || lower.endsWith('.json') || lower.endsWith('.txt') || lower.endsWith('.md')) {
+      if (lower.endsWith('.csv')) {
+        const txt = await stellaReadAsText(file);
+        sampleText = txt.substring(0, 18000);
+        const lines = txt.split(/\r?\n/).filter(l => l.trim().length > 0);
+        if (lines.length > 0) {
+          columns = lines[0].split(',').map(c => ({ name: c.trim().replace(/^"|"$/g, ''), description: '' })).filter(c => c.name);
+          rowCountEstimate = Math.max(0, lines.length - 1);
+        }
+      } else if (lower.endsWith('.json')) {
+        const txt = await stellaReadAsText(file);
+        sampleText = txt.substring(0, 18000);
+        const parsedJson = safeJsonParse(txt);
+        const firstRow = Array.isArray(parsedJson) ? parsedJson[0] : (parsedJson && typeof parsedJson === 'object' ? parsedJson : null);
+        if (firstRow && typeof firstRow === 'object') {
+          columns = Object.keys(firstRow).map(k => ({ name: k, description: '' }));
+        }
+        if (Array.isArray(parsedJson)) rowCountEstimate = parsedJson.length;
+      } else if (lower.endsWith('.txt') || lower.endsWith('.md')) {
         const txt = await stellaReadAsText(file);
         sampleText = txt.substring(0, 18000);
       } else if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
@@ -1824,6 +1901,10 @@ ${isFocused
           const sheetName = wb.SheetNames?.[0];
           const ws = sheetName ? wb.Sheets[sheetName] : null;
           const rows = ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
+          if (rows.length > 0 && typeof rows[0] === 'object') {
+            columns = Object.keys(rows[0]).map(k => ({ name: k, description: '' }));
+          }
+          rowCountEstimate = rows.length;
           sampleText = JSON.stringify(rows.slice(0, 50), null, 2).substring(0, 18000);
         } catch {
           sampleText = 'Excel file uploaded. (Preview parsing not available.)';
@@ -1834,11 +1915,24 @@ ${isFocused
         sampleText = `File uploaded: ${file.name}`;
       }
 
-      const onboarding = await stellaBuildContentSummary({ name: file.name, type: saved.type, textSample: sampleText });
+      const onboarding = await stellaBuildContentSummary({ name: file.name, type: saved.type, textSample: sampleText, columns });
       const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
-      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${onboarding.summary || ''}\n\nTo interpret this correctly, I need a bit more context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nReply with answers (numbered is fine).`;
+      // Merge any AI-provided column descriptions back onto detected columns
+      let mergedColumns = columns;
+      if (Array.isArray(onboarding.columns) && onboarding.columns.length) {
+        if (columns.length) {
+          mergedColumns = columns.map(c => {
+            const match = onboarding.columns.find(oc => (oc.name || '').toLowerCase() === c.name.toLowerCase());
+            return match ? { name: c.name, description: match.description || '' } : c;
+          });
+        } else {
+          mergedColumns = onboarding.columns.map(oc => ({ name: oc.name || '', description: oc.description || '' })).filter(c => c.name);
+        }
+      }
+      const colLine = mergedColumns.length ? `\n\n**Detected columns:** ${mergedColumns.map(c => c.name).join(', ')}` : '';
+      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${onboarding.summary || ''}${colLine}\n\nTo interpret this correctly, I need a bit more context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nReply with answers (numbered is fine).`;
 
-      const withIntake = { ...saved, summary: onboarding.summary || 'Uploaded dataset.', intakeMessages: [{ role: 'assistant', content: assistantMsg }] };
+      const withIntake = { ...saved, summary: onboarding.summary || 'Uploaded dataset.', columns: mergedColumns, rowCountEstimate, intakeMessages: [{ role: 'assistant', content: assistantMsg }] };
       setStellaDataFiles(prev => prev.map(f => f.id === id ? withIntake : f));
       await stellaUpdateMeta(id, withIntake);
     } catch (e) {
@@ -1859,6 +1953,194 @@ ${isFocused
     await stellaIntakeNextTurn(fileId);
   };
 
+  const handleStellaDeleteFile = async (fileId) => {
+    const f = stellaDataFiles.find(x => x.id === fileId);
+    if (!f) return;
+    if (!window.confirm(`Delete "${f.name}" and its captured context? This cannot be undone.`)) return;
+    // Remove from Supabase storage (raw file + metadata companion)
+    try {
+      if (f.storageBucket) {
+        const toRemove = [f.storagePath, f.metaPath].filter(Boolean);
+        if (toRemove.length) await supabase.storage.from(f.storageBucket).remove(toRemove);
+      }
+    } catch (e) {
+      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not fully remove "${f.name}" from Supabase: ${e.message}` }]);
+    }
+    setStellaDataFiles(prev => prev.filter(x => x.id !== fileId));
+    setActiveStellaDataId(prev => (prev === fileId ? null : prev));
+  };
+
+  // ── STELLA: Reusable admin panels ──
+  const renderStellaDataPanel = () => (
+    <div className="flex flex-col lg:flex-row gap-4">
+      <div className="w-full lg:w-2/5">
+        <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-bold text-white">Datasets</div>
+              <div className="text-xs text-blue-300/60 mt-1">Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions.</div>
+            </div>
+            <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
+              <Upload className="w-4 h-4" /> Upload
+            </button>
+            <input ref={stellaDataFileInputRef} type="file" accept=".csv,.json,.xlsx,.xls,.pdf,.txt,.md" onChange={handleStellaDataUpload} className="hidden" />
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          {stellaDataFiles.length === 0 && (
+            <div className="bg-slate-800/20 border border-slate-700/40 rounded-xl p-5 text-sm text-blue-300/60">
+              No datasets uploaded yet. Upload a file to begin intake.
+            </div>
+          )}
+          {stellaDataFiles.map(f => (
+            <div key={f.id} className={`w-full bg-slate-800/30 border rounded-xl p-4 transition-all ${activeStellaDataId === f.id ? 'border-cyan-400/60 bg-cyan-500/10' : 'border-blue-400/20 hover:border-blue-400/40'}`}>
+              <div className="flex items-start justify-between gap-3">
+                <button onClick={() => setActiveStellaDataId(f.id)} className="min-w-0 text-left flex-1">
+                  <div className="text-sm font-semibold text-white truncate">{f.name}</div>
+                  <div className="text-xs text-blue-300/60 mt-1">{f.size} • {f.type || 'file'}{Array.isArray(f.columns) && f.columns.length ? ` • ${f.columns.length} cols` : ''}</div>
+                  {f.summary && <div className="text-xs text-blue-200/80 mt-2 line-clamp-3">{f.summary}</div>}
+                </button>
+                <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                  {f.capturedContext ? (
+                    <span className="px-2 py-1 bg-green-500/20 text-green-300 text-xs rounded border border-green-400/30">Context captured</span>
+                  ) : (
+                    <span className="px-2 py-1 bg-yellow-500/15 text-yellow-200 text-xs rounded border border-yellow-400/25">Intake pending</span>
+                  )}
+                  <button onClick={() => handleStellaDeleteFile(f.id)} className="p-1.5 hover:bg-red-500/20 rounded transition-colors text-red-400" title="Delete file and context"><Trash2 className="w-4 h-4" /></button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="w-full lg:w-3/5">
+        <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5">
+          <div className="text-sm font-bold text-white mb-1">Intake assistant</div>
+          <div className="text-xs text-blue-300/60 mb-4">Answer a few questions so Stella can interpret your dataset correctly.</div>
+
+          {(() => {
+            const f = stellaDataFiles.find(x => x.id === activeStellaDataId);
+            if (!f) return <div className="text-sm text-blue-300/60">Select a dataset on the left.</div>;
+            const intake = f.intakeMessages || [];
+            return (
+              <div className="space-y-3">
+                <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4 max-h-[420px] overflow-y-auto custom-scrollbar space-y-3">
+                  {intake.length === 0 ? (
+                    <div className="text-sm text-blue-300/60">Upload processing…</div>
+                  ) : intake.map((m, i) => (
+                    <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[90%] px-3 py-2 rounded-xl text-sm ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                        {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : formatMarkdown(m.content)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {Array.isArray(f.columns) && f.columns.length > 0 && (
+                  <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4">
+                    <div className="text-xs font-bold text-blue-300 mb-2">Columns ({f.columns.length})</div>
+                    <div className="space-y-1">
+                      {f.columns.map((c, i) => (
+                        <div key={i} className="text-[11px] text-blue-200/80"><span className="text-cyan-300 font-semibold">{c.name}</span>{c.description ? ` — ${c.description}` : ''}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {f.capturedContext && (
+                  <div className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl p-4">
+                    <div className="text-xs font-bold text-emerald-300 mb-2">Captured context</div>
+                    <pre className="text-[11px] text-emerald-200/90 whitespace-pre-wrap">{JSON.stringify(f.capturedContext, null, 2)}</pre>
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  <textarea value={stellaIntakeInput} onChange={(e) => setStellaIntakeInput(e.target.value)} placeholder="Answer the intake questions…" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} />
+                  <button onClick={handleStellaIntakeSend} disabled={!stellaIntakeInput.trim()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
+                    <Send className="w-4 h-4" /> Send
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderStellaBusinessPanel = () => (
+    <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
+      <h3 className="text-lg font-bold text-white mb-2">Business Context</h3>
+      <p className="text-xs text-blue-300/60 mb-6">This context is injected into every Stella chat prompt.</p>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
+          <input value={stellaBusinessContext.companyName} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, companyName: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
+        </div>
+        <div>
+          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry</label>
+          <input value={stellaBusinessContext.industry} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, industry: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
+        </div>
+        <div className="md:col-span-2">
+          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key goals</label>
+          <textarea value={stellaBusinessContext.keyGoals} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyGoals: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+        </div>
+        <div className="md:col-span-2">
+          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key metrics</label>
+          <textarea value={stellaBusinessContext.keyMetrics} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyMetrics: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+        </div>
+        <div className="md:col-span-2">
+          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Terminology / definitions</label>
+          <textarea value={stellaBusinessContext.terminology} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, terminology: e.target.value }))} rows={4} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+        </div>
+      </div>
+      <div className="flex items-center gap-3 mt-6">
+        <button onClick={() => stellaSaveBusinessContext(stellaBusinessContext)} disabled={stellaBizSaveStatus === 'saving'} className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 text-white font-semibold rounded-lg transition-all flex items-center gap-2">
+          <Save className="w-4 h-4" /> {stellaBizSaveStatus === 'saving' ? 'Saving…' : 'Save'}
+        </button>
+        <button onClick={() => stellaSaveBusinessContext({ companyName: '', industry: '', keyGoals: '', keyMetrics: '', terminology: '' })} className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30">
+          Reset
+        </button>
+        {stellaBizSaveStatus === 'saved' && (
+          <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved to Supabase</span>
+        )}
+        {stellaBizSaveStatus === 'error' && (
+          <span className="flex items-center gap-1.5 text-sm text-red-400 font-semibold"><AlertTriangle className="w-4 h-4" /> Save failed — see chat</span>
+        )}
+      </div>
+    </div>
+  );
+
+  const renderStellaConnectionsPanel = () => (
+    <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
+      <h3 className="text-lg font-bold text-white mb-2">Connections</h3>
+      <p className="text-xs text-blue-300/60 mb-6">Direct connectors (APIs / databases / CRM) will be enabled here in a future release.</p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {[
+          { name: 'Salesforce' },
+          { name: 'Veeva' },
+          { name: 'SAP' },
+          { name: 'Power BI' },
+          { name: 'Google Analytics' },
+          { name: 'Databricks' },
+        ].map(c => (
+          <div key={c.name} className="bg-slate-800/20 border border-slate-700/50 rounded-2xl p-5 opacity-60">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="text-sm font-bold text-slate-200">{c.name}</div>
+                <div className="text-xs text-slate-400 mt-1">Connector</div>
+              </div>
+              <span className="px-2 py-1 bg-slate-700/50 text-slate-300 text-xs rounded border border-slate-600/50">Coming Soon</span>
+            </div>
+            <div className="mt-4 text-xs text-slate-400/80">Authentication, schema mapping, and scheduled sync will be available.</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
   // ── STELLA: Chat prompt builder + submit ──
   const buildStellaSystemPrompt = () => {
     const biz = stellaBusinessContext || {};
@@ -1866,11 +2148,19 @@ ${isFocused
     const filesText = (stellaDataFiles || [])
       .map((f, i) => {
         const ctx = f.capturedContext ? JSON.stringify(f.capturedContext, null, 2) : '(no intake context captured yet)';
-        return `DATASET ${i + 1}: ${f.name}\nSummary: ${f.summary || ''}\nCaptured context:\n${ctx}\n`;
+        const cols = Array.isArray(f.columns) && f.columns.length
+          ? f.columns.map(c => `    - ${c.name}${c.description ? `: ${c.description}` : ''}`).join('\n')
+          : '    (no columns detected — may be a document or free text)';
+        const rowInfo = f.rowCountEstimate != null ? ` | approx rows: ${f.rowCountEstimate}` : '';
+        return `DATASET ${i + 1}: ${f.name} (type: ${f.type || 'file'}${rowInfo})\nSummary: ${f.summary || ''}\nColumns:\n${cols}\nCaptured context:\n${ctx}\n`;
       })
       .join('\n\n');
 
-    return `You are Stella Insights — a Commercial Excellence data analysis assistant.\n\n${bizText}\n\nUPLOADED DATASETS (summaries + captured context):\n${filesText || '(none uploaded yet)'}\n\nINSTRUCTIONS:\n- Answer questions about the datasets using the captured context.\n- Be explicit about assumptions and ask clarifying questions when needed.\n- When a chart would help, include exactly ONE chart block in this format:\n\n\`\`\`chart-recharts\n{\n  \"type\": \"bar|line|scatter|pie\",\n  \"title\": \"...\",\n  \"data\": [ {\"x\": \"...\", \"y\": 123}, ... ],\n  \"xKey\": \"x\",\n  \"yKey\": \"y\",\n  \"yKeys\": [\"y1\",\"y2\"]\n}\n\`\`\`\n\nRules:\n- Use bar/line as default. Use scatter only when it clarifies relationships.\n- Keep chart data to <= 40 rows.\n- Do not invent dataset values; if you can't compute from the provided summaries/context, ask for the needed data upload or details.\n\nRESPONSE STYLE:\nUse ## headers, bullet points, concise explanations, and include recommended next questions.`;
+    const inventory = (stellaDataFiles || []).length
+      ? (stellaDataFiles || []).map((f, i) => `${i + 1}. ${f.name}`).join('\n')
+      : '(no files available)';
+
+    return `You are Stella Insights — a Commercial Excellence data analysis assistant.\n\n${bizText}\n\nFILES YOU CURRENTLY HAVE ACCESS TO:\n${inventory}\n\nUPLOADED DATASETS (summaries + columns + captured context):\n${filesText || '(none uploaded yet)'}\n\nINSTRUCTIONS:\n- You can only see the summaries, column definitions, and captured context above — not the full raw rows. Reason from these; if you need exact row-level values you don't have, say so and ask the user.\n- When the user asks what data you have, list the files above by name.\n- Refer to columns by their exact names, and use the captured context and business context to interpret metrics/terminology.\n- Be explicit about assumptions and ask clarifying questions when needed.\n- When a chart would help, include exactly ONE chart block in this format:\n\n\`\`\`chart-recharts\n{\n  \"type\": \"bar|line|scatter|pie\",\n  \"title\": \"...\",\n  \"data\": [ {\"x\": \"...\", \"y\": 123}, ... ],\n  \"xKey\": \"x\",\n  \"yKey\": \"y\",\n  \"yKeys\": [\"y1\",\"y2\"]\n}\n\`\`\`\n\nRules:\n- Use bar/line as default. Use scatter only when it clarifies relationships.\n- Keep chart data to <= 40 rows.\n- Do not invent dataset values; if you can't compute from the provided summaries/context, ask for the needed data upload or details.\n\nRESPONSE STYLE:\nUse ## headers, bullet points, concise explanations, and include recommended next questions.`;
   };
 
   const handleStellaChatSubmit = async (e) => {
@@ -2564,235 +2854,78 @@ ${isFocused
                     <Layers className="w-6 h-6" />
                     <div>
                       <h2 className="text-xl font-bold">Stella Insights</h2>
-                      <p className="text-cyan-100 text-xs">Chat with your data — upload datasets, capture context, analyse trends, and chart insights</p>
+                      <p className="text-cyan-100 text-xs">Chat with your data — analyse trends and chart insights</p>
                     </div>
                   </div>
-                  <div className="flex gap-2 bg-slate-800/40 border border-white/10 rounded-xl p-1">
-                    {[{ id: 'chat', label: 'Chat' }, { id: 'data', label: 'Data' }, { id: 'business', label: 'Business Context' }, { id: 'connections', label: 'Connections' }].map(t => (
-                      <button key={t.id} onClick={() => setStellaTab(t.id)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${stellaTab === t.id ? 'bg-white/20 text-white' : 'text-cyan-100/70 hover:bg-white/10'}`}>
-                        {t.label}
-                      </button>
-                    ))}
-                  </div>
+                  <button onClick={() => { setActiveTab('admin'); setAdminModule('stella'); setStellaTab('data'); }} className="flex items-center gap-2 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold transition-all"><Settings className="w-4 h-4" /> Manage data & context</button>
                 </div>
               </div>
 
-              {stellaTab === 'chat' && (
-                <div className="flex flex-col flex-1 min-h-0">
-                  <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 overflow-y-auto space-y-4 custom-scrollbar mb-4 min-h-0">
-                    {stellaMessages.map((message, index) => (
-                      <div key={index} className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                        <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-400 to-blue-400' : message.role === 'system' ? 'bg-gradient-to-br from-yellow-400 to-orange-400' : 'bg-gradient-to-br from-blue-400 to-purple-400'}`}>
-                          {message.role === 'user' ? <Users className="w-5 h-5 text-slate-900" /> : message.role === 'system' ? <FileText className="w-5 h-5 text-slate-900" /> : <Layers className="w-5 h-5 text-slate-900" />}
-                        </div>
-                        <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
-                          <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
-                            <div className="text-sm leading-relaxed">
-                              {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : formatMarkdown(message.content)}
-                            </div>
+              <div className="flex flex-col flex-1 min-h-0">
+                <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 overflow-y-auto space-y-4 custom-scrollbar mb-4 min-h-0">
+                  {stellaMessages.map((message, index) => (
+                    <div key={index} className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                      <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-400 to-blue-400' : message.role === 'system' ? 'bg-gradient-to-br from-yellow-400 to-orange-400' : 'bg-gradient-to-br from-blue-400 to-purple-400'}`}>
+                        {message.role === 'user' ? <Users className="w-5 h-5 text-slate-900" /> : message.role === 'system' ? <FileText className="w-5 h-5 text-slate-900" /> : <Layers className="w-5 h-5 text-slate-900" />}
+                      </div>
+                      <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
+                        <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
+                          <div className="text-sm leading-relaxed">
+                            {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : formatMarkdown(message.content)}
                           </div>
                         </div>
                       </div>
-                    ))}
-                    {stellaIsLoading && (
-                      <div className="flex gap-3">
-                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-400 to-purple-400 flex items-center justify-center"><Layers className="w-5 h-5 text-slate-900" /></div>
-                        <div className="flex-1">
-                          <div className="inline-block px-4 py-3 rounded-2xl bg-slate-700/50 border border-blue-400/20">
-                            <div className="flex gap-1">
-                              <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0s'}}></span>
-                              <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></span>
-                              <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></span>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                    <div ref={messagesEndRef} />
-                  </div>
-
-                  <form onSubmit={handleStellaChatSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-4">
-                    <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
+                    </div>
+                  ))}
+                  {stellaIsLoading && (
+                    <div className="flex gap-3">
+                      <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-400 to-purple-400 flex items-center justify-center"><Layers className="w-5 h-5 text-slate-900" /></div>
                       <div className="flex-1">
-                        <textarea
-                          value={stellaInput}
-                          onChange={(e) => setStellaInput(e.target.value)}
-                          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleStellaChatSubmit(e); } }}
-                          placeholder="Ask a question about your uploaded datasets…"
-                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 sm:py-3 text-sm outline-none focus:border-blue-400 transition-colors resize-none"
-                          rows={2}
-                          disabled={stellaIsLoading}
-                        />
-                      </div>
-                      <div className="flex gap-2 sm:gap-3 sm:items-end">
-                        <button type="button" onClick={() => { setStellaTab('data'); }} className="flex-1 sm:flex-none px-4 py-3 bg-slate-700 hover:bg-slate-600 text-cyan-300 rounded-lg transition-all border border-cyan-400/25 hover:border-cyan-400/50 text-xs font-semibold" disabled={stellaIsLoading}>Data</button>
-                        <button type="submit" disabled={stellaIsLoading || !stellaInput.trim()} className="flex-1 sm:flex-none px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
-                      </div>
-                    </div>
-                  </form>
-                </div>
-              )}
-
-              {stellaTab === 'data' && (
-                <div className="flex-1 min-h-0 overflow-hidden flex gap-4">
-                  <div className="w-full lg:w-2/5 overflow-y-auto custom-scrollbar">
-                    <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-bold text-white">Datasets</div>
-                          <div className="text-xs text-blue-300/60 mt-1">Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions.</div>
-                        </div>
-                        <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
-                          <Upload className="w-4 h-4" /> Upload
-                        </button>
-                        <input ref={stellaDataFileInputRef} type="file" accept=".csv,.json,.xlsx,.xls,.pdf,.txt,.md" onChange={handleStellaDataUpload} className="hidden" />
-                      </div>
-                    </div>
-
-                    <div className="space-y-3">
-                      {stellaDataFiles.length === 0 && (
-                        <div className="bg-slate-800/20 border border-slate-700/40 rounded-xl p-5 text-sm text-blue-300/60">
-                          No datasets uploaded yet. Upload a file to begin intake.
-                        </div>
-                      )}
-                      {stellaDataFiles.map(f => (
-                        <button key={f.id} onClick={() => setActiveStellaDataId(f.id)} className={`w-full text-left bg-slate-800/30 border rounded-xl p-4 transition-all ${activeStellaDataId === f.id ? 'border-cyan-400/60 bg-cyan-500/10' : 'border-blue-400/20 hover:border-blue-400/40'}`}>
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="text-sm font-semibold text-white truncate">{f.name}</div>
-                              <div className="text-xs text-blue-300/60 mt-1">{f.size} • {f.type || 'file'}</div>
-                              {f.summary && <div className="text-xs text-blue-200/80 mt-2 line-clamp-3">{f.summary}</div>}
-                            </div>
-                            <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                              {f.capturedContext ? (
-                                <span className="px-2 py-1 bg-green-500/20 text-green-300 text-xs rounded border border-green-400/30">Context captured</span>
-                              ) : (
-                                <span className="px-2 py-1 bg-yellow-500/15 text-yellow-200 text-xs rounded border border-yellow-400/25">Intake pending</span>
-                              )}
-                            </div>
+                        <div className="inline-block px-4 py-3 rounded-2xl bg-slate-700/50 border border-blue-400/20">
+                          <div className="flex gap-1">
+                            <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0s'}}></span>
+                            <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></span>
+                            <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></span>
                           </div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="hidden lg:block w-3/5 overflow-y-auto custom-scrollbar">
-                    <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5">
-                      <div className="text-sm font-bold text-white mb-1">Intake assistant</div>
-                      <div className="text-xs text-blue-300/60 mb-4">Answer a few questions so Stella can interpret your dataset correctly.</div>
-
-                      {(() => {
-                        const f = stellaDataFiles.find(x => x.id === activeStellaDataId);
-                        if (!f) return <div className="text-sm text-blue-300/60">Select a dataset on the left.</div>;
-                        const intake = f.intakeMessages || [];
-                        return (
-                          <div className="space-y-3">
-                            <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4 max-h-[420px] overflow-y-auto custom-scrollbar space-y-3">
-                              {intake.length === 0 ? (
-                                <div className="text-sm text-blue-300/60">Upload processing…</div>
-                              ) : intake.map((m, i) => (
-                                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                  <div className={`max-w-[90%] px-3 py-2 rounded-xl text-sm ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                                    {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : formatMarkdown(m.content)}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-
-                            {f.capturedContext && (
-                              <div className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl p-4">
-                                <div className="text-xs font-bold text-emerald-300 mb-2">Captured context</div>
-                                <pre className="text-[11px] text-emerald-200/90 whitespace-pre-wrap">{JSON.stringify(f.capturedContext, null, 2)}</pre>
-                              </div>
-                            )}
-
-                            <div className="flex gap-2">
-                              <textarea value={stellaIntakeInput} onChange={(e) => setStellaIntakeInput(e.target.value)} placeholder="Answer the intake questions…" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} />
-                              <button onClick={handleStellaIntakeSend} disabled={!stellaIntakeInput.trim()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
-                                <Send className="w-4 h-4" /> Send
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {stellaTab === 'business' && (
-                <div className="flex-1 overflow-y-auto custom-scrollbar">
-                  <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
-                    <h3 className="text-lg font-bold text-white mb-2">Business Context</h3>
-                    <p className="text-xs text-blue-300/60 mb-6">This context is injected into every Stella chat prompt.</p>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
-                        <input value={stellaBusinessContext.companyName} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, companyName: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry</label>
-                        <input value={stellaBusinessContext.industry} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, industry: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
-                      </div>
-                      <div className="md:col-span-2">
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key goals</label>
-                        <textarea value={stellaBusinessContext.keyGoals} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyGoals: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
-                      </div>
-                      <div className="md:col-span-2">
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key metrics</label>
-                        <textarea value={stellaBusinessContext.keyMetrics} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyMetrics: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
-                      </div>
-                      <div className="md:col-span-2">
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Terminology / definitions</label>
-                        <textarea value={stellaBusinessContext.terminology} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, terminology: e.target.value }))} rows={4} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
-                      </div>
-                    </div>
-                    <div className="flex gap-3 mt-6">
-                      <button onClick={() => stellaSaveBusinessContext(stellaBusinessContext)} className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2">
-                        <Save className="w-4 h-4" /> Save
-                      </button>
-                      <button onClick={() => stellaSaveBusinessContext({ companyName: '', industry: '', keyGoals: '', keyMetrics: '', terminology: '' })} className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30">
-                        Reset
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {stellaTab === 'connections' && (
-                <div className="flex-1 overflow-y-auto custom-scrollbar">
-                  <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
-                    <h3 className="text-lg font-bold text-white mb-2">Connections</h3>
-                    <p className="text-xs text-blue-300/60 mb-6">Direct connectors (APIs / databases / CRM) will be enabled here in a future release.</p>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                      {[
-                        { name: 'Salesforce' },
-                        { name: 'Veeva' },
-                        { name: 'SAP' },
-                        { name: 'Power BI' },
-                        { name: 'Google Analytics' },
-                        { name: 'Databricks' },
-                      ].map(c => (
-                        <div key={c.name} className="bg-slate-800/20 border border-slate-700/50 rounded-2xl p-5 opacity-60">
-                          <div className="flex items-start justify-between">
-                            <div>
-                              <div className="text-sm font-bold text-slate-200">{c.name}</div>
-                              <div className="text-xs text-slate-400 mt-1">Connector</div>
-                            </div>
-                            <span className="px-2 py-1 bg-slate-700/50 text-slate-300 text-xs rounded border border-slate-600/50">Coming Soon</span>
-                          </div>
-                          <div className="mt-4 text-xs text-slate-400/80">Authentication, schema mapping, and scheduled sync will be available.</div>
                         </div>
-                      ))}
+                      </div>
+                    </div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
+
+                <form onSubmit={handleStellaChatSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-4">
+                  <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
+                    <div className="flex-1">
+                      <textarea
+                        value={stellaInput}
+                        onChange={(e) => setStellaInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleStellaChatSubmit(e); } }}
+                        placeholder="Ask a question about your uploaded datasets…"
+                        className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 sm:py-3 text-sm outline-none focus:border-blue-400 transition-colors resize-none"
+                        rows={2}
+                        disabled={stellaIsLoading}
+                      />
+                    </div>
+                    <div className="flex gap-2 sm:gap-3 sm:items-end">
+                      <button type="submit" disabled={stellaIsLoading || !stellaInput.trim()} className="flex-1 sm:flex-none px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
                     </div>
                   </div>
-                </div>
-              )}
+                </form>
+              </div>
             </div>
 
           ) : (
             // ADMIN
             <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full custom-scrollbar pr-1 sm:pr-2">
+              <div className="flex gap-2 pb-1 overflow-x-auto">
+                {[{ id: 'incentive', label: 'Incentive Comp' }, { id: 'territory', label: 'Territory' }, { id: 'stella', label: 'Stella Insights' }].map(m => (
+                  <button key={m.id} onClick={() => setAdminModule(m.id)} className={`px-4 py-2 rounded-lg text-sm font-bold whitespace-nowrap transition-all ${adminModule === m.id ? 'bg-white/15 text-white border border-white/20' : 'bg-slate-800/40 text-blue-300/70 hover:bg-slate-700/50'}`}>{m.label}</button>
+                ))}
+              </div>
+
+              {adminModule === 'incentive' && (
+              <>
               <div className="flex gap-2 border-b border-blue-400/20 pb-3 overflow-x-auto">
                 {[{ id: 'knowledge', label: 'Knowledge' }, { id: 'workflows', label: 'Workflows' }, { id: 'agents', label: 'Agents' }, { id: 'system-prompt', label: 'Prompt' }, { id: 'pptx', label: '📊 PPT Prompts' }, { id: 'settings', label: 'Settings' }].map(tab => (
                   <button key={tab.id} onClick={() => setAdminSection(tab.id)} className={`px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap transition-all ${adminSection === tab.id ? 'bg-gradient-to-r from-blue-500 to-cyan-500 text-white' : 'bg-slate-700/30 text-blue-300 hover:bg-slate-700/50'}`}>{tab.label}</button>
@@ -2984,6 +3117,27 @@ ${isFocused
                       <button onClick={() => setEditingTopic(null)} className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors">Cancel</button>
                     </div>
                   </div>
+                </div>
+              )}
+              </>
+              )}
+
+              {adminModule === 'territory' && (
+                <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 text-sm text-blue-300/70">
+                  Territory admin settings will appear here. Territory structures are currently managed directly in the <span className="text-cyan-300 font-semibold">Territory</span> tab.
+                </div>
+              )}
+
+              {adminModule === 'stella' && (
+                <div className="space-y-4">
+                  <div className="flex gap-2 border-b border-blue-400/20 pb-3 overflow-x-auto">
+                    {[{ id: 'data', label: 'Data' }, { id: 'business', label: 'Business Context' }, { id: 'connections', label: 'Connections' }].map(tab => (
+                      <button key={tab.id} onClick={() => setStellaTab(tab.id)} className={`px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap transition-all ${stellaTab === tab.id ? 'bg-gradient-to-r from-blue-500 to-cyan-500 text-white' : 'bg-slate-700/30 text-blue-300 hover:bg-slate-700/50'}`}>{tab.label}</button>
+                    ))}
+                  </div>
+                  {(stellaTab === 'data' || stellaTab === 'chat') && renderStellaDataPanel()}
+                  {stellaTab === 'business' && renderStellaBusinessPanel()}
+                  {stellaTab === 'connections' && renderStellaConnectionsPanel()}
                 </div>
               )}
             </div>
