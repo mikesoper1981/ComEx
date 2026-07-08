@@ -2394,20 +2394,20 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
       ? `\nTABULAR DATA (query with tools):\n- Query tables using the \`run_sql\` tool (single SELECT only). Available tables: ${tableList}.\n- Use \`inspect_table\` to preview a table's real values/formats before writing analytical queries.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n- To combine datasets, JOIN across tables using the confirmed relationships above (or a sensible key if none is confirmed — state the assumption).\n`
       : '';
     const docInstr = docs.length
-      ? `\nDOCUMENTS (PDF / text):\nAnswer questions about stored documents directly from their summary and interpretive context above. Do NOT use SQL tools for documents.\n`
+      ? `\nDOCUMENTS (PDF / text):\nAnswer questions about stored documents from their summary and interpretive context in the catalog above — do NOT use SQL tools for documents. Still follow the agentic workflow: plan what you need from the document context, check your reasoning against the captured intake Q&A, and verify your answer addresses the question before responding.\n`
       : '';
 
-    return `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools, verify your findings, and explain them clearly.
+    return `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and careful reasoning (for documents), verify your findings, and explain them clearly.
 
 ${bizText}
 DATA CATALOG (${files.length} file${files.length === 1 ? '' : 's'}):
 ${blocks || '(no files uploaded yet)'}
 ${sqlInstr}${docInstr}
 HOW TO WORK (be agentic):
-1. PLAN — briefly think through what the question needs and which datasets/columns are relevant.
-2. INSPECT — when working with tabular data, use \`inspect_table\` first to see real values, formats, and distinct categories before committing to a query. Don't assume value formats.
-3. EXECUTE — run the analytical query/queries with \`run_sql\`. For multi-dataset questions, join across tables.
-4. VERIFY — sanity-check results: do row counts make sense? any unexpected nulls/empties? do totals reconcile? If a query returns nothing or looks wrong, diagnose and try a different approach rather than guessing.
+1. PLAN — briefly think through what the question needs and which datasets/columns or document context are relevant.
+2. INSPECT — for tabular data, use \`inspect_table\` to see real values before querying. For PDFs/text, re-read the file's summary and intake context in the catalog.
+3. EXECUTE — run analytical queries with \`run_sql\` (tabular only). For documents, reason from the captured context.
+4. VERIFY — sanity-check: do results make sense? does the answer match what was asked? If a query returns nothing or looks wrong, diagnose and try again.
 5. ANSWER — only when confident, give the final plain-English answer.
 
 RULES:
@@ -2496,7 +2496,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
   const renderStellaSteps = (steps) => {
     const iconFor = (t) => (t === 'query' ? '🔎' : t === 'inspect' ? '👁' : t === 'error' ? '⚠️' : '🧠');
     return (
-      <details className="mb-3 bg-slate-900/50 border border-blue-400/20 rounded-lg overflow-hidden">
+      <details className="mt-3 bg-slate-900/50 border border-blue-400/20 rounded-lg overflow-hidden">
         <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-cyan-300/90 hover:bg-slate-800/50 flex items-center gap-2">
           <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> How Stella worked this out ({steps.length} step{steps.length === 1 ? '' : 's'})
         </summary>
@@ -3280,10 +3280,10 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       </div>
                       <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
                         <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
-                          {Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps)}
                           <div className="text-sm leading-relaxed">
                             {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : <MessageErrorBoundary>{formatMarkdown(message.content)}</MessageErrorBoundary>}
                           </div>
+                          {message.role === 'assistant' && Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps)}
                         </div>
                       </div>
                     </div>
