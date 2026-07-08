@@ -1830,7 +1830,7 @@ ${isFocused
       if (error || !Array.isArray(data)) return null;
       const mapped = data.map(stellaMapRegistryRow);
       setStellaDataFiles(prev => {
-        const prevById = new Map(prev.filter(f => f.dbId).map(f => [f.dbId, f]));
+        const prevById = new globalThis.Map(prev.filter(f => f.dbId).map(f => [f.dbId, f]));
         const merged = mapped.map(m => {
           const p = prevById.get(m.dbId);
           // Keep a live (unsaved) intake conversation if it's ahead of the DB copy.
