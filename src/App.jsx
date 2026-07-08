@@ -1,5 +1,13 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers } from 'lucide-react';
+import {
+  ResponsiveContainer,
+  BarChart, Bar,
+  LineChart, Line,
+  ScatterChart, Scatter,
+  PieChart, Pie, Cell,
+  CartesianGrid, XAxis, YAxis, Tooltip, Legend,
+} from 'recharts';
 import { supabase } from './supabase';
 
 const MANAGER_COLOURS = ['#34d399', '#60a5fa', '#a78bfa'];
@@ -24,6 +32,23 @@ function toAnthropicRole(role) {
   if (role === 'user' || role === 'assistant') return role;
   return 'user';
 }
+
+function safeJsonParse(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function sanitizeStorageName(name) {
+  return String(name || 'file')
+    .replace(/[^\w.\-() ]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140) || 'file';
+}
+
+const STELLA_STORAGE_CANDIDATES = [
+  { bucket: 'stella-data', prefix: '' },
+  { bucket: 'intelligence', prefix: 'stella/' },
+];
 
 function guessCountry(structure) {
   const name = (structure.name || '').toLowerCase();
@@ -495,6 +520,22 @@ export default function CommercialExcellenceApp() {
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [stellaTab, setStellaTab] = useState('chat'); // chat | data | business | connections
+  const [stellaMessages, setStellaMessages] = useState([
+    { role: 'assistant', content: 'Welcome to **Stella Insights**. Upload a dataset in the **Data** tab, define your **Business Context**, then ask me questions here — I can analyse trends and generate charts.' }
+  ]);
+  const [stellaInput, setStellaInput] = useState('');
+  const [stellaIsLoading, setStellaIsLoading] = useState(false);
+  const [stellaDataFiles, setStellaDataFiles] = useState([]); // { id, name, type, size, uploadedAt, storageBucket, storagePath, metaPath, summary, capturedContext, intakeMessages }
+  const [activeStellaDataId, setActiveStellaDataId] = useState(null);
+  const [stellaIntakeInput, setStellaIntakeInput] = useState('');
+  const [stellaBusinessContext, setStellaBusinessContext] = useState({
+    companyName: '',
+    industry: '',
+    keyGoals: '',
+    keyMetrics: '',
+    terminology: '',
+  });
   const [knowledgeBase, setKnowledgeBase] = useState(DEFAULT_KNOWLEDGE);
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
   const [documents, setDocuments] = useState([
@@ -745,6 +786,7 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
   const fileInputRef = useRef(null);
   const adminFileInputRef = useRef(null);
   const territoryFileInputRef = useRef(null);
+  const stellaDataFileInputRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -780,6 +822,63 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
       }
     };
     loadIntelligenceFiles();
+  }, []);
+
+  // ── SUPABASE: Load Stella metadata + business context on startup ──
+  useEffect(() => {
+    const loadStella = async () => {
+      const buildCandidatePath = (candidate, path) => `${candidate.prefix}${path}`;
+
+      const tryLoadBusinessContext = async (candidate) => {
+        try {
+          const { data, error } = await supabase.storage.from(candidate.bucket).download(buildCandidatePath(candidate, 'business-context.json'));
+          if (error || !data) return false;
+          const text = await data.text();
+          const parsed = safeJsonParse(text);
+          if (parsed && typeof parsed === 'object') setStellaBusinessContext(prev => ({ ...prev, ...parsed }));
+          return true;
+        } catch { return false; }
+      };
+
+      const tryLoadMetaFiles = async (candidate) => {
+        try {
+          const listPrefix = candidate.prefix ? candidate.prefix.replace(/\/$/, '') : '';
+          const { data, error } = await supabase.storage.from(candidate.bucket).list(listPrefix, { limit: 200 });
+          if (error || !data) return false;
+          const metaItems = data.filter(x => x.name && x.name.endsWith('.meta.json'));
+          const loaded = [];
+          for (const item of metaItems) {
+            const fullPath = buildCandidatePath(candidate, item.name);
+            const { data: fileData, error: dlErr } = await supabase.storage.from(candidate.bucket).download(fullPath);
+            if (dlErr || !fileData) continue;
+            const parsed = safeJsonParse(await fileData.text());
+            if (!parsed || typeof parsed !== 'object') continue;
+            loaded.push(parsed);
+          }
+          if (loaded.length) {
+            setStellaDataFiles(prev => {
+              const existingMetaPaths = new Set(prev.map(f => f.metaPath).filter(Boolean));
+              const merged = [...prev];
+              for (const f of loaded) {
+                if (f?.metaPath && existingMetaPaths.has(f.metaPath)) continue;
+                merged.push(f);
+              }
+              return merged;
+            });
+          }
+          return true;
+        } catch { return false; }
+      };
+
+      for (const candidate of STELLA_STORAGE_CANDIDATES) {
+        const loadedMeta = await tryLoadMetaFiles(candidate);
+        await tryLoadBusinessContext(candidate);
+        if (loadedMeta) {
+          break;
+        }
+      }
+    };
+    loadStella();
   }, []);
 
   useEffect(() => {
@@ -910,6 +1009,95 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
     );
   };
 
+  const renderRechartsChart = (spec) => {
+    if (!spec || typeof spec !== 'object') return null;
+    const type = String(spec.type || '').toLowerCase();
+    const title = spec.title || '📊 Chart';
+    const data = Array.isArray(spec.data) ? spec.data : [];
+    const xKey = spec.xKey || 'x';
+    const yKey = spec.yKey || 'y';
+    const yKeys = Array.isArray(spec.yKeys) ? spec.yKeys : (spec.yKeys ? [spec.yKeys] : []);
+    const palette = ['#22d3ee', '#60a5fa', '#34d399', '#a78bfa', '#f472b6', '#fbbf24', '#fb7185'];
+
+    if (!data.length) return (
+      <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4 text-xs text-blue-300/70">
+        Chart spec was provided but contains no data.
+      </div>
+    );
+
+    const wrap = (children) => (
+      <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
+        <h3 className="text-base font-semibold text-cyan-400 mb-3">{title}</h3>
+        <div className="w-full h-[320px]">
+          <ResponsiveContainer width="100%" height="100%">
+            {children}
+          </ResponsiveContainer>
+        </div>
+      </div>
+    );
+
+    if (type === 'bar') {
+      const series = yKeys.length ? yKeys : [yKey];
+      return wrap(
+        <BarChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+          <XAxis dataKey={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+          <YAxis stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+          <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
+          <Legend />
+          {series.map((k, i) => <Bar key={k} dataKey={k} fill={palette[i % palette.length]} radius={[6, 6, 0, 0]} />)}
+        </BarChart>
+      );
+    }
+
+    if (type === 'line') {
+      const series = yKeys.length ? yKeys : [yKey];
+      return wrap(
+        <LineChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+          <XAxis dataKey={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+          <YAxis stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+          <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
+          <Legend />
+          {series.map((k, i) => <Line key={k} type="monotone" dataKey={k} stroke={palette[i % palette.length]} strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />)}
+        </LineChart>
+      );
+    }
+
+    if (type === 'scatter') {
+      return wrap(
+        <ScatterChart>
+          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+          <XAxis dataKey={xKey} name={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+          <YAxis dataKey={yKey} name={yKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+          <Tooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
+          <Legend />
+          <Scatter name={spec.seriesName || yKey} data={data} fill={palette[0]} />
+        </ScatterChart>
+      );
+    }
+
+    if (type === 'pie') {
+      const nameKey = spec.nameKey || xKey;
+      const valueKey = spec.valueKey || yKey;
+      return wrap(
+        <PieChart>
+          <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
+          <Legend />
+          <Pie data={data} dataKey={valueKey} nameKey={nameKey} outerRadius={110}>
+            {data.map((_, i) => <Cell key={i} fill={palette[i % palette.length]} />)}
+          </Pie>
+        </PieChart>
+      );
+    }
+
+    return (
+      <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4 text-xs text-blue-300/70">
+        Unsupported chart type: <span className="text-cyan-300 font-semibold">{String(spec.type)}</span>
+      </div>
+    );
+  };
+
   const formatMarkdown = (content) => {
     const references = parseReferences(content);
     const cleanContent = content.replace(/[-]{2,}\s*\nReferences:\s*\n[\s\S]+?(\n[-]{2,}|\s*$)/i, '').trimEnd();
@@ -925,6 +1113,19 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
           </div>
         );
       } catch(e) { /* fall through */ }
+    }
+    const rechartsMatch = cleanContent.match(/```chart-recharts\n([\s\S]+?)\n```/);
+    if (rechartsMatch) {
+      try {
+        const spec = JSON.parse(rechartsMatch[1]);
+        const textWithoutChart = cleanContent.replace(/```chart-recharts\n[\s\S]+?\n```/, '').trim();
+        return (
+          <div className="space-y-2">
+            {renderRechartsChart(spec)}
+            {textWithoutChart && <div>{formatMarkdown(textWithoutChart)}</div>}
+          </div>
+        );
+      } catch (e) { /* fall through */ }
     }
     const lines = cleanContent.split('\n');
     const elements = [];
@@ -1444,6 +1645,261 @@ ${isFocused
     setDocuments(prev => prev.filter(d => d.id !== id));
   };
 
+  // ── STELLA: Supabase storage helpers ──
+  const stellaResolveStoragePath = (candidate, path) => `${candidate.prefix}${path}`;
+
+  const stellaUploadToStorage = async (path, blobOrFile, contentType) => {
+    let lastErr = null;
+    for (const candidate of STELLA_STORAGE_CANDIDATES) {
+      try {
+        const objectPath = stellaResolveStoragePath(candidate, path);
+        const { error } = await supabase.storage
+          .from(candidate.bucket)
+          .upload(objectPath, blobOrFile, { upsert: true, contentType });
+        if (!error) return { bucket: candidate.bucket, objectPath };
+        lastErr = error;
+      } catch (e) { lastErr = e; }
+    }
+    throw new Error(lastErr?.message || 'Upload failed');
+  };
+
+  const stellaDownloadJson = async (bucket, path) => {
+    const { data, error } = await supabase.storage.from(bucket).download(path);
+    if (error || !data) throw error || new Error('Download failed');
+    return safeJsonParse(await data.text());
+  };
+
+  const reloadStellaBusinessContextFromSupabase = async () => {
+    for (const candidate of STELLA_STORAGE_CANDIDATES) {
+      try {
+        const parsed = await stellaDownloadJson(candidate.bucket, stellaResolveStoragePath(candidate, 'business-context.json'));
+        if (parsed && typeof parsed === 'object') {
+          setStellaBusinessContext(prev => ({ ...prev, ...parsed }));
+          return parsed;
+        }
+      } catch {
+        // try next candidate
+      }
+    }
+    return null;
+  };
+
+  const reloadStellaFileMetaFromSupabase = async (fileRecord) => {
+    if (!fileRecord?.storageBucket || !fileRecord?.metaPath) return null;
+    try {
+      const parsed = await stellaDownloadJson(fileRecord.storageBucket, fileRecord.metaPath);
+      if (parsed && typeof parsed === 'object') {
+        setStellaDataFiles(prev => prev.map(f => f.id === fileRecord.id ? { ...f, ...parsed } : f));
+        return parsed;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  };
+
+  const stellaSaveBusinessContext = async (next) => {
+    setStellaBusinessContext(next);
+    try {
+      const payload = new Blob([JSON.stringify(next, null, 2)], { type: 'application/json' });
+      await stellaUploadToStorage('business-context.json', payload, 'application/json');
+      await reloadStellaBusinessContextFromSupabase();
+    } catch (e) {
+      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not persist business context to Supabase: ${e.message}` }]);
+    }
+  };
+
+  const stellaUpdateMeta = async (fileId, patch = {}) => {
+    const current = stellaDataFiles.find(f => f.id === fileId);
+    if (!current) return;
+    const updated = { ...current, ...patch };
+    setStellaDataFiles(prev => prev.map(f => f.id === fileId ? updated : f));
+    try {
+      const relativeStoragePath = updated.storagePath
+        ? updated.storagePath.replace(/^stella\//, '')
+        : null;
+      const relativeMetaPath = updated.metaPath
+        ? updated.metaPath.replace(/^stella\//, '')
+        : (relativeStoragePath ? `${relativeStoragePath}.meta.json` : `data_${updated.id}.meta.json`);
+      const payload = new Blob([JSON.stringify({ ...updated, metaPath: relativeMetaPath }, null, 2)], { type: 'application/json' });
+      const saveRes = await stellaUploadToStorage(relativeMetaPath, payload, 'application/json');
+      const savedRecord = {
+        ...updated,
+        storageBucket: saveRes.bucket,
+        metaPath: saveRes.objectPath,
+      };
+      setStellaDataFiles(prev => prev.map(f => f.id === fileId ? savedRecord : f));
+      await reloadStellaFileMetaFromSupabase(savedRecord);
+    } catch (e) {
+      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not persist Stella dataset metadata: ${e.message}` }]);
+    }
+  };
+
+  // ── STELLA: File parsing (lightweight MVP) ──
+  const stellaReadAsText = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(String(e.target.result || ''));
+    reader.onerror = () => reject(new Error('File read failed'));
+    reader.readAsText(file);
+  });
+
+  const stellaBuildContentSummary = async ({ name, type, textSample }) => {
+    const system = `You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nBe precise. If unsure, say what you can infer and what is missing.`;
+    const user = `FILE:\n- name: ${name}\n- type: ${type}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
+    const raw = await callAnthropic(system, [{ role: 'user', content: user }], 800);
+    const cleaned = String(raw || '').replace(/```json|```/g, '').trim();
+    const parsed = safeJsonParse(cleaned);
+    return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', suggestedQuestions: ['What does this data represent?', 'What time period does it cover?', 'Which metrics matter most?', 'Any definitions or filters to apply?'] };
+  };
+
+  const stellaIntakeNextTurn = async (fileId) => {
+    const f = stellaDataFiles.find(x => x.id === fileId);
+    if (!f) return;
+    const system = `You are the Stella Insights intake agent.\n\nGoal: collect enough context to interpret the dataset correctly.\nAsk 1-2 questions per turn.\nStop when you have enough and then return ONLY valid JSON with complete=true.\n\nReturn ONLY valid JSON, no markdown.\nSchema:\n{\n  "complete": true/false,\n  "assistantMessage": "what to show in the intake panel",\n  "capturedContext": {\n    "whatIsThisData": "",\n    "timePeriod": "",\n    "keyMetrics": "",\n    "grain": "",\n    "filters": "",\n    "definitions": "",\n    "dataQualityNotes": ""\n  }\n}\n\nIf complete=false, set capturedContext to null and use assistantMessage to ask follow-up questions.`;
+
+    const contextBlob = `DATASET SUMMARY:\n${f.summary || ''}\n\nKNOWN CAPTURED CONTEXT (may be empty):\n${f.capturedContext ? JSON.stringify(f.capturedContext, null, 2) : '{}'}`;
+    const convo = [
+      { role: 'user', content: `You are onboarding dataset: "${f.name}".\n\n${contextBlob}` },
+      ...((f.intakeMessages || []).map(m => ({ role: toAnthropicRole(m.role), content: m.content }))),
+    ];
+
+    const raw = await callAnthropic(system, convo, 900);
+    const cleaned = String(raw || '').replace(/```json|```/g, '').trim();
+    const parsed = safeJsonParse(cleaned);
+    if (!parsed || typeof parsed !== 'object') {
+      const fallback = { complete: false, assistantMessage: 'I had trouble parsing my own intake response. Could you tell me: what does the data represent, what time period, and which key metrics matter?', capturedContext: null };
+      await stellaUpdateMeta(fileId, { intakeMessages: [...(f.intakeMessages || []), { role: 'assistant', content: fallback.assistantMessage }] });
+      return;
+    }
+    const assistantMessage = parsed.assistantMessage || '';
+    const nextIntakeMessages = [...(f.intakeMessages || []), { role: 'assistant', content: assistantMessage }];
+    if (parsed.complete) {
+      await stellaUpdateMeta(fileId, { capturedContext: parsed.capturedContext || {}, intakeMessages: nextIntakeMessages });
+    } else {
+      await stellaUpdateMeta(fileId, { intakeMessages: nextIntakeMessages });
+    }
+  };
+
+  const handleStellaDataUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const id = Date.now() + Math.random();
+    const cleanName = sanitizeStorageName(file.name);
+    const storagePath = `data_${Date.now()}_${cleanName}`;
+    const base = {
+      id,
+      name: file.name,
+      type: file.type || (file.name.endsWith('.csv') ? 'text/csv' : file.name.endsWith('.json') ? 'application/json' : file.name.endsWith('.xlsx') ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'text/plain'),
+      size: `${(file.size / 1024).toFixed(1)} KB`,
+      uploadedAt: new Date().toISOString(),
+      storageBucket: null,
+      storagePath: null,
+      metaPath: null,
+      summary: '',
+      capturedContext: null,
+      intakeMessages: [],
+    };
+    setStellaDataFiles(prev => [...prev, base]);
+    setActiveStellaDataId(id);
+    setStellaTab('data');
+
+    try {
+      // Upload raw file
+      const up = await stellaUploadToStorage(storagePath, file, file.type || undefined);
+      const saved = { ...base, storageBucket: up.bucket, storagePath: up.objectPath };
+      setStellaDataFiles(prev => prev.map(f => f.id === id ? saved : f));
+
+      // Build a lightweight content sample for intake
+      let sampleText = '';
+      const lower = file.name.toLowerCase();
+      if (lower.endsWith('.csv') || lower.endsWith('.json') || lower.endsWith('.txt') || lower.endsWith('.md')) {
+        const txt = await stellaReadAsText(file);
+        sampleText = txt.substring(0, 18000);
+      } else if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
+        try {
+          const xlsxMod = await import('xlsx');
+          const XLSX = xlsxMod?.default || xlsxMod;
+          const buf = await file.arrayBuffer();
+          const wb = XLSX.read(buf, { type: 'array' });
+          const sheetName = wb.SheetNames?.[0];
+          const ws = sheetName ? wb.Sheets[sheetName] : null;
+          const rows = ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
+          sampleText = JSON.stringify(rows.slice(0, 50), null, 2).substring(0, 18000);
+        } catch {
+          sampleText = 'Excel file uploaded. (Preview parsing not available.)';
+        }
+      } else if (lower.endsWith('.pdf')) {
+        sampleText = 'PDF file uploaded. (Text extraction not enabled in this MVP.)';
+      } else {
+        sampleText = `File uploaded: ${file.name}`;
+      }
+
+      const onboarding = await stellaBuildContentSummary({ name: file.name, type: saved.type, textSample: sampleText });
+      const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${onboarding.summary || ''}\n\nTo interpret this correctly, I need a bit more context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nReply with answers (numbered is fine).`;
+
+      const withIntake = { ...saved, summary: onboarding.summary || 'Uploaded dataset.', intakeMessages: [{ role: 'assistant', content: assistantMsg }] };
+      setStellaDataFiles(prev => prev.map(f => f.id === id ? withIntake : f));
+      await stellaUpdateMeta(id, withIntake);
+    } catch (e) {
+      setStellaDataFiles(prev => prev.map(f => f.id === id ? { ...f, intakeMessages: [{ role: 'system', content: `❌ Upload failed: ${e.message}` }] } : f));
+    } finally {
+      event.target.value = '';
+    }
+  };
+
+  const handleStellaIntakeSend = async () => {
+    const fileId = activeStellaDataId;
+    const f = stellaDataFiles.find(x => x.id === fileId);
+    const msg = stellaIntakeInput.trim();
+    if (!f || !msg) return;
+    setStellaIntakeInput('');
+    const nextMsgs = [...(f.intakeMessages || []), { role: 'user', content: msg }];
+    await stellaUpdateMeta(fileId, { intakeMessages: nextMsgs });
+    await stellaIntakeNextTurn(fileId);
+  };
+
+  // ── STELLA: Chat prompt builder + submit ──
+  const buildStellaSystemPrompt = () => {
+    const biz = stellaBusinessContext || {};
+    const bizText = `BUSINESS CONTEXT:\n- Company: ${biz.companyName || '(not set)'}\n- Industry: ${biz.industry || '(not set)'}\n- Key goals: ${biz.keyGoals || '(not set)'}\n- Key metrics: ${biz.keyMetrics || '(not set)'}\n- Terminology/definitions: ${biz.terminology || '(not set)'}\n`;
+    const filesText = (stellaDataFiles || [])
+      .map((f, i) => {
+        const ctx = f.capturedContext ? JSON.stringify(f.capturedContext, null, 2) : '(no intake context captured yet)';
+        return `DATASET ${i + 1}: ${f.name}\nSummary: ${f.summary || ''}\nCaptured context:\n${ctx}\n`;
+      })
+      .join('\n\n');
+
+    return `You are Stella Insights — a Commercial Excellence data analysis assistant.\n\n${bizText}\n\nUPLOADED DATASETS (summaries + captured context):\n${filesText || '(none uploaded yet)'}\n\nINSTRUCTIONS:\n- Answer questions about the datasets using the captured context.\n- Be explicit about assumptions and ask clarifying questions when needed.\n- When a chart would help, include exactly ONE chart block in this format:\n\n\`\`\`chart-recharts\n{\n  \"type\": \"bar|line|scatter|pie\",\n  \"title\": \"...\",\n  \"data\": [ {\"x\": \"...\", \"y\": 123}, ... ],\n  \"xKey\": \"x\",\n  \"yKey\": \"y\",\n  \"yKeys\": [\"y1\",\"y2\"]\n}\n\`\`\`\n\nRules:\n- Use bar/line as default. Use scatter only when it clarifies relationships.\n- Keep chart data to <= 40 rows.\n- Do not invent dataset values; if you can't compute from the provided summaries/context, ask for the needed data upload or details.\n\nRESPONSE STYLE:\nUse ## headers, bullet points, concise explanations, and include recommended next questions.`;
+  };
+
+  const handleStellaChatSubmit = async (e) => {
+    if (e) e.preventDefault();
+    const messageContent = stellaInput.trim();
+    if (!messageContent || stellaIsLoading) return;
+    setStellaIsLoading(true);
+    setStellaMessages(prev => [...prev, { role: 'user', content: messageContent }]);
+    setStellaInput('');
+    try {
+      const systemPrompt = buildStellaSystemPrompt();
+      const response = await anthropicMessagesPost({
+        system: systemPrompt,
+        messages: [
+          ...stellaMessages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
+          { role: 'user', content: messageContent },
+        ],
+        max_tokens: 4000,
+      });
+      const data = await response.json();
+      const assistantMessage = anthropicAssistantText(data) || '';
+      setStellaMessages(prev => [...prev, { role: 'assistant', content: assistantMessage }]);
+    } catch (error) {
+      setStellaMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error: Unable to process request. Please try again.' }]);
+    } finally {
+      setStellaIsLoading(false);
+    }
+  };
+
   const handleGeneratePptx = async (offer, mode = 'summary') => {
     setPptxOffers(null);
     setPptxGenerating(true);
@@ -1670,7 +2126,7 @@ ${isFocused
             </div>
             {!showLanding && (
               <div className="flex gap-1 sm:gap-2 bg-slate-800/50 rounded-lg p-1">
-                {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance'], ['admin', Settings, 'Admin'], ['territory', Map, 'Territory']].map(([tab, Icon, label]) => (
+                {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance'], ['territory', Map, 'Territory'], ['stella', Layers, 'Stella Insights'], ['admin', Settings, 'Admin']].map(([tab, Icon, label]) => (
                   <button key={tab} onClick={() => setActiveTab(tab)} className={`flex items-center gap-1 sm:gap-2 px-2 sm:px-4 py-1.5 sm:py-2 rounded-md transition-all text-xs sm:text-sm ${activeTab === tab ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}>
                     <Icon className="w-3 h-3 sm:w-4 sm:h-4" /><span className="hidden sm:inline">{label}</span>
                   </button>
@@ -1699,6 +2155,12 @@ ${isFocused
               <div className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><Map className="w-6 h-6 text-white" /></div>
               <h3 className="font-bold text-white text-base mb-1">Territory Design</h3>
               <p className="text-xs text-blue-300/60 leading-relaxed">Assess and optimise territory structures.</p>
+              <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
+            </button>
+            <button onClick={() => { setShowLanding(false); setActiveTab('stella'); setStellaTab('chat'); }} className="text-left bg-slate-800/60 hover:bg-slate-700/60 border border-cyan-400/30 hover:border-cyan-400/60 rounded-2xl p-6 transition-all group hover:shadow-xl hover:shadow-cyan-500/10 hover:-translate-y-0.5">
+              <div className="w-12 h-12 bg-gradient-to-br from-cyan-500 to-blue-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><Layers className="w-6 h-6 text-white" /></div>
+              <h3 className="font-bold text-white text-base mb-1">Stella Insights</h3>
+              <p className="text-xs text-blue-300/60 leading-relaxed">Chat with your data, run analysis and generate charts.</p>
               <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
             </button>
             {[{ icon: BarChart3, label: 'Sales Performance', desc: 'Track and benchmark rep performance.' }, { icon: Target, label: 'Targeting & Segmentation', desc: 'Build and refine HCP target lists.' }, { icon: Users, label: 'Workforce Planning', desc: 'Model headcount and deployment.' }, { icon: Calendar, label: 'Business Planning', desc: 'Align field activity with strategy.' }, { icon: Award, label: 'Customer Engagement', desc: 'Design multi-channel engagement plans.' }, { icon: TrendingUp, label: 'Market Access', desc: 'Formulary positioning and payer strategy.' }].map(({ icon: Icon, label, desc }) => (
@@ -2092,6 +2554,240 @@ ${isFocused
                 <button onClick={() => { setActiveTab('chat'); setTimeout(() => handleSubmit(null, 'I want to design new territories'), 100); }} className="py-2.5 bg-blue-500/15 hover:bg-blue-500/25 border border-blue-400/25 hover:border-blue-400/45 rounded-xl text-sm text-blue-300 font-semibold transition-all flex items-center justify-center gap-2"><MapPin className="w-4 h-4" /> New Territory Design</button>
                 <button onClick={() => { setActiveTab('chat'); setTimeout(() => handleSubmit(null, 'I want to set up a new field team'), 100); }} className="py-2.5 bg-violet-500/15 hover:bg-violet-500/25 border border-violet-400/25 hover:border-violet-400/45 rounded-xl text-sm text-violet-300 font-semibold transition-all flex items-center justify-center gap-2"><Users className="w-4 h-4" /> New Team Setup</button>
               </div>
+            </div>
+
+          ) : activeTab === 'stella' ? (
+            <div className="flex flex-col h-full overflow-hidden">
+              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-4">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-3">
+                    <Layers className="w-6 h-6" />
+                    <div>
+                      <h2 className="text-xl font-bold">Stella Insights</h2>
+                      <p className="text-cyan-100 text-xs">Chat with your data — upload datasets, capture context, analyse trends, and chart insights</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-2 bg-slate-800/40 border border-white/10 rounded-xl p-1">
+                    {[{ id: 'chat', label: 'Chat' }, { id: 'data', label: 'Data' }, { id: 'business', label: 'Business Context' }, { id: 'connections', label: 'Connections' }].map(t => (
+                      <button key={t.id} onClick={() => setStellaTab(t.id)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${stellaTab === t.id ? 'bg-white/20 text-white' : 'text-cyan-100/70 hover:bg-white/10'}`}>
+                        {t.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {stellaTab === 'chat' && (
+                <div className="flex flex-col flex-1 min-h-0">
+                  <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 overflow-y-auto space-y-4 custom-scrollbar mb-4 min-h-0">
+                    {stellaMessages.map((message, index) => (
+                      <div key={index} className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                        <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-400 to-blue-400' : message.role === 'system' ? 'bg-gradient-to-br from-yellow-400 to-orange-400' : 'bg-gradient-to-br from-blue-400 to-purple-400'}`}>
+                          {message.role === 'user' ? <Users className="w-5 h-5 text-slate-900" /> : message.role === 'system' ? <FileText className="w-5 h-5 text-slate-900" /> : <Layers className="w-5 h-5 text-slate-900" />}
+                        </div>
+                        <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
+                          <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
+                            <div className="text-sm leading-relaxed">
+                              {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : formatMarkdown(message.content)}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    {stellaIsLoading && (
+                      <div className="flex gap-3">
+                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-400 to-purple-400 flex items-center justify-center"><Layers className="w-5 h-5 text-slate-900" /></div>
+                        <div className="flex-1">
+                          <div className="inline-block px-4 py-3 rounded-2xl bg-slate-700/50 border border-blue-400/20">
+                            <div className="flex gap-1">
+                              <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0s'}}></span>
+                              <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></span>
+                              <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    <div ref={messagesEndRef} />
+                  </div>
+
+                  <form onSubmit={handleStellaChatSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-4">
+                    <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
+                      <div className="flex-1">
+                        <textarea
+                          value={stellaInput}
+                          onChange={(e) => setStellaInput(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleStellaChatSubmit(e); } }}
+                          placeholder="Ask a question about your uploaded datasets…"
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 sm:py-3 text-sm outline-none focus:border-blue-400 transition-colors resize-none"
+                          rows={2}
+                          disabled={stellaIsLoading}
+                        />
+                      </div>
+                      <div className="flex gap-2 sm:gap-3 sm:items-end">
+                        <button type="button" onClick={() => { setStellaTab('data'); }} className="flex-1 sm:flex-none px-4 py-3 bg-slate-700 hover:bg-slate-600 text-cyan-300 rounded-lg transition-all border border-cyan-400/25 hover:border-cyan-400/50 text-xs font-semibold" disabled={stellaIsLoading}>Data</button>
+                        <button type="submit" disabled={stellaIsLoading || !stellaInput.trim()} className="flex-1 sm:flex-none px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
+                      </div>
+                    </div>
+                  </form>
+                </div>
+              )}
+
+              {stellaTab === 'data' && (
+                <div className="flex-1 min-h-0 overflow-hidden flex gap-4">
+                  <div className="w-full lg:w-2/5 overflow-y-auto custom-scrollbar">
+                    <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-bold text-white">Datasets</div>
+                          <div className="text-xs text-blue-300/60 mt-1">Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions.</div>
+                        </div>
+                        <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
+                          <Upload className="w-4 h-4" /> Upload
+                        </button>
+                        <input ref={stellaDataFileInputRef} type="file" accept=".csv,.json,.xlsx,.xls,.pdf,.txt,.md" onChange={handleStellaDataUpload} className="hidden" />
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      {stellaDataFiles.length === 0 && (
+                        <div className="bg-slate-800/20 border border-slate-700/40 rounded-xl p-5 text-sm text-blue-300/60">
+                          No datasets uploaded yet. Upload a file to begin intake.
+                        </div>
+                      )}
+                      {stellaDataFiles.map(f => (
+                        <button key={f.id} onClick={() => setActiveStellaDataId(f.id)} className={`w-full text-left bg-slate-800/30 border rounded-xl p-4 transition-all ${activeStellaDataId === f.id ? 'border-cyan-400/60 bg-cyan-500/10' : 'border-blue-400/20 hover:border-blue-400/40'}`}>
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold text-white truncate">{f.name}</div>
+                              <div className="text-xs text-blue-300/60 mt-1">{f.size} • {f.type || 'file'}</div>
+                              {f.summary && <div className="text-xs text-blue-200/80 mt-2 line-clamp-3">{f.summary}</div>}
+                            </div>
+                            <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                              {f.capturedContext ? (
+                                <span className="px-2 py-1 bg-green-500/20 text-green-300 text-xs rounded border border-green-400/30">Context captured</span>
+                              ) : (
+                                <span className="px-2 py-1 bg-yellow-500/15 text-yellow-200 text-xs rounded border border-yellow-400/25">Intake pending</span>
+                              )}
+                            </div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="hidden lg:block w-3/5 overflow-y-auto custom-scrollbar">
+                    <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5">
+                      <div className="text-sm font-bold text-white mb-1">Intake assistant</div>
+                      <div className="text-xs text-blue-300/60 mb-4">Answer a few questions so Stella can interpret your dataset correctly.</div>
+
+                      {(() => {
+                        const f = stellaDataFiles.find(x => x.id === activeStellaDataId);
+                        if (!f) return <div className="text-sm text-blue-300/60">Select a dataset on the left.</div>;
+                        const intake = f.intakeMessages || [];
+                        return (
+                          <div className="space-y-3">
+                            <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4 max-h-[420px] overflow-y-auto custom-scrollbar space-y-3">
+                              {intake.length === 0 ? (
+                                <div className="text-sm text-blue-300/60">Upload processing…</div>
+                              ) : intake.map((m, i) => (
+                                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                  <div className={`max-w-[90%] px-3 py-2 rounded-xl text-sm ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                                    {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : formatMarkdown(m.content)}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+
+                            {f.capturedContext && (
+                              <div className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl p-4">
+                                <div className="text-xs font-bold text-emerald-300 mb-2">Captured context</div>
+                                <pre className="text-[11px] text-emerald-200/90 whitespace-pre-wrap">{JSON.stringify(f.capturedContext, null, 2)}</pre>
+                              </div>
+                            )}
+
+                            <div className="flex gap-2">
+                              <textarea value={stellaIntakeInput} onChange={(e) => setStellaIntakeInput(e.target.value)} placeholder="Answer the intake questions…" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} />
+                              <button onClick={handleStellaIntakeSend} disabled={!stellaIntakeInput.trim()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
+                                <Send className="w-4 h-4" /> Send
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {stellaTab === 'business' && (
+                <div className="flex-1 overflow-y-auto custom-scrollbar">
+                  <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
+                    <h3 className="text-lg font-bold text-white mb-2">Business Context</h3>
+                    <p className="text-xs text-blue-300/60 mb-6">This context is injected into every Stella chat prompt.</p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
+                        <input value={stellaBusinessContext.companyName} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, companyName: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry</label>
+                        <input value={stellaBusinessContext.industry} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, industry: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key goals</label>
+                        <textarea value={stellaBusinessContext.keyGoals} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyGoals: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key metrics</label>
+                        <textarea value={stellaBusinessContext.keyMetrics} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyMetrics: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Terminology / definitions</label>
+                        <textarea value={stellaBusinessContext.terminology} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, terminology: e.target.value }))} rows={4} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+                      </div>
+                    </div>
+                    <div className="flex gap-3 mt-6">
+                      <button onClick={() => stellaSaveBusinessContext(stellaBusinessContext)} className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2">
+                        <Save className="w-4 h-4" /> Save
+                      </button>
+                      <button onClick={() => stellaSaveBusinessContext({ companyName: '', industry: '', keyGoals: '', keyMetrics: '', terminology: '' })} className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30">
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {stellaTab === 'connections' && (
+                <div className="flex-1 overflow-y-auto custom-scrollbar">
+                  <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
+                    <h3 className="text-lg font-bold text-white mb-2">Connections</h3>
+                    <p className="text-xs text-blue-300/60 mb-6">Direct connectors (APIs / databases / CRM) will be enabled here in a future release.</p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {[
+                        { name: 'Salesforce' },
+                        { name: 'Veeva' },
+                        { name: 'SAP' },
+                        { name: 'Power BI' },
+                        { name: 'Google Analytics' },
+                        { name: 'Databricks' },
+                      ].map(c => (
+                        <div key={c.name} className="bg-slate-800/20 border border-slate-700/50 rounded-2xl p-5 opacity-60">
+                          <div className="flex items-start justify-between">
+                            <div>
+                              <div className="text-sm font-bold text-slate-200">{c.name}</div>
+                              <div className="text-xs text-slate-400 mt-1">Connector</div>
+                            </div>
+                            <span className="px-2 py-1 bg-slate-700/50 text-slate-300 text-xs rounded border border-slate-600/50">Coming Soon</span>
+                          </div>
+                          <div className="mt-4 text-xs text-slate-400/80">Authentication, schema mapping, and scheduled sync will be available.</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
           ) : (
