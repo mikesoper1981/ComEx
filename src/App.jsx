@@ -2531,6 +2531,13 @@ RULES:
 - If the data genuinely can't answer the question, say so plainly and suggest what's needed.
 - NEVER expose raw SQL or raw JSON to the user — only clear findings.
 
+SQL DIALECT (PostgreSQL — follow exactly to avoid errors):
+- Columns marked [numeric] are already PostgreSQL \`numeric\` — do NOT cast them to FLOAT or DOUBLE PRECISION.
+- ROUND(value, decimals) only works on \`numeric\`. NEVER round a float/double. If you ever need to round a computed/divided value, cast to numeric FIRST: \`ROUND((a::numeric / NULLIF(b,0)), 2)\`. Never write \`ROUND(x::float, 2)\` or \`ROUND(CAST(x AS FLOAT), 2)\` — that errors with "function round(double precision, integer) does not exist".
+- For division that should yield decimals, cast the numerator to numeric and guard against divide-by-zero: \`(SUM(x)::numeric / NULLIF(COUNT(*),0))\`.
+- Columns marked [text] that hold numbers must be cast with \`::numeric\` (not \`::float\`) before maths.
+- If a query errors, read the error message, fix the specific cast/function, and retry — don't repeat the same failing SQL.
+
 CHARTS:
 When a chart helps, include exactly ONE chart block in your FINAL answer, EXACTLY like this:
 \`\`\`chart-stella
