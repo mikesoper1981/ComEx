@@ -196,6 +196,21 @@ function stellaExtractedTextPath(storagePath) {
   return storagePath ? `${storagePath}.extracted.txt` : null;
 }
 
+// Compact, human-readable preview of query result rows for the reasoning trail.
+function stellaPreviewRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return 'No rows returned.';
+  const preview = rows.slice(0, 5).map(r => {
+    if (r && typeof r === 'object') {
+      return Object.entries(r)
+        .map(([k, v]) => `${k}: ${v === null || v === undefined ? '—' : v}`)
+        .join('  |  ');
+    }
+    return String(r);
+  });
+  const more = rows.length > 5 ? `\n… and ${rows.length - 5} more row${rows.length - 5 === 1 ? '' : 's'}` : '';
+  return preview.join('\n') + more;
+}
+
 // Human-readable rendering of the structured context_qa JSON for prompts.
 function stellaFormatContextQa(ctx) {
   if (!ctx || typeof ctx !== 'object') return '(no interpretive context captured yet)';
@@ -2476,6 +2491,9 @@ HOW TO WORK (be agentic):
 4. VERIFY — sanity-check: do results make sense? do document facts and numbers align? If a query returns nothing or looks wrong, diagnose and try again.
 5. ANSWER — only when confident, give the final plain-English answer.
 
+NARRATE YOUR THINKING (important for transparency):
+Before EVERY tool call, write 1-2 short sentences of plain text explaining what you are about to do and WHY (e.g. "I'll first inspect the sales table to see how revenue is formatted." or "The engagement data looks like it links to sales by territory, so I'll join them."). After you see tool results, briefly note what you found and what it means before your next step (e.g. "Found 12 territories; three are missing targets, I'll exclude those."). This running commentary is shown to the user, so make your reasoning, checks, and discoveries visible at each step — never call a tool silently.
+
 RULES:
 - Prefer tools over assumptions. Never invent values, table names, or column names.
 - Use the interpretive context to read values correctly (currency, units, definitions).
@@ -2547,9 +2565,10 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       }
       try {
         const rows = await stellaRunQuery(`SELECT * FROM ${table} LIMIT 8`);
+        const cols = rows.length ? Object.keys(rows[0]) : [];
         return {
           text: `Sample rows from ${table} (up to 8):\n${JSON.stringify(rows).slice(0, 6000)}`,
-          step: { type: 'inspect', label: `Inspected ${table}`, detail: `${rows.length} sample row${rows.length === 1 ? '' : 's'}` },
+          step: { type: 'inspect', label: `Inspected ${table}`, detail: cols.length ? `Columns: ${cols.join(', ')}` : `${rows.length} sample row${rows.length === 1 ? '' : 's'}`, result: stellaPreviewRows(rows) },
         };
       } catch (err) {
         return { text: `Could not inspect ${table}: ${err.message}`, step: { type: 'error', label: `Inspect ${table}`, detail: err.message } };
@@ -2561,7 +2580,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         const rows = await stellaRunQuery(query);
         return {
           text: `Rows (${rows.length}):\n${JSON.stringify(rows).slice(0, 10000)}`,
-          step: { type: 'query', label: 'Ran query', detail: query, resultCount: rows.length },
+          step: { type: 'query', label: 'Ran query', detail: query, resultCount: rows.length, result: stellaPreviewRows(rows) },
         };
       } catch (err) {
         return { text: `Query failed: ${err.message}`, step: { type: 'error', label: 'Query failed', detail: `${query}\n→ ${err.message}` } };
@@ -2612,14 +2631,17 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-cyan-300/90 hover:bg-slate-800/50 flex items-center gap-2">
           <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> How Stella worked this out ({steps.length} step{steps.length === 1 ? '' : 's'})
         </summary>
-        <div className="px-3 pb-3 pt-1 space-y-2">
+        <ol className="px-3 pb-3 pt-1 space-y-2 list-none">
           {steps.map((s, i) => (
-            <div key={i} className="text-[11px] text-blue-200/80">
-              <div className="font-semibold text-blue-100/90">{iconFor(s.type)} {s.label}{typeof s.resultCount === 'number' ? ` — ${s.resultCount} row${s.resultCount === 1 ? '' : 's'}` : ''}</div>
-              {s.detail && <pre className="mt-0.5 whitespace-pre-wrap text-blue-300/70 bg-slate-950/40 rounded px-2 py-1 overflow-x-auto">{s.detail}</pre>}
+            <div key={i} className="text-[11px] text-blue-200/80 border-l-2 border-blue-400/25 pl-2.5">
+              <div className="font-semibold text-blue-100/90">{i + 1}. {iconFor(s.type)} {s.label}{typeof s.resultCount === 'number' ? ` — ${s.resultCount} row${s.resultCount === 1 ? '' : 's'}` : ''}</div>
+              {s.detail && (s.type === 'thought'
+                ? <div className="mt-0.5 whitespace-pre-wrap text-blue-200/85 leading-relaxed">{s.detail}</div>
+                : <pre className="mt-0.5 whitespace-pre-wrap text-blue-300/70 bg-slate-950/40 rounded px-2 py-1 overflow-x-auto">{s.detail}</pre>)}
+              {s.result && <pre className="mt-1 whitespace-pre-wrap text-emerald-200/70 bg-emerald-950/20 border border-emerald-400/15 rounded px-2 py-1 overflow-x-auto">{s.result}</pre>}
             </div>
           ))}
-        </div>
+        </ol>
       </details>
     );
   };
@@ -2662,8 +2684,11 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         const textParts = content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
         const toolUses = content.filter(b => b.type === 'tool_use');
 
-        // Capture the agent's thinking/plan for the reasoning trail.
-        if (textParts && toolUses.length) steps.push({ type: 'thought', label: 'Reasoning', detail: textParts });
+        // Capture the agent's narrated thinking/plan for the reasoning trail
+        // whenever it produced any text this turn (planning or observations).
+        if (textParts && toolUses.length) {
+          steps.push({ type: 'thought', label: round === 0 ? 'Plan' : 'Thinking', detail: textParts });
+        }
 
         if (data.stop_reason !== 'tool_use' || !toolUses.length) {
           finalText = textParts || finalText;
