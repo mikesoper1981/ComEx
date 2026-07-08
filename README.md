@@ -2,6 +2,26 @@
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
+## Environment variables
+
+Set these in your local `.env` and in your Vercel project settings:
+
+| Variable | Where it runs | Purpose |
+| --- | --- | --- |
+| `VITE_SUPABASE_URL` | Browser | Supabase project URL |
+| `VITE_SUPABASE_ANON_KEY` | Browser | Supabase anon key (used by `src/supabase.js`) |
+| `VITE_APP_PASSWORD` | Browser | Password gate for the app |
+| `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
+| `SUPABASE_URL` | Server (`api/stella-query.cjs`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |
+| `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.cjs`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used solely to run validated read-only `SELECT` queries for Stella Insights. |
+
+## Stella Insights setup
+
+Run `supabase/stella_setup.sql` once in the Supabase SQL editor. It creates the
+`stella_files` registry table, the read-only `stella_run_select` executor, the
+dynamic-table helper functions (`stella_create_table`, `stella_insert_rows`,
+`stella_drop_table`), and the `stella-data` storage bucket.
+
 Currently, two official plugins are available:
 
 - [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)

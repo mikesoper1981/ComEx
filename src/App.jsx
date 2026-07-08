@@ -9,8 +9,11 @@ import {
   CartesianGrid, XAxis, YAxis, Tooltip, Legend,
 } from 'recharts';
 import { supabase } from './supabase';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 const MANAGER_COLOURS = ['#34d399', '#60a5fa', '#a78bfa'];
+
+const STELLA_QUERY_API_PATH = '/api/stella-query';
 const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
 const CHAT_API_PATH = '/api/chat';
@@ -83,6 +86,23 @@ function extractJsonObject(text) {
   return null;
 }
 
+// Extract a single SELECT query from a ```sql-query (or ```sql) block.
+function stellaExtractSqlQuery(text) {
+  if (!text) return null;
+  const m = String(text).match(/```sql-query\s*([\s\S]*?)```/i) || String(text).match(/```sql\s*([\s\S]*?)```/i);
+  if (!m) return null;
+  const sql = m[1].trim();
+  return /^select\b/i.test(sql) ? sql : null;
+}
+
+// Remove any SQL blocks so they are never shown to the end user.
+function stellaStripSqlBlocks(text) {
+  return String(text || '')
+    .replace(/```sql-query[\s\S]*?```/gi, '')
+    .replace(/```sql[\s\S]*?```/gi, '')
+    .trim();
+}
+
 function sanitizeStorageName(name) {
   return String(name || 'file')
     .replace(/[^\w.\-() ]+/g, '_')
@@ -92,9 +112,144 @@ function sanitizeStorageName(name) {
 }
 
 const STELLA_STORAGE_CANDIDATES = [
-  { bucket: 'stella-data', prefix: '' },
+  { bucket: 'stella-data', prefix: 'stella/' },
   { bucket: 'intelligence', prefix: 'stella/' },
 ];
+
+// Short, URL/identifier-safe random id (used for stella_data_<id> tables).
+function stellaNanoId(len = 10) {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let out = '';
+  const rand = (typeof crypto !== 'undefined' && crypto.getRandomValues)
+    ? crypto.getRandomValues(new Uint32Array(len))
+    : null;
+  for (let i = 0; i < len; i++) {
+    const n = rand ? rand[i] : Math.floor(Math.random() * chars.length);
+    out += chars[n % chars.length];
+  }
+  return out;
+}
+
+// Turn an arbitrary header into a safe, unique snake_case Postgres identifier.
+function stellaSafeColumnName(name, index, used) {
+  let base = String(name == null ? '' : name)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  if (!base || /^[0-9]/.test(base)) base = `col_${base || index + 1}`;
+  base = base.slice(0, 55);
+  let candidate = base;
+  let n = 2;
+  while (used.has(candidate)) candidate = `${base}_${n++}`;
+  used.add(candidate);
+  return candidate;
+}
+
+function stellaInferColumnType(values) {
+  let seen = 0;
+  for (const v of values) {
+    if (v === null || v === undefined || v === '') continue;
+    seen += 1;
+    const num = typeof v === 'number' ? v : Number(String(v).replace(/[,\s]/g, ''));
+    if (!Number.isFinite(num)) return 'text';
+  }
+  return seen > 0 ? 'numeric' : 'text';
+}
+
+function stellaCoerceValue(v, type) {
+  if (v === null || v === undefined || v === '') return null;
+  if (type === 'numeric') {
+    const num = typeof v === 'number' ? v : Number(String(v).replace(/[,\s]/g, ''));
+    return Number.isFinite(num) ? num : null;
+  }
+  return typeof v === 'string' ? v : String(v);
+}
+
+// Given an array of plain-object records, build typed columns + normalized rows.
+function stellaBuildTabularPayload(records) {
+  const clean = (records || []).filter(r => r && typeof r === 'object' && !Array.isArray(r));
+  const originalCols = [];
+  const seenCols = new Set();
+  for (const r of clean) {
+    for (const k of Object.keys(r)) {
+      if (!seenCols.has(k)) { seenCols.add(k); originalCols.push(k); }
+    }
+  }
+  const used = new Set();
+  const columns = originalCols.map((orig, i) => {
+    const values = clean.map(r => r[orig]);
+    return { original: orig, name: stellaSafeColumnName(orig, i, used), type: stellaInferColumnType(values), description: '' };
+  });
+  const rows = clean.map(r => {
+    const row = {};
+    for (const c of columns) row[c.name] = stellaCoerceValue(r[c.original], c.type);
+    return row;
+  });
+  return { columns, rows, rowCount: rows.length };
+}
+
+// Extract text from a PDF in the browser (best-effort, capped for size).
+async function stellaExtractPdfText(file) {
+  const pdfjs = await import('pdfjs-dist');
+  try { pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl; } catch { /* ignore */ }
+  const buf = await file.arrayBuffer();
+  const doc = await pdfjs.getDocument({ data: buf }).promise;
+  const maxPages = Math.min(doc.numPages, 40);
+  let text = '';
+  for (let p = 1; p <= maxPages; p++) {
+    const page = await doc.getPage(p);
+    const content = await page.getTextContent();
+    text += content.items.map(it => (it.str || '')).join(' ') + '\n';
+    if (text.length > 80000) break;
+  }
+  return text.trim();
+}
+
+// Human-readable rendering of the structured context_qa JSON for prompts.
+function stellaFormatContextQa(ctx) {
+  if (!ctx || typeof ctx !== 'object') return '(no interpretive context captured yet)';
+  const lines = [];
+  if (ctx.what_it_represents) lines.push(`What it represents: ${ctx.what_it_represents}`);
+  if (ctx.time_period) lines.push(`Time period: ${ctx.time_period}`);
+  if (Array.isArray(ctx.key_metrics) && ctx.key_metrics.length) lines.push(`Key metrics: ${ctx.key_metrics.join(', ')}`);
+  else if (ctx.key_metrics) lines.push(`Key metrics: ${ctx.key_metrics}`);
+  if (ctx.interpretation_notes) lines.push(`Interpretation notes: ${ctx.interpretation_notes}`);
+  if (Array.isArray(ctx.qa_pairs) && ctx.qa_pairs.length) {
+    lines.push('Intake Q&A:');
+    ctx.qa_pairs.forEach(qa => { if (qa && (qa.question || qa.answer)) lines.push(`  Q: ${qa.question || ''}\n  A: ${qa.answer || ''}`); });
+  }
+  return lines.length ? lines.join('\n') : '(no interpretive context captured yet)';
+}
+
+// Map a stella_files DB row into the local file object used by the UI.
+function stellaMapRegistryRow(row) {
+  const ctx = row.context_qa && typeof row.context_qa === 'object' ? row.context_qa : null;
+  const qa = ctx && Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : [];
+  const intakeMessages = qa.flatMap(p => [
+    ...(p && p.question ? [{ role: 'assistant', content: p.question }] : []),
+    ...(p && p.answer ? [{ role: 'user', content: p.answer }] : []),
+  ]);
+  return {
+    id: row.id,
+    dbId: row.id,
+    name: row.file_name,
+    fileType: row.file_type,
+    type: row.file_type,
+    tableName: row.table_name || null,
+    storagePath: row.storage_path || null,
+    storageBucket: null,
+    columns: Array.isArray(row.columns) ? row.columns : [],
+    rowCount: row.row_count ?? null,
+    summary: row.summary || '',
+    capturedContext: ctx,
+    intakeMessages,
+    intakeComplete: !!ctx,
+    uploadedAt: row.uploaded_at,
+    size: row.row_count != null ? `${row.row_count} rows` : '',
+    processing: false,
+  };
+}
 
 function guessCountry(structure) {
   const name = (structure.name || '').toLowerCase();
@@ -872,58 +1027,33 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
     loadIntelligenceFiles();
   }, []);
 
-  // ── SUPABASE: Load Stella metadata + business context on startup ──
+  // ── SUPABASE: Load Stella registry + business context on startup ──
   useEffect(() => {
     const loadStella = async () => {
-      const buildCandidatePath = (candidate, path) => `${candidate.prefix}${path}`;
-
-      const tryLoadBusinessContext = async (candidate) => {
-        try {
-          const { data, error } = await supabase.storage.from(candidate.bucket).download(buildCandidatePath(candidate, 'business-context.json'));
-          if (error || !data) return false;
-          const text = await data.text();
-          const parsed = safeJsonParse(text);
-          if (parsed && typeof parsed === 'object') setStellaBusinessContext(prev => ({ ...prev, ...parsed }));
-          return true;
-        } catch { return false; }
-      };
-
-      const tryLoadMetaFiles = async (candidate) => {
-        try {
-          const listPrefix = candidate.prefix ? candidate.prefix.replace(/\/$/, '') : '';
-          const { data, error } = await supabase.storage.from(candidate.bucket).list(listPrefix, { limit: 200 });
-          if (error || !data) return false;
-          const metaItems = data.filter(x => x.name && x.name.endsWith('.meta.json'));
-          const loaded = [];
-          for (const item of metaItems) {
-            const fullPath = buildCandidatePath(candidate, item.name);
-            const { data: fileData, error: dlErr } = await supabase.storage.from(candidate.bucket).download(fullPath);
-            if (dlErr || !fileData) continue;
-            const parsed = safeJsonParse(await fileData.text());
-            if (!parsed || typeof parsed !== 'object') continue;
-            loaded.push(parsed);
-          }
-          if (loaded.length) {
-            setStellaDataFiles(prev => {
-              const existingMetaPaths = new Set(prev.map(f => f.metaPath).filter(Boolean));
-              const merged = [...prev];
-              for (const f of loaded) {
-                if (f?.metaPath && existingMetaPaths.has(f.metaPath)) continue;
-                merged.push(f);
-              }
-              return merged;
-            });
-          }
-          return true;
-        } catch { return false; }
-      };
-
-      for (const candidate of STELLA_STORAGE_CANDIDATES) {
-        const loadedMeta = await tryLoadMetaFiles(candidate);
-        await tryLoadBusinessContext(candidate);
-        if (loadedMeta) {
-          break;
+      // File registry (stella_files table).
+      try {
+        const { data, error } = await supabase
+          .from('stella_files')
+          .select('*')
+          .eq('org_id', 'default')
+          .order('uploaded_at', { ascending: true });
+        if (!error && Array.isArray(data)) {
+          const mapped = data.map(stellaMapRegistryRow);
+          setStellaDataFiles(prev => {
+            const existing = new Set(prev.map(f => f.dbId).filter(Boolean));
+            return [...prev, ...mapped.filter(f => !existing.has(f.dbId))];
+          });
         }
+      } catch { /* stella_files table may not exist yet */ }
+
+      // Business context (persisted as JSON in storage).
+      for (const candidate of STELLA_STORAGE_CANDIDATES) {
+        try {
+          const { data, error } = await supabase.storage.from(candidate.bucket).download(`${candidate.prefix}business-context.json`);
+          if (error || !data) continue;
+          const parsed = safeJsonParse(await data.text());
+          if (parsed && typeof parsed === 'object') { setStellaBusinessContext(prev => ({ ...prev, ...parsed })); break; }
+        } catch { /* try next candidate */ }
       }
     };
     loadStella();
@@ -1167,6 +1297,19 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
       try {
         const spec = JSON.parse(rechartsMatch[1]);
         const textWithoutChart = cleanContent.replace(/```chart-recharts\n[\s\S]+?\n```/, '').trim();
+        return (
+          <div className="space-y-2">
+            {renderRechartsChart(spec)}
+            {textWithoutChart && <div>{formatMarkdown(textWithoutChart)}</div>}
+          </div>
+        );
+      } catch (e) { /* fall through */ }
+    }
+    const stellaChartMatch = cleanContent.match(/```chart-stella\s*([\s\S]+?)```/);
+    if (stellaChartMatch) {
+      try {
+        const spec = JSON.parse(stellaChartMatch[1].trim());
+        const textWithoutChart = cleanContent.replace(/```chart-stella\s*[\s\S]+?```/, '').trim();
         return (
           <div className="space-y-2">
             {renderRechartsChart(spec)}
@@ -1732,18 +1875,94 @@ ${isFocused
     return null;
   };
 
-  const reloadStellaFileMetaFromSupabase = async (fileRecord) => {
-    if (!fileRecord?.storageBucket || !fileRecord?.metaPath) return null;
+  // ── STELLA: DB registry (stella_files) + local state helpers ──
+  const stellaPatchLocal = (fileId, patch) =>
+    setStellaDataFiles(prev => prev.map(f => (f.id === fileId ? { ...f, ...patch } : f)));
+
+  const stellaReloadRegistry = async () => {
     try {
-      const parsed = await stellaDownloadJson(fileRecord.storageBucket, fileRecord.metaPath);
-      if (parsed && typeof parsed === 'object') {
-        setStellaDataFiles(prev => prev.map(f => f.id === fileRecord.id ? { ...f, ...parsed } : f));
-        return parsed;
-      }
+      const { data, error } = await supabase
+        .from('stella_files')
+        .select('*')
+        .eq('org_id', 'default')
+        .order('uploaded_at', { ascending: true });
+      if (error || !Array.isArray(data)) return null;
+      const mapped = data.map(stellaMapRegistryRow);
+      setStellaDataFiles(prev => {
+        const prevById = new Map(prev.filter(f => f.dbId).map(f => [f.dbId, f]));
+        const merged = mapped.map(m => {
+          const p = prevById.get(m.dbId);
+          // Keep a live (unsaved) intake conversation if it's ahead of the DB copy.
+          if (p && !p.intakeComplete && (p.intakeMessages?.length || 0) > (m.intakeMessages?.length || 0)) {
+            return { ...m, intakeMessages: p.intakeMessages, capturedContext: p.capturedContext || m.capturedContext };
+          }
+          return m;
+        });
+        const temps = prev.filter(f => !f.dbId);
+        return [...merged, ...temps];
+      });
+      return mapped;
     } catch {
       return null;
     }
-    return null;
+  };
+
+  const stellaInsertRegistry = async (record) => {
+    const { data, error } = await supabase
+      .from('stella_files')
+      .insert({ org_id: 'default', ...record })
+      .select()
+      .single();
+    if (error) throw new Error(`Registry insert failed: ${error.message}`);
+    return data;
+  };
+
+  const stellaUpdateRegistry = async (dbId, patch) => {
+    if (!dbId) return;
+    const { error } = await supabase.from('stella_files').update(patch).eq('id', dbId);
+    if (error) throw new Error(`Registry update failed: ${error.message}`);
+  };
+
+  // Create a dynamic stella_data_* table via RPC and load rows in batches.
+  const stellaCreateAndLoadTable = async (tableName, columns, rows) => {
+    const cols = columns.map(c => ({ name: c.name, type: c.type }));
+    const { error: createErr } = await supabase.rpc('stella_create_table', { p_table_name: tableName, p_columns: cols });
+    if (createErr) throw new Error(`Table create failed: ${createErr.message}`);
+    const BATCH = 500;
+    for (let i = 0; i < rows.length; i += BATCH) {
+      const batch = rows.slice(i, i + BATCH);
+      const { error: insErr } = await supabase.rpc('stella_insert_rows', { p_table_name: tableName, p_rows: batch });
+      if (insErr) throw new Error(`Row insert failed: ${insErr.message}`);
+    }
+  };
+
+  const stellaRemoveStorage = async (objectPath) => {
+    if (!objectPath) return;
+    for (const candidate of STELLA_STORAGE_CANDIDATES) {
+      try { await supabase.storage.from(candidate.bucket).remove([objectPath]); } catch { /* ignore */ }
+    }
+  };
+
+  // Normalize the intake agent's context_qa into the canonical shape.
+  const normalizeContextQa = (ctx, intakeMessages) => {
+    const base = ctx && typeof ctx === 'object' ? ctx : {};
+    let qa = Array.isArray(base.qa_pairs) ? base.qa_pairs.filter(p => p && (p.question || p.answer)) : [];
+    if (!qa.length) {
+      const msgs = intakeMessages || [];
+      for (let i = 0; i < msgs.length; i++) {
+        if (msgs[i].role === 'assistant') {
+          const ans = msgs.slice(i + 1).find(m => m.role === 'user');
+          if (ans) qa.push({ question: msgs[i].content, answer: ans.content });
+        }
+      }
+    }
+    return {
+      what_it_represents: base.what_it_represents || '',
+      time_period: base.time_period || '',
+      key_metrics: Array.isArray(base.key_metrics) ? base.key_metrics : (base.key_metrics ? [String(base.key_metrics)] : []),
+      interpretation_notes: base.interpretation_notes || '',
+      qa_pairs: qa,
+    };
   };
 
   const stellaSaveBusinessContext = async (next) => {
@@ -1761,33 +1980,7 @@ ${isFocused
     }
   };
 
-  const stellaUpdateMeta = async (fileId, patch = {}) => {
-    const current = stellaDataFiles.find(f => f.id === fileId);
-    if (!current) return;
-    const updated = { ...current, ...patch };
-    setStellaDataFiles(prev => prev.map(f => f.id === fileId ? updated : f));
-    try {
-      const relativeStoragePath = updated.storagePath
-        ? updated.storagePath.replace(/^stella\//, '')
-        : null;
-      const relativeMetaPath = updated.metaPath
-        ? updated.metaPath.replace(/^stella\//, '')
-        : (relativeStoragePath ? `${relativeStoragePath}.meta.json` : `data_${updated.id}.meta.json`);
-      const payload = new Blob([JSON.stringify({ ...updated, metaPath: relativeMetaPath }, null, 2)], { type: 'application/json' });
-      const saveRes = await stellaUploadToStorage(relativeMetaPath, payload, 'application/json');
-      const savedRecord = {
-        ...updated,
-        storageBucket: saveRes.bucket,
-        metaPath: saveRes.objectPath,
-      };
-      setStellaDataFiles(prev => prev.map(f => f.id === fileId ? savedRecord : f));
-      await reloadStellaFileMetaFromSupabase(savedRecord);
-    } catch (e) {
-      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not persist Stella dataset metadata: ${e.message}` }]);
-    }
-  };
-
-  // ── STELLA: File parsing (lightweight MVP) ──
+  // ── STELLA: File parsing ──
   const stellaReadAsText = (file) => new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => resolve(String(e.target.result || ''));
@@ -1804,139 +1997,211 @@ ${isFocused
     return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', columns: [], suggestedQuestions: ['What does this data represent?', 'What time period does it cover?', 'Which metrics matter most?', 'Any definitions or filters to apply?'] };
   };
 
-  const stellaIntakeNextTurn = async (fileId) => {
-    const f = stellaDataFiles.find(x => x.id === fileId);
+  // Runs one intake turn for the given (up-to-date) file object.
+  const stellaIntakeNextTurn = async (f) => {
     if (!f) return;
-    const system = `You are the Stella Insights intake agent.\n\nGoal: collect enough context to interpret the dataset correctly.\nAsk 1-2 questions per turn.\nStop when you have enough and then return ONLY valid JSON with complete=true.\n\nReturn ONLY valid JSON, no markdown.\nSchema:\n{\n  "complete": true/false,\n  "assistantMessage": "what to show in the intake panel",\n  "capturedContext": {\n    "whatIsThisData": "",\n    "timePeriod": "",\n    "keyMetrics": "",\n    "grain": "",\n    "filters": "",\n    "definitions": "",\n    "dataQualityNotes": ""\n  }\n}\n\nIf complete=false, set capturedContext to null and use assistantMessage to ask follow-up questions.`;
+    const isDoc = !f.tableName;
+    const system = `You are the Stella Insights data intake agent. Your job is to capture the interpretive context that lets an analyst understand this ${isDoc ? 'document' : 'dataset'} correctly.
+
+Ask ONE focused question per turn. Ask 3-5 questions in total across turns, covering:
+- what the ${isDoc ? 'document contains / represents' : 'data represents'}
+- the time period it covers
+- the key metrics / important fields and EXACTLY what they mean (e.g. a column "rev" = actual revenue in GBP)
+- how the data should be interpreted (definitions, filters, caveats)
+
+When you have enough, set "complete": true and fill "context_qa" fully.
+
+Return ONLY valid JSON — no markdown fences, no prose outside the JSON.
+Schema:
+{
+  "complete": true | false,
+  "message": "the single next question to ask (when complete=false) OR a one-line confirmation (when complete=true)",
+  "context_qa": {
+    "what_it_represents": "",
+    "time_period": "",
+    "key_metrics": ["", ""],
+    "interpretation_notes": "",
+    "qa_pairs": [{"question": "", "answer": ""}]
+  }
+}
+When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked and the user's answer.`;
 
     const colsBlob = Array.isArray(f.columns) && f.columns.length
-      ? f.columns.map(c => `- ${c.name}${c.description ? `: ${c.description}` : ''}`).join('\n')
-      : '(no columns detected)';
-    const contextBlob = `DATASET SUMMARY:\n${f.summary || ''}\n\nDETECTED COLUMNS:\n${colsBlob}\n\nKNOWN CAPTURED CONTEXT (may be empty):\n${f.capturedContext ? JSON.stringify(f.capturedContext, null, 2) : '{}'}`;
+      ? f.columns.map(c => `- ${c.name}${c.type ? ` [${c.type}]` : ''}${c.description ? `: ${c.description}` : ''}`).join('\n')
+      : '(no columns — this is a document)';
+    const contextBlob = `FILE: "${f.name}" (type: ${f.fileType || f.type})\nSUMMARY: ${f.summary || ''}\nCOLUMNS:\n${colsBlob}`;
     const convo = [
-      { role: 'user', content: `You are onboarding dataset: "${f.name}".\n\n${contextBlob}` },
+      { role: 'user', content: `You are onboarding: "${f.name}".\n\n${contextBlob}` },
       ...((f.intakeMessages || []).map(m => ({ role: toAnthropicRole(m.role), content: m.content }))),
     ];
 
-    const raw = await callAnthropic(system, convo, 900);
-    const parsed = extractJsonObject(raw);
-    if (!parsed || typeof parsed !== 'object') {
-      const fallback = { complete: false, assistantMessage: 'I had trouble parsing my own intake response. Could you tell me: what does the data represent, what time period, and which key metrics matter?', capturedContext: null };
-      await stellaUpdateMeta(fileId, { intakeMessages: [...(f.intakeMessages || []), { role: 'assistant', content: fallback.assistantMessage }] });
-      return;
-    }
-    const assistantMessage = parsed.assistantMessage || (parsed.complete
-      ? 'Thanks — I have enough context to interpret this dataset.'
-      : 'I need a bit more context before I can analyse this dataset properly.');
+    let parsed = null;
+    let raw = '';
+    try {
+      raw = await callAnthropic(system, convo, 900);
+      parsed = extractJsonObject(raw);
+    } catch { /* fall through to fallback handling */ }
+
+    // Robust fallback: if we couldn't parse JSON, treat the raw text as the next question.
+    const complete = !!(parsed && parsed.complete);
+    const assistantMessage =
+      (parsed && parsed.message) ||
+      (complete ? 'Thanks — I have enough context to interpret this now.' : (String(raw).trim() || 'Could you tell me what this represents, the time period it covers, and the key metrics involved?'));
+
     const nextIntakeMessages = [...(f.intakeMessages || []), { role: 'assistant', content: assistantMessage }];
-    if (parsed.complete) {
-      await stellaUpdateMeta(fileId, { capturedContext: parsed.capturedContext || {}, intakeMessages: nextIntakeMessages });
+
+    if (complete) {
+      const ctx = normalizeContextQa(parsed.context_qa, nextIntakeMessages);
+      stellaPatchLocal(f.id, { intakeMessages: nextIntakeMessages, capturedContext: ctx, intakeComplete: true });
+      try {
+        await stellaUpdateRegistry(f.dbId, { context_qa: ctx });
+      } catch (e) {
+        setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not save captured context: ${e.message}` }]);
+      }
     } else {
-      await stellaUpdateMeta(fileId, { intakeMessages: nextIntakeMessages });
+      stellaPatchLocal(f.id, { intakeMessages: nextIntakeMessages });
     }
+  };
+
+  // Parse a tabular file (CSV / Excel / JSON array) into plain-object records.
+  const stellaParseTabular = async (file, kind) => {
+    if (kind === 'json') {
+      const txt = await stellaReadAsText(file);
+      const parsedJson = safeJsonParse(txt);
+      if (Array.isArray(parsedJson)) return parsedJson.filter(r => r && typeof r === 'object' && !Array.isArray(r));
+      return null; // not an array of objects → treat as a document
+    }
+    const xlsxMod = await import('xlsx');
+    const XLSX = xlsxMod?.default || xlsxMod;
+    let wb;
+    if (kind === 'csv') {
+      const txt = await stellaReadAsText(file);
+      wb = XLSX.read(txt, { type: 'string' });
+    } else {
+      const buf = await file.arrayBuffer();
+      wb = XLSX.read(buf, { type: 'array' });
+    }
+    const sheetName = wb.SheetNames?.[0];
+    const ws = sheetName ? wb.Sheets[sheetName] : null;
+    return ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
   };
 
   const handleStellaDataUpload = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    const id = Date.now() + Math.random();
-    const cleanName = sanitizeStorageName(file.name);
-    const storagePath = `data_${Date.now()}_${cleanName}`;
-    const base = {
-      id,
-      name: file.name,
-      type: file.type || (file.name.endsWith('.csv') ? 'text/csv' : file.name.endsWith('.json') ? 'application/json' : file.name.endsWith('.xlsx') ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'text/plain'),
-      size: `${(file.size / 1024).toFixed(1)} KB`,
-      uploadedAt: new Date().toISOString(),
-      storageBucket: null,
-      storagePath: null,
-      metaPath: null,
-      summary: '',
-      columns: [],
-      rowCountEstimate: null,
-      capturedContext: null,
-      intakeMessages: [],
-    };
-    setStellaDataFiles(prev => [...prev, base]);
-    setActiveStellaDataId(id);
+    const tempId = `tmp_${Date.now()}_${Math.random()}`;
+    const lower = file.name.toLowerCase();
+    const kind =
+      lower.endsWith('.csv') ? 'csv'
+      : (lower.endsWith('.xlsx') || lower.endsWith('.xls')) ? 'excel'
+      : lower.endsWith('.json') ? 'json'
+      : lower.endsWith('.pdf') ? 'pdf'
+      : 'text';
+
+    setStellaDataFiles(prev => [...prev, {
+      id: tempId, dbId: null, name: file.name, type: kind, fileType: kind,
+      size: `${(file.size / 1024).toFixed(1)} KB`, columns: [], rowCount: null,
+      summary: '', capturedContext: null, tableName: null, storagePath: null, storageBucket: null,
+      intakeMessages: [{ role: 'assistant', content: `⏳ Processing **${file.name}**…` }],
+      intakeComplete: false, processing: true,
+    }]);
+    setActiveStellaDataId(tempId);
     setStellaTab('data');
 
     try {
-      // Upload raw file
-      const up = await stellaUploadToStorage(storagePath, file, file.type || undefined);
-      const saved = { ...base, storageBucket: up.bucket, storagePath: up.objectPath };
-      setStellaDataFiles(prev => prev.map(f => f.id === id ? saved : f));
-
-      // Build a lightweight content sample for intake + detect columns
-      let sampleText = '';
+      let tableName = null;
+      let storagePath = null;
+      let storageBucket = null;
       let columns = [];
-      let rowCountEstimate = null;
-      const lower = file.name.toLowerCase();
-      if (lower.endsWith('.csv')) {
-        const txt = await stellaReadAsText(file);
-        sampleText = txt.substring(0, 18000);
-        const lines = txt.split(/\r?\n/).filter(l => l.trim().length > 0);
-        if (lines.length > 0) {
-          columns = lines[0].split(',').map(c => ({ name: c.trim().replace(/^"|"$/g, ''), description: '' })).filter(c => c.name);
-          rowCountEstimate = Math.max(0, lines.length - 1);
-        }
-      } else if (lower.endsWith('.json')) {
-        const txt = await stellaReadAsText(file);
-        sampleText = txt.substring(0, 18000);
-        const parsedJson = safeJsonParse(txt);
-        const firstRow = Array.isArray(parsedJson) ? parsedJson[0] : (parsedJson && typeof parsedJson === 'object' ? parsedJson : null);
-        if (firstRow && typeof firstRow === 'object') {
-          columns = Object.keys(firstRow).map(k => ({ name: k, description: '' }));
-        }
-        if (Array.isArray(parsedJson)) rowCountEstimate = parsedJson.length;
-      } else if (lower.endsWith('.txt') || lower.endsWith('.md')) {
-        const txt = await stellaReadAsText(file);
-        sampleText = txt.substring(0, 18000);
-      } else if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
-        try {
-          const xlsxMod = await import('xlsx');
-          const XLSX = xlsxMod?.default || xlsxMod;
-          const buf = await file.arrayBuffer();
-          const wb = XLSX.read(buf, { type: 'array' });
-          const sheetName = wb.SheetNames?.[0];
-          const ws = sheetName ? wb.Sheets[sheetName] : null;
-          const rows = ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
-          if (rows.length > 0 && typeof rows[0] === 'object') {
-            columns = Object.keys(rows[0]).map(k => ({ name: k, description: '' }));
-          }
-          rowCountEstimate = rows.length;
-          sampleText = JSON.stringify(rows.slice(0, 50), null, 2).substring(0, 18000);
-        } catch {
-          sampleText = 'Excel file uploaded. (Preview parsing not available.)';
-        }
-      } else if (lower.endsWith('.pdf')) {
-        sampleText = 'PDF file uploaded. (Text extraction not enabled in this MVP.)';
+      let rowCount = null;
+      let sampleText = '';
+
+      // Decide flow: tabular (→ dynamic table) vs document (→ storage).
+      let records = null;
+      if (kind === 'csv' || kind === 'excel' || kind === 'json') {
+        records = await stellaParseTabular(file, kind);
+      }
+
+      const isTabular = Array.isArray(records) && records.length > 0;
+
+      if (isTabular) {
+        // ── Tabular flow: create a dynamic table and load all rows ──
+        const payload = stellaBuildTabularPayload(records);
+        columns = payload.columns;
+        rowCount = payload.rowCount;
+        tableName = `stella_data_${stellaNanoId()}`;
+        await stellaCreateAndLoadTable(tableName, payload.columns, payload.rows);
+        sampleText = JSON.stringify(records.slice(0, 30), null, 2).substring(0, 16000);
       } else {
-        sampleText = `File uploaded: ${file.name}`;
-      }
-
-      const onboarding = await stellaBuildContentSummary({ name: file.name, type: saved.type, textSample: sampleText, columns });
-      const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
-      // Merge any AI-provided column descriptions back onto detected columns
-      let mergedColumns = columns;
-      if (Array.isArray(onboarding.columns) && onboarding.columns.length) {
-        if (columns.length) {
-          mergedColumns = columns.map(c => {
-            const match = onboarding.columns.find(oc => (oc.name || '').toLowerCase() === c.name.toLowerCase());
-            return match ? { name: c.name, description: match.description || '' } : c;
-          });
+        // ── Document flow: upload raw file to storage + extract text ──
+        const cleanName = sanitizeStorageName(file.name);
+        const objectRelPath = `data_${Date.now()}_${cleanName}`;
+        const up = await stellaUploadToStorage(objectRelPath, file, file.type || undefined);
+        storagePath = up.objectPath;
+        storageBucket = up.bucket;
+        if (kind === 'pdf') {
+          try { sampleText = await stellaExtractPdfText(file); }
+          catch { sampleText = ''; }
+          if (!sampleText) sampleText = `PDF document "${file.name}". Text could not be automatically extracted; please describe its contents in the intake questions.`;
         } else {
-          mergedColumns = onboarding.columns.map(oc => ({ name: oc.name || '', description: oc.description || '' })).filter(c => c.name);
+          // .txt / .md / non-array JSON
+          sampleText = (await stellaReadAsText(file)).substring(0, 18000);
         }
       }
-      const colLine = mergedColumns.length ? `\n\n**Detected columns:** ${mergedColumns.map(c => c.name).join(', ')}` : '';
-      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${onboarding.summary || ''}${colLine}\n\nTo interpret this correctly, I need a bit more context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nReply with answers (numbered is fine).`;
 
-      const withIntake = { ...saved, summary: onboarding.summary || 'Uploaded dataset.', columns: mergedColumns, rowCountEstimate, intakeMessages: [{ role: 'assistant', content: assistantMsg }] };
-      setStellaDataFiles(prev => prev.map(f => f.id === id ? withIntake : f));
-      await stellaUpdateMeta(id, withIntake);
+      // AI: plain-English summary + column descriptions.
+      const onboarding = await stellaBuildContentSummary({
+        name: file.name,
+        type: kind,
+        textSample: sampleText,
+        columns: columns.map(c => ({ name: c.original || c.name })),
+      });
+      const summary = onboarding.summary || (isTabular ? 'Uploaded dataset.' : 'Uploaded document.');
+
+      // Merge AI column descriptions back onto the typed columns.
+      let mergedColumns = columns;
+      if (isTabular && Array.isArray(onboarding.columns) && onboarding.columns.length) {
+        mergedColumns = columns.map(c => {
+          const match = onboarding.columns.find(oc => (oc.name || '').toLowerCase() === String(c.original || c.name).toLowerCase());
+          return match ? { ...c, description: match.description || '' } : c;
+        });
+      }
+
+      // Persist a registry row (context_qa filled in once intake completes).
+      const dbRow = await stellaInsertRegistry({
+        file_name: file.name,
+        file_type: kind,
+        storage_path: storagePath,
+        table_name: tableName,
+        columns: mergedColumns,
+        row_count: rowCount,
+        summary,
+        context_qa: null,
+      });
+      const dbId = dbRow?.id || tempId;
+
+      // Opening intake message (asks 3-5 questions to seed the conversation).
+      const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+      const colLine = mergedColumns.length ? `\n\n**Columns:** ${mergedColumns.map(c => c.name).join(', ')}` : '';
+      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nTo interpret this correctly I need a little context. Let's start:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them all together or one at a time.`;
+
+      const finalFile = {
+        id: dbId, dbId,
+        name: file.name, type: kind, fileType: kind,
+        size: rowCount != null ? `${rowCount} rows` : `${(file.size / 1024).toFixed(1)} KB`,
+        columns: mergedColumns, rowCount,
+        summary, capturedContext: null,
+        tableName, storagePath, storageBucket,
+        intakeMessages: [{ role: 'assistant', content: assistantMsg }],
+        intakeComplete: false, processing: false,
+        uploadedAt: dbRow?.uploaded_at || new Date().toISOString(),
+      };
+      setStellaDataFiles(prev => prev.map(f => (f.id === tempId ? finalFile : f)));
+      setActiveStellaDataId(prev => (prev === tempId ? dbId : prev));
     } catch (e) {
-      setStellaDataFiles(prev => prev.map(f => f.id === id ? { ...f, intakeMessages: [{ role: 'system', content: `❌ Upload failed: ${e.message}` }] } : f));
+      setStellaDataFiles(prev => prev.map(f => f.id === tempId
+        ? { ...f, processing: false, intakeMessages: [{ role: 'system', content: `❌ Upload failed: ${e.message}` }] }
+        : f));
     } finally {
       event.target.value = '';
     }
@@ -1944,28 +2209,26 @@ ${isFocused
 
   const handleStellaIntakeSend = async () => {
     const fileId = activeStellaDataId;
-    const f = stellaDataFiles.find(x => x.id === fileId);
+    const current = stellaDataFiles.find(x => x.id === fileId);
     const msg = stellaIntakeInput.trim();
-    if (!f || !msg) return;
+    if (!current || !msg || current.processing) return;
     setStellaIntakeInput('');
-    const nextMsgs = [...(f.intakeMessages || []), { role: 'user', content: msg }];
-    await stellaUpdateMeta(fileId, { intakeMessages: nextMsgs });
-    await stellaIntakeNextTurn(fileId);
+    const updated = { ...current, intakeMessages: [...(current.intakeMessages || []), { role: 'user', content: msg }] };
+    stellaPatchLocal(fileId, { intakeMessages: updated.intakeMessages });
+    await stellaIntakeNextTurn(updated);
   };
 
   const handleStellaDeleteFile = async (fileId) => {
     const f = stellaDataFiles.find(x => x.id === fileId);
     if (!f) return;
     if (!window.confirm(`Delete "${f.name}" and its captured context? This cannot be undone.`)) return;
-    // Remove from Supabase storage (raw file + metadata companion)
     try {
-      if (f.storageBucket) {
-        const toRemove = [f.storagePath, f.metaPath].filter(Boolean);
-        if (toRemove.length) await supabase.storage.from(f.storageBucket).remove(toRemove);
-      }
+      if (f.dbId) await supabase.from('stella_files').delete().eq('id', f.dbId);
     } catch (e) {
-      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not fully remove "${f.name}" from Supabase: ${e.message}` }]);
+      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not remove "${f.name}" from the registry: ${e.message}` }]);
     }
+    try { if (f.tableName) await supabase.rpc('stella_drop_table', { p_table_name: f.tableName }); } catch { /* ignore */ }
+    await stellaRemoveStorage(f.storagePath);
     setStellaDataFiles(prev => prev.filter(x => x.id !== fileId));
     setActiveStellaDataId(prev => (prev === fileId ? null : prev));
   };
@@ -2142,25 +2405,63 @@ ${isFocused
   );
 
   // ── STELLA: Chat prompt builder + submit ──
-  const buildStellaSystemPrompt = () => {
+  const buildStellaSystemPrompt = (filesArg) => {
+    const files = Array.isArray(filesArg) ? filesArg : (stellaDataFiles || []);
     const biz = stellaBusinessContext || {};
     const bizText = `BUSINESS CONTEXT:\n- Company: ${biz.companyName || '(not set)'}\n- Industry: ${biz.industry || '(not set)'}\n- Key goals: ${biz.keyGoals || '(not set)'}\n- Key metrics: ${biz.keyMetrics || '(not set)'}\n- Terminology/definitions: ${biz.terminology || '(not set)'}\n`;
-    const filesText = (stellaDataFiles || [])
-      .map((f, i) => {
-        const ctx = f.capturedContext ? JSON.stringify(f.capturedContext, null, 2) : '(no intake context captured yet)';
-        const cols = Array.isArray(f.columns) && f.columns.length
-          ? f.columns.map(c => `    - ${c.name}${c.description ? `: ${c.description}` : ''}`).join('\n')
-          : '    (no columns detected — may be a document or free text)';
-        const rowInfo = f.rowCountEstimate != null ? ` | approx rows: ${f.rowCountEstimate}` : '';
-        return `DATASET ${i + 1}: ${f.name} (type: ${f.type || 'file'}${rowInfo})\nSummary: ${f.summary || ''}\nColumns:\n${cols}\nCaptured context:\n${ctx}\n`;
-      })
-      .join('\n\n');
 
-    const inventory = (stellaDataFiles || []).length
-      ? (stellaDataFiles || []).map((f, i) => `${i + 1}. ${f.name}`).join('\n')
-      : '(no files available)';
+    const tabular = files.filter(f => f.tableName);
+    const docs = files.filter(f => !f.tableName);
 
-    return `You are Stella Insights — a Commercial Excellence data analysis assistant.\n\n${bizText}\n\nFILES YOU CURRENTLY HAVE ACCESS TO:\n${inventory}\n\nUPLOADED DATASETS (summaries + columns + captured context):\n${filesText || '(none uploaded yet)'}\n\nINSTRUCTIONS:\n- You can only see the summaries, column definitions, and captured context above — not the full raw rows. Reason from these; if you need exact row-level values you don't have, say so and ask the user.\n- When the user asks what data you have, list the files above by name.\n- Refer to columns by their exact names, and use the captured context and business context to interpret metrics/terminology.\n- Be explicit about assumptions and ask clarifying questions when needed.\n- When a chart would help, include exactly ONE chart block in this format:\n\n\`\`\`chart-recharts\n{\n  \"type\": \"bar|line|scatter|pie\",\n  \"title\": \"...\",\n  \"data\": [ {\"x\": \"...\", \"y\": 123}, ... ],\n  \"xKey\": \"x\",\n  \"yKey\": \"y\",\n  \"yKeys\": [\"y1\",\"y2\"]\n}\n\`\`\`\n\nRules:\n- Use bar/line as default. Use scatter only when it clarifies relationships.\n- Keep chart data to <= 40 rows.\n- Do not invent dataset values; if you can't compute from the provided summaries/context, ask for the needed data upload or details.\n\nRESPONSE STYLE:\nUse ## headers, bullet points, concise explanations, and include recommended next questions.`;
+    const blocks = files.map((f, i) => {
+      const cols = Array.isArray(f.columns) && f.columns.length
+        ? f.columns.map(c => `    - ${c.name}${c.original && c.original !== c.name ? ` (source header: "${c.original}")` : ''} [${c.type || 'text'}]${c.description ? `: ${c.description}` : ''}`).join('\n')
+        : '    (no columns — this is a document)';
+      const location = f.tableName ? `SQL table: ${f.tableName}` : `Stored document (path: ${f.storagePath || 'n/a'})`;
+      const ctx = stellaFormatContextQa(f.capturedContext).split('\n').map(l => `    ${l}`).join('\n');
+      return `FILE ${i + 1}: ${f.name}\n- Type: ${f.fileType || f.type || 'file'}\n- ${location}${f.rowCount != null ? `\n- Rows: ${f.rowCount}` : ''}\n- Summary: ${f.summary || '(none)'}\n- Columns:\n${cols}\n- Interpretive context:\n${ctx}`;
+    }).join('\n\n');
+
+    const sqlInstr = tabular.length
+      ? `\nQUERYING TABULAR DATA:\nWhen you need actual data from a tabular dataset to answer a question, write a SINGLE SQL SELECT query in a block EXACTLY like this:\n\`\`\`sql-query\nSELECT ... FROM ${tabular[0].tableName} WHERE ...\n\`\`\`\n- Only SELECT statements are allowed.\n- Reference the EXACT table name(s) from the list above: ${tabular.map(t => t.tableName).join(', ')}.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n- After the query runs I will return the results to you; then interpret them for the user in plain English.\n`
+      : '';
+    const docInstr = docs.length
+      ? `\nDOCUMENTS (PDF / text):\nFor questions about the stored documents, answer directly from their summary and interpretive context above. Do NOT write SQL for documents.\n`
+      : '';
+
+    return `You are Stella Insights — a Commercial Excellence data analysis assistant. You help the user understand and analyse their uploaded data, spot trends, and visualise results.
+
+${bizText}
+FILES AVAILABLE TO YOU (${files.length}):
+${blocks || '(no files uploaded yet)'}
+${sqlInstr}${docInstr}
+HOW TO ANSWER:
+- Always use the interpretive context above to understand what each column and value means (e.g. currency, units, definitions).
+- When the user asks what data you have, list the files above by name.
+- NEVER show raw SQL or raw JSON to the user — present findings in clear plain English.
+- Do not invent values or table/column names. If you can't answer from the available data, say so and ask for what's needed.
+
+CHARTS:
+When a chart would help, include exactly ONE chart block EXACTLY like this:
+\`\`\`chart-stella
+{"type": "bar", "title": "...", "data": [{"label": "A", "value": 10}], "xKey": "label", "yKey": "value"}
+\`\`\`
+- Supported types: bar, line, scatter.
+- Use xKey / yKey to name the fields in your data objects. Keep to <= 40 data points.
+
+RESPONSE STYLE:
+Use ## headers, bullet points, concise explanations, and suggest useful follow-up questions.`;
+  };
+
+  const stellaRunQuery = async (sql) => {
+    const res = await fetch(STELLA_QUERY_API_PATH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `Query failed (${res.status})`);
+    return Array.isArray(data.rows) ? data.rows : [];
   };
 
   const handleStellaChatSubmit = async (e) => {
@@ -2171,18 +2472,43 @@ ${isFocused
     setStellaMessages(prev => [...prev, { role: 'user', content: messageContent }]);
     setStellaInput('');
     try {
-      const systemPrompt = buildStellaSystemPrompt();
-      const response = await anthropicMessagesPost({
-        system: systemPrompt,
-        messages: [
-          ...stellaMessages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
-          { role: 'user', content: messageContent },
-        ],
-        max_tokens: 4000,
-      });
-      const data = await response.json();
-      const assistantMessage = anthropicAssistantText(data) || '';
-      setStellaMessages(prev => [...prev, { role: 'assistant', content: assistantMessage }]);
+      // Always build the prompt from the freshest registry.
+      const registry = await stellaReloadRegistry();
+      const files = registry || stellaDataFiles;
+      const systemPrompt = buildStellaSystemPrompt(files);
+
+      const convo = [
+        ...stellaMessages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
+        { role: 'user', content: messageContent },
+      ];
+
+      const callStella = async () => {
+        const resp = await anthropicMessagesPost({ system: systemPrompt, messages: convo, max_tokens: 4000 });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error.message);
+        return anthropicAssistantText(data) || '';
+      };
+
+      // Iterative loop: run any SQL the model requests, feed results back, interpret.
+      let finalText = '';
+      for (let round = 0; round < 4; round++) {
+        const text = await callStella();
+        const sql = stellaExtractSqlQuery(text);
+        if (!sql) { finalText = text; break; }
+        convo.push({ role: 'assistant', content: text });
+        let resultBlock;
+        try {
+          const rows = await stellaRunQuery(sql);
+          const rowsJson = JSON.stringify(rows).slice(0, 12000);
+          resultBlock = `QUERY RESULTS (JSON) for the SQL you wrote:\n${rowsJson}\n\nNow answer the user's question in plain English using these results. Do not show the SQL or the raw JSON. If a chart would help, include a chart-stella block.`;
+        } catch (qErr) {
+          resultBlock = `The query could not be executed (${qErr.message}). Explain to the user that the data couldn't be retrieved and, if helpful, suggest what to check. Do not show any SQL.`;
+        }
+        convo.push({ role: 'user', content: resultBlock });
+      }
+      if (!finalText) finalText = await callStella();
+
+      setStellaMessages(prev => [...prev, { role: 'assistant', content: stellaStripSqlBlocks(finalText) || finalText }]);
     } catch (error) {
       setStellaMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error: Unable to process request. Please try again.' }]);
     } finally {
