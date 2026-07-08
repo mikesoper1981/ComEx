@@ -1,15 +1,10 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers } from 'lucide-react';
-import {
-  ResponsiveContainer,
-  BarChart, Bar,
-  LineChart, Line,
-  ScatterChart, Scatter,
-  PieChart, Pie, Cell,
-  CartesianGrid, XAxis, YAxis, Tooltip, Legend,
-} from 'recharts';
 import { supabase } from './supabase';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+
+// Recharts is loaded lazily so it can never affect initial page load.
+const StellaChart = lazy(() => import('./StellaChart'));
 
 const MANAGER_COLOURS = ['#34d399', '#60a5fa', '#a78bfa'];
 
@@ -727,7 +722,7 @@ class MessageErrorBoundary extends React.Component {
   }
   render() {
     if (this.state.hasError) {
-      return (
+      return this.props.fallback || (
         <div className="text-xs text-red-300/80 bg-red-500/10 border border-red-400/25 rounded-lg p-3">
           ⚠️ This response couldn't be displayed (a chart or block failed to render). The rest of Stella is unaffected.
         </div>
@@ -1213,103 +1208,12 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
 
   const renderRechartsChart = (spec) => {
     if (!spec || typeof spec !== 'object') return null;
-    const type = String(spec.type || '').toLowerCase();
-    const title = spec.title || '📊 Chart';
-    const xKey = spec.xKey || 'x';
-    const yKey = spec.yKey || 'y';
-    const yKeys = Array.isArray(spec.yKeys) ? spec.yKeys : (spec.yKeys ? [spec.yKeys] : []);
-    const valueKeys = [...(yKeys.length ? yKeys : [yKey]), spec.valueKey].filter(Boolean);
-    // Coerce numeric-looking strings so the chart renders reliably.
-    const data = (Array.isArray(spec.data) ? spec.data : [])
-      .filter(d => d && typeof d === 'object')
-      .map(d => {
-        const row = { ...d };
-        for (const k of valueKeys) {
-          if (row[k] != null && typeof row[k] !== 'number') {
-            const n = Number(String(row[k]).replace(/[,\s%£$€]/g, ''));
-            if (Number.isFinite(n)) row[k] = n;
-          }
-        }
-        return row;
-      });
-    const palette = ['#22d3ee', '#60a5fa', '#34d399', '#a78bfa', '#f472b6', '#fbbf24', '#fb7185'];
-
-    if (!data.length) return (
-      <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4 text-xs text-blue-300/70">
-        Chart spec was provided but contains no data.
-      </div>
-    );
-
-    const wrap = (children) => (
-      <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
-        <h3 className="text-base font-semibold text-cyan-400 mb-3">{title}</h3>
-        <div className="w-full h-[320px]">
-          <ResponsiveContainer width="100%" height="100%">
-            {children}
-          </ResponsiveContainer>
-        </div>
-      </div>
-    );
-
-    if (type === 'bar') {
-      const series = yKeys.length ? yKeys : [yKey];
-      return wrap(
-        <BarChart data={data}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-          <XAxis dataKey={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-          <YAxis stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-          <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
-          <Legend />
-          {series.map((k, i) => <Bar key={k} dataKey={k} fill={palette[i % palette.length]} radius={[6, 6, 0, 0]} />)}
-        </BarChart>
-      );
-    }
-
-    if (type === 'line') {
-      const series = yKeys.length ? yKeys : [yKey];
-      return wrap(
-        <LineChart data={data}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-          <XAxis dataKey={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-          <YAxis stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-          <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
-          <Legend />
-          {series.map((k, i) => <Line key={k} type="monotone" dataKey={k} stroke={palette[i % palette.length]} strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />)}
-        </LineChart>
-      );
-    }
-
-    if (type === 'scatter') {
-      return wrap(
-        <ScatterChart>
-          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-          <XAxis dataKey={xKey} name={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-          <YAxis dataKey={yKey} name={yKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-          <Tooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
-          <Legend />
-          <Scatter name={spec.seriesName || yKey} data={data} fill={palette[0]} />
-        </ScatterChart>
-      );
-    }
-
-    if (type === 'pie') {
-      const nameKey = spec.nameKey || xKey;
-      const valueKey = spec.valueKey || yKey;
-      return wrap(
-        <PieChart>
-          <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
-          <Legend />
-          <Pie data={data} dataKey={valueKey} nameKey={nameKey} outerRadius={110}>
-            {data.map((_, i) => <Cell key={i} fill={palette[i % palette.length]} />)}
-          </Pie>
-        </PieChart>
-      );
-    }
-
     return (
-      <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4 text-xs text-blue-300/70">
-        Unsupported chart type: <span className="text-cyan-300 font-semibold">{String(spec.type)}</span>
-      </div>
+      <MessageErrorBoundary>
+        <Suspense fallback={<div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4 text-xs text-blue-300/70">Loading chart…</div>}>
+          <StellaChart spec={spec} />
+        </Suspense>
+      </MessageErrorBoundary>
     );
   };
 
@@ -2832,6 +2736,15 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         </div>
       ) : (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 sm:py-6 h-[calc(100vh-80px)] sm:h-[calc(100vh-100px)] overflow-hidden">
+          <MessageErrorBoundary fallback={
+            <div className="h-full flex items-center justify-center">
+              <div className="max-w-md text-center bg-red-500/10 border border-red-400/25 rounded-xl p-6">
+                <AlertTriangle className="w-8 h-8 text-red-400 mx-auto mb-3" />
+                <div className="text-sm font-semibold text-red-200 mb-1">Something went wrong rendering this view</div>
+                <div className="text-xs text-red-300/70">Try switching tabs or reloading the page. Other areas of the app still work.</div>
+              </div>
+            </div>
+          }>
           {activeTab === 'chat' ? (
             <div className="flex flex-col h-full">
               {/* Quick Actions */}
@@ -3509,6 +3422,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
               )}
             </div>
           )}
+          </MessageErrorBoundary>
         </div>
       )}
     </div>
