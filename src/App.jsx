@@ -713,6 +713,30 @@ Always use rich formatting to make responses visually engaging:
 
 Format responses conversationally and practically.`;
 
+// Prevents a single bad message/chart render from blanking the whole app.
+class MessageErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error) {
+    console.error('Stella message render error:', error);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="text-xs text-red-300/80 bg-red-500/10 border border-red-400/25 rounded-lg p-3">
+          ⚠️ This response couldn't be displayed (a chart or block failed to render). The rest of Stella is unaffected.
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function CommercialExcellenceApp() {
   const [activeTab, setActiveTab] = useState('chat');
   const [showLanding, setShowLanding] = useState(true);
@@ -1191,10 +1215,23 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
     if (!spec || typeof spec !== 'object') return null;
     const type = String(spec.type || '').toLowerCase();
     const title = spec.title || '📊 Chart';
-    const data = Array.isArray(spec.data) ? spec.data : [];
     const xKey = spec.xKey || 'x';
     const yKey = spec.yKey || 'y';
     const yKeys = Array.isArray(spec.yKeys) ? spec.yKeys : (spec.yKeys ? [spec.yKeys] : []);
+    const valueKeys = [...(yKeys.length ? yKeys : [yKey]), spec.valueKey].filter(Boolean);
+    // Coerce numeric-looking strings so the chart renders reliably.
+    const data = (Array.isArray(spec.data) ? spec.data : [])
+      .filter(d => d && typeof d === 'object')
+      .map(d => {
+        const row = { ...d };
+        for (const k of valueKeys) {
+          if (row[k] != null && typeof row[k] !== 'number') {
+            const n = Number(String(row[k]).replace(/[,\s%£$€]/g, ''));
+            if (Number.isFinite(n)) row[k] = n;
+          }
+        }
+        return row;
+      });
     const palette = ['#22d3ee', '#60a5fa', '#34d399', '#a78bfa', '#f472b6', '#fbbf24', '#fb7185'];
 
     if (!data.length) return (
@@ -2295,29 +2332,11 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
                   ) : intake.map((m, i) => (
                     <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                       <div className={`max-w-[90%] px-3 py-2 rounded-xl text-sm ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                        {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : formatMarkdown(m.content)}
+                        {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}
                       </div>
                     </div>
                   ))}
                 </div>
-
-                {Array.isArray(f.columns) && f.columns.length > 0 && (
-                  <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4">
-                    <div className="text-xs font-bold text-blue-300 mb-2">Columns ({f.columns.length})</div>
-                    <div className="space-y-1">
-                      {f.columns.map((c, i) => (
-                        <div key={i} className="text-[11px] text-blue-200/80"><span className="text-cyan-300 font-semibold">{c.name}</span>{c.description ? ` — ${c.description}` : ''}</div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {f.capturedContext && (
-                  <div className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl p-4">
-                    <div className="text-xs font-bold text-emerald-300 mb-2">Captured context</div>
-                    <pre className="text-[11px] text-emerald-200/90 whitespace-pre-wrap">{JSON.stringify(f.capturedContext, null, 2)}</pre>
-                  </div>
-                )}
 
                 <div className="flex gap-2">
                   <textarea value={stellaIntakeInput} onChange={(e) => setStellaIntakeInput(e.target.value)} placeholder="Answer the intake questions…" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} />
@@ -2325,6 +2344,28 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
                     <Send className="w-4 h-4" /> Send
                   </button>
                 </div>
+
+                {Array.isArray(f.columns) && f.columns.length > 0 && (
+                  <details className="bg-slate-900/40 border border-blue-400/15 rounded-xl overflow-hidden">
+                    <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-blue-300 hover:bg-slate-800/40 flex items-center gap-2">
+                      <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Detected fields ({f.columns.length})
+                    </summary>
+                    <div className="px-4 pb-4 space-y-1">
+                      {f.columns.map((c, i) => (
+                        <div key={i} className="text-[11px] text-blue-200/80"><span className="text-cyan-300 font-semibold">{c.name}</span>{c.type ? <span className="text-blue-400/50"> [{c.type}]</span> : null}{c.description ? ` — ${c.description}` : ''}</div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+
+                {f.capturedContext && (
+                  <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden">
+                    <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">
+                      <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
+                    </summary>
+                    <pre className="px-4 pb-4 text-[11px] text-emerald-200/90 whitespace-pre-wrap">{JSON.stringify(f.capturedContext, null, 2)}</pre>
+                  </details>
+                )}
               </div>
             );
           })()}
@@ -2510,7 +2551,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
 
       setStellaMessages(prev => [...prev, { role: 'assistant', content: stellaStripSqlBlocks(finalText) || finalText }]);
     } catch (error) {
-      setStellaMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error: Unable to process request. Please try again.' }]);
+      setStellaMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: Unable to process request.\n\n${error?.message || 'Unknown error'}` }]);
     } finally {
       setStellaIsLoading(false);
     }
@@ -3197,7 +3238,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
                         <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
                           <div className="text-sm leading-relaxed">
-                            {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : formatMarkdown(message.content)}
+                            {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : <MessageErrorBoundary>{formatMarkdown(message.content)}</MessageErrorBoundary>}
                           </div>
                         </div>
                       </div>
