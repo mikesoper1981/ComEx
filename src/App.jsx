@@ -7,7 +7,9 @@ import {
   getHardcodedUser,
   userSettingsLocalKey,
   userSettingsRemotePath,
+  userPptxTemplateRemotePath,
 } from './auth';
+import { extractPptxThemeFromFile, getPptxGeneratorThemeFromUserSettings } from './pptxTheme';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -122,6 +124,8 @@ const DEFAULT_USER_SETTINGS = {
   preferences: '',
   constraints: '',
   customContext: '',
+  // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
+  pptxTemplate: null,
 };
 
 /** Pull settings fields out of a stored document (new or legacy shape). */
@@ -964,6 +968,8 @@ export default function CommercialExcellenceApp() {
   const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
   const [userSettings, setUserSettings] = useState(() => readLocalUserSettings(getCurrentUser().id));
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
+  const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
+  const [pptxTemplateError, setPptxTemplateError] = useState('');
   const [knowledgeBase, setKnowledgeBase] = useState(DEFAULT_KNOWLEDGE);
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
   const [documents, setDocuments] = useState([
@@ -1242,6 +1248,7 @@ First slide must be type "title". Prefer tables for components/weights. Keep JSO
   const adminFileInputRef = useRef(null);
   const territoryFileInputRef = useRef(null);
   const stellaDataFileInputRef = useRef(null);
+  const pptxTemplateInputRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1692,6 +1699,60 @@ First slide must be type "title". Prefer tables for components/weights. Keep JSO
       setUserSettingsSaveStatus('saved-local');
       setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
     }
+  };
+
+  const handlePptxTemplateUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const name = String(file.name || '').toLowerCase();
+    if (!name.endsWith('.pptx')) {
+      setPptxTemplateError('Please upload a .pptx PowerPoint file.');
+      setPptxTemplateStatus('error');
+      return;
+    }
+    setPptxTemplateError('');
+    setPptxTemplateStatus('extracting');
+    try {
+      // Style only — slide content is never read into the AI / export text.
+      const theme = await extractPptxThemeFromFile(file);
+      setPptxTemplateStatus('uploading');
+      const storagePath = userPptxTemplateRemotePath(currentUser.id);
+      const { error: upErr } = await supabase.storage
+        .from('intelligence')
+        .upload(storagePath, file, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
+      if (upErr) throw upErr;
+
+      const pptxTemplate = {
+        fileName: file.name,
+        uploadedAt: new Date().toISOString(),
+        storagePath,
+        storageBucket: 'intelligence',
+        theme: {
+          schemeName: theme.schemeName,
+          colors: theme.colors,
+          fonts: theme.fonts,
+          sourceFileName: theme.sourceFileName,
+          extractedAt: theme.extractedAt,
+        },
+      };
+      await saveUserSettings({ ...userSettings, pptxTemplate });
+      setPptxTemplateStatus('idle');
+    } catch (e) {
+      console.error('PPTX template upload failed:', e);
+      setPptxTemplateError(e.message || 'Failed to process PowerPoint template');
+      setPptxTemplateStatus('error');
+    }
+  };
+
+  const handleRemovePptxTemplate = async () => {
+    const path = userSettings.pptxTemplate?.storagePath || userPptxTemplateRemotePath(currentUser.id);
+    try {
+      await supabase.storage.from('intelligence').remove([path]);
+    } catch { /* ignore missing file */ }
+    await saveUserSettings({ ...userSettings, pptxTemplate: null });
+    setPptxTemplateError('');
+    setPptxTemplateStatus('idle');
   };
 
   const buildAgentKnowledge = (agent) => {
@@ -3143,8 +3204,17 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       const pptx = new PptxGenJS();
       pptx.layout = 'LAYOUT_16x9';
       pptx.title = slideData.title || offer?.title || 'PowerPoint';
-      const BG_DARK = '1E2761', BG_LIGHT = 'FFFFFF', ACCENT = '60A5FA';
-      const TEXT_LIGHT = 'CADCFC', TEXT_WHITE = 'FFFFFF', TEXT_DARK = '1E2761', TEXT_MUTED = '94A3B8';
+      const theme = getPptxGeneratorThemeFromUserSettings(userSettings);
+      const BG_DARK = theme.bgDark;
+      const BG_LIGHT = theme.bgLight;
+      const ACCENT = theme.accent;
+      const TEXT_ON_DARK = theme.textOnDark;
+      const TEXT_ON_DARK_MUTED = theme.textOnDarkMuted;
+      const TEXT_ON_LIGHT = theme.textOnLight;
+      const TEXT_MUTED = theme.textMuted;
+      const BORDER = theme.border;
+      const FONT_HEADING = theme.headingFont;
+      const FONT_BODY = theme.bodyFont;
       const slides = Array.isArray(slideData.slides) ? slideData.slides.filter(s => s && (s.type || s.title)) : [];
       if (!slides.length) throw new Error('No slides returned');
 
@@ -3157,29 +3227,29 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         if (type === 'title') {
           s.background = { color: BG_DARK };
           s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 0.18, h: 5.625, fill: { color: ACCENT }, line: { color: ACCENT } });
-          s.addText(slide.title || slideData.title || offer?.title || '', { x: 0.5, y: 1.4, w: 9, h: 1.6, fontSize: 36, bold: true, color: TEXT_WHITE, fontFace: 'Calibri', align: 'left', valign: 'middle' });
+          s.addText(slide.title || slideData.title || offer?.title || '', { x: 0.5, y: 1.4, w: 9, h: 1.6, fontSize: 36, bold: true, color: TEXT_ON_DARK, fontFace: FONT_HEADING, align: 'left', valign: 'middle' });
           if (slide.subtitle || slideData.subtitle) {
-            s.addText(slide.subtitle || slideData.subtitle, { x: 0.5, y: 3.1, w: 8, h: 0.6, fontSize: 18, color: TEXT_LIGHT, fontFace: 'Calibri', align: 'left' });
+            s.addText(slide.subtitle || slideData.subtitle, { x: 0.5, y: 3.1, w: 8, h: 0.6, fontSize: 18, color: TEXT_ON_DARK_MUTED, fontFace: FONT_BODY, align: 'left' });
           }
           const today = new Date().toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
-          s.addText(today, { x: 6, y: 5.1, w: 3.7, h: 0.4, fontSize: 11, color: TEXT_MUTED, align: 'right', fontFace: 'Calibri' });
+          s.addText(today, { x: 6, y: 5.1, w: 3.7, h: 0.4, fontSize: 11, color: TEXT_MUTED, align: 'right', fontFace: FONT_BODY });
           return;
         }
 
         s.background = { color: BG_LIGHT };
         s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 10, h: 0.88, fill: { color: BG_DARK }, line: { color: BG_DARK } });
-        s.addText(slide.title || `Slide ${idx + 1}`, { x: 0.4, y: 0, w: 9.2, h: 0.88, fontSize: 20, bold: true, color: TEXT_WHITE, valign: 'middle', fontFace: 'Calibri' });
+        s.addText(slide.title || `Slide ${idx + 1}`, { x: 0.4, y: 0, w: 9.2, h: 0.88, fontSize: 20, bold: true, color: TEXT_ON_DARK, valign: 'middle', fontFace: FONT_HEADING });
         s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0.88, w: 10, h: 0.05, fill: { color: ACCENT }, line: { color: ACCENT } });
 
         let cursorY = 1.05;
         if (slide.body) {
-          s.addText(String(slide.body), { x: 0.5, y: cursorY, w: 9, h: 0.7, fontSize: 13, color: TEXT_DARK, fontFace: 'Calibri', align: 'left', valign: 'top' });
+          s.addText(String(slide.body), { x: 0.5, y: cursorY, w: 9, h: 0.7, fontSize: 13, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, align: 'left', valign: 'top' });
           cursorY += 0.75;
         }
 
         if (slide.dataPoints.length) {
           const lines = slide.dataPoints.map(dp => `${dp.label || ''}: ${dp.value || ''}${dp.context ? ` (${dp.context})` : ''}`);
-          s.addText(lines.map((t, i) => ({ text: t, options: { bullet: true, breakLine: i < lines.length - 1, fontSize: 13, color: TEXT_DARK, fontFace: 'Calibri', paraSpaceAfter: 4 } })), {
+          s.addText(lines.map((t, i) => ({ text: t, options: { bullet: true, breakLine: i < lines.length - 1, fontSize: 13, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 4 } })), {
             x: 0.5, y: cursorY, w: 9, h: Math.min(1.6, 0.28 * lines.length + 0.2),
           });
           cursorY += Math.min(1.7, 0.28 * lines.length + 0.3);
@@ -3191,13 +3261,13 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
           const colW = Math.min(9.2 / colCount, 3.2);
           const headerRow = table.headers.map(h => ({
             text: String(h ?? ''),
-            options: { bold: true, color: TEXT_WHITE, fill: { color: BG_DARK }, align: 'center', valign: 'middle' },
+            options: { bold: true, color: TEXT_ON_DARK, fill: { color: BG_DARK }, align: 'center', valign: 'middle' },
           }));
           const bodyRows = table.rows.slice(0, 12).map(row => {
             const cells = Array.isArray(row) ? row : [row];
             return Array.from({ length: colCount }, (_, i) => ({
               text: String(cells[i] ?? ''),
-              options: { color: TEXT_DARK, align: 'left', valign: 'middle' },
+              options: { color: TEXT_ON_LIGHT, align: 'left', valign: 'middle' },
             }));
           });
           const tableH = Math.min(3.6, 0.35 * (bodyRows.length + 1) + 0.2);
@@ -3206,10 +3276,10 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
             y: cursorY,
             w: colW * colCount,
             colW: Array(colCount).fill(colW),
-            border: [{ type: 'solid', pt: 0.5, color: 'CBD5E1' }, { type: 'solid', pt: 0.5, color: 'CBD5E1' }, { type: 'solid', pt: 0.5, color: 'CBD5E1' }, { type: 'solid', pt: 0.5, color: 'CBD5E1' }],
-            fontFace: 'Calibri',
+            border: [{ type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }],
+            fontFace: FONT_BODY,
             fontSize: 11,
-            color: TEXT_DARK,
+            color: TEXT_ON_LIGHT,
           });
           cursorY += tableH + 0.15;
         }
@@ -3218,20 +3288,23 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
           const remaining = Math.max(0.8, 5.1 - cursorY);
           const bulletItems = slide.bullets.map((b, i) => ({
             text: String(b),
-            options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: 13, color: TEXT_DARK, fontFace: 'Calibri', paraSpaceAfter: 5 },
+            options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: 13, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 5 },
           }));
           s.addText(bulletItems, { x: 0.5, y: cursorY, w: 9, h: remaining });
         }
 
         if (slide.notes) s.addNotes(String(slide.notes));
-        s.addText(`${idx + 1}`, { x: 9.5, y: 5.3, w: 0.4, h: 0.2, fontSize: 9, color: TEXT_MUTED, align: 'right', fontFace: 'Calibri' });
+        s.addText(`${idx + 1}`, { x: 9.5, y: 5.3, w: 0.4, h: 0.2, fontSize: 9, color: TEXT_MUTED, align: 'right', fontFace: FONT_BODY });
       });
 
       const fileName = (slideData.title || offer?.title || 'powerpoint').replace(/[^a-z0-9]+/gi, '_').toLowerCase();
       await pptx.writeFile({ fileName: `${fileName}.pptx` });
+      const themeNote = userSettings.pptxTemplate?.fileName
+        ? ` using template style from **${userSettings.pptxTemplate.fileName}**`
+        : ' using the default ComEx style';
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `📊 **PowerPoint generated** — "${slideData.title || offer?.title}" (${slides.length} slides${isSummary ? ', conversation summary' : `, ${deckType}`}) downloaded. Check your downloads folder.`,
+        content: `📊 **PowerPoint generated** — "${slideData.title || offer?.title}" (${slides.length} slides${isSummary ? ', conversation summary' : `, ${deckType}`})${themeNote}. Check your downloads folder.`,
       }]);
     } catch (e) {
       console.error('PPTX generation error:', e);
@@ -4046,6 +4119,83 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                   </div>
                 </div>
 
+                <div className="mt-8 pt-6 border-t border-blue-400/15">
+                  <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
+                  <p className="text-xs text-blue-300/60 mb-4">
+                    Upload a .pptx to drive export look &amp; feel (colours + fonts from the file theme). Slide content is ignored. Stored at{' '}
+                    <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>. Without a template, exports use the default ComEx style.
+                  </p>
+
+                  {userSettings.pptxTemplate ? (
+                    <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 space-y-3">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold text-white">{userSettings.pptxTemplate.fileName}</div>
+                          <div className="text-xs text-blue-300/50 mt-0.5">
+                            Theme: {userSettings.pptxTemplate.theme?.schemeName || 'Custom'}
+                            {userSettings.pptxTemplate.theme?.fonts?.heading ? ` · ${userSettings.pptxTemplate.theme.fonts.heading}` : ''}
+                            {userSettings.pptxTemplate.uploadedAt ? ` · ${new Date(userSettings.pptxTemplate.uploadedAt).toLocaleDateString('en-GB')}` : ''}
+                          </div>
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => pptxTemplateInputRef.current?.click()}
+                            disabled={pptxTemplateStatus === 'extracting' || pptxTemplateStatus === 'uploading'}
+                            className="px-3 py-1.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 text-xs font-semibold rounded-lg border border-slate-500/30 disabled:opacity-50"
+                          >
+                            Replace
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleRemovePptxTemplate}
+                            className="px-3 py-1.5 bg-red-500/15 hover:bg-red-500/25 text-red-300 text-xs font-semibold rounded-lg border border-red-400/25"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                      {(() => {
+                        const gen = getPptxGeneratorThemeFromUserSettings(userSettings);
+                        const swatches = [
+                          ['Dark', gen.bgDark],
+                          ['Light', gen.bgLight],
+                          ['Accent', gen.accent],
+                          ['Text', gen.textOnLight],
+                        ];
+                        return (
+                          <div className="flex flex-wrap gap-3 items-center">
+                            {swatches.map(([label, hex]) => (
+                              <div key={label} className="flex items-center gap-2 text-xs text-blue-200/70">
+                                <span className="w-6 h-6 rounded border border-white/20 shadow-inner" style={{ backgroundColor: `#${hex}` }} title={`#${hex}`} />
+                                <span>{label}</span>
+                              </div>
+                            ))}
+                            <span className="text-[10px] text-emerald-400/80 font-semibold">Active for exports</span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  ) : (
+                    <div className="bg-slate-900/30 border border-dashed border-blue-400/25 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="text-xs text-blue-300/60">No template uploaded — exports use the default navy / cyan ComEx style.</div>
+                      <button
+                        type="button"
+                        onClick={() => pptxTemplateInputRef.current?.click()}
+                        disabled={pptxTemplateStatus === 'extracting' || pptxTemplateStatus === 'uploading'}
+                        className="px-4 py-2 bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold disabled:opacity-50 flex items-center gap-2"
+                      >
+                        <Upload className="w-3.5 h-3.5" />
+                        {pptxTemplateStatus === 'extracting' ? 'Reading theme…' : pptxTemplateStatus === 'uploading' ? 'Uploading…' : 'Upload .pptx template'}
+                      </button>
+                    </div>
+                  )}
+                  {pptxTemplateStatus === 'error' && pptxTemplateError && (
+                    <div className="mt-2 text-xs text-red-300 flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5" /> {pptxTemplateError}</div>
+                  )}
+                  <input ref={pptxTemplateInputRef} type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={handlePptxTemplateUpload} className="hidden" />
+                </div>
+
                 <div className="flex flex-wrap items-center gap-3 mt-6">
                   <button
                     onClick={() => saveUserSettings(userSettings)}
@@ -4055,7 +4205,15 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                     <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save settings'}
                   </button>
                   <button
-                    onClick={() => saveUserSettings({ ...DEFAULT_USER_SETTINGS })}
+                    onClick={async () => {
+                      const path = userSettings.pptxTemplate?.storagePath || userPptxTemplateRemotePath(currentUser.id);
+                      if (userSettings.pptxTemplate) {
+                        try { await supabase.storage.from('intelligence').remove([path]); } catch { /* ignore */ }
+                      }
+                      setPptxTemplateError('');
+                      setPptxTemplateStatus('idle');
+                      await saveUserSettings({ ...DEFAULT_USER_SETTINGS });
+                    }}
                     className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30"
                   >
                     Reset

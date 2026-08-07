@@ -57,3 +57,7 @@ export function userSettingsLocalKey(userId) {
 export function userSettingsRemotePath(userId) {
   return `users/${userId}/settings.json`;
 }
+
+export function userPptxTemplateRemotePath(userId) {
+  return `users/${userId}/pptx-template.pptx`;
+}
