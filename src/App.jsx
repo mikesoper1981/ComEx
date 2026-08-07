@@ -1876,15 +1876,26 @@ You have been assigned a specific sub-task by the workflow orchestrator.`);
 
     if (isIntro) {
       logActivity('orchestrator', `Starting workflow: ${topic.name}`);
-      const stepList = topic.workflow.map(s => `Step ${s.step}: ${s.name} — ${s.goal}`).join('\n');
       const firstAgent = agents.find(a => a.id === topic.workflow[0].agents[0]);
       const isFocused = !!currentWorkflow?.focusedContext;
+      const stepCount = topic.workflow.length;
+      const stepsBlock = topic.workflow
+        .map((s) => `**Step ${s.step}: ${s.name}** — ${s.goal}`)
+        .join('\n');
       const introSystem = withUserSettings(`${topic.orchestrator.role}
 ${isFocused
-  ? `The user has already selected a specific territory. Keep your introduction to 1 sentence. End with: "I'll hand you to **${firstAgent?.name}** to begin."`
-  : `Introduce yourself briefly (1-2 sentences), state the overall goal, list the steps clearly, then hand off to the first agent. End with: "I'll now hand you to **${firstAgent?.name}** to begin."`
+  ? `The user has already selected a specific territory. Keep your introduction to 1 sentence. Do NOT list workflow steps — they are appended separately.`
+  : `Introduce yourself briefly (1-2 sentences) and state the overall goal. Do NOT list the workflow steps yourself — they are appended separately from the plan. Keep it short.`
 }`);
-      const introResponse = await callAnthropic(introSystem, [{ role: 'user', content: isFocused ? `The user wants to: ${userMessage}` : `The user wants to: ${userMessage}\n\nWorkflow steps:\n${stepList}` }], 200);
+      const introLead = await callAnthropic(
+        introSystem,
+        [{ role: 'user', content: `The user wants to: ${userMessage}\n\nOverall orchestrator goal: ${topic.orchestrator.goal}` }],
+        400,
+      );
+      const handoff = `I'll now hand you to **${firstAgent?.name || 'the first specialist'}** to begin.`;
+      const introResponse = isFocused
+        ? `${introLead}\n\n${handoff}`
+        : `${introLead}\n\n**Full plan (${stepCount} steps):**\n\n${stepsBlock}\n\n${handoff}`;
       setMessages(prev => [...prev, { role: 'orchestrator', content: introResponse }]);
       setIsLoading(false);
       setTimeout(async () => {
