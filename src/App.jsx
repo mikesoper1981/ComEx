@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers, UserCog } from 'lucide-react';
 import { supabase } from './supabase';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
@@ -101,6 +101,42 @@ const STELLA_STORAGE_CANDIDATES = [
   { bucket: 'stella-data', prefix: 'stella/' },
   { bucket: 'intelligence', prefix: 'stella/' },
 ];
+
+const USER_SETTINGS_STORAGE_KEY = 'comex-user-settings';
+const USER_SETTINGS_FILE = 'user-settings.json';
+
+const DEFAULT_USER_SETTINGS = {
+  companyName: '',
+  industry: '',
+  role: '',
+  currency: 'GBP',
+  metrics: '',
+  abbreviations: '',
+  preferences: '',
+  constraints: '',
+  customContext: '',
+};
+
+/** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
+function buildUserSettingsPromptBlock(settings) {
+  if (!settings || typeof settings !== 'object') return '';
+  const lines = [];
+  const push = (label, value) => {
+    const v = String(value || '').trim();
+    if (v) lines.push(`- ${label}: ${v}`);
+  };
+  push('Company', settings.companyName);
+  push('Industry / therapeutic area', settings.industry);
+  push('User role', settings.role);
+  push('Preferred currency / units', settings.currency);
+  push('Company metrics & definitions', settings.metrics);
+  push('Abbreviations & terminology', settings.abbreviations);
+  push('Preferences', settings.preferences);
+  push('Hard constraints', settings.constraints);
+  const extra = String(settings.customContext || '').trim();
+  if (!lines.length && !extra) return '';
+  return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, and constraints in every response; do not contradict them):\n${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}\n`;
+}
 
 // Short, URL/identifier-safe random id (used for stella_data_<id> tables).
 function stellaNanoId(len = 10) {
@@ -803,6 +839,15 @@ export default function CommercialExcellenceApp() {
     terminology: '',
   });
   const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
+  const [userSettings, setUserSettings] = useState(() => {
+    try {
+      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(USER_SETTINGS_STORAGE_KEY) : null;
+      const parsed = raw ? safeJsonParse(raw) : null;
+      if (parsed && typeof parsed === 'object') return { ...DEFAULT_USER_SETTINGS, ...parsed };
+    } catch { /* ignore */ }
+    return { ...DEFAULT_USER_SETTINGS };
+  });
+  const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
   const [knowledgeBase, setKnowledgeBase] = useState(DEFAULT_KNOWLEDGE);
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
   const [documents, setDocuments] = useState([
@@ -1120,6 +1165,19 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
           if (parsed && typeof parsed === 'object') { setStellaBusinessContext(prev => ({ ...prev, ...parsed })); break; }
         } catch { /* try next candidate */ }
       }
+
+      // User settings (JSON in intelligence bucket; localStorage is the fast local source of truth).
+      try {
+        const { data, error } = await supabase.storage.from('intelligence').download(USER_SETTINGS_FILE);
+        if (!error && data) {
+          const parsed = safeJsonParse(await data.text());
+          if (parsed && typeof parsed === 'object') {
+            const merged = { ...DEFAULT_USER_SETTINGS, ...parsed };
+            setUserSettings(merged);
+            try { localStorage.setItem(USER_SETTINGS_STORAGE_KEY, JSON.stringify(merged)); } catch { /* ignore */ }
+          }
+        }
+      } catch { /* user-settings.json may not exist yet */ }
     };
     loadStella();
   }, []);
@@ -1397,7 +1455,7 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
     try {
       const recentMessages = conversationHistory.slice(-6).map(m => `${m.role}: ${m.content.substring(0, 300)}`).join('\n');
       const response = await anthropicMessagesPost({
-        system: 'You generate short follow-up questions for pharmaceutical sales/IC conversations. Respond ONLY with a JSON array of strings, no other text. Max 3 items, max 10 words each.',
+        system: `You generate short follow-up questions for pharmaceutical sales/IC conversations. Respond ONLY with a JSON array of strings, no other text. Max 3 items, max 10 words each.${buildUserSettingsPromptBlock(userSettings)}`,
         messages: [{ role: 'user', content: `Recent conversation:\n${recentMessages}\n\nGenerate 2-3 follow-up questions: ["Q1", "Q2"]` }],
         max_tokens: 200,
       });
@@ -1415,7 +1473,7 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
     try {
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
       const response = await anthropicMessagesPost({
-        system: pptxPrompts.intentDetection,
+        system: `${pptxPrompts.intentDetection}${buildUserSettingsPromptBlock(userSettings)}`,
         messages: [{ role: 'user', content: `Conversation:\n${recentMessages}` }],
         max_tokens: 400,
       });
@@ -1457,6 +1515,31 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
     return anthropicAssistantText(data);
   };
 
+  /** Append mandatory user preferences/context to any system prompt. */
+  const withUserSettings = (system) => `${system || ''}${buildUserSettingsPromptBlock(userSettings)}`;
+
+  const saveUserSettings = async (next) => {
+    const payload = { ...DEFAULT_USER_SETTINGS, ...(next || userSettings) };
+    setUserSettings(payload);
+    setUserSettingsSaveStatus('saving');
+    try {
+      localStorage.setItem(USER_SETTINGS_STORAGE_KEY, JSON.stringify(payload));
+    } catch { /* private mode / quota — continue to cloud */ }
+    try {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const { error } = await supabase.storage
+        .from('intelligence')
+        .upload(USER_SETTINGS_FILE, blob, { upsert: true, contentType: 'application/json' });
+      if (error) throw error;
+      setUserSettingsSaveStatus('saved');
+      setTimeout(() => setUserSettingsSaveStatus('idle'), 3000);
+    } catch {
+      // Local save is enough until login/DB exists; surface soft status.
+      setUserSettingsSaveStatus('saved-local');
+      setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
+    }
+  };
+
   const buildAgentKnowledge = (agent) => {
     if (!agent.knowledgeFiles) return '';
     return documents
@@ -1467,7 +1550,7 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
 
   const runAgent = async (agent, step, messages) => {
     const knowledge = buildAgentKnowledge(agent);
-    const system = `${agent.systemPrompt}
+    const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 
 YOUR CURRENT TASK:
@@ -1475,7 +1558,7 @@ Step ${step.step}: ${step.name}
 Goal: ${step.goal}
 Success criteria: ${step.successCriteria}
 
-Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`;
+Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`);
     return await callAnthropic(system, messages, 3000);
   };
 
@@ -1483,7 +1566,7 @@ Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your respo
     const orch = topic.orchestrator;
     const allAgentsList = agents.map(a => `${a.id}: ${a.name}`).join('\n');
     const stepList = topic.workflow.map(s => `Step ${s.step} (index ${s.step - 1}): ${s.name} — agent: ${s.agents[0]}`).join('\n');
-    const system = `${orch.role}
+    const system = withUserSettings(`${orch.role}
 Overall goal: ${orch.goal}
 
 Workflow steps:
@@ -1504,7 +1587,7 @@ Respond in JSON only:
 
 If agentStillWorking is true, set orchestratorMessage to "" and buttons to [].
 When agentStillWorking is false, always write orchestratorMessage and 2-4 buttons.
-Always include at least one "proceed" path and one "refine/revisit" path.`;
+Always include at least one "proceed" path and one "refine/revisit" path.`);
 
     const contextStr = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output.substring(0, 300)}`).join('\n\n');
     const userContent = `Workflow: ${topic.name}
@@ -1534,9 +1617,9 @@ ${contextStr || 'None'}`;
     const agent = agents.find(a => a.id === agentId);
     if (!agent || agent.status !== 'active') return null;
     const knowledge = buildAgentKnowledge(agent);
-    const system = `${agent.systemPrompt}
+    const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
-You have been assigned a specific sub-task by the workflow orchestrator.`;
+You have been assigned a specific sub-task by the workflow orchestrator.`);
     return await callAnthropic(system, [{ role: 'user', content: task }], 2000);
   };
 
@@ -1550,11 +1633,11 @@ You have been assigned a specific sub-task by the workflow orchestrator.`;
       const stepList = topic.workflow.map(s => `Step ${s.step}: ${s.name} — ${s.goal}`).join('\n');
       const firstAgent = agents.find(a => a.id === topic.workflow[0].agents[0]);
       const isFocused = !!currentWorkflow?.focusedContext;
-      const introSystem = `${topic.orchestrator.role}
+      const introSystem = withUserSettings(`${topic.orchestrator.role}
 ${isFocused
   ? `The user has already selected a specific territory. Keep your introduction to 1 sentence. End with: "I'll hand you to **${firstAgent?.name}** to begin."`
   : `Introduce yourself briefly (1-2 sentences), state the overall goal, list the steps clearly, then hand off to the first agent. End with: "I'll now hand you to **${firstAgent?.name}** to begin."`
-}`;
+}`);
       const introResponse = await callAnthropic(introSystem, [{ role: 'user', content: isFocused ? `The user wants to: ${userMessage}` : `The user wants to: ${userMessage}\n\nWorkflow steps:\n${stepList}` }], 200);
       setMessages(prev => [...prev, { role: 'orchestrator', content: introResponse }]);
       setIsLoading(false);
@@ -1677,7 +1760,7 @@ ${isFocused
   };
 
   const wrapUpWorkflow = async (topic, updatedContext) => {
-    const wrapSystem = `${topic.orchestrator.role}\nThe workflow is now complete. Write a brief, warm closing summary (3-5 sentences) covering what was accomplished.`;
+    const wrapSystem = withUserSettings(`${topic.orchestrator.role}\nThe workflow is now complete. Write a brief, warm closing summary (3-5 sentences) covering what was accomplished.`);
     const wrapSummary = await callAnthropic(wrapSystem, [{ role: 'user', content: `Completed: ${topic.name}\n${updatedContext.map(c => `${c.step}: ${c.output.substring(0, 150)}`).join('\n')}` }], 300);
     setMessages(prev => {
       const updated = [...prev, { role: 'orchestrator', content: wrapSummary }];
@@ -1715,7 +1798,7 @@ ${isFocused
         }
       } else if (workflowContext.length > 0) {
         const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
-        const briefingSystem = `${topic.orchestrator.role}\nPrepare a focused task briefing for the next specialist agent. Be specific and concise (3-5 sentences max).`;
+        const briefingSystem = withUserSettings(`${topic.orchestrator.role}\nPrepare a focused task briefing for the next specialist agent. Be specific and concise (3-5 sentences max).`);
         const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing.`;
         taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 300);
       }
@@ -2035,7 +2118,7 @@ ${isFocused
   });
 
   const stellaBuildContentSummary = async ({ name, type, textSample, columns = [], profile = '' }) => {
-    const system = `You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "columns": [{ "name": "exact column name", "description": "what this column represents" }],\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nIf column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. If unsure, say what you can infer and what is missing.\n\nCRITICAL — do NOT ask questions whose answers are already observable in the DATA PROFILE below (row counts, number of distinct territories/reps/products, column names, value ranges). You can see those directly; state them in the summary instead. Only suggest questions about MEANING and INTENT that cannot be derived from the data: what the dataset represents, the exact business meaning/units of ambiguous columns (e.g. does "rev" mean gross or net revenue in GBP?), the time period, definitions, filters, and caveats.`;
+    const system = withUserSettings(`You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "columns": [{ "name": "exact column name", "description": "what this column represents" }],\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nIf column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. If unsure, say what you can infer and what is missing.\n\nCRITICAL — do NOT ask questions whose answers are already observable in the DATA PROFILE below (row counts, number of distinct territories/reps/products, column names, value ranges). You can see those directly; state them in the summary instead. Only suggest questions about MEANING and INTENT that cannot be derived from the data: what the dataset represents, the exact business meaning/units of ambiguous columns (e.g. does "rev" mean gross or net revenue in GBP?), the time period, definitions, filters, and caveats.`);
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
     const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
@@ -2058,7 +2141,7 @@ ${isFocused
       ? `\n\nRELATIONSHIPS: Other datasets already exist (listed below). Based on the column names, if this dataset looks like it could be linked to any of them, propose the likely link in PLAIN ENGLISH and ask the user to confirm it makes sense — never ask them for technical join syntax. Example: "It looks like this sales file links to your Targets file by territory — is that right?". Capture any confirmed links in context_qa.relationships.\n\nOTHER DATASETS:\n${otherFilesBlob}`
       : '';
 
-    const system = `You are the Stella Insights data intake agent. Your job is to capture the interpretive context that lets an analyst understand this ${isDoc ? 'document' : 'dataset'} correctly.
+    const system = withUserSettings(`You are the Stella Insights data intake agent. Your job is to capture the interpretive context that lets an analyst understand this ${isDoc ? 'document' : 'dataset'} correctly.
 
 Ask ONE focused question per turn. Ask 3-5 questions in total across turns, covering:
 - what the ${isDoc ? 'document contains / represents' : 'data represents'}
@@ -2084,7 +2167,7 @@ Schema:
     "relationships": [{"related_file": "other file name", "related_table": "its table name if known", "this_field": "column in THIS dataset", "related_field": "column in the other dataset", "note": "plain-English description the user confirmed"}]
   }
 }
-When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked and the user's answer, and "relationships" MUST only contain links the user explicitly confirmed (empty array if none).${relationshipGuidance}`;
+When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked and the user's answer, and "relationships" MUST only contain links the user explicitly confirmed (empty array if none).${relationshipGuidance}`);
 
     const colsBlob = Array.isArray(f.columns) && f.columns.length
       ? f.columns.map(c => `- ${c.name}${c.type ? ` [${c.type}]` : ''}${c.description ? `: ${c.description}` : ''}`).join('\n')
@@ -2509,7 +2592,7 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
       ? `\nCROSS-SOURCE QUESTIONS:\nMany questions combine tabular data (sales, engagement metrics in SQL) with document context (policies, reports, PDFs). For these:\n1. Use \`read_document\` to pull relevant passages from PDFs/text files\n2. Use \`inspect_table\` / \`run_sql\` for quantitative data\n3. Synthesise both in your answer — explicitly connect numbers to document context\n4. Verify that findings from each source align before answering\n`
       : '';
 
-    return `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and document reading (for PDFs/text), verify your findings, and explain them clearly.
+    return withUserSettings(`You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and document reading (for PDFs/text), verify your findings, and explain them clearly.
 
 ${bizText}
 DATA CATALOG (${files.length} file${files.length === 1 ? '' : 's'}):
@@ -2550,7 +2633,7 @@ When a chart helps, include exactly ONE chart block in your FINAL answer, EXACTL
 - Keep to <= 40 data points.
 
 RESPONSE STYLE:
-Use ## headers, bullet points, concise explanations, and suggest useful follow-up questions.`;
+Use ## headers, bullet points, concise explanations, and suggest useful follow-up questions.`);
   };
 
   const stellaRunQuery = async (sql) => {
@@ -2785,7 +2868,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     setPptxGenerating(true);
     const conversationSummary = messages.slice(-16).filter(m => ['user','assistant','orchestrator'].includes(m.role)).map(m => `${m.role}: ${m.content.substring(0, 500)}`).join('\n');
     const isSummary = mode === 'summary';
-    const systemPrompt = isSummary ? pptxPrompts.summary : pptxPrompts.produced;
+    const systemPrompt = withUserSettings(isSummary ? pptxPrompts.summary : pptxPrompts.produced);
     try {
       const res = await anthropicMessagesPost({
         system: systemPrompt,
@@ -2959,10 +3042,10 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
 
     try {
       const fileContext = isFileAnalysis && uploadedFile ? `\n\nCONTEXT: The user has just uploaded a file named "${uploadedFile.name}" for assessment.` : '';
-      const systemPrompt = customSystemPrompt
+      const systemPrompt = withUserSettings(customSystemPrompt
         .replace('KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
           'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.\n\n' + knowledgeBase + '\n\n' + PILLAR_2_KNOWLEDGE)
-        + fileContext;
+        + fileContext);
 
       const response = await anthropicMessagesPost({
         system: systemPrompt,
@@ -3006,7 +3089,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
             </div>
             {!showLanding && (
               <div className="flex gap-1 sm:gap-2 bg-slate-800/50 rounded-lg p-1">
-                {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance'], ['territory', Map, 'Territory'], ['stella', Layers, 'Stella Insights'], ['admin', Settings, 'Admin']].map(([tab, Icon, label]) => (
+                {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance'], ['territory', Map, 'Territory'], ['stella', Layers, 'Stella Insights'], ['user-settings', UserCog, 'User Settings'], ['admin', Settings, 'Admin']].map(([tab, Icon, label]) => (
                   <button key={tab} onClick={() => setActiveTab(tab)} className={`flex items-center gap-1 sm:gap-2 px-2 sm:px-4 py-1.5 sm:py-2 rounded-md transition-all text-xs sm:text-sm ${activeTab === tab ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}>
                     <Icon className="w-3 h-3 sm:w-4 sm:h-4" /><span className="hidden sm:inline">{label}</span>
                   </button>
@@ -3512,6 +3595,139 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                     </div>
                   </div>
                 </form>
+              </div>
+            </div>
+
+          ) : activeTab === 'user-settings' ? (
+            <div className="overflow-y-auto h-full custom-scrollbar pr-1 sm:pr-2 space-y-4">
+              <div className="bg-gradient-to-r from-blue-600 to-indigo-600 rounded-xl p-4 sm:p-5 text-white shadow-xl">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-white/15 rounded-lg flex items-center justify-center"><UserCog className="w-5 h-5" /></div>
+                  <div>
+                    <h2 className="text-xl font-bold">User Settings</h2>
+                    <p className="text-blue-100 text-xs sm:text-sm">Preferences and context the AI must respect across Consultation, agents, and Stella.</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 sm:p-6">
+                <p className="text-xs text-blue-300/70 mb-5">
+                  Saved as JSON in this browser and to Supabase storage (<code className="text-cyan-300/80">{USER_SETTINGS_FILE}</code>). When you add user login later, this can move to a per-user database record.
+                </p>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
+                    <input
+                      value={userSettings.companyName}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, companyName: e.target.value }))}
+                      placeholder="e.g. Acme Pharma UK"
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry / therapeutic area</label>
+                    <input
+                      value={userSettings.industry}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, industry: e.target.value }))}
+                      placeholder="e.g. Specialty pharma — oncology"
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Your role</label>
+                    <input
+                      value={userSettings.role}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, role: e.target.value }))}
+                      placeholder="e.g. Incentive Compensation Manager"
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Preferred currency / units</label>
+                    <input
+                      value={userSettings.currency}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, currency: e.target.value }))}
+                      placeholder="e.g. GBP, % of target"
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company metrics &amp; definitions</label>
+                    <textarea
+                      value={userSettings.metrics}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, metrics: e.target.value }))}
+                      rows={3}
+                      placeholder={"e.g. Attainment = actual / quota\nPrimary KPI = Net Sales\nQuota year = calendar year"}
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Abbreviations &amp; terminology</label>
+                    <textarea
+                      value={userSettings.abbreviations}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, abbreviations: e.target.value }))}
+                      rows={4}
+                      placeholder={"e.g. AE = Account Executive\nKAM = Key Account Manager\nSPIFF = Short-term incentive / contest"}
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Preferences</label>
+                    <textarea
+                      value={userSettings.preferences}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, preferences: e.target.value }))}
+                      rows={3}
+                      placeholder={"e.g. Prefer 3–5 plan components\nKeep responses concise with tables\nAlways show weightings as %"}
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Hard constraints</label>
+                    <textarea
+                      value={userSettings.constraints}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, constraints: e.target.value }))}
+                      rows={3}
+                      placeholder={"e.g. Must comply with ABPI\nNo individual SPIFs\nTeam component < 20%"}
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Additional context</label>
+                    <textarea
+                      value={userSettings.customContext}
+                      onChange={(e) => setUserSettings(prev => ({ ...prev, customContext: e.target.value }))}
+                      rows={4}
+                      placeholder="Anything else the AI should always know — org structure notes, product portfolio, historical scheme quirks, etc."
+                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 mt-6">
+                  <button
+                    onClick={() => saveUserSettings(userSettings)}
+                    disabled={userSettingsSaveStatus === 'saving'}
+                    className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 text-white font-semibold rounded-lg transition-all flex items-center gap-2"
+                  >
+                    <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save settings'}
+                  </button>
+                  <button
+                    onClick={() => saveUserSettings({ ...DEFAULT_USER_SETTINGS })}
+                    className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30"
+                  >
+                    Reset
+                  </button>
+                  {userSettingsSaveStatus === 'saved' && (
+                    <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved (browser + Supabase)</span>
+                  )}
+                  {userSettingsSaveStatus === 'saved-local' && (
+                    <span className="flex items-center gap-1.5 text-sm text-amber-300 font-semibold"><CheckCircle className="w-4 h-4" /> Saved locally (cloud sync unavailable)</span>
+                  )}
+                  {userSettingsSaveStatus === 'error' && (
+                    <span className="flex items-center gap-1.5 text-sm text-red-400 font-semibold"><AlertTriangle className="w-4 h-4" /> Save failed</span>
+                  )}
+                </div>
               </div>
             </div>
 
