@@ -10,6 +10,7 @@ import {
   userPptxTemplateRemotePath,
 } from './auth';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
+import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -126,24 +127,37 @@ const DEFAULT_USER_SETTINGS = {
   customContext: '',
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
+  // PowerPoint generation guidance — editable in User Settings; persisted with settings JSON
+  pptxContext: { ...DEFAULT_PPTX_CONTEXT },
 };
 
 /** Pull settings fields out of a stored document (new or legacy shape). */
 function normalizeLoadedUserSettings(parsed) {
-  if (!parsed || typeof parsed !== 'object') return { ...DEFAULT_USER_SETTINGS };
-  if (parsed.settings && typeof parsed.settings === 'object') {
-    return { ...DEFAULT_USER_SETTINGS, ...parsed.settings };
-  }
-  const { userId: _userId, updatedAt: _updatedAt, settings: _settings, ...fields } = parsed;
-  return { ...DEFAULT_USER_SETTINGS, ...fields };
+  if (!parsed || typeof parsed !== 'object') return { ...DEFAULT_USER_SETTINGS, pptxContext: { ...DEFAULT_PPTX_CONTEXT } };
+  const raw = parsed.settings && typeof parsed.settings === 'object'
+    ? parsed.settings
+    : (() => {
+        const { userId: _userId, updatedAt: _updatedAt, settings: _settings, ...fields } = parsed;
+        return fields;
+      })();
+  return {
+    ...DEFAULT_USER_SETTINGS,
+    ...raw,
+    pptxContext: mergePptxContext(raw.pptxContext),
+  };
 }
 
 /** Document shape saved to localStorage / Supabase — always includes userId. */
 function buildUserSettingsDocument(userId, settings) {
+  const merged = {
+    ...DEFAULT_USER_SETTINGS,
+    ...settings,
+    pptxContext: mergePptxContext(settings?.pptxContext),
+  };
   return {
     userId,
     updatedAt: new Date().toISOString(),
-    settings: { ...DEFAULT_USER_SETTINGS, ...settings },
+    settings: merged,
   };
 }
 
@@ -1259,95 +1273,6 @@ export default function CommercialExcellenceApp() {
   const [pptxOffers, setPptxOffers] = useState(null);
   const [pptxGenerating, setPptxGenerating] = useState(false);
   const [pptxClarifyPending, setPptxClarifyPending] = useState(false);
-  const [pptxPrompts, setPptxPrompts] = useState({
-    intentDetection: `You detect PowerPoint export opportunities in pharmaceutical sales / IC conversations. Respond ONLY with valid JSON, no markdown.
-
-Return:
-{
-  "offer": true/false,
-  "summaryDeck": { "title": "...", "description": "Factual recap of this conversation only" },
-  "producedDeck": { "title": "...", "description": "...", "deckType": "ic_one_pager|ic_doc_pack|rep_comms|manager_briefing|ic_explainer|territory_report|general", "hasRealData": true/false }
-}
-
-Offer when there is substantive IC/territory content worth exporting. Prefer deckType ic_doc_pack after a scheme design, ic_one_pager for short overviews. hasRealData true only if specific numbers/names appear in the conversation.`,
-
-    summary: `You create a PowerPoint that summarises ONLY the conversation provided in Context.
-Return ONLY valid JSON, no markdown.
-
-GROUNDING RULES (mandatory):
-- Use ONLY facts, decisions, numbers, names, and recommendations that appear in Context.
-- Do NOT invent products, territories, weightings, payouts, quotas, or best-practice claims that were not discussed.
-- If something was not covered, omit it or write "Not discussed in this conversation" — never fill gaps from general knowledge.
-- Ignore any user settings that conflict with staying faithful to the chat transcript.
-
-LAYOUT RULES (mandatory — vary layouts; do NOT make every slide the same):
-- Pick the best layout for each slide's content via the "layout" field.
-- Allowed layouts: "title" | "section" | "one_pager" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
-- title: opening slide only. one_pager: dense single-slide IC scheme snapshot (REQUIRED as slide 2 whenever an IC scheme was designed). section: chapter divider. bullets: narrative list. cards: 3–5 peer themes (use "Label: detail" bullets). table: comparisons / weights / metrics (require tableData). two_column: left bullets + right bullets (put left in "bullets", right in "bulletsRight"). process: ordered steps (3–6). callout: one key message in body + optional short bullets.
-- Mix layouts across the deck. Prefer a table when numbers/weights compare. Prefer cards for peer topics. Prefer process for sequences. Prefer callout for a single IC ask or decision.
-
-ONE-PAGER SLIDE (mandatory when scheme details exist in Context):
-- Slide 2 MUST use layout "one_pager" with title like "IC Scheme One-Pager".
-- body = scheme purpose (1–2 sentences).
-- tableData = components with headers e.g. ["Component","Weight","Metric"] and rows from the conversation.
-- bulletsRight = key eligibility / caps / gates / rules (short).
-- payout or payoutBullets = how payout / attainment works (short).
-- Do not invent missing cells — use "TBC" only if truly not discussed.
-
-Output schema:
-{
-  "title": "...",
-  "subtitle": "...",
-  "slides": [
-    { "type": "title|section|content|table|summary|one_pager", "layout": "title|section|one_pager|bullets|cards|table|two_column|process|callout",
-      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "payout": "...", "payoutBullets": ["..."], "notes": "...",
-      "tableData": { "headers": ["Col1","Col2"], "rows": [["A","B"]] } }
-  ]
-}
-
-Slide count: short chat = 4-6 slides, rich chat = 7-9. First slide must be layout "title"; second should be "one_pager" when an IC scheme was discussed. Keep JSON compact.`,
-
-    produced: `You create a PowerPoint WORKING DOCUMENT from an IC / commercial excellence conversation — ready to distribute.
-Return ONLY valid JSON, no markdown.
-
-GROUNDING RULES (mandatory):
-- Base every slide on the Conversation Context. Do not invent scheme details, numbers, products, or rules that were not agreed or stated there.
-- You MAY organise and phrase content professionally (headings, FAQs) but content must come from the chat.
-- If a section cannot be filled from the conversation, include a short slide noting what still needs confirmation — do not fabricate it.
-- Respect USER SETTINGS for terminology/currency only; never use them to invent missing scheme facts.
-
-LAYOUT RULES (mandatory — vary layouts; do NOT clone the same layout on every slide):
-- Set "layout" per slide to the best fit: "title" | "section" | "one_pager" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
-- title: first slide. one_pager: REQUIRED as slide 2 for every IC documentation export — the full scheme on one page. section: major section breaks. table: components/weights/metrics (always include tableData). cards: 3–5 themes as "Label: detail". process: step-by-step cascade or payout flow. two_column: e.g. rules vs exceptions (bullets + bulletsRight). callout: the IC ask / decision. bullets: general narrative.
-- A strong deck mixes these. Never output 8 identical bullet slides.
-
-ONE-PAGER SLIDE (mandatory — never skip):
-- Always include exactly one slide with layout "one_pager" immediately after the title slide.
-- title: "IC Scheme One-Pager" (or similar).
-- body: purpose of the scheme (1–2 sentences from the chat).
-- tableData: Component / Weight / Metric (and Threshold if discussed) — one row per component.
-- bulletsRight: key rules (eligibility, caps, gates, thresholds) — short bullets.
-- payout or payoutBullets: payout / attainment mechanics in brief.
-- This slide must stand alone as a printable one-page scheme overview. Later slides can go deeper.
-
-Deck types (follow the requested deckType):
-- ic_one_pager: title, one_pager, then 3–5 supporting slides (rules detail, payout, next steps) — still include the one_pager slide
-- ic_doc_pack: title, one_pager, then deeper slides — components detail, payout process, eligibility, FAQs, cascade, open items
-- rep_comms / manager_briefing / ic_explainer / territory_report / general: still include one_pager as slide 2 whenever IC scheme facts exist; otherwise structure for that audience
-
-Output schema:
-{
-  "title": "...",
-  "subtitle": "...",
-  "slides": [
-    { "type": "title|section|content|table|summary|one_pager", "layout": "title|section|one_pager|bullets|cards|table|two_column|process|callout",
-      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "payout": "...", "payoutBullets": ["..."], "notes": "...",
-      "tableData": { "headers": ["Component","Weight","Metric"], "rows": [["Sales","40%","Net sales"]] } }
-  ]
-}
-
-First slide must be layout "title". Second slide must be layout "one_pager" when documenting an IC scheme. Keep JSON compact.`
-  });
   const [maxSuggestions, setMaxSuggestions] = useState(3);
   const [hoveredCitation, setHoveredCitation] = useState(null);
   const [customSystemPrompt, setCustomSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
@@ -1763,8 +1688,9 @@ Rules (mandatory):
     if (conversationHistory.length < 2) return;
     try {
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
+      const pptxCtx = getPptxContext(userSettings);
       const response = await anthropicMessagesPost({
-        system: `${pptxPrompts.intentDetection}${buildUserSettingsPromptBlock(userSettings)}`,
+        system: `${pptxCtx.intentDetection}${buildUserSettingsPromptBlock(userSettings)}`,
         messages: [{ role: 'user', content: `Conversation:\n${recentMessages}` }],
         max_tokens: 400,
       });
@@ -1810,7 +1736,12 @@ Rules (mandatory):
   const withUserSettings = (system) => `${system || ''}${buildUserSettingsPromptBlock(userSettings)}`;
 
   const saveUserSettings = async (next) => {
-    const settings = { ...DEFAULT_USER_SETTINGS, ...(next || userSettings) };
+    const incoming = next || userSettings;
+    const settings = {
+      ...DEFAULT_USER_SETTINGS,
+      ...incoming,
+      pptxContext: mergePptxContext(incoming?.pptxContext),
+    };
     const doc = buildUserSettingsDocument(currentUser.id, settings);
     setUserSettings(settings);
     setUserSettingsSaveStatus('saving');
@@ -3403,13 +3334,13 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     const isSummary = mode === 'summary';
     const deckType = offer?.deckType || (isSummary ? 'session_summary' : 'general');
     const conversationContext = buildPptxConversationContext(messages);
-    const systemPrompt = withUserSettings(isSummary ? pptxPrompts.summary : pptxPrompts.produced);
+    const pptxCtx = getPptxContext(userSettings);
+    const systemPrompt = withUserSettings(isSummary ? pptxCtx.summary : pptxCtx.produced);
     const userContent = [
       `Export mode: ${isSummary ? 'SESSION SUMMARY (chat facts only)' : 'PRODUCED WORKING DOCUMENT'}`,
       `Requested title: "${offer?.title || (isSummary ? 'Session Summary' : 'Working Document')}"`,
       `deckType: ${deckType}`,
       `hasRealData hint: ${offer?.hasRealData ? 'true' : 'false'}`,
-      !isSummary ? 'REQUIRED: Include layout "one_pager" as slide 2 (IC scheme on a single page: purpose, components table, key rules, payout).' : 'If an IC scheme was designed in this chat, include layout "one_pager" as slide 2.',
       '',
       'Conversation Context (ONLY source of truth — do not invent beyond this):',
       conversationContext || '(empty conversation)',
@@ -4444,6 +4375,39 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                   <input ref={pptxTemplateInputRef} type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={handlePptxTemplateUpload} className="hidden" />
                 </div>
 
+                <div className="mt-8 pt-6 border-t border-blue-400/15">
+                  <h3 className="text-sm font-bold text-white mb-1">PowerPoint context</h3>
+                  <p className="text-xs text-blue-300/60 mb-4">
+                    Guidance used when offering and generating PowerPoint exports. Saved in your settings JSON with everything else — not hardcoded in the app.
+                  </p>
+                  {[
+                    ['intentDetection', 'Intent detection', 'When to offer an export after a conversation.'],
+                    ['summary', 'Session summary', 'System prompt for conversation-summary decks.'],
+                    ['produced', 'Produced document', 'System prompt for working documents / IC packs.'],
+                  ].map(([key, title, desc]) => (
+                    <div key={key} className="mb-4">
+                      <label className="block text-xs text-blue-300/70 font-semibold mb-1">{title}</label>
+                      <p className="text-[11px] text-blue-300/45 mb-2">{desc}</p>
+                      <textarea
+                        value={userSettings.pptxContext?.[key] ?? ''}
+                        onChange={(e) => setUserSettings(prev => ({
+                          ...prev,
+                          pptxContext: { ...mergePptxContext(prev.pptxContext), [key]: e.target.value },
+                        }))}
+                        rows={key === 'intentDetection' ? 6 : 10}
+                        className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-xs font-mono outline-none focus:border-blue-400 resize-y"
+                      />
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setUserSettings(prev => ({ ...prev, pptxContext: { ...DEFAULT_PPTX_CONTEXT } }))}
+                    className="text-xs text-blue-300/70 hover:text-blue-200 underline underline-offset-2"
+                  >
+                    Restore factory PowerPoint context
+                  </button>
+                </div>
+
                 <div className="flex flex-wrap items-center gap-3 mt-6">
                   <button
                     onClick={() => saveUserSettings(userSettings)}
@@ -4584,14 +4548,50 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
 
               {adminSection === 'pptx' && (
                 <div className="space-y-6">
-                  <h3 className="text-lg font-bold text-white">PowerPoint Generation Prompts</h3>
-                  {[['intentDetection', '🔍 Intent Detection', 'Decides when to offer a PowerPoint export.'], ['summary', '📋 Session Summary Prompt', 'Used when generating a summary deck.'], ['produced', '📄 Produced Document Prompt', 'Used when generating a working document.']].map(([key, title, desc]) => (
+                  <div>
+                    <h3 className="text-lg font-bold text-white">PowerPoint context</h3>
+                    <p className="text-xs text-blue-300/55 mt-1">
+                      Same fields as User Settings → PowerPoint context. Saved to this user’s settings JSON (local + Supabase).
+                    </p>
+                  </div>
+                  {[['intentDetection', 'Intent Detection', 'Decides when to offer a PowerPoint export.'], ['summary', 'Session Summary', 'Used when generating a summary deck.'], ['produced', 'Produced Document', 'Used when generating a working document.']].map(([key, title, desc]) => (
                     <div key={key} className="bg-slate-800/40 border border-blue-400/20 rounded-xl p-4">
                       <div className="text-sm font-semibold text-white mb-1">{title}</div>
                       <p className="text-xs text-blue-300/50 mb-3">{desc}</p>
-                      <textarea value={pptxPrompts[key]} onChange={e => setPptxPrompts(prev => ({ ...prev, [key]: e.target.value }))} rows={8} className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-blue-400/20 focus:border-blue-400/50 focus:outline-none font-mono resize-y" />
+                      <textarea
+                        value={userSettings.pptxContext?.[key] ?? ''}
+                        onChange={e => setUserSettings(prev => ({
+                          ...prev,
+                          pptxContext: { ...mergePptxContext(prev.pptxContext), [key]: e.target.value },
+                        }))}
+                        rows={8}
+                        className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-blue-400/20 focus:border-blue-400/50 focus:outline-none font-mono resize-y"
+                      />
                     </div>
                   ))}
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      type="button"
+                      onClick={() => saveUserSettings(userSettings)}
+                      disabled={userSettingsSaveStatus === 'saving'}
+                      className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 text-white font-semibold rounded-lg transition-all flex items-center gap-2"
+                    >
+                      <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save PowerPoint context'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setUserSettings(prev => ({ ...prev, pptxContext: { ...DEFAULT_PPTX_CONTEXT } }))}
+                      className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg border border-slate-500/30"
+                    >
+                      Restore factory defaults
+                    </button>
+                    {userSettingsSaveStatus === 'saved' && (
+                      <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved</span>
+                    )}
+                    {userSettingsSaveStatus === 'saved-local' && (
+                      <span className="flex items-center gap-1.5 text-sm text-amber-300 font-semibold"><CheckCircle className="w-4 h-4" /> Saved locally</span>
+                    )}
+                  </div>
                 </div>
               )}
 
