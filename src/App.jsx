@@ -9,7 +9,7 @@ import {
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
 } from './auth';
-import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyTemplateChrome, applyContentHeader } from './pptxTheme';
+import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -3231,132 +3231,24 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       if (!PptxGenJS) throw new Error('PptxGenJS library not available');
 
       const pptx = new PptxGenJS();
-      pptx.layout = 'LAYOUT_16x9';
-      pptx.title = slideData.title || offer?.title || 'PowerPoint';
-      // Reload template PPTX from storage so logos / backgrounds / fonts are applied.
       const theme = await loadFullPptxStyleForGeneration(userSettings, supabase);
-      const hasTemplate = !!userSettings.pptxTemplate;
-      const BG_DARK = theme.bgDark;
-      const ACCENT = theme.accent;
-      const TEXT_ON_DARK = theme.textOnDark;
-      const TEXT_ON_DARK_MUTED = theme.textOnDarkMuted;
-      const TEXT_ON_LIGHT = theme.textOnLight;
-      const TEXT_MUTED = theme.textMuted;
-      const BORDER = theme.border;
-      const FONT_HEADING = theme.headingFont;
-      const FONT_BODY = theme.bodyFont;
-      const TITLE_SIZE = theme.titleFontSize || 36;
-      const HEADING_SIZE = theme.headingFontSize || 22;
-      const SUBTITLE_SIZE = theme.subtitleFontSize || 18;
-      const BODY_SIZE = theme.bodyFontSize || 14;
+      applyPptxLayout(pptx, theme);
+      pptx.title = slideData.title || offer?.title || 'PowerPoint';
+
       const slides = Array.isArray(slideData.slides) ? slideData.slides.filter(s => s && (s.type || s.title)) : [];
       if (!slides.length) throw new Error('No slides returned');
 
       slides.forEach((slide, idx) => {
-        const type = slide.type || 'content';
         slide.bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
         slide.dataPoints = Array.isArray(slide.dataPoints) ? slide.dataPoints : [];
-        const s = pptx.addSlide();
-        const isTitle = type === 'title';
-
-        applyTemplateChrome(pptx, s, theme, { variant: isTitle ? 'title' : 'content' });
-
-        if (isTitle) {
-          if (!hasTemplate || theme.useDefaultChrome) {
-            s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 0.18, h: 5.625, fill: { color: ACCENT }, line: { color: ACCENT } });
-          }
-          s.addText(slide.title || slideData.title || offer?.title || '', {
-            x: 0.5, y: 1.35, w: 9, h: 1.7,
-            fontSize: TITLE_SIZE, bold: theme.titleBold !== false, color: TEXT_ON_DARK,
-            fontFace: FONT_HEADING, align: 'left', valign: 'middle',
-          });
-          if (slide.subtitle || slideData.subtitle) {
-            s.addText(slide.subtitle || slideData.subtitle, {
-              x: 0.5, y: 3.15, w: 8.5, h: 0.7,
-              fontSize: SUBTITLE_SIZE, color: TEXT_ON_DARK_MUTED,
-              fontFace: FONT_BODY, align: 'left',
-            });
-          }
-          const today = new Date().toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
-          s.addText(today, { x: 6, y: 5.1, w: 3.7, h: 0.4, fontSize: 11, color: TEXT_MUTED, align: 'right', fontFace: FONT_BODY });
-          return;
-        }
-
-        let cursorY;
-        if (hasTemplate && !theme.useDefaultChrome) {
-          cursorY = applyContentHeader(pptx, s, theme, slide.title || `Slide ${idx + 1}`);
-        } else {
-          s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 10, h: 0.88, fill: { color: BG_DARK }, line: { color: BG_DARK } });
-          s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0.88, w: 10, h: 0.05, fill: { color: ACCENT }, line: { color: ACCENT } });
-          s.addText(slide.title || `Slide ${idx + 1}`, {
-            x: 0.4, y: 0, w: 9.2, h: 0.88,
-            fontSize: HEADING_SIZE, bold: true, color: TEXT_ON_DARK, valign: 'middle', fontFace: FONT_HEADING,
-          });
-          cursorY = 1.05;
-        }
-
-        if (slide.body) {
-          s.addText(String(slide.body), {
-            x: 0.5, y: cursorY, w: 9, h: 0.7,
-            fontSize: BODY_SIZE, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, align: 'left', valign: 'top',
-          });
-          cursorY += 0.75;
-        }
-
-        if (slide.dataPoints.length) {
-          const lines = slide.dataPoints.map(dp => `${dp.label || ''}: ${dp.value || ''}${dp.context ? ` (${dp.context})` : ''}`);
-          s.addText(lines.map((t, i) => ({ text: t, options: { bullet: true, breakLine: i < lines.length - 1, fontSize: BODY_SIZE, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 4 } })), {
-            x: 0.5, y: cursorY, w: 9, h: Math.min(1.6, 0.28 * lines.length + 0.2),
-          });
-          cursorY += Math.min(1.7, 0.28 * lines.length + 0.3);
-        }
-
-        const table = slide.tableData;
-        if (table && Array.isArray(table.headers) && Array.isArray(table.rows) && table.headers.length) {
-          const colCount = table.headers.length;
-          const colW = Math.min(9.2 / colCount, 3.2);
-          const headerRow = table.headers.map(h => ({
-            text: String(h ?? ''),
-            options: { bold: true, color: TEXT_ON_DARK, fill: { color: BG_DARK }, align: 'center', valign: 'middle' },
-          }));
-          const bodyRows = table.rows.slice(0, 12).map(row => {
-            const cells = Array.isArray(row) ? row : [row];
-            return Array.from({ length: colCount }, (_, i) => ({
-              text: String(cells[i] ?? ''),
-              options: { color: TEXT_ON_LIGHT, align: 'left', valign: 'middle' },
-            }));
-          });
-          const tableH = Math.min(3.6, 0.35 * (bodyRows.length + 1) + 0.2);
-          s.addTable([headerRow, ...bodyRows], {
-            x: 0.4,
-            y: cursorY,
-            w: colW * colCount,
-            colW: Array(colCount).fill(colW),
-            border: [{ type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }],
-            fontFace: FONT_BODY,
-            fontSize: Math.max(10, BODY_SIZE - 2),
-            color: TEXT_ON_LIGHT,
-          });
-          cursorY += tableH + 0.15;
-        }
-
-        if (slide.bullets.length) {
-          const remaining = Math.max(0.8, 5.1 - cursorY);
-          const bulletItems = slide.bullets.map((b, i) => ({
-            text: String(b),
-            options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: BODY_SIZE, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 5 },
-          }));
-          s.addText(bulletItems, { x: 0.5, y: cursorY, w: 9, h: remaining });
-        }
-
-        if (slide.notes) s.addNotes(String(slide.notes));
-        s.addText(`${idx + 1}`, { x: 9.5, y: 5.3, w: 0.4, h: 0.2, fontSize: 9, color: TEXT_MUTED, align: 'right', fontFace: FONT_BODY });
+        if (!slide.type) slide.type = idx === 0 ? 'title' : 'content';
+        renderSlideFromTheme(pptx, theme, slide, idx);
       });
 
       const fileName = (slideData.title || offer?.title || 'powerpoint').replace(/[^a-z0-9]+/gi, '_').toLowerCase();
       await pptx.writeFile({ fileName: `${fileName}.pptx` });
       const themeNote = userSettings.pptxTemplate?.fileName
-        ? ` styled from **${userSettings.pptxTemplate.fileName}** (sampled slide colours, fonts & logos)`
+        ? ` using **${userSettings.pptxTemplate.fileName}** background, colours & fonts`
         : ' using the default ComEx style';
       setMessages(prev => [...prev, {
         role: 'assistant',
@@ -4196,7 +4088,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                 <div className="mt-8 pt-6 border-t border-blue-400/15">
                   <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
                   <p className="text-xs text-blue-300/60 mb-4">
-                    Upload a branded .pptx. We sample completed slides (and masters if present) for real colours, shading, title/subtitle/body fonts & sizes, backgrounds, and logos — slide text content is ignored. Re-upload after changing your template. Stored at{' '}
+                    Upload a branded .pptx. Exports replay that slide’s layout, background, shapes, fonts and colours — nothing is invented. Template wording is ignored; your export content is mapped into the same slots. Without a template, ComEx uses its built-in default style. Stored at{' '}
                     <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>.
                   </p>
 
@@ -4233,13 +4125,14 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       </div>
                       {(() => {
                         const gen = getPptxGeneratorThemeFromUserSettings(userSettings);
+                        const meta = userSettings.pptxTemplate?.theme?.blueprintMeta;
                         const swatches = [
-                          ['Header', gen.bgDark],
-                          ['Slide', gen.bgLight],
+                          ['Brand', gen.bgDark],
                           ['Accent', gen.accent],
-                          ['Title text', gen.textOnDark],
-                          ['Body text', gen.textOnLight],
-                        ];
+                          ['Subtitle', gen.subtitleColor],
+                          ['Title', gen.textOnDark],
+                          ['Body', gen.textOnLight],
+                        ].filter(([, hex]) => hex);
                         return (
                           <div className="flex flex-wrap gap-3 items-center">
                             {swatches.map(([label, hex]) => (
@@ -4248,7 +4141,21 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                                 <span>{label} <span className="text-blue-300/40 font-mono">#{hex}</span></span>
                               </div>
                             ))}
-                            <span className="text-[10px] text-emerald-400/80 font-semibold">Active for exports</span>
+                            {userSettings.pptxTemplate?.theme?.hasBackgroundImage && (
+                              <span className="text-[10px] text-cyan-300/80 font-semibold">Background from template ✓</span>
+                            )}
+                            {meta && (
+                              <span className="text-[10px] text-cyan-300/80 font-semibold">
+                                {meta.cardColumnCount || 0} columns · {meta.chromeShapeCount || 0} shapes
+                              </span>
+                            )}
+                            {gen.slideWidth && gen.slideHeight && (
+                              <span className="text-[10px] text-emerald-400/80 font-semibold">
+                                {gen.slideWidth}&quot;×{gen.slideHeight}&quot;
+                                {gen.headingFont ? ` · ${gen.headingFont}` : ''}
+                                {gen.titleFontSize ? ` ${gen.titleFontSize}pt` : ''}
+                              </span>
+                            )}
                           </div>
                         );
                       })()}

@@ -1,34 +1,39 @@
 import JSZip from 'jszip';
 
 const EMU_PER_INCH = 914400;
-const SLIDE_W_IN = 10;
-const SLIDE_H_IN = 5.625;
 
-/** Default ComEx deck look when no user template is uploaded. */
+/**
+ * ComEx default look — used ONLY when the user has not uploaded a template.
+ * Never mixed into template-driven exports.
+ */
 export const DEFAULT_PPTX_GENERATOR_THEME = {
+  slideWidth: 10,
+  slideHeight: 5.625,
   bgDark: '1E2761',
   bgLight: 'FFFFFF',
   accent: '60A5FA',
+  subtitleColor: '93C5FD',
+  cardFill: 'FFFFFF',
+  cardTransparency: 0,
+  contentTextLight: false,
   textOnDark: 'FFFFFF',
-  textOnDarkMuted: 'CADCFC',
-  textOnLight: '1E2761',
-  textMuted: '94A3B8',
+  textOnLight: '1E293B',
+  textMuted: '64748B',
   border: 'CBD5E1',
   headingFont: 'Calibri',
   bodyFont: 'Calibri',
-  titleFontSize: 36,
-  headingFontSize: 22,
+  cardHeadingFont: 'Calibri',
+  titleFontSize: 28,
+  subtitleFontSize: 14,
   bodyFontSize: 14,
-  subtitleFontSize: 18,
+  cardTitleFontSize: 14,
+  cardBodyFontSize: 12,
   titleBold: true,
-  headingBold: true,
   schemeName: 'ComEx Default',
   sourceFileName: null,
-  titleBackground: null,
-  contentBackground: null,
+  backgroundImage: null,
   logos: [],
-  accentShapes: [],
-  headerBand: { x: 0, y: 0, w: 10, h: 0.88 },
+  blueprint: null,
   useDefaultChrome: true,
 };
 
@@ -59,13 +64,10 @@ function isNearGrey(hex) {
   const r = parseInt(h.slice(0, 2), 16);
   const g = parseInt(h.slice(2, 4), 16);
   const b = parseInt(h.slice(4, 6), 16);
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  return max - min < 28; // low saturation
+  return Math.max(r, g, b) - Math.min(r, g, b) < 28;
 }
 
 function colourScore(hex) {
-  // Prefer saturated brand colours over greys/black/white.
   const h = normalizeHex(hex);
   if (!h) return -1;
   const r = parseInt(h.slice(0, 2), 16);
@@ -75,8 +77,7 @@ function colourScore(hex) {
   const min = Math.min(r, g, b);
   const sat = max === 0 ? 0 : (max - min) / max;
   const lum = hexLuminance(h);
-  // Mid-dark saturated blues/teals score high
-  return sat * 2 + (lum > 0.15 && lum < 0.75 ? 1 : 0) + (b > r && b >= g ? 0.5 : 0);
+  return sat * 2 + (lum > 0.12 && lum < 0.78 ? 1 : 0) + (b > r && b >= g ? 0.6 : 0);
 }
 
 function emuToInches(emu) {
@@ -88,22 +89,25 @@ function emuToInches(emu) {
 function halfPointsToPt(sz) {
   const n = Number(sz);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.round(n / 100);
+  return Math.round((n / 100) * 10) / 10;
 }
 
-function colorFromSlotBlock(block) {
-  if (!block) return null;
-  const srgb = block.match(/srgbClr[^>]*\bval\s*=\s*"([0-9A-Fa-f]{6,8})"/i);
-  if (srgb) return normalizeHex(srgb[1]);
-  const sys = block.match(/sysClr[^>]*\blastClr\s*=\s*"([0-9A-Fa-f]{6,8})"/i);
-  if (sys) return normalizeHex(sys[1]);
-  return null;
+function alphaToTransparency(alphaVal) {
+  const a = Number(alphaVal);
+  if (!Number.isFinite(a) || a <= 0) return 0;
+  const opacityPct = Math.min(100, Math.max(0, a / 1000));
+  return Math.round(100 - opacityPct);
 }
 
 function extractSlotColor(themeXml, slot) {
   const re = new RegExp(`<(?:\\w+:)?${slot}\\b[^>]*>([\\s\\S]*?)<\\/(?:\\w+:)?${slot}>`, 'i');
   const m = themeXml.match(re);
-  return m ? colorFromSlotBlock(m[1]) : null;
+  if (!m) return null;
+  const srgb = m[1].match(/srgbClr[^>]*\bval\s*=\s*"([0-9A-Fa-f]{6,8})"/i);
+  if (srgb) return normalizeHex(srgb[1]);
+  const sys = m[1].match(/sysClr[^>]*\blastClr\s*=\s*"([0-9A-Fa-f]{6,8})"/i);
+  if (sys) return normalizeHex(sys[1]);
+  return null;
 }
 
 function extractLatinFont(themeXml, which) {
@@ -123,20 +127,15 @@ function resolveSchemeColor(schemeClr, colors) {
   if (!schemeClr || !colors) return null;
   const key = String(schemeClr).toLowerCase();
   const map = {
-    dk1: colors.dk1, dark1: colors.dk1,
-    lt1: colors.lt1, light1: colors.lt1,
-    dk2: colors.dk2, dark2: colors.dk2,
-    lt2: colors.lt2, light2: colors.lt2,
+    dk1: colors.dk1, lt1: colors.lt1, dk2: colors.dk2, lt2: colors.lt2,
     accent1: colors.accent1, accent2: colors.accent2, accent3: colors.accent3,
     accent4: colors.accent4, accent5: colors.accent5, accent6: colors.accent6,
-    tx1: colors.dk1, tx2: colors.dk2, bg1: colors.lt1, bg2: colors.lt2,
   };
   return map[key] || null;
 }
 
 function extractFillColor(xmlFragment, colors) {
   if (!xmlFragment) return null;
-  // Prefer explicit srgb over scheme (scheme often resolves to grey/black)
   const srgb = xmlFragment.match(/srgbClr[^>]*\bval\s*=\s*"([0-9A-Fa-f]{6,8})"/i);
   if (srgb) return normalizeHex(srgb[1]);
   const sys = xmlFragment.match(/sysClr[^>]*\blastClr\s*=\s*"([0-9A-Fa-f]{6,8})"/i);
@@ -144,6 +143,12 @@ function extractFillColor(xmlFragment, colors) {
   const scheme = xmlFragment.match(/schemeClr[^>]*\bval\s*=\s*"([^"]+)"/i);
   if (scheme) return resolveSchemeColor(scheme[1], colors);
   return null;
+}
+
+function extractFillAlpha(xmlFragment) {
+  if (!xmlFragment) return null;
+  const m = xmlFragment.match(/<(?:\w+:)?alpha\b[^>]*\bval\s*=\s*"(\d+)"/i);
+  return m ? Number(m[1]) : null;
 }
 
 function parseRels(relsXml) {
@@ -199,28 +204,11 @@ async function readMediaAsDataUrl(zip, mediaPath) {
   const mime = mimeFromPath(mediaPath);
   if (!mime) return null;
   const buf = await file.async('uint8array');
-  if (!buf?.length || buf.length > 4_500_000) return null;
+  if (!buf?.length || buf.length > 6_000_000) return null;
   return `data:${mime};base64,${uint8ToBase64(buf)}`;
 }
 
-function extractBackground(xml, colors) {
-  if (!xml) return null;
-  const bg = xml.match(/<(?:\w+:)?bg\b[^>]*>([\s\S]*?)<\/(?:\w+:)?bg>/i);
-  if (!bg) return null;
-  const block = bg[1];
-  const embed = block.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i);
-  if (embed) return { type: 'image', embedId: embed[1] };
-  const solid = extractFillColor(block, colors);
-  if (solid) return { type: 'solid', color: solid };
-  const grad = block.match(/gradFill[\s\S]{0,800}/i);
-  if (grad) {
-    const c = extractFillColor(grad[0], colors);
-    if (c) return { type: 'solid', color: c };
-  }
-  return null;
-}
-
-function shapeGeometry(block) {
+function shapeGeom(block) {
   const xfrm = block.match(/<(?:\w+:)?xfrm\b[^>]*>[\s\S]*?<\/(?:\w+:)?xfrm>/i)?.[0] || '';
   const x = emuToInches((xfrm.match(/\bx\s*=\s*"(-?\d+)"/i) || [])[1]);
   const y = emuToInches((xfrm.match(/\by\s*=\s*"(-?\d+)"/i) || [])[1]);
@@ -229,355 +217,274 @@ function shapeGeometry(block) {
   return { x, y, w, h, area: w * h };
 }
 
-/** Mine completed slides for real fills + text styling (not just theme placeholders). */
-function analyzeSlideXml(xml, colors) {
-  const fills = []; // {color, area, x, y, w, h, role}
-  const texts = []; // {color, size, bold, font, roleHint}
-  if (!xml) return { fills, texts, background: null, pics: [] };
+function shapePreset(block) {
+  const prst = (block.match(/prstGeom[^>]*\bprst\s*=\s*"([^"]+)"/i) || [])[1] || 'rect';
+  return String(prst).toLowerCase();
+}
 
-  const background = extractBackground(xml, colors);
+function pptxShapeName(pptx, preset) {
+  const p = String(preset || 'rect').toLowerCase();
+  if (p.includes('ellipse') || p.includes('oval')) return pptx.shapes.OVAL;
+  if (p.includes('round') || p.includes('corner')) return pptx.shapes.ROUNDED_RECTANGLE;
+  return pptx.shapes.RECTANGLE;
+}
 
-  // Full-bleed / large solid shapes often ARE the visual background or header.
-  const shapes = [...xml.matchAll(/<(?:\w+:)?sp\b[^>]*>[\s\S]*?<\/(?:\w+:)?sp>/gi)].map((m) => m[0]);
-  for (const block of shapes) {
-    const isPh = /<(?:\w+:)?ph\b/i.test(block);
-    const phType = (block.match(/ph\b[^>]*\btype\s*=\s*"([^"]+)"/i) || [])[1] || '';
-    const geom = shapeGeometry(block);
-    const fillFrag = block.match(/<(?:\w+:)?solidFill\b[\s\S]*?<\/(?:\w+:)?solidFill>/i)?.[0]
-      || block.match(/<(?:\w+:)?gradFill\b[\s\S]*?<\/(?:\w+:)?gradFill>/i)?.[0]
+function firstRunStyle(block, colors) {
+  const runs = [...block.matchAll(/<(?:\w+:)?r\b[^>]*>[\s\S]*?<\/(?:\w+:)?r>/gi)].map((m) => m[0]);
+  for (const run of runs) {
+    const rPr = run.match(/<(?:\w+:)?rPr\b[^>]*>[\s\S]*?<\/(?:\w+:)?rPr>/i)?.[0]
+      || run.match(/<(?:\w+:)?rPr\b[^>]*\/>/i)?.[0]
       || '';
-    const fill = extractFillColor(fillFrag, colors);
-    if (fill && geom.area > 0.05) {
-      let role = 'shape';
-      if (geom.w >= SLIDE_W_IN * 0.9 && geom.h >= SLIDE_H_IN * 0.9) role = 'slideFill';
-      else if (geom.y < 1.2 && geom.w >= 8 && geom.h <= 1.6) role = 'headerBand';
-      else if (geom.x < 0.4 && geom.h >= 4 && geom.w <= 0.6) role = 'sideRail';
-      else if (geom.area > 4 && !isLightHex(fill)) role = 'panel';
-      fills.push({ color: fill, ...geom, role, isPh, phType });
-    }
-
-    // Text runs inside this shape
-    const runs = [...block.matchAll(/<(?:\w+:)?r\b[^>]*>[\s\S]*?<\/(?:\w+:)?r>/gi)].map((m) => m[0]);
-    for (const run of runs) {
-      const rPr = run.match(/<(?:\w+:)?rPr\b[^>]*\/?>/i)?.[0]
-        || run.match(/<(?:\w+:)?rPr\b[^>]*>[\s\S]*?<\/(?:\w+:)?rPr>/i)?.[0]
-        || '';
-      const sz = halfPointsToPt((rPr.match(/\bsz\s*=\s*"(\d+)"/i) || [])[1]);
-      const bold = /\bb\s*=\s*"(?:1|true)"/i.test(rPr) || /<(?:\w+:)?b\s*\/>/i.test(rPr);
-      const font = (rPr.match(/latin[^>]*\btypeface\s*=\s*"([^"]+)"/i) || [])[1] || null;
-      const color = extractFillColor(rPr, colors) || extractFillColor(run.match(/solidFill[\s\S]{0,250}/i)?.[0] || '', colors);
-      const text = (run.match(/<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/i) || [])[1] || '';
-      if (!sz && !color) continue;
-      let roleHint = 'body';
-      if (/title|ctrTitle/i.test(phType) || (sz && sz >= 28)) roleHint = 'title';
-      else if (/subTitle/i.test(phType) || (sz && sz >= 18 && sz < 28)) roleHint = 'subtitle';
-      else if (sz && sz >= 16 && sz < 22) roleHint = 'heading';
-      texts.push({
-        color: color || null,
-        size: sz,
-        bold,
-        font,
-        roleHint,
-        phType,
-        len: text.replace(/<[^>]+>/g, '').trim().length,
-      });
-    }
-
-    // Placeholder defaults (even without runs)
-    if (isPh) {
-      const def = block.match(/defRPr[^>]*>/i)?.[0] || block.match(/defRPr[\s\S]{0,400}/i)?.[0] || '';
-      const sz = halfPointsToPt((def.match(/\bsz\s*=\s*"(\d+)"/i) || block.match(/\bsz\s*=\s*"(\d+)"/i) || [])[1]);
-      const color = extractFillColor(def, colors);
-      const font = (def.match(/latin[^>]*\btypeface\s*=\s*"([^"]+)"/i) || [])[1] || null;
-      if (sz || color) {
-        let roleHint = 'body';
-        if (/title|ctrTitle/i.test(phType)) roleHint = 'title';
-        else if (/subTitle/i.test(phType)) roleHint = 'subtitle';
-        else if (/body|obj/i.test(phType)) roleHint = 'body';
-        texts.push({ color, size: sz, bold: /title/i.test(phType), font, roleHint, phType, len: 0 });
-      }
-    }
-  }
-
-  const pics = [];
-  const picBlocks = [...xml.matchAll(/<(?:\w+:)?pic\b[^>]*>[\s\S]*?<\/(?:\w+:)?pic>/gi)].map((m) => m[0]);
-  for (const block of picBlocks) {
-    const embed = block.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i);
-    if (!embed) continue;
-    const geom = shapeGeometry(block);
-    if (geom.w >= SLIDE_W_IN * 0.92 && geom.h >= SLIDE_H_IN * 0.92) continue;
-    if (geom.w < 0.15 || geom.h < 0.15) continue;
-    pics.push({ embedId: embed[1], ...geom });
-  }
-
-  return { fills, texts, background, pics };
-}
-
-function pickBestFill(fills, predicate) {
-  const list = fills.filter(predicate);
-  if (!list.length) return null;
-  list.sort((a, b) => (colourScore(b.color) * b.area) - (colourScore(a.color) * a.area));
-  return list[0];
-}
-
-function pickTextStyle(texts, role) {
-  const list = texts.filter((t) => t.roleHint === role && (t.color || t.size));
-  if (!list.length) return null;
-  // Prefer runs that actually have content, then larger size
-  list.sort((a, b) => (b.len - a.len) || ((b.size || 0) - (a.size || 0)));
-  const withColor = list.find((t) => t.color) || list[0];
-  const withSize = list.find((t) => t.size) || list[0];
-  const withFont = list.find((t) => t.font) || list[0];
-  return {
-    color: withColor.color || null,
-    size: withSize.size || null,
-    bold: list.some((t) => t.bold),
-    font: withFont.font || null,
-  };
-}
-
-function inferDesignFromAnalyses(analyses, themeColors) {
-  const fills = analyses.flatMap((a) => a.fills);
-  const texts = analyses.flatMap((a) => a.texts);
-
-  const slideFill = pickBestFill(fills, (f) => f.role === 'slideFill')
-    || (analyses.map((a) => a.background).find((b) => b?.type === 'solid') && {
-      color: analyses.map((a) => a.background).find((b) => b?.type === 'solid')?.color,
-    });
-
-  const headerBand = pickBestFill(fills, (f) => f.role === 'headerBand')
-    || pickBestFill(fills, (f) => f.y < 1.3 && f.w >= 7 && f.h <= 1.8 && !isLightHex(f.color));
-
-  const brandPanel = pickBestFill(fills, (f) => !isLightHex(f.color) && !isNearGrey(f.color) && f.area >= 1)
-    || pickBestFill(fills, (f) => !isLightHex(f.color) && f.area >= 1);
-
-  const accent = pickBestFill(fills, (f) => f.role === 'sideRail' || (f.area < 3 && f.area > 0.08 && !isNearGrey(f.color) && colourScore(f.color) > 1))
-    || pickBestFill(fills, (f) => !isNearGrey(f.color) && colourScore(f.color) > 1.2 && f.color !== brandPanel?.color);
-
-  const lightBg = pickBestFill(fills, (f) => isLightHex(f.color) && f.area > 2)
-    || { color: themeColors.lt1 || 'FFFFFF' };
-
-  const titleStyle = pickTextStyle(texts, 'title');
-  const subtitleStyle = pickTextStyle(texts, 'subtitle');
-  const headingStyle = pickTextStyle(texts, 'heading');
-  const bodyStyle = pickTextStyle(texts, 'body');
-
-  // Brand / header colour: prefer saturated dark-ish fill from real slides over theme greys
-  const candidates = [headerBand?.color, brandPanel?.color, themeColors.accent1, themeColors.dk2, themeColors.dk1]
-    .map(normalizeHex)
-    .filter(Boolean);
-  candidates.sort((a, b) => colourScore(b) - colourScore(a));
-  let bgDark = candidates[0] || DEFAULT_PPTX_GENERATOR_THEME.bgDark;
-  // If we somehow still got near-black/grey but a blue accent exists, prefer accent for brand bar
-  if (isNearGrey(bgDark) || hexLuminance(bgDark) < 0.08) {
-    const colorful = [headerBand?.color, brandPanel?.color, accent?.color, themeColors.accent1]
-      .map(normalizeHex).filter((c) => c && !isNearGrey(c));
-    colorful.sort((a, b) => colourScore(b) - colourScore(a));
-    if (colorful[0]) bgDark = colorful[0];
-  }
-
-  const bgLight = normalizeHex(slideFill?.color) && isLightHex(slideFill.color)
-    ? slideFill.color
-    : (normalizeHex(lightBg?.color) || themeColors.lt1 || 'FFFFFF');
-
-  const accentColor = normalizeHex(accent?.color) && !isNearGrey(accent.color)
-    ? accent.color
-    : (normalizeHex(themeColors.accent1) || DEFAULT_PPTX_GENERATOR_THEME.accent);
-
-  // Title text: white/light on dark headers is common for blue templates
-  let textOnDark = normalizeHex(titleStyle?.color);
-  if (!textOnDark || (!isLightHex(textOnDark) && !isLightHex(bgDark))) {
-    textOnDark = isLightHex(bgDark) ? (themeColors.dk1 || '1E2761') : 'FFFFFF';
-  }
-  // If title is white and header is blue — good. Force white when header is dark.
-  if (!isLightHex(bgDark) && textOnDark && !isLightHex(textOnDark) && colourScore(bgDark) > 1) {
-    textOnDark = 'FFFFFF';
-  }
-
-  let textOnLight = normalizeHex(bodyStyle?.color) || normalizeHex(headingStyle?.color);
-  if (!textOnLight || (isLightHex(bgLight) && isLightHex(textOnLight))) {
-    textOnLight = themeColors.dk1 || '1E293B';
-  }
-
-  const textOnDarkMuted = normalizeHex(subtitleStyle?.color) && isLightHex(subtitleStyle.color)
-    ? subtitleStyle.color
-    : (isLightHex(bgDark) ? textOnLight : 'E2E8F0');
-
-  const decorative = fills
-    .filter((f) => ['headerBand', 'sideRail', 'panel'].includes(f.role) || (f.area < 8 && f.area > 0.08 && !f.isPh))
-    .filter((f) => f.area < 20)
-    .slice(0, 12)
-    .map((f) => ({ x: f.x, y: f.y, w: f.w, h: f.h, color: f.color }));
-
-  return {
-    bgDark,
-    bgLight,
-    accent: accentColor,
-    textOnDark,
-    textOnDarkMuted,
-    textOnLight,
-    textMuted: isLightHex(bgLight) ? '64748B' : '94A3B8',
-    border: themeColors.lt2 || 'CBD5E1',
-    headingFont: titleStyle?.font || headingStyle?.font || null,
-    bodyFont: bodyStyle?.font || subtitleStyle?.font || null,
-    titleFontSize: titleStyle?.size || 36,
-    headingFontSize: headingStyle?.size || titleStyle?.size || 22,
-    subtitleFontSize: subtitleStyle?.size || 18,
-    bodyFontSize: bodyStyle?.size || 14,
-    titleBold: titleStyle?.bold !== false,
-    headerBand: headerBand
-      ? { x: headerBand.x, y: headerBand.y, w: headerBand.w, h: headerBand.h, color: headerBand.color || bgDark }
-      : { x: 0, y: 0, w: 10, h: 0.88, color: bgDark },
-    accentShapes: decorative,
-    contentBackgroundSolid: bgLight,
-    titleBackgroundSolid: (!isLightHex(bgDark) ? bgDark : null),
-  };
-}
-
-async function hydrateBackground(bg, rels, zip, partPath) {
-  if (!bg) return null;
-  if (bg.type === 'solid') return bg;
-  if (bg.type === 'image' && bg.embedId) {
-    const target = rels[bg.embedId];
-    if (!target) return null;
-    const partDir = partPath.split('/').slice(0, -1).join('/');
-    const resolved = resolveZipPath(`${partDir}/file.xml`, target);
-    const data = await readMediaAsDataUrl(zip, resolved);
-    if (data) return { type: 'image', data };
+    const size = halfPointsToPt((rPr.match(/\bsz\s*=\s*"(\d+)"/i) || [])[1]);
+    const bold = /\bb\s*=\s*"(?:1|true)"/i.test(rPr);
+    const font = (rPr.match(/latin[^>]*\btypeface\s*=\s*"([^"]+)"/i) || [])[1] || null;
+    const color = extractFillColor(rPr, colors);
+    const text = ((run.match(/<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/i) || [])[1] || '').replace(/<[^>]+>/g, '').trim();
+    if (size || color || font) return { size, bold, font, color, sampleLen: text.length };
   }
   return null;
 }
 
-async function hydratePics(pics, rels, zip, partPath) {
-  const partDir = partPath.split('/').slice(0, -1).join('/');
-  const out = [];
-  for (const pic of pics) {
-    const target = rels[pic.embedId];
-    if (!target) continue;
-    const resolved = resolveZipPath(`${partDir}/file.xml`, target);
-    const data = await readMediaAsDataUrl(zip, resolved);
-    if (!data) continue;
-    out.push({ data, x: pic.x, y: pic.y, w: pic.w, h: pic.h });
-  }
-  return out;
+function collectParagraphTexts(block) {
+  const paras = [...block.matchAll(/<(?:\w+:)?p\b[^>]*>[\s\S]*?<\/(?:\w+:)?p>/gi)].map((m) => m[0]);
+  return paras.map((p) => {
+    const parts = [...p.matchAll(/<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/gi)].map((m) => m[1].replace(/<[^>]+>/g, ''));
+    return parts.join('').trim();
+  }).filter(Boolean);
 }
 
 /**
- * Extract design from theme + slide masters/layouts + completed slides.
- * Completed-slide fills/text win over grey theme scheme defaults.
+ * Build a full visual blueprint from the uploaded slide — every filled shape,
+ * text slot (with live font/size/colour/position), background, and pictures.
+ * Template wording is ignored; styles and layout are kept.
  */
 export async function extractPptxThemeFromArrayBuffer(arrayBuffer, fileName = null) {
   const zip = await JSZip.loadAsync(arrayBuffer);
   const files = zip.files;
 
-  const themePath = Object.keys(files).filter((n) => !files[n].dir).find((n) => /^ppt\/theme\/theme\d+\.xml$/i.test(n));
-  const colors = {};
-  let fonts = { heading: 'Calibri', body: 'Calibri' };
-  let schemeName = 'Custom';
-  let themeXml = '';
+  let slideWidth = 10;
+  let slideHeight = 5.625;
+  const presPath = Object.keys(files).find((n) => /^ppt\/presentation\.xml$/i.test(n));
+  if (presPath) {
+    const presXml = await zip.file(presPath).async('text');
+    const cx = Number((presXml.match(/<(?:\w+:)?sldSz[^>]*\bcx\s*=\s*"(\d+)"/i) || [])[1]);
+    const cy = Number((presXml.match(/<(?:\w+:)?sldSz[^>]*\bcy\s*=\s*"(\d+)"/i) || [])[1]);
+    if (cx > 0 && cy > 0) {
+      slideWidth = Math.round((cx / EMU_PER_INCH) * 1000) / 1000;
+      slideHeight = Math.round((cy / EMU_PER_INCH) * 1000) / 1000;
+    }
+  }
 
+  const colors = {};
+  let fonts = { heading: null, body: null };
+  let schemeName = 'Custom';
+  const themePath = Object.keys(files).find((n) => /^ppt\/theme\/theme\d+\.xml$/i.test(n));
   if (themePath) {
-    themeXml = await zip.file(themePath).async('text');
+    const themeXml = await zip.file(themePath).async('text');
     for (const slot of ['dk1', 'lt1', 'dk2', 'lt2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6']) {
       const hex = extractSlotColor(themeXml, slot);
       if (hex) colors[slot] = hex;
     }
     fonts = {
-      heading: extractLatinFont(themeXml, 'majorFont') || 'Calibri',
-      body: extractLatinFont(themeXml, 'minorFont') || extractLatinFont(themeXml, 'majorFont') || 'Calibri',
+      heading: extractLatinFont(themeXml, 'majorFont'),
+      body: extractLatinFont(themeXml, 'minorFont'),
     };
     schemeName = extractSchemeName(themeXml) || 'Custom';
   }
 
-  const readPart = async (path) => {
-    if (!path || !zip.file(path)) return { xml: '', rels: {}, path };
-    const xml = await zip.file(path).async('text');
-    const relsPath = path.replace(/([^/]+)$/, '_rels/$1.rels');
-    const relsXml = zip.file(relsPath) ? await zip.file(relsPath).async('text') : '';
-    return { xml, rels: parseRels(relsXml), path };
-  };
-
   const slidePaths = Object.keys(files)
     .filter((n) => /^ppt\/slides\/slide\d+\.xml$/i.test(n))
-    .sort((a, b) => {
-      const na = Number((a.match(/slide(\d+)/i) || [])[1] || 0);
-      const nb = Number((b.match(/slide(\d+)/i) || [])[1] || 0);
-      return na - nb;
-    })
-    .slice(0, 8); // sample first slides — enough for design language
+    .sort((a, b) => Number((a.match(/slide(\d+)/i) || [])[1] || 0) - Number((b.match(/slide(\d+)/i) || [])[1] || 0));
 
-  const masterPath = Object.keys(files).find((n) => /^ppt\/slideMasters\/slideMaster\d+\.xml$/i.test(n));
-  const layoutPaths = Object.keys(files).filter((n) => /^ppt\/slideLayouts\/slideLayout\d+\.xml$/i.test(n)).slice(0, 4);
+  if (!slidePaths.length) throw new Error('No slides found in this PowerPoint');
 
-  const parts = [];
-  for (const p of [masterPath, ...layoutPaths, ...slidePaths].filter(Boolean)) {
-    parts.push(await readPart(p));
+  const designSlidePath = slidePaths[0];
+  const slideXml = await zip.file(designSlidePath).async('text');
+  const relsPath = designSlidePath.replace(/([^/]+)$/, '_rels/$1.rels');
+  const rels = parseRels(zip.file(relsPath) ? await zip.file(relsPath).async('text') : '');
+  const partDir = designSlidePath.split('/').slice(0, -1).join('/');
+
+  let backgroundImage = null;
+  const bgBlock = slideXml.match(/<(?:\w+:)?bg\b[^>]*>([\s\S]*?)<\/(?:\w+:)?bg>/i)?.[1] || '';
+  const bgEmbed = (bgBlock.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i) || [])[1];
+  if (bgEmbed && rels[bgEmbed]) {
+    const mediaPath = resolveZipPath(`${partDir}/file.xml`, rels[bgEmbed]);
+    backgroundImage = await readMediaAsDataUrl(zip, mediaPath);
   }
 
-  if (!parts.length) throw new Error('No slides or masters found in this PowerPoint');
+  const chromeShapes = [];
+  const textSlots = [];
+  const shapes = [...slideXml.matchAll(/<(?:\w+:)?sp\b[^>]*>[\s\S]*?<\/(?:\w+:)?sp>/gi)].map((m) => m[0]);
 
-  const analyses = parts.map((p) => analyzeSlideXml(p.xml, colors));
-  // Prefer completed slides for inference (last N parts that are slides)
-  const slideAnalyses = [];
-  for (let i = 0; i < parts.length; i++) {
-    if (/\/slides\/slide\d+\.xml$/i.test(parts[i].path)) slideAnalyses.push(analyses[i]);
-  }
-  const inferSource = slideAnalyses.length ? slideAnalyses : analyses;
-  const inferred = inferDesignFromAnalyses(inferSource, colors);
+  for (const block of shapes) {
+    const geom = shapeGeom(block);
+    if (geom.w <= 0 || geom.h <= 0) continue;
+    const spPr = block.match(/<(?:\w+:)?spPr\b[\s\S]*?<\/(?:\w+:)?spPr>/i)?.[0] || '';
+    const preset = shapePreset(block);
+    const hasNoFill = /<(?:\w+:)?noFill\b/i.test(spPr);
+    const fill = !hasNoFill && /solidFill/i.test(spPr) ? extractFillColor(spPr, colors) : null;
+    const alpha = !hasNoFill ? extractFillAlpha(spPr) : null;
+    const transparency = alpha != null ? alphaToTransparency(alpha) : 0;
+    const style = firstRunStyle(block, colors);
+    const paras = collectParagraphTexts(block);
 
-  // Logos from master + layouts + first slides
-  const logos = [];
-  const seen = new Set();
-  for (let i = 0; i < parts.length; i++) {
-    const hydrated = await hydratePics(analyses[i].pics, parts[i].rels, zip, parts[i].path);
-    for (const logo of hydrated) {
-      const key = `${logo.x.toFixed(2)}_${logo.y.toFixed(2)}_${logo.w.toFixed(2)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      logos.push(logo);
+    if (fill) {
+      chromeShapes.push({
+        kind: 'shape',
+        preset,
+        ...geom,
+        fill,
+        transparency,
+      });
+    }
+
+    if (style && (paras.length || style.size)) {
+      textSlots.push({
+        kind: 'text',
+        ...geom,
+        style: {
+          fontSize: style.size,
+          bold: !!style.bold,
+          fontFace: style.font || null,
+          color: style.color || null,
+        },
+        paragraphCount: Math.max(1, paras.length),
+        // sample text length only — never used as export content
+        _sampleLen: paras.join(' ').length,
+      });
     }
   }
 
-  // Backgrounds: prefer image from first title-ish slide / master, else inferred solid
-  let titleBackground = null;
-  let contentBackground = null;
-  for (let i = 0; i < parts.length; i++) {
-    const bg = analyses[i].background;
-    if (!bg) continue;
-    const hydrated = await hydrateBackground(bg, parts[i].rels, zip, parts[i].path);
-    if (!hydrated) continue;
-    if (!titleBackground) titleBackground = hydrated;
-    contentBackground = hydrated;
+  // Pictures on the design slide (icons / logos) — keep positions for visual match
+  const pictures = [];
+  const picBlocks = [...slideXml.matchAll(/<(?:\w+:)?pic\b[^>]*>[\s\S]*?<\/(?:\w+:)?pic>/gi)].map((m) => m[0]);
+  for (const block of picBlocks) {
+    const embed = (block.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i) || [])[1];
+    if (!embed || !rels[embed] || embed === bgEmbed) continue;
+    const geom = shapeGeom(block);
+    if (geom.w >= slideWidth * 0.85 && geom.h >= slideHeight * 0.85) continue;
+    if (geom.w < 0.1 || geom.h < 0.1) continue;
+    const mediaPath = resolveZipPath(`${partDir}/file.xml`, rels[embed]);
+    const data = await readMediaAsDataUrl(zip, mediaPath);
+    if (!data) continue;
+    pictures.push({ kind: 'picture', data, ...geom });
   }
-  if (!titleBackground && inferred.titleBackgroundSolid) {
-    titleBackground = { type: 'solid', color: inferred.titleBackgroundSolid };
+
+  // Classify text slots from geometry + relative size (not from wording)
+  const slotsBySize = [...textSlots].sort((a, b) => (b.style.fontSize || 0) - (a.style.fontSize || 0));
+  const titleSlot = slotsBySize.find((s) => s.y < slideHeight * 0.28 && (s.style.fontSize || 0) >= 18)
+    || slotsBySize[0]
+    || null;
+  const subtitleSlot = textSlots
+    .filter((s) => s !== titleSlot && s.y < slideHeight * 0.35 && s.w > slideWidth * 0.4)
+    .sort((a, b) => a.y - b.y)[0]
+    || null;
+
+  const contentSlots = textSlots
+    .filter((s) => s !== titleSlot && s !== subtitleSlot && s.y >= slideHeight * 0.28)
+    .sort((a, b) => (a.x - b.x) || (a.y - b.y));
+
+  // Pair card title (higher, shorter) with card body (lower, taller) into columns
+  const cardColumns = [];
+  const used = new Set();
+  const titleLike = contentSlots.filter((s) => s.h <= 1.2 && (s.style.fontSize || 0) >= 12);
+  const bodyLike = contentSlots.filter((s) => s.h > 1.2 || (s.paragraphCount || 1) >= 2);
+  for (const t of titleLike) {
+    if (used.has(t)) continue;
+    const body = bodyLike.find((b) => !used.has(b) && Math.abs(b.x - t.x) < 0.6 && b.y > t.y);
+    used.add(t);
+    if (body) used.add(body);
+    cardColumns.push({ title: t, body: body || null });
   }
-  if (!contentBackground) {
-    contentBackground = { type: 'solid', color: inferred.contentBackgroundSolid || inferred.bgLight };
+  for (const b of bodyLike) {
+    if (used.has(b)) continue;
+    used.add(b);
+    cardColumns.push({ title: null, body: b });
   }
+  // leftover short content slots
+  for (const s of contentSlots) {
+    if (used.has(s)) continue;
+    used.add(s);
+    cardColumns.push({ title: s, body: null });
+  }
+  cardColumns.sort((a, b) => {
+    const ax = a.title?.x ?? a.body?.x ?? 0;
+    const bx = b.title?.x ?? b.body?.x ?? 0;
+    return ax - bx;
+  });
+
+  const panelShapes = chromeShapes
+    .filter((s) => s.area > 1.5 && s.w < slideWidth * 0.95)
+    .sort((a, b) => a.x - b.x || a.y - b.y);
+
+  const brandCandidates = [colors.accent1, colors.accent5, colors.dk2, ...chromeShapes.map((s) => s.fill)]
+    .map(normalizeHex)
+    .filter((c) => c && !isNearGrey(c) && !isLightHex(c));
+  brandCandidates.sort((a, b) => colourScore(b) - colourScore(a));
+
+  const titleStyle = titleSlot?.style || {};
+  const subtitleStyle = subtitleSlot?.style || {};
+  const cardTitleStyle = cardColumns.find((c) => c.title)?.title?.style || {};
+  const cardBodyStyle = cardColumns.find((c) => c.body)?.body?.style || {};
+  const panel = panelShapes[0];
+
+  const contentTextLight = !!(
+    (cardBodyStyle.color && isLightHex(cardBodyStyle.color))
+    || (cardTitleStyle.color && isLightHex(cardTitleStyle.color))
+    || (panel && panel.transparency >= 50)
+  );
+
+  const blueprint = {
+    slideWidth,
+    slideHeight,
+    backgroundImage,
+    chromeShapes,
+    pictures,
+    titleSlot,
+    subtitleSlot,
+    cardColumns,
+    panelShapes,
+  };
 
   return {
     schemeName,
     colors,
     fonts: {
-      heading: inferred.headingFont || fonts.heading,
-      body: inferred.bodyFont || fonts.body,
+      heading: titleStyle.fontFace || fonts.heading,
+      body: cardBodyStyle.fontFace || subtitleStyle.fontFace || fonts.body,
+      cardHeading: cardTitleStyle.fontFace || titleStyle.fontFace || fonts.heading,
     },
     typography: {
-      titleFontSize: inferred.titleFontSize,
-      headingFontSize: inferred.headingFontSize,
-      subtitleFontSize: inferred.subtitleFontSize,
-      bodyFontSize: inferred.bodyFontSize,
-      titleBold: inferred.titleBold,
-      titleColor: inferred.textOnDark,
-      bodyColor: inferred.textOnLight,
+      titleFontSize: titleStyle.fontSize || null,
+      subtitleFontSize: subtitleStyle.fontSize || null,
+      bodyFontSize: cardBodyStyle.fontSize || null,
+      cardTitleFontSize: cardTitleStyle.fontSize || null,
+      cardBodyFontSize: cardBodyStyle.fontSize || null,
+      titleBold: titleStyle.bold !== false,
+      titleColor: titleStyle.color || null,
+      subtitleColor: subtitleStyle.color || null,
+      bodyColor: cardBodyStyle.color || null,
+      cardTitleColor: cardTitleStyle.color || null,
     },
-    inferred,
-    titleBackground,
-    contentBackground,
-    logos: logos.slice(0, 10),
-    accentShapes: inferred.accentShapes,
-    headerBand: inferred.headerBand,
+    slideWidth,
+    slideHeight,
+    backgroundImage,
+    logos: pictures.filter((p) => {
+      const inCorner = (p.x < slideWidth * 0.12 || p.x + p.w > slideWidth * 0.88)
+        && (p.y < slideHeight * 0.15 || p.y + p.h > slideHeight * 0.85);
+      return inCorner;
+    }),
+    blueprint,
+    palette: {
+      bgDark: brandCandidates[0] || colors.accent1 || null,
+      accent: colors.accent1 || brandCandidates[0] || null,
+      subtitleColor: subtitleStyle.color || null,
+      cardFill: panel?.fill || null,
+      cardTransparency: panel?.transparency || 0,
+      contentTextLight,
+      textOnDark: titleStyle.color || null,
+      textOnLight: cardBodyStyle.color || null,
+    },
     sourceFileName: fileName || null,
     extractedAt: new Date().toISOString(),
     sampledSlides: slidePaths.length,
@@ -589,79 +496,76 @@ export async function extractPptxThemeFromFile(file) {
   return extractPptxThemeFromArrayBuffer(buf, file.name);
 }
 
-/** Lightweight metadata for settings.json (no large base64 blobs). */
 export function themeToSettingsMeta(extracted) {
   if (!extracted) return null;
+  // Persist styles/layout metadata only — binary assets reload from storage on export
+  const bp = extracted.blueprint;
   return {
     schemeName: extracted.schemeName,
     colors: extracted.colors,
     fonts: extracted.fonts,
     typography: extracted.typography,
-    inferred: extracted.inferred
-      ? {
-          bgDark: extracted.inferred.bgDark,
-          bgLight: extracted.inferred.bgLight,
-          accent: extracted.inferred.accent,
-          textOnDark: extracted.inferred.textOnDark,
-          textOnLight: extracted.inferred.textOnLight,
-          titleFontSize: extracted.inferred.titleFontSize,
-          headingFontSize: extracted.inferred.headingFontSize,
-          bodyFontSize: extracted.inferred.bodyFontSize,
-          subtitleFontSize: extracted.inferred.subtitleFontSize,
-        }
-      : null,
+    slideWidth: extracted.slideWidth,
+    slideHeight: extracted.slideHeight,
+    palette: extracted.palette,
     logoCount: Array.isArray(extracted.logos) ? extracted.logos.length : 0,
+    hasBackgroundImage: !!extracted.backgroundImage,
+    blueprintMeta: bp ? {
+      chromeShapeCount: bp.chromeShapes?.length || 0,
+      pictureCount: bp.pictures?.length || 0,
+      cardColumnCount: bp.cardColumns?.length || 0,
+      hasTitleSlot: !!bp.titleSlot,
+      hasSubtitleSlot: !!bp.subtitleSlot,
+    } : null,
     sampledSlides: extracted.sampledSlides || 0,
-    hasTitleBackgroundImage: extracted.titleBackground?.type === 'image',
-    hasContentBackgroundImage: extracted.contentBackground?.type === 'image',
     sourceFileName: extracted.sourceFileName,
     extractedAt: extracted.extractedAt,
   };
 }
 
 export function resolvePptxGeneratorTheme(extracted) {
-  if (!extracted) return { ...DEFAULT_PPTX_GENERATOR_THEME };
-
-  const inf = extracted.inferred || {};
-  const typo = extracted.typography || {};
-  const c = extracted.colors || {};
-
-  // Prefer slide-inferred palette — avoids grey theme scheme colours
-  const bgDark = normalizeHex(inf.bgDark) || normalizeHex(c.accent1) || normalizeHex(c.dk2) || DEFAULT_PPTX_GENERATOR_THEME.bgDark;
-  const bgLight = normalizeHex(inf.bgLight) || normalizeHex(c.lt1) || DEFAULT_PPTX_GENERATOR_THEME.bgLight;
-  const accent = normalizeHex(inf.accent) || normalizeHex(c.accent1) || DEFAULT_PPTX_GENERATOR_THEME.accent;
-
+  if (!extracted?.blueprint && !extracted?.palette && !extracted?.colors) {
+    return { ...DEFAULT_PPTX_GENERATOR_THEME };
+  }
+  // Template path: values come from the upload only (nulls stay null — renderer uses slot styles)
+  const p = extracted.palette || {};
+  const t = extracted.typography || {};
+  const f = extracted.fonts || {};
   return {
-    bgDark,
-    bgLight,
-    accent,
-    textOnDark: normalizeHex(inf.textOnDark) || normalizeHex(typo.titleColor) || DEFAULT_PPTX_GENERATOR_THEME.textOnDark,
-    textOnDarkMuted: normalizeHex(inf.textOnDarkMuted) || DEFAULT_PPTX_GENERATOR_THEME.textOnDarkMuted,
-    textOnLight: normalizeHex(inf.textOnLight) || normalizeHex(typo.bodyColor) || DEFAULT_PPTX_GENERATOR_THEME.textOnLight,
-    textMuted: normalizeHex(inf.textMuted) || DEFAULT_PPTX_GENERATOR_THEME.textMuted,
-    border: normalizeHex(inf.border) || c.lt2 || DEFAULT_PPTX_GENERATOR_THEME.border,
-    headingFont: extracted.fonts?.heading || DEFAULT_PPTX_GENERATOR_THEME.headingFont,
-    bodyFont: extracted.fonts?.body || DEFAULT_PPTX_GENERATOR_THEME.bodyFont,
-    titleFontSize: typo.titleFontSize || inf.titleFontSize || DEFAULT_PPTX_GENERATOR_THEME.titleFontSize,
-    headingFontSize: typo.headingFontSize || inf.headingFontSize || DEFAULT_PPTX_GENERATOR_THEME.headingFontSize,
-    subtitleFontSize: typo.subtitleFontSize || inf.subtitleFontSize || DEFAULT_PPTX_GENERATOR_THEME.subtitleFontSize,
-    bodyFontSize: typo.bodyFontSize || inf.bodyFontSize || DEFAULT_PPTX_GENERATOR_THEME.bodyFontSize,
-    titleBold: typo.titleBold !== false,
-    headingBold: true,
+    slideWidth: extracted.slideWidth,
+    slideHeight: extracted.slideHeight,
+    bgDark: normalizeHex(p.bgDark),
+    bgLight: normalizeHex(p.cardFill),
+    accent: normalizeHex(p.accent),
+    subtitleColor: normalizeHex(p.subtitleColor) || normalizeHex(t.subtitleColor),
+    cardFill: normalizeHex(p.cardFill),
+    cardTransparency: Number(p.cardTransparency) || 0,
+    contentTextLight: !!p.contentTextLight,
+    textOnDark: normalizeHex(p.textOnDark) || normalizeHex(t.titleColor),
+    textOnLight: normalizeHex(p.textOnLight) || normalizeHex(t.bodyColor),
+    textMuted: normalizeHex(p.subtitleColor),
+    border: normalizeHex(extracted.colors?.lt2),
+    headingFont: f.heading || null,
+    bodyFont: f.body || null,
+    cardHeadingFont: f.cardHeading || null,
+    titleFontSize: t.titleFontSize || null,
+    subtitleFontSize: t.subtitleFontSize || null,
+    bodyFontSize: t.bodyFontSize || null,
+    cardTitleFontSize: t.cardTitleFontSize || null,
+    cardBodyFontSize: t.cardBodyFontSize || null,
+    titleBold: t.titleBold !== false,
     schemeName: extracted.schemeName || 'Custom',
     sourceFileName: extracted.sourceFileName || null,
-    titleBackground: extracted.titleBackground || (inf.titleBackgroundSolid ? { type: 'solid', color: inf.titleBackgroundSolid } : null),
-    contentBackground: extracted.contentBackground || { type: 'solid', color: bgLight },
+    backgroundImage: extracted.backgroundImage || null,
     logos: Array.isArray(extracted.logos) ? extracted.logos : [],
-    accentShapes: Array.isArray(extracted.accentShapes) ? extracted.accentShapes : (inf.accentShapes || []),
-    headerBand: extracted.headerBand || inf.headerBand || DEFAULT_PPTX_GENERATOR_THEME.headerBand,
+    blueprint: extracted.blueprint || null,
     useDefaultChrome: false,
   };
 }
 
 export function getPptxGeneratorThemeFromUserSettings(userSettings) {
   const tpl = userSettings?.pptxTemplate;
-  if (tpl?.theme?.inferred || tpl?.theme?.colors) {
+  if (tpl?.theme?.palette || tpl?.theme?.colors || tpl?.theme?.blueprintMeta) {
     return resolvePptxGeneratorTheme(tpl.theme);
   }
   return { ...DEFAULT_PPTX_GENERATOR_THEME };
@@ -685,83 +589,337 @@ export async function loadFullPptxStyleForGeneration(userSettings, supabaseClien
   }
 }
 
-/** Apply template background, header band, accent shapes, and logos. */
-export function applyTemplateChrome(pptx, slide, theme, { variant = 'content' } = {}) {
-  const bg = variant === 'title'
-    ? (theme.titleBackground || theme.contentBackground)
-    : (theme.contentBackground || theme.titleBackground);
-
-  if (bg?.type === 'image' && bg.data) {
-    try { slide.background = { data: bg.data }; }
-    catch { slide.background = { color: variant === 'title' ? theme.bgDark : theme.bgLight }; }
-  } else if (bg?.type === 'solid' && bg.color) {
-    slide.background = { color: bg.color };
-  } else {
-    slide.background = { color: variant === 'title' ? theme.bgDark : theme.bgLight };
-  }
-
-  // Title slides: fill with brand colour when we inferred a dark brand bg
-  if (variant === 'title' && theme.bgDark && !(bg?.type === 'image')) {
-    slide.background = { color: theme.bgDark };
-  }
-
-  for (const shape of theme.accentShapes || []) {
+function applyBackground(slide, theme) {
+  if (theme.backgroundImage) {
     try {
-      slide.addShape(pptx.shapes.RECTANGLE, {
-        x: shape.x, y: shape.y, w: shape.w, h: shape.h,
-        fill: { color: shape.color },
-        line: { color: shape.color },
-      });
-    } catch { /* skip */ }
+      slide.background = { data: theme.backgroundImage };
+      return;
+    } catch { /* fall through */ }
   }
+  if (theme.bgDark) slide.background = { color: theme.bgDark };
+  else if (theme.bgLight) slide.background = { color: theme.bgLight };
+}
 
-  for (const logo of theme.logos || []) {
+function fillFromShape(shape) {
+  if (!shape?.fill) return { type: 'none' };
+  if (shape.transparency > 0) return { color: shape.fill, transparency: shape.transparency };
+  return { color: shape.fill };
+}
+
+function styleOpts(style = {}, fallback = {}) {
+  return {
+    fontSize: style?.fontSize || fallback.fontSize || null,
+    bold: style?.bold ?? fallback.bold ?? false,
+    color: style?.color || fallback.color || null,
+    fontFace: style?.fontFace || fallback.fontFace || null,
+  };
+}
+
+function paintBlueprintChrome(pptx, slide, blueprint) {
+  if (!blueprint) return;
+  for (const shape of blueprint.chromeShapes || []) {
+    slide.addShape(pptxShapeName(pptx, shape.preset), {
+      x: shape.x,
+      y: shape.y,
+      w: shape.w,
+      h: shape.h,
+      fill: fillFromShape(shape),
+      line: { color: shape.fill, transparency: Math.min(100, (shape.transparency || 0) + 5) },
+      rectRadius: String(shape.preset || '').includes('round') ? 0.06 : 0,
+    });
+  }
+  for (const pic of blueprint.pictures || []) {
     try {
-      slide.addImage({ data: logo.data, x: logo.x, y: logo.y, w: logo.w, h: logo.h });
+      slide.addImage({ data: pic.data, x: pic.x, y: pic.y, w: pic.w, h: pic.h });
     } catch { /* skip */ }
   }
 }
 
-/** Draw content-slide header using inferred band colour (blue etc.), not grey defaults. */
-export function applyContentHeader(pptx, slide, theme, titleText) {
-  const band = theme.headerBand || { x: 0, y: 0, w: 10, h: 0.88, color: theme.bgDark };
-  const fill = band.color || theme.bgDark;
-  const hasBgImage = theme.contentBackground?.type === 'image';
+function splitBullet(text) {
+  const s = String(text || '').trim();
+  const colon = s.indexOf(':');
+  if (colon > 0 && colon < 48) {
+    return { heading: s.slice(0, colon).trim(), body: s.slice(colon + 1).trim() };
+  }
+  return { heading: null, body: s };
+}
 
-  if (!hasBgImage) {
-    slide.addShape(pptx.shapes.RECTANGLE, {
-      x: band.x ?? 0,
-      y: band.y ?? 0,
-      w: band.w ?? 10,
-      h: Math.max(0.55, band.h ?? 0.88),
-      fill: { color: fill },
-      line: { color: fill },
+/**
+ * Render one slide by replaying the uploaded slide blueprint and filling its text slots.
+ * When no blueprint exists, falls back to the ComEx default chrome only.
+ */
+export function renderSlideFromTheme(pptx, theme, slide, idx = 0) {
+  if (theme?.blueprint && !theme.useDefaultChrome) {
+    return renderFromBlueprint(pptx, theme, slide, idx);
+  }
+  return renderDefaultSlide(pptx, theme || DEFAULT_PPTX_GENERATOR_THEME, slide, idx);
+}
+
+function renderFromBlueprint(pptx, theme, slide, idx) {
+  const bp = theme.blueprint;
+  const s = pptx.addSlide();
+  applyBackground(s, theme);
+  paintBlueprintChrome(pptx, s, bp);
+
+  const title = slide.title || (idx === 0 ? '' : `Slide ${idx + 1}`);
+  const subtitle = slide.subtitle || '';
+  const bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
+  const dataPoints = Array.isArray(slide.dataPoints) ? slide.dataPoints : [];
+  const body = slide.body ? String(slide.body) : '';
+  const table = slide.tableData;
+
+  if (bp.titleSlot && title) {
+    const st = styleOpts(bp.titleSlot.style, { fontSize: theme.titleFontSize, color: theme.textOnDark, fontFace: theme.headingFont, bold: true });
+    s.addText(title, {
+      x: bp.titleSlot.x, y: bp.titleSlot.y, w: bp.titleSlot.w, h: bp.titleSlot.h,
+      fontSize: st.fontSize, bold: st.bold, color: st.color, fontFace: st.fontFace,
+      align: 'left', valign: 'middle',
     });
-    if (theme.accent && theme.accent !== fill) {
-      slide.addShape(pptx.shapes.RECTANGLE, {
-        x: 0,
-        y: (band.y ?? 0) + Math.max(0.55, band.h ?? 0.88),
-        w: 10,
-        h: 0.05,
-        fill: { color: theme.accent },
-        line: { color: theme.accent },
+  }
+
+  if (bp.subtitleSlot && subtitle) {
+    const st = styleOpts(bp.subtitleSlot.style, { fontSize: theme.subtitleFontSize, color: theme.subtitleColor, fontFace: theme.bodyFont });
+    s.addText(String(subtitle), {
+      x: bp.subtitleSlot.x, y: bp.subtitleSlot.y, w: bp.subtitleSlot.w, h: bp.subtitleSlot.h,
+      fontSize: st.fontSize, bold: st.bold, color: st.color, fontFace: st.fontFace,
+      align: 'left', valign: 'middle',
+    });
+  }
+
+  const columns = bp.cardColumns || [];
+  const hasTable = table && Array.isArray(table.headers) && Array.isArray(table.rows) && table.headers.length;
+
+  // Build content units for columns: prefer structured bullets, else body / data points
+  let units = [];
+  if (bullets.length) {
+    units = bullets.map((b) => splitBullet(b));
+  } else if (dataPoints.length) {
+    units = dataPoints.map((dp) => ({
+      heading: dp.label || null,
+      body: `${dp.value || ''}${dp.context ? ` (${dp.context})` : ''}`.trim(),
+    }));
+  } else if (body) {
+    units = [{ heading: null, body }];
+  }
+
+  if (hasTable && columns.length) {
+    // Use first column body area (or span of panels) for the table — styles from template body/accent
+    const first = columns[0];
+    const last = columns[columns.length - 1];
+    const x = first.title?.x ?? first.body?.x ?? bp.panelShapes?.[0]?.x ?? 0.5;
+    const y = first.title?.y ?? first.body?.y ?? bp.panelShapes?.[0]?.y ?? 1.8;
+    const right = (last.body || last.title || bp.panelShapes?.[bp.panelShapes.length - 1] || { x: x + 4, w: 4 });
+    const w = Math.max(2, (right.x + right.w) - x);
+    const bodyStyle = styleOpts(first.body?.style || first.title?.style, {
+      fontSize: theme.bodyFontSize,
+      color: theme.textOnLight,
+      fontFace: theme.bodyFont,
+    });
+    const headerFill = theme.accent || theme.bgDark;
+    const colCount = table.headers.length;
+    const colW = w / colCount;
+    const headerRow = table.headers.map((h) => ({
+      text: String(h ?? ''),
+      options: {
+        bold: true,
+        color: theme.textOnDark || bodyStyle.color,
+        fill: headerFill ? { color: headerFill } : undefined,
+        align: 'center',
+        valign: 'middle',
+      },
+    }));
+    const bodyRows = table.rows.slice(0, 10).map((row) => {
+      const cells = Array.isArray(row) ? row : [row];
+      return Array.from({ length: colCount }, (_, i) => ({
+        text: String(cells[i] ?? ''),
+        options: { color: bodyStyle.color, align: 'left', valign: 'middle' },
+      }));
+    });
+    // Optional intro body above table in title row of first column
+    if (body && first.title) {
+      const ts = styleOpts(first.title.style, { fontSize: theme.cardTitleFontSize, color: theme.textOnLight, fontFace: theme.cardHeadingFont, bold: true });
+      s.addText(body, {
+        x: first.title.x, y: first.title.y, w: w, h: first.title.h,
+        fontSize: ts.fontSize, bold: ts.bold, color: ts.color, fontFace: ts.fontFace, valign: 'middle',
       });
     }
+    s.addTable([headerRow, ...bodyRows], {
+      x,
+      y: y + (first.title ? first.title.h + 0.1 : 0),
+      w,
+      colW: Array(colCount).fill(colW),
+      fontFace: bodyStyle.fontFace,
+      fontSize: bodyStyle.fontSize,
+      color: bodyStyle.color,
+      border: [
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
+      ],
+    });
+  } else if (columns.length && units.length) {
+    const n = Math.min(columns.length, units.length);
+    for (let i = 0; i < n; i++) {
+      const col = columns[i];
+      const unit = units[i];
+      const titleStyle = styleOpts(col.title?.style, {
+        fontSize: theme.cardTitleFontSize,
+        color: theme.textOnLight,
+        fontFace: theme.cardHeadingFont,
+        bold: true,
+      });
+      const bodyStyle = styleOpts(col.body?.style, {
+        fontSize: theme.cardBodyFontSize || theme.bodyFontSize,
+        color: theme.textOnLight,
+        fontFace: theme.bodyFont,
+      });
+
+      const heading = unit.heading || null;
+      const bodyText = unit.body || '';
+
+      if (col.title) {
+        s.addText(heading || `Point ${i + 1}`, {
+          x: col.title.x, y: col.title.y, w: col.title.w, h: col.title.h,
+          fontSize: titleStyle.fontSize, bold: true, color: titleStyle.color, fontFace: titleStyle.fontFace, valign: 'top',
+        });
+      }
+
+      if (col.body) {
+        const textForBody = col.title
+          ? bodyText
+          : (heading && bodyText ? `${heading}: ${bodyText}` : (bodyText || heading || ''));
+        if (!textForBody) continue;
+        const lines = String(textForBody).split(/\n+/).map((l) => l.trim()).filter(Boolean);
+        const use = lines.slice(0, Math.max(1, col.body.paragraphCount || 6));
+        s.addText(use.map((line, li) => ({
+          text: String(line),
+          options: {
+            bullet: use.length > 1,
+            breakLine: li < use.length - 1,
+            fontSize: bodyStyle.fontSize,
+            color: bodyStyle.color,
+            fontFace: bodyStyle.fontFace,
+            paraSpaceAfter: 6,
+          },
+        })), {
+          x: col.body.x, y: col.body.y, w: col.body.w, h: col.body.h,
+          valign: 'top',
+        });
+      }
+    }
+
+    if (units.length > columns.length && columns.length) {
+      const last = columns[columns.length - 1];
+      const slot = last.body || last.title;
+      if (slot) {
+        const st = styleOpts(slot.style, { fontSize: theme.bodyFontSize, color: theme.textOnLight, fontFace: theme.bodyFont });
+        const extra = units.slice(columns.length).map((u) => (u.heading ? `${u.heading}: ${u.body}` : u.body)).filter(Boolean);
+        if (extra.length) {
+          s.addText(extra.map((line, li) => ({
+            text: String(line),
+            options: { bullet: true, breakLine: li < extra.length - 1, fontSize: st.fontSize, color: st.color, fontFace: st.fontFace, paraSpaceAfter: 4 },
+          })), {
+            x: slot.x,
+            y: slot.y + slot.h * 0.55,
+            w: slot.w,
+            h: slot.h * 0.4,
+          });
+        }
+      }
+    }
+  } else if (body || bullets.length) {
+    // No card columns — write into largest text area below subtitle using subtitle/body styles from template
+    const slot = bp.subtitleSlot || bp.titleSlot;
+    const y = slot ? slot.y + slot.h + 0.3 : 1.8;
+    const st = styleOpts(bp.cardColumns?.[0]?.body?.style || bp.subtitleSlot?.style, {
+      fontSize: theme.bodyFontSize,
+      color: theme.textOnLight || theme.subtitleColor,
+      fontFace: theme.bodyFont,
+    });
+    const lines = bullets.length ? bullets : [body];
+    s.addText(lines.map((line, li) => ({
+      text: String(line),
+      options: { bullet: bullets.length > 0, breakLine: li < lines.length - 1, fontSize: st.fontSize, color: st.color, fontFace: st.fontFace, paraSpaceAfter: 6 },
+    })), {
+      x: 0.5, y, w: (bp.slideWidth || theme.slideWidth) - 1, h: (bp.slideHeight || theme.slideHeight) - y - 0.4,
+    });
   }
 
-  const titleY = hasBgImage ? 0.25 : (band.y ?? 0);
-  const titleH = hasBgImage ? 0.7 : Math.max(0.55, band.h ?? 0.88);
-  slide.addText(titleText || '', {
-    x: 0.4,
-    y: titleY,
-    w: 9.2,
-    h: titleH,
-    fontSize: theme.headingFontSize || 22,
-    bold: true,
-    color: hasBgImage ? theme.textOnDark : theme.textOnDark,
-    valign: 'middle',
-    fontFace: theme.headingFont || 'Calibri',
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
+
+/** Default ComEx chrome — only when no user template is uploaded. */
+function renderDefaultSlide(pptx, theme, slide, idx) {
+  const s = pptx.addSlide();
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  const isTitle = (slide.type === 'title') || idx === 0;
+  s.background = { color: isTitle ? theme.bgDark : theme.bgLight };
+
+  if (isTitle) {
+    s.addText(slide.title || '', {
+      x: 0.5, y: 1.8, w: W - 1, h: 1,
+      fontSize: theme.titleFontSize || 28, bold: true, color: theme.textOnDark,
+      fontFace: theme.headingFont || 'Calibri', align: 'center',
+    });
+    if (slide.subtitle) {
+      s.addText(String(slide.subtitle), {
+        x: 0.5, y: 2.9, w: W - 1, h: 0.5,
+        fontSize: theme.subtitleFontSize || 14, color: theme.subtitleColor || theme.textOnDark,
+        fontFace: theme.bodyFont || 'Calibri', align: 'center',
+      });
+    }
+    return s;
+  }
+
+  s.addShape(pptx.shapes.RECTANGLE, {
+    x: 0, y: 0, w: W, h: 0.85,
+    fill: { color: theme.bgDark }, line: { color: theme.bgDark },
+  });
+  s.addText(slide.title || `Slide ${idx + 1}`, {
+    x: 0.5, y: 0.2, w: W - 1, h: 0.5,
+    fontSize: 22, bold: true, color: theme.textOnDark, fontFace: theme.headingFont || 'Calibri', valign: 'middle',
   });
 
-  return hasBgImage ? 1.1 : ((band.y ?? 0) + Math.max(0.55, band.h ?? 0.88) + 0.15);
+  let y = 1.2;
+  const textColor = theme.textOnLight;
+  const fontBody = theme.bodyFont || 'Calibri';
+  const bodySize = theme.bodyFontSize || 14;
+
+  if (slide.body) {
+    s.addText(String(slide.body), {
+      x: 0.5, y, w: W - 1, h: 0.7, fontSize: bodySize, color: textColor, fontFace: fontBody,
+    });
+    y += 0.8;
+  }
+  if (Array.isArray(slide.bullets) && slide.bullets.length) {
+    s.addText(slide.bullets.map((b, i) => ({
+      text: String(b),
+      options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: bodySize, color: textColor, fontFace: fontBody, paraSpaceAfter: 6 },
+    })), { x: 0.5, y, w: W - 1, h: H - y - 0.4 });
+  }
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
 }
+
+/** @deprecated use renderSlideFromTheme */
+export function renderTitleSlide(pptx, theme, opts) {
+  return renderSlideFromTheme(pptx, theme, { type: 'title', ...opts }, 0);
+}
+
+/** @deprecated use renderSlideFromTheme */
+export function renderContentSlide(pptx, theme, slide, idx) {
+  return renderSlideFromTheme(pptx, theme, { type: 'content', ...slide }, idx);
+}
+
+export function applyPptxLayout(pptx, theme) {
+  const width = theme.slideWidth || DEFAULT_PPTX_GENERATOR_THEME.slideWidth;
+  const height = theme.slideHeight || DEFAULT_PPTX_GENERATOR_THEME.slideHeight;
+  pptx.defineLayout({ name: 'USER_TEMPLATE', width, height });
+  pptx.layout = 'USER_TEMPLATE';
+}
+
+export function applyTemplateChrome() { /* superseded */ }
+export function applyContentHeader() { return 1.2; }
