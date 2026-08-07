@@ -1851,7 +1851,9 @@ CRITICAL — waiting on the user:
 - Only set agentStillWorking=false when the agent has produced a substantive deliverable for this step's success criteria AND is not asking the user for more input.
 
 If agentStillWorking is true, set orchestratorMessage to "" and buttons to [].
-When agentStillWorking is false, write orchestratorMessage and 2-4 buttons (include at least one "proceed" and one "refine/revisit" path).`);
+When agentStillWorking is false, write orchestratorMessage and 2-4 buttons.
+Button "action" values MUST be exactly one of: "proceed", "refine", "redesign", "override" (never "continue", "next", or free text).
+Include at least one proceed button and one refine button.`);
 
     const contextStr = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output.substring(0, 300)}`).join('\n\n');
     const userContent = `Workflow: ${topic.name}
@@ -2024,15 +2026,56 @@ ${isFocused
     }
   };
 
+  const normalizeOrchestratorAction = (action) => {
+    const a = String(action || '').toLowerCase().trim().replace(/[\s-]+/g, '_');
+    if (['proceed', 'continue', 'next', 'advance', 'approve', 'accept', 'yes', 'ok', 'okay', 'go', 'go_ahead', 'move_on', 'confirm'].includes(a)) {
+      return 'proceed';
+    }
+    if (['override', 'force', 'ignore_risk', 'ignore'].includes(a)) return 'override';
+    if (['redesign', 'send_back', 'rollback', 'rework', 'restart'].includes(a)) return 'redesign';
+    if (['refine', 'revise', 'edit', 'update', 'custom', 'change', 'tweak', 'adjust'].includes(a)) return 'refine';
+    return a || 'proceed';
+  };
+
+  /** Map a free-text reply to an orchestrator decision action while Continue buttons are showing. */
+  const resolveOrchestratorTypedAction = (text, decision) => {
+    const t = String(text || '').trim();
+    const lower = t.toLowerCase();
+    if (/^(y|yes|yeah|yep|sure|ok|okay|continue|proceed|next|go ahead|looks good|lgtm|approve|approved|move on|sounds good)[\s.!]*$/i.test(lower)) {
+      return 'proceed';
+    }
+    for (const btn of decision?.buttons || []) {
+      const label = String(btn.label || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+      if (label && lower.includes(label)) return normalizeOrchestratorAction(btn.action);
+      const act = normalizeOrchestratorAction(btn.action);
+      if (act === 'proceed' && /\b(continue|proceed|next|approve)\b/i.test(lower) && t.length < 80) return 'proceed';
+    }
+    if (/\b(refine|revise|change|redo|redesign|update|tweak|adjust|instead)\b/i.test(lower)) return 'refine';
+    // Short affirmative-ish → advance; longer text is feedback to refine the current step
+    if (t.length <= 24) return 'proceed';
+    return 'refine';
+  };
+
   const postOrchestratorDecision = (evaluation, topic, stepIndex, updatedContext, userMessage) => {
     if (evaluation.agentStillWorking) {
       setOrchestratorDecision(null);
       return;
     }
     if (evaluation.orchestratorMessage) setMessages(prev => [...prev, { role: 'orchestrator', content: evaluation.orchestratorMessage }]);
-    const buttons = evaluation.buttons || [];
+    const buttons = (evaluation.buttons || []).map((btn) => ({
+      ...btn,
+      action: normalizeOrchestratorAction(btn.action),
+    }));
     if (buttons.length > 0) {
-      setOrchestratorDecision({ buttons, topic, stepIndex, context: updatedContext, userMessage, rerouteToStep: evaluation.rerouteToStep, rerouteBriefing: evaluation.rerouteBriefing });
+      setOrchestratorDecision({
+        buttons,
+        topic,
+        stepIndex,
+        context: updatedContext,
+        userMessage,
+        rerouteToStep: evaluation.rerouteToStep,
+        rerouteBriefing: evaluation.rerouteBriefing,
+      });
     }
   };
 
@@ -2041,23 +2084,28 @@ ${isFocused
     setIsLoading(true);
     const { topic, stepIndex, context, userMessage, rerouteToStep, rerouteBriefing } = decision;
     const effectiveInput = typedInput || userMessage;
-    if (action === 'proceed') {
-      setCurrentWorkflow(prev => prev ? { ...prev, waitingForUser: false, stepMessages: [] } : null);
+    const normalized = normalizeOrchestratorAction(action);
+    if (normalized === 'proceed') {
+      setCurrentWorkflow(prev => prev ? { ...prev, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
       await advanceToNextStep(topic, stepIndex, context, effectiveInput);
-    } else if (action === 'redesign' || action === 'send_back') {
-      const targetIdx = (rerouteToStep !== null && rerouteToStep !== undefined) ? rerouteToStep : stepIndex - 1;
+    } else if (normalized === 'redesign' || normalized === 'send_back') {
+      const targetIdx = (rerouteToStep !== null && rerouteToStep !== undefined) ? rerouteToStep : Math.max(0, stepIndex - 1);
       const targetStep = topic.workflow[targetIdx];
       const targetAgent = agents.find(a => a.id === targetStep?.agents[0]);
       setMessages(prev => [...prev, { role: 'orchestrator', content: `🔄 Routing back to **${targetStep?.name}** (${targetAgent?.name}) for rework.` }]);
-      setCurrentWorkflow(prev => prev ? { ...prev, currentStep: targetIdx, context, waitingForUser: false, stepMessages: [] } : null);
+      setCurrentWorkflow(prev => prev ? { ...prev, currentStep: targetIdx, context, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
       await runWorkflowStep(topic, targetIdx, rerouteBriefing || effectiveInput, context);
-    } else if (action === 'override') {
+    } else if (normalized === 'override') {
       setMessages(prev => [...prev, { role: 'orchestrator', content: `⚠️ Override accepted. Proceeding with noted risks.` }]);
-      setCurrentWorkflow(prev => prev ? { ...prev, waitingForUser: false, stepMessages: [] } : null);
+      setCurrentWorkflow(prev => prev ? { ...prev, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
       await advanceToNextStep(topic, stepIndex, context, effectiveInput);
     } else {
-      const briefing = typedInput || `User instruction: ${action}. Please refine your work accordingly.`;
-      setCurrentWorkflow(prev => prev ? { ...prev, currentStep: stepIndex, waitingForUser: false, stepMessages: [] } : null);
+      // refine / unknown → rework current step with the user's feedback (never silently "continue")
+      const briefing = typedInput
+        ? `User feedback on this step — revise accordingly:\n${typedInput}`
+        : `User instruction: ${action}. Please refine your work accordingly.`;
+      setMessages(prev => [...prev, { role: 'orchestrator', content: `✏️ Refining **${topic.workflow[stepIndex]?.name || 'this step'}** with your feedback.` }]);
+      setCurrentWorkflow(prev => prev ? { ...prev, currentStep: stepIndex, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
       await runWorkflowStep(topic, stepIndex, briefing, context);
     }
     setIsLoading(false);
@@ -3395,6 +3443,8 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     const messageContent = overrideInput || input.trim();
     if (!messageContent || isLoading) return;
     setInput('');
+    // Capture before clearing — needed to route Continue / typed replies correctly
+    const pendingDecision = orchestratorDecision;
     setOrchestratorDecision(null);
     setPendingButtonAction(null);
 
@@ -3427,13 +3477,19 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     if (currentWorkflow) {
       const topic = topics.find(t => t.id === currentWorkflow.topicId);
       if (topic) {
-        // Prefer answering the specialist agent when it asked clarifying questions
-        if (currentWorkflow.awaitingAgentReply || (currentWorkflow.waitingForUser && !orchestratorDecision)) {
+        // Agent still collecting answers — keep talking to that specialist
+        if (currentWorkflow.awaitingAgentReply) {
           await continueAgentWithUserReply(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []);
           return;
         }
-        if (orchestratorDecision) {
-          await handleOrchestratorAction('custom', orchestratorDecision, messageContent);
+        // Stage-complete decision pending — map typed "yes/continue" to proceed, not a silent redesign
+        if (pendingDecision) {
+          const action = resolveOrchestratorTypedAction(messageContent, pendingDecision);
+          await handleOrchestratorAction(action, pendingDecision, messageContent);
+          return;
+        }
+        if (currentWorkflow.waitingForUser) {
+          await continueAgentWithUserReply(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []);
           return;
         }
         await runWorkflowStep(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []);
