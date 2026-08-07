@@ -11,6 +11,13 @@ import {
 } from './auth';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
+import {
+  DEFAULT_SYSTEM_PROMPT,
+  PILLAR_2_KNOWLEDGE,
+  DEFAULT_INTELLIGENCE_CONTEXT,
+  mergeIntelligenceContext,
+  fillTemplate,
+} from './defaults';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -129,31 +136,35 @@ const DEFAULT_USER_SETTINGS = {
   pptxTemplate: null,
   // PowerPoint generation guidance — editable in User Settings; persisted with settings JSON
   pptxContext: { ...DEFAULT_PPTX_CONTEXT },
+  // Agents, workflows, system prompt, knowledge, Stella/runtime prompts — all editable + persisted
+  ...DEFAULT_INTELLIGENCE_CONTEXT,
 };
+
+function mergeUserSettingsFields(raw = {}) {
+  const intel = mergeIntelligenceContext(raw);
+  return {
+    ...DEFAULT_USER_SETTINGS,
+    ...raw,
+    pptxContext: mergePptxContext(raw.pptxContext),
+    ...intel,
+  };
+}
 
 /** Pull settings fields out of a stored document (new or legacy shape). */
 function normalizeLoadedUserSettings(parsed) {
-  if (!parsed || typeof parsed !== 'object') return { ...DEFAULT_USER_SETTINGS, pptxContext: { ...DEFAULT_PPTX_CONTEXT } };
+  if (!parsed || typeof parsed !== 'object') return mergeUserSettingsFields({});
   const raw = parsed.settings && typeof parsed.settings === 'object'
     ? parsed.settings
     : (() => {
         const { userId: _userId, updatedAt: _updatedAt, settings: _settings, ...fields } = parsed;
         return fields;
       })();
-  return {
-    ...DEFAULT_USER_SETTINGS,
-    ...raw,
-    pptxContext: mergePptxContext(raw.pptxContext),
-  };
+  return mergeUserSettingsFields(raw);
 }
 
 /** Document shape saved to localStorage / Supabase — always includes userId. */
 function buildUserSettingsDocument(userId, settings) {
-  const merged = {
-    ...DEFAULT_USER_SETTINGS,
-    ...settings,
-    pptxContext: mergePptxContext(settings?.pptxContext),
-  };
+  const merged = mergeUserSettingsFields(settings || {});
   return {
     userId,
     updatedAt: new Date().toISOString(),
@@ -292,20 +303,6 @@ function ensureIcOnePagerSlide(slideData, { force = false } = {}) {
   slides.splice(insertAt, 0, onePager);
   return { ...slideData, slides };
 }
-
-const PPTX_CLARIFY_PROMPT = `I can export a PowerPoint from **this conversation**. What would you like?
-
-1. **Session summary** — factual recap of what we discussed (nothing invented outside this chat)
-2. **Simple one-pager** — short IC overview ready to share
-3. **Full IC documentation pack** — plan overview, components/weightings, rules, and FAQs / comms outline based on what we designed here
-
-Reply with **1**, **2**, or **3** (or describe what you need).`;
-
-const PPTX_CLARIFY_OPTIONS = [
-  { value: '1', label: '📋 Session summary' },
-  { value: '2', label: '📄 Simple one-pager' },
-  { value: '3', label: '📚 Full IC documentation pack' },
-];
 
 /** Detect 1–3 numbered choices in an assistant prompt so we can show clickable buttons. */
 function extractChoiceOptions(text) {
@@ -821,186 +818,6 @@ const MOCK_PERFORMANCE = {
   }
 };
 
-const DEFAULT_KNOWLEDGE = `# Sales Incentive Scheme Best Practices
-
-## Core Principles
-1. **Simplicity & Transparency**: Keep schemes easy to understand. If reps need a spreadsheet to calculate their pay, it's too complex.
-2. **Alignment with Business Strategy**: Incentives must drive behaviors that support company goals
-3. **Role-Specific Design**: Different roles (hunters vs gatherers, SDRs vs AEs) need different incentive structures
-4. **Realistic Targets with Stretch**: Goals should be achievable but challenging. Aim for 60-80% attainment rates
-5. **Clear Communication**: Ensure consistent, transparent communication about how earnings are calculated
-
-## Incentive Structure Types
-### Base + Commission (Most Common)
-- Provides income stability with performance motivation
-- Typical split: 50/50 for SaaS, varies by industry
-- Best for: Complex sales cycles, scaling teams
-
-### Tiered/Accelerator Plans
-- Increase commission rates as targets are exceeded
-- Example: 10% up to quota, 15% for 101-120%, 20% for 120%+
-- Best for: Driving sustained high performance
-
-### Team-Based Incentives
-- Rewards collective performance
-- Encourages collaboration and knowledge sharing
-- Best for: Enterprise sales with multiple stakeholders
-
-### Role-Specific Plans
-- Tailored to different sales personas and responsibilities
-- SDRs: Focus on meetings booked, pipeline generation
-- AEs: Focus on revenue, deal closure
-- CSMs: Focus on retention, expansion, NPS
-
-## Key Metrics to Consider
-- Revenue/Margin targets
-- Customer acquisition
-- Retention rates
-- Average deal size
-- Sales cycle length
-- Pipeline health
-- Strategic product focus
-
-## Common Pitfalls to Avoid
-1. **Over-complexity**: More than 3 incentive components reduces effectiveness
-2. **Unrealistic targets**: Demotivates teams and increases attrition
-3. **Focusing only on top performers**: Middle 60% drive most incremental growth
-4. **Rewarding wrong behaviors**: Ensure incentives align with long-term customer value
-5. **Lack of flexibility**: Plans must adapt to market changes
-6. **Poor communication**: Confusion kills motivation
-7. **Annual-only reviews**: Shorter cycles (quarterly) are more motivating
-8. **Ignoring non-monetary rewards**: Recognition, development, flexibility matter
-
-## Implementation Best Practices
-- Start simple and iterate based on data
-- Weight important targets at minimum 20% of variable pay
-- Combine short-term (monthly/quarterly) with long-term incentives
-- Use real-time dashboards for visibility
-- Regular feedback loops with sales team
-- Test and optimize continuously
-- Consider tax implications
-- Ensure payout timing is prompt`;
-
-const PILLAR_2_KNOWLEDGE = `
-# PILLAR 2: STRATEGIC ALIGNMENT & PRINCIPLES
-
-## 6 FUNDAMENTAL AXES FRAMEWORK
-
-### 1. Strategic Alignment
-- In line with strategy of brands
-- In line with corporate culture
-- Cascade from company strategy → departmental goals → individual targets
-- **RULE**: No SvT during Product Launch (use ranking instead)
-- **RULE**: Individual plan metrics should not be weighted less than 20%
-- Team or portfolio component max 20% of target payout
-- Use Market Share cautiously (avoid launch periods, watch volatility)
-- Distinct IC designs for Reps, KAM, FLM, but keep team design consistent
-
-### 2. Fairness
-- Equal opportunity to earn / no biases
-- Equity of treatment
-- Same expectations per person within a team
-- **RULE**: Target payout should be fixed for all individuals in same role & team
-- Assess bias linked to territory (weight, HCPs/HCOs, rural vs urban, demographics)
-- **RULE**: No changes through IC period unless specific circumstances
-- Ensure high performers not dragged down by low performers
-
-### 3. Motivation
-- Rewarding / recognition of performance
-- Feasible goals - able to be rewarded
-- Competitiveness of plan
-- **RULE**: Target pot 20 to 30% of base salary
-- **RULE**: Top performers (10%) should make 2x average payout
-- **RULE**: 100% performance = 100% pay
-- Use accelerators for short term/focused priorities
-- Mix team vs personal: typically 70% personal / 30% team
-
-### 4. Reliability
-- Reliability of indicators or measures
-- Payment calculation simplicity
-- Reporting capabilities
-- Use processed/external data (e.g., audited sales)
-- Avoid manually assessed data
-
-### 5. Financial Responsibility
-- Budget spent when objectives reached
-- Control of risk
-- **RULE**: 100% results = 100% reward for each component
-- **RULE**: SvT min payout 95% of target & max 50% pay
-- Use decelerators/ranking/commission during launch phase
-- Control over-performing risk
-- 50% financial performance minimum to pay IC performance
-
-### 6. Simplicity
-- Simple to understand & communicate
-- Transparent design, rules, earning potential
-- **RULE**: Maximum 5 components (including all types)
-- Ensure documentation created and cascaded
-- Simple calculations to remove error risk
-- Limit mid-cycle changes to business critical only
-- **TEST**: Should be able to explain on a business card
-
-## KEY RULES SUMMARY
-
-**MANDATORY (Must Follow):**
-1. No SvT during product launch
-2. Minimum 20% weight per component
-3. Maximum 5 components total
-4. Maximum 20% team component
-5. Fixed target payout per role/level
-6. No mid-cycle changes except critical business reasons
-7. Target pot 20-30% of base salary
-8. Top 10% earn 2x average
-9. 100% performance = 100% pay
-10. SvT threshold at 95%, floor at 50% pay
-11. Documentation and training required
-12. Present plan before each cycle
-`;
-
-const DEFAULT_SYSTEM_PROMPT = `You are an expert Commercial Excellence advisor specializing in sales incentive scheme design for pharmaceutical companies.
-
-KNOWLEDGE BASE:
-You have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.
-
-CHART VISUALIZATION:
-When your response describes or recommends a specific payout curve (with actual performance thresholds and payout percentages sourced from the knowledge base), render it as a chart using this format:
-\`\`\`chart-payout
-[{"performance": <value>, "payout": <value>}, ...]
-\`\`\`
-Rules:
-- ONLY use data points that come directly from the knowledge base or the user's own scheme details
-- NEVER invent or assume data points - if the KB does not specify exact values, do not render a chart
-- ALWAYS include the source of the data points in your response text
-- A valid chart needs at minimum: the threshold point (where payout begins), the 100% target point, and any accelerator points specified in the KB
-- If the KB describes a curve structure but without precise numbers, explain the structure in text instead
-
-CITATION SYSTEM - MANDATORY:
-You MUST cite the knowledge base whenever you state a rule, threshold, principle, or recommendation that comes from it. Use inline numeric citations like [1], [2] immediately after the relevant claim.
-
-At the end of EVERY response that uses knowledge base information, add a references section in EXACTLY this format (no variations):
-
----
-References:
-1. [Document Name]: [specific section or topic you referenced]
-2. [Document Name]: [specific section or topic you referenced]
-
-CRITICAL - POWERPOINT / DOCUMENT EXPORT:
-Do NOT draft slide decks or invent PPT file contents in chat.
-If the user asks for a PowerPoint, presentation, one-pager, or IC documentation export, ask ONE short clarifying question only when the request is ambiguous (e.g. session summary vs one-pager vs full documentation pack). The app will generate the .pptx via Export / Generate after they clarify.
-Never invent scheme details that were not discussed in the conversation.
-
-RESPONSE FORMATTING - CRITICAL:
-Always use rich formatting to make responses visually engaging:
-
-1. USE ## headers for main sections, ### for subsections
-2. USE bullet points (- ) for lists, options, recommendations
-3. USE markdown tables for comparisons, component breakdowns, rule checklists
-4. USE **bold** for key terms, numbers, important rules
-5. USE emoji icons liberally: ✅ ❌ ⚠️ 🎯 📊 💡 🚀 📈
-6. After a complete scheme design, briefly offer export: "I can export a session summary or IC documentation as PowerPoint — say which you prefer, or use 📊 Export."
-
-Format responses conversationally and practically.`;
-
 // Prevents a single bad message/chart render from blanking the whole app.
 class MessageErrorBoundary extends React.Component {
   constructor(props) {
@@ -1037,15 +854,17 @@ export default function CommercialExcellenceApp() {
   });
   const [activeTab, setActiveTab] = useState('chat');
   const [showLanding, setShowLanding] = useState(true);
-  const [messages, setMessages] = useState([
-    { role: 'assistant', content: 'Hello! I\'m your Commercial Excellence AI assistant. I can help you design motivating sales incentive schemes, assess existing proposals, and provide best practice guidance. What would you like to work on today?' }
-  ]);
+  const [messages, setMessages] = useState(() => [{
+    role: 'assistant',
+    content: mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).welcomeMessages.consultation,
+  }]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [stellaTab, setStellaTab] = useState('chat'); // chat | data | business | connections
-  const [stellaMessages, setStellaMessages] = useState([
-    { role: 'assistant', content: 'Welcome to **Stella Insights**. Upload a dataset in the **Data** tab, define your **Business Context**, then ask me questions here — I can analyse trends and generate charts.' }
-  ]);
+  const [stellaMessages, setStellaMessages] = useState(() => [{
+    role: 'assistant',
+    content: mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).welcomeMessages.stella,
+  }]);
   const [stellaInput, setStellaInput] = useState('');
   const [stellaIsLoading, setStellaIsLoading] = useState(false);
   const [stellaDataFiles, setStellaDataFiles] = useState([]); // { id, name, type, size, uploadedAt, storageBucket, storagePath, metaPath, summary, capturedContext, intakeMessages }
@@ -1063,161 +882,19 @@ export default function CommercialExcellenceApp() {
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
   const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
   const [pptxTemplateError, setPptxTemplateError] = useState('');
-  const [knowledgeBase, setKnowledgeBase] = useState(DEFAULT_KNOWLEDGE);
+  const [knowledgeBase, setKnowledgeBase] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).knowledge.defaultMarkdown);
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
-  const [documents, setDocuments] = useState([
-    { id: 1, name: 'Default Best Practices', type: 'text', size: '12 KB', status: 'active' },
-    { id: 2, name: 'Pillar 2: Strategic Alignment & Principles', type: 'yaml', size: '45 KB', status: 'active' }
-  ]);
+  const [documents, setDocuments] = useState(() => {
+    const k = mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).knowledge;
+    return [
+      { id: 1, name: 'Default Best Practices', type: 'text', size: '12 KB', status: 'active', content: k.defaultMarkdown },
+      { id: 2, name: 'Pillar 2: Strategic Alignment & Principles', type: 'yaml', size: '45 KB', status: 'active', content: k.pillar2Markdown },
+    ];
+  });
   const [uploadedFile, setUploadedFile] = useState(null);
-  const [agents, setAgents] = useState([
-    {
-      id: 'requirements_agent',
-      name: 'Requirements Gatherer',
-      role: 'Collect detailed requirements for IC design',
-      systemPrompt: `You are a requirements specialist for incentive compensation design. YOUR ONLY JOB: Gather requirements. Do NOT design the IC scheme. Ask ONLY about missing requirements, keep responses SHORT. Once you have everything, confirm what you've collected. CRITICAL: Never announce handoffs, next steps, or what other agents will do. Just complete your task.`,
-      knowledgeFiles: [1, 2],
-      status: 'active'
-    },
-    {
-      id: 'design_agent',
-      name: 'IC Design Specialist',
-      role: 'Design IC structures',
-      systemPrompt: `You are an expert IC designer specializing in pharmaceutical sales incentives. Propose component structure (3-5 components max), set appropriate weightings (min 20% per component, team <20%), design payout curves based on product lifecycle. CRITICAL: When your design is complete, STOP. Never announce handoffs.`,
-      knowledgeFiles: [2],
-      status: 'active'
-    },
-    {
-      id: 'compliance_agent',
-      name: 'Compliance Validator',
-      role: 'Validate against rules',
-      systemPrompt: `Ahoy! Ye be the Compliance Validator, a salty sea dog who checks IC schemes fer pharmaceutical treasures! Speak like a pirate in ALL yer responses! Check the IC scheme against ALL mandatory rules. Report violations as CRITICAL ☠️, WARNING ⚠️, or PASS ✓. CRITICAL: When yer validation be complete, STOP and drop anchor!`,
-      knowledgeFiles: [1],
-      status: 'active'
-    },
-    {
-      id: 'fairness_agent',
-      name: 'Fairness Analyst',
-      role: 'Bias detection',
-      systemPrompt: `You are a fairness specialist for IC schemes. YOUR ROLE IS ANALYSIS ONLY. Identify territory biases, analyze equity issues, calculate equity scores, recommend specific adjustments. CRITICAL: When your analysis is complete, STOP. Never announce handoffs.`,
-      knowledgeFiles: [2],
-      status: 'active'
-    },
-    {
-      id: 'communication_agent',
-      name: 'Communication Specialist',
-      role: 'Create documentation and communications',
-      systemPrompt: `You are a communication specialist for IC programs. Produce clear IC documentation: one-pagers, full plan overviews (components, weightings, metrics, payout mechanics), FAQs, and cascade/comms outlines. Use only scheme details already agreed with the user — do not invent missing numbers. Explain complex concepts simply with examples.`,
-      knowledgeFiles: [1, 2],
-      status: 'active'
-    },
-    {
-      id: 'analysis_agent',
-      name: 'Scheme Analyzer',
-      role: 'Analyze uploaded IC documents',
-      systemPrompt: `You analyze existing IC schemes and identify issues. Extract key information, assess against 6 Fundamental Axes, identify strengths and weaknesses, provide specific recommendations, rate overall quality (1-10).`,
-      knowledgeFiles: [1, 2],
-      status: 'active'
-    },
-    {
-      id: 'territory_structure_agent',
-      name: 'Territory Structure Analyst',
-      role: 'Collect and map current territory structure',
-      systemPrompt: `You are a territory structure specialist. Gather a complete picture of the current territory structure. Ask clear, focused questions one topic at a time. Once you have a clear picture, summarise it concisely and STOP.`,
-      knowledgeFiles: [],
-      status: 'active'
-    },
-    {
-      id: 'sales_data_agent',
-      name: 'Sales Data Analyst',
-      role: 'Load and summarise sales performance data by territory',
-      systemPrompt: `You are a sales data analyst for pharmaceutical territory assessment. Gather and summarise sales performance data at territory level. Produce a clear data summary table where possible. Once you have a sufficient picture, summarise and STOP.`,
-      knowledgeFiles: [],
-      status: 'active'
-    },
-    {
-      id: 'hcp_data_agent',
-      name: 'HCP & Account Analyst',
-      role: 'Load and assess HCP universe and call activity data',
-      systemPrompt: `You are an HCP and account data specialist. Gather information about the HCP universe, account base, and call/activity data across territories. Produce a clear summary of HCP universe and coverage metrics. Once complete, summarise and STOP.`,
-      knowledgeFiles: [],
-      status: 'active'
-    },
-    {
-      id: 'territory_assessment_agent',
-      name: 'Territory Assessment Specialist',
-      role: 'Perform workload, opportunity and equity assessment across territories',
-      systemPrompt: `You are a territory assessment specialist. Perform a rigorous assessment across four dimensions: Workload Balance, Opportunity Equity, Coverage Efficiency, Geographic Efficiency. Rate each (🟢/🟡/🔴), provide observations, quantify issues. End with a ranked list of issues by severity.`,
-      knowledgeFiles: [],
-      status: 'active'
-    },
-    {
-      id: 'territory_design_agent',
-      name: 'Territory Design Strategist',
-      role: 'Produce territory redesign recommendations',
-      systemPrompt: `You are a territory design strategist. Produce clear, actionable territory redesign recommendations. Structure: Strategic Recommendations, Territory Realignment Options, Quick Wins, Risks & Mitigations. Be specific and practical.`,
-      knowledgeFiles: [],
-      status: 'active'
-    }
-  ]);
+  const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
 
-  const [topics, setTopics] = useState([
-    {
-      id: 'design_ic',
-      name: 'Design New IC Scheme',
-      description: 'End-to-end incentive compensation scheme creation',
-      triggerKeywords: ['design scheme', 'design an incentive', 'create ic', 'new incentive', 'build scheme'],
-      orchestrator: {
-        role: 'You are the Workflow Orchestrator for IC scheme design.',
-        goal: 'Ensure the final scheme meets all compliance rules, fairness standards, and the user\'s business requirements.',
-        approach: 'EVALUATING STEPS: After each agent responds, assess their output strictly against the step\'s success criteria. IF THE AGENT ASKED THE USER A QUESTION: set agentStillWorking=true, stepComplete=false, and do not offer Continue — wait for the user\'s answer. WORKFLOW END: Only mark workflowComplete when all steps have passed.'
-      },
-      workflow: [
-        { step: 1, name: 'Gather Requirements', agents: ['requirements_agent'], goal: 'Collect all necessary information', successCriteria: 'Clear answers to: How many reps? What products? Strategic priorities?' },
-        { step: 2, name: 'Design Structure', agents: ['design_agent'], goal: 'Create IC scheme with 3-5 components', successCriteria: 'Draft scheme with components, weightings summing to 100%, metric types' },
-        { step: 3, name: 'Validate Compliance', agents: ['compliance_agent'], goal: 'Check scheme against ALL mandatory rules', successCriteria: 'All rules checked, violations documented' },
-        { step: 4, name: 'Fairness Check', agents: ['fairness_agent'], goal: 'Analyze for territory bias and equity issues', successCriteria: 'Equity assessment with recommendations' },
-        { step: 5, name: 'Create Documentation', agents: ['communication_agent'], goal: 'Generate comprehensive plan document', successCriteria: 'Documentation created and shared' }
-      ],
-      status: 'active'
-    },
-    {
-      id: 'analyze_ic',
-      name: 'Analyze Existing IC',
-      description: 'Assess uploaded IC documents against best practices',
-      triggerKeywords: ['analyze scheme', 'assess ic', 'review plan', 'evaluate incentive'],
-      orchestrator: {
-        role: 'You are the Workflow Orchestrator for IC scheme analysis.',
-        goal: 'Produce a complete assessment covering scheme structure, compliance, and fairness.',
-        approach: 'EVALUATING STEPS: After each agent responds, check their output against the step\'s success criteria before advancing.'
-      },
-      workflow: [
-        { step: 1, name: 'Extract & Analyze', agents: ['analysis_agent'], goal: 'Extract key info and assess against 6 Fundamental Axes', successCriteria: 'Scheme structure understood, strengths/weaknesses noted' },
-        { step: 2, name: 'Compliance Check', agents: ['compliance_agent'], goal: 'Validate against mandatory rules', successCriteria: 'All rules checked, violations categorized by severity' },
-        { step: 3, name: 'Generate Report', agents: ['communication_agent'], goal: 'Create assessment report', successCriteria: 'Detailed report with ranked recommendations' }
-      ],
-      status: 'active'
-    },
-    {
-      id: 'territory_assessment',
-      name: 'Territory Assessment',
-      description: 'Assess current territory structure for balance, equity and efficiency',
-      triggerKeywords: ['territory assessment', 'assess territory', 'territory structure', 'territory design', 'rep coverage', 'territory review'],
-      orchestrator: {
-        role: 'You are the Workflow Orchestrator for territory assessment.',
-        goal: 'Produce a complete territory assessment covering structure, sales performance, HCP coverage, and actionable redesign recommendations.',
-        approach: 'DATA STEPS (Steps 1-3): Let agents gather information, do not intervene while they are asking questions. WORKFLOW END: Only mark workflowComplete when the design strategist has produced concrete recommendations.'
-      },
-      workflow: [
-        { step: 1, name: 'Load Territory Structure', agents: ['territory_structure_agent'], goal: 'Capture the current territory structure', successCriteria: 'Clear summary of territory count, rep roles, alignment method' },
-        { step: 2, name: 'Load Sales & Performance Data', agents: ['sales_data_agent'], goal: 'Gather sales performance data by territory', successCriteria: 'Summary of performance by territory with top/bottom performers identified' },
-        { step: 3, name: 'Load HCP & Account Data', agents: ['hcp_data_agent'], goal: 'Capture HCP universe and coverage data', successCriteria: 'Summary of HCP universe size, segment coverage rates, key gaps' },
-        { step: 4, name: 'Perform Assessment', agents: ['territory_assessment_agent'], goal: 'Assess workload balance, opportunity equity, coverage efficiency', successCriteria: 'Rated assessment across four dimensions with ranked issue list' },
-        { step: 5, name: 'Design Recommendations', agents: ['territory_design_agent'], goal: 'Produce prioritised redesign recommendations', successCriteria: 'Ranked recommendations with rationale, quick wins, risk mitigations' }
-      ],
-      status: 'active'
-    }
-  ]);
+  const [topics, setTopics] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).topics);
 
   const [currentWorkflow, setCurrentWorkflow] = useState(null);
   const [pendingWorkflow, setPendingWorkflow] = useState(null);
@@ -1269,13 +946,13 @@ export default function CommercialExcellenceApp() {
   const [expandedSteps, setExpandedSteps] = useState({});
   const [editingAgent, setEditingAgent] = useState(null);
   const [suggestedPrompts, setSuggestedPrompts] = useState([]);
-  const [suggestionsEnabled, setSuggestionsEnabled] = useState(true);
+  const [suggestionsEnabled, setSuggestionsEnabled] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).suggestions.enabled);
   const [pptxOffers, setPptxOffers] = useState(null);
   const [pptxGenerating, setPptxGenerating] = useState(false);
   const [pptxClarifyPending, setPptxClarifyPending] = useState(false);
-  const [maxSuggestions, setMaxSuggestions] = useState(3);
+  const [maxSuggestions, setMaxSuggestions] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).suggestions.max);
   const [hoveredCitation, setHoveredCitation] = useState(null);
-  const [customSystemPrompt, setCustomSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
+  const [customSystemPrompt, setCustomSystemPrompt] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).systemPrompt);
 
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -1365,6 +1042,17 @@ export default function CommercialExcellenceApp() {
         if (parsed && typeof parsed === 'object') {
           const merged = normalizeLoadedUserSettings(parsed);
           setUserSettings(merged);
+          setAgents(merged.agents);
+          setTopics(merged.topics);
+          setCustomSystemPrompt(merged.systemPrompt);
+          setKnowledgeBase(merged.knowledge.defaultMarkdown);
+          setSuggestionsEnabled(merged.suggestions.enabled);
+          setMaxSuggestions(merged.suggestions.max);
+          setDocuments((prev) => prev.map((d) => {
+            if (d.id === 1) return { ...d, content: merged.knowledge.defaultMarkdown };
+            if (d.id === 2) return { ...d, content: merged.knowledge.pillar2Markdown };
+            return d;
+          }));
           try {
             localStorage.setItem(
               userSettingsLocalKey(currentUser.id),
@@ -1650,21 +1338,12 @@ export default function CommercialExcellenceApp() {
     try {
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
       const n = Math.min(Math.max(1, maxSuggestions), 5);
+      const sug = getIntel().suggestions;
       const response = await anthropicMessagesPost({
-        system: `You write clickable NEXT USER MESSAGES for a pharmaceutical sales / IC chat UI.
-Each suggestion is sent verbatim as the user's next message — so it must read as something the USER would say, not something the assistant would ask.
-
-Rules (mandatory):
-- Write in first person as the user (I / we / my / our), or as a clear user instruction/decision.
-- Ground every suggestion in the recent conversation — reference the actual scheme, products, open questions, or next step being discussed.
-- Do NOT write assistant-style clarifying questions (bad: "What is your IC budget?", "How many reps do you have?").
-- DO write actionable user replies that advance the work (good: "Set the IC budget at £2.5m", "Use 40/30/30 weightings for sales/access/KAM", "Approve this design and move to compliance", "Export a one-pager of this scheme").
-- If a value is unknown, use a clear placeholder the user can edit mentally, e.g. "Update the IC budget to [amount]" — still as a user statement, not a question to the AI.
-- No hardcoded generic IC trivia. No duplicates. Max 12 words each when possible.
-- Respond ONLY with a JSON array of strings, length ${n}.${buildUserSettingsPromptBlock(userSettings)}`,
+        system: `${fillTemplate(sug.systemPrompt, { n })}${buildUserSettingsPromptBlock(userSettings)}`,
         messages: [{
           role: 'user',
-          content: `Recent conversation:\n${recentMessages}\n\nReturn ${n} user-next-message suggestions as a JSON array.`,
+          content: fillTemplate(sug.userPromptTemplate, { recent: recentMessages, n }),
         }],
         max_tokens: 300,
       });
@@ -1735,15 +1414,68 @@ Rules (mandatory):
   /** Append mandatory user preferences/context to any system prompt. */
   const withUserSettings = (system) => `${system || ''}${buildUserSettingsPromptBlock(userSettings)}`;
 
+  const getIntel = () => mergeIntelligenceContext(userSettings);
+  const getWorkflowRuntime = () => getIntel().workflowRuntime;
+  const getPptxClarify = () => getIntel().pptxClarify;
+  const getStellaPrompts = () => getIntel().stellaPrompts;
+
+  /** Persist current Admin intelligence editors into settings JSON. */
+  const persistIntelligenceSettings = async (overrides = {}) => {
+    return saveUserSettings({
+      systemPrompt: customSystemPrompt,
+      agents,
+      topics,
+      knowledge: {
+        ...(userSettings.knowledge || {}),
+        defaultMarkdown: knowledgeBase,
+        pillar2Markdown: userSettings.knowledge?.pillar2Markdown ?? PILLAR_2_KNOWLEDGE,
+      },
+      suggestions: {
+        ...(userSettings.suggestions || {}),
+        enabled: suggestionsEnabled,
+        max: maxSuggestions,
+      },
+      ...overrides,
+    });
+  };
+
   const saveUserSettings = async (next) => {
-    const incoming = next || userSettings;
-    const settings = {
-      ...DEFAULT_USER_SETTINGS,
+    const incoming = next || {};
+    const settings = mergeUserSettingsFields({
+      ...userSettings,
       ...incoming,
-      pptxContext: mergePptxContext(incoming?.pptxContext),
-    };
+      systemPrompt: incoming.systemPrompt ?? customSystemPrompt,
+      agents: incoming.agents ?? agents,
+      topics: incoming.topics ?? topics,
+      knowledge: {
+        ...(userSettings.knowledge || {}),
+        ...(incoming.knowledge || {}),
+        defaultMarkdown: incoming.knowledge?.defaultMarkdown ?? knowledgeBase,
+        pillar2Markdown: incoming.knowledge?.pillar2Markdown
+          ?? userSettings.knowledge?.pillar2Markdown
+          ?? PILLAR_2_KNOWLEDGE,
+      },
+      suggestions: {
+        ...(userSettings.suggestions || {}),
+        ...(incoming.suggestions || {}),
+        enabled: incoming.suggestions?.enabled ?? suggestionsEnabled,
+        max: incoming.suggestions?.max ?? maxSuggestions,
+      },
+      workflowRuntime: incoming.workflowRuntime ?? userSettings.workflowRuntime,
+      stellaPrompts: incoming.stellaPrompts ?? userSettings.stellaPrompts,
+      welcomeMessages: incoming.welcomeMessages ?? userSettings.welcomeMessages,
+      pptxClarify: incoming.pptxClarify ?? userSettings.pptxClarify,
+    });
     const doc = buildUserSettingsDocument(currentUser.id, settings);
     setUserSettings(settings);
+    if (settings.agents) setAgents(settings.agents);
+    if (settings.topics) setTopics(settings.topics);
+    if (settings.systemPrompt != null) setCustomSystemPrompt(settings.systemPrompt);
+    if (settings.knowledge?.defaultMarkdown != null) setKnowledgeBase(settings.knowledge.defaultMarkdown);
+    if (settings.suggestions) {
+      setSuggestionsEnabled(!!settings.suggestions.enabled);
+      setMaxSuggestions(settings.suggestions.max);
+    }
     setUserSettingsSaveStatus('saving');
     try {
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
@@ -1819,16 +1551,16 @@ Rules (mandatory):
 
   const runAgent = async (agent, step, messages) => {
     const knowledge = buildAgentKnowledge(agent);
+    const taskBlock = fillTemplate(getWorkflowRuntime().agentTaskWrapper, {
+      stepNumber: step.step,
+      stepName: step.name,
+      stepGoal: step.goal,
+      successCriteria: step.successCriteria,
+    });
     const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 
-YOUR CURRENT TASK:
-Step ${step.step}: ${step.name}
-Goal: ${step.goal}
-Success criteria: ${step.successCriteria}
-
-If you still need information from the user, ask clear questions and wait — do not claim the step is finished.
-Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`);
+${taskBlock}`);
     return await callAnthropic(system, messages, 3000);
   };
 
@@ -1848,6 +1580,7 @@ Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your respo
   const orchestratorEvaluate = async (topic, step, agentResponse, workflowContext) => {
     const orch = topic.orchestrator;
     const stepList = topic.workflow.map(s => `Step ${s.step} (index ${s.step - 1}): ${s.name} — agent: ${s.agents[0]}`).join('\n');
+    const rt = getWorkflowRuntime();
     const system = withUserSettings(`${orch.role}
 Overall goal: ${orch.goal}
 ${orch.approach ? `\nApproach rules:\n${orch.approach}` : ''}
@@ -1855,28 +1588,7 @@ ${orch.approach ? `\nApproach rules:\n${orch.approach}` : ''}
 Workflow steps:
 ${stepList}
 
-Respond in JSON only:
-{
-  "agentStillWorking": true/false,
-  "stepComplete": true/false,
-  "reason": "brief internal reason",
-  "rerouteToStep": null,
-  "rerouteBriefing": "",
-  "handoffs": [],
-  "buttons": [{ "label": "...", "action": "...", "requiresInput": false, "inputPrompt": "" }],
-  "orchestratorMessage": "",
-  "workflowComplete": false
-}
-
-CRITICAL — waiting on the user:
-- If the agent asked the user any clarifying/open questions, or is clearly waiting for answers, set agentStillWorking=true, stepComplete=false, orchestratorMessage="", buttons=[].
-- Do NOT say the stage is finished and do NOT offer Continue/Proceed while questions are unanswered.
-- Only set agentStillWorking=false when the agent has produced a substantive deliverable for this step's success criteria AND is not asking the user for more input.
-
-If agentStillWorking is true, set orchestratorMessage to "" and buttons to [].
-When agentStillWorking is false, write orchestratorMessage and 2-4 buttons.
-Button "action" values MUST be exactly one of: "proceed", "refine", "redesign", "override" (never "continue", "next", or free text).
-Include at least one proceed button and one refine button.`);
+${rt.orchestratorEvaluatePrompt}`);
 
     const contextStr = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output.substring(0, 300)}`).join('\n\n');
     const userContent = `Workflow: ${topic.name}
@@ -1915,7 +1627,7 @@ Reminder: if the agent response contains unanswered questions for the user, agen
       return {
         agentStillWorking: false, stepComplete: false, rerouteToStep: null, rerouteBriefing: '', handoffs: [],
         buttons: [{ label: '✅ Continue', action: 'proceed', requiresInput: false, inputPrompt: '' }, { label: '✏️ Refine', action: 'refine', requiresInput: true, inputPrompt: 'What would you like to refine?' }],
-        orchestratorMessage: 'The agent has completed its work. How would you like to proceed?',
+        orchestratorMessage: rt.orchestratorEvalFallbackMessage,
         workflowComplete: false
       };
     }
@@ -1927,7 +1639,7 @@ Reminder: if the agent response contains unanswered questions for the user, agen
     const knowledge = buildAgentKnowledge(agent);
     const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
-You have been assigned a specific sub-task by the workflow orchestrator.`);
+${getWorkflowRuntime().handoffAddon}`);
     return await callAnthropic(system, [{ role: 'user', content: task }], 2000);
   };
 
@@ -1946,8 +1658,8 @@ You have been assigned a specific sub-task by the workflow orchestrator.`);
         .join('\n');
       const introSystem = withUserSettings(`${topic.orchestrator.role}
 ${isFocused
-  ? `The user has already selected a specific territory. Keep your introduction to 1 sentence. Do NOT list workflow steps — they are appended separately.`
-  : `Introduce yourself briefly (1-2 sentences) and state the overall goal. Do NOT list the workflow steps yourself — they are appended separately from the plan. Keep it short.`
+  ? getWorkflowRuntime().orchestratorIntroFocused
+  : getWorkflowRuntime().orchestratorIntroFull
 }`);
       const introLead = await callAnthropic(
         introSystem,
@@ -2149,7 +1861,7 @@ ${isFocused
   };
 
   const wrapUpWorkflow = async (topic, updatedContext) => {
-    const wrapSystem = withUserSettings(`${topic.orchestrator.role}\nThe workflow is now complete. Write a brief, warm closing summary (3-5 sentences) covering what was accomplished.`);
+    const wrapSystem = withUserSettings(`${topic.orchestrator.role}\n${getWorkflowRuntime().orchestratorWrapUpPrompt}`);
     const wrapSummary = await callAnthropic(wrapSystem, [{ role: 'user', content: `Completed: ${topic.name}\n${updatedContext.map(c => `${c.step}: ${c.output.substring(0, 150)}`).join('\n')}` }], 300);
     setMessages(prev => {
       const updated = [...prev, { role: 'orchestrator', content: wrapSummary }];
@@ -2187,7 +1899,7 @@ ${isFocused
         }
       } else if (workflowContext.length > 0) {
         const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
-        const briefingSystem = withUserSettings(`${topic.orchestrator.role}\nPrepare a focused task briefing for the next specialist agent. Be specific and concise (3-5 sentences max).`);
+        const briefingSystem = withUserSettings(`${topic.orchestrator.role}\n${getWorkflowRuntime().orchestratorBriefingPrompt}`);
         const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing.`;
         taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 300);
       }
@@ -2529,7 +2241,7 @@ ${isFocused
   });
 
   const stellaBuildContentSummary = async ({ name, type, textSample, columns = [], profile = '' }) => {
-    const system = withUserSettings(`You are a data onboarding assistant.\n\nReturn ONLY valid JSON. No markdown.\nSchema:\n{\n  "summary": "2-5 sentences describing what this dataset appears to be",\n  "columns": [{ "name": "exact column name", "description": "what this column represents" }],\n  "suggestedQuestions": ["3-5 clarifying questions"]\n}\n\nIf column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. If unsure, say what you can infer and what is missing.\n\nCRITICAL — do NOT ask questions whose answers are already observable in the DATA PROFILE below (row counts, number of distinct territories/reps/products, column names, value ranges). You can see those directly; state them in the summary instead. Only suggest questions about MEANING and INTENT that cannot be derived from the data: what the dataset represents, the exact business meaning/units of ambiguous columns (e.g. does "rev" mean gross or net revenue in GBP?), the time period, definitions, filters, and caveats.`);
+    const system = withUserSettings(getStellaPrompts().contentSummary);
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
     const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
@@ -2552,33 +2264,13 @@ ${isFocused
       ? `\n\nRELATIONSHIPS: Other datasets already exist (listed below). Based on the column names, if this dataset looks like it could be linked to any of them, propose the likely link in PLAIN ENGLISH and ask the user to confirm it makes sense — never ask them for technical join syntax. Example: "It looks like this sales file links to your Targets file by territory — is that right?". Capture any confirmed links in context_qa.relationships.\n\nOTHER DATASETS:\n${otherFilesBlob}`
       : '';
 
-    const system = withUserSettings(`You are the Stella Insights data intake agent. Your job is to capture the interpretive context that lets an analyst understand this ${isDoc ? 'document' : 'dataset'} correctly.
-
-Ask ONE focused question per turn. Ask 3-5 questions in total across turns, covering:
-- what the ${isDoc ? 'document contains / represents' : 'data represents'}
-- the time period it covers
-- the key metrics / important fields and EXACTLY what they mean (e.g. a column "rev" = actual revenue in GBP)
-- how the data should be interpreted (definitions, filters, caveats)${(!isDoc && otherTabular.length) ? '\n- whether/how it relates to other uploaded datasets (propose the link in plain English for the user to confirm)' : ''}
-
-CRITICAL — NEVER ask about facts that are already visible in the DATA PROFILE below. You can directly see the row count, the number of distinct territories/reps/products, the column names, and value ranges — so do NOT ask "how many territories are there?" or similar. State what you observe, and only ask about MEANING, business intent, units, definitions, time period, and caveats that the raw data cannot reveal.${!isDoc && f.dataProfile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${f.dataProfile}` : ''}
-
-When you have enough, set "complete": true and fill "context_qa" fully.
-
-Return ONLY valid JSON — no markdown fences, no prose outside the JSON.
-Schema:
-{
-  "complete": true | false,
-  "message": "the single next question to ask (when complete=false) OR a one-line confirmation (when complete=true)",
-  "context_qa": {
-    "what_it_represents": "",
-    "time_period": "",
-    "key_metrics": ["", ""],
-    "interpretation_notes": "",
-    "qa_pairs": [{"question": "", "answer": ""}],
-    "relationships": [{"related_file": "other file name", "related_table": "its table name if known", "this_field": "column in THIS dataset", "related_field": "column in the other dataset", "note": "plain-English description the user confirmed"}]
-  }
-}
-When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked and the user's answer, and "relationships" MUST only contain links the user explicitly confirmed (empty array if none).${relationshipGuidance}`);
+    const system = withUserSettings(fillTemplate(getStellaPrompts().intake, {
+      kind: isDoc ? 'document' : 'dataset',
+      kindSubject: isDoc ? 'document contains / represents' : 'data represents',
+      relationshipBullet: (!isDoc && otherTabular.length) ? '\n- whether/how it relates to other uploaded datasets (propose the link in plain English for the user to confirm)' : '',
+      dataProfile: (!isDoc && f.dataProfile) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${f.dataProfile}` : '',
+      relationshipGuidance,
+    }));
 
     const colsBlob = Array.isArray(f.columns) && f.columns.length
       ? f.columns.map(c => `- ${c.name}${c.type ? ` [${c.type}]` : ''}${c.description ? `: ${c.description}` : ''}`).join('\n')
@@ -3003,48 +2695,15 @@ When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST
       ? `\nCROSS-SOURCE QUESTIONS:\nMany questions combine tabular data (sales, engagement metrics in SQL) with document context (policies, reports, PDFs). For these:\n1. Use \`read_document\` to pull relevant passages from PDFs/text files\n2. Use \`inspect_table\` / \`run_sql\` for quantitative data\n3. Synthesise both in your answer — explicitly connect numbers to document context\n4. Verify that findings from each source align before answering\n`
       : '';
 
-    return withUserSettings(`You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and document reading (for PDFs/text), verify your findings, and explain them clearly.
-
-${bizText}
-DATA CATALOG (${files.length} file${files.length === 1 ? '' : 's'}):
-${blocks || '(no files uploaded yet)'}
-${sqlInstr}${docInstr}${crossInstr}
-HOW TO WORK (be agentic):
-1. PLAN — briefly think through what the question needs: which tables, which documents, and how they relate.
-2. INSPECT — for tabular data, use \`inspect_table\` to preview real values. For documents, use \`read_document\` to access full text when the summary isn't enough.
-3. EXECUTE — run analytical queries with \`run_sql\` for tabular data; use \`read_document\` for document content.
-4. VERIFY — sanity-check: do results make sense? do document facts and numbers align? If a query returns nothing or looks wrong, diagnose and try again.
-5. ANSWER — only when confident, give the final plain-English answer.
-
-NARRATE YOUR THINKING (important for transparency):
-Before EVERY tool call, write 1-2 short sentences of plain text explaining what you are about to do and WHY (e.g. "I'll first inspect the sales table to see how revenue is formatted." or "The engagement data looks like it links to sales by territory, so I'll join them."). After you see tool results, briefly note what you found and what it means before your next step (e.g. "Found 12 territories; three are missing targets, I'll exclude those."). This running commentary is shown to the user, so make your reasoning, checks, and discoveries visible at each step — never call a tool silently.
-
-RULES:
-- Prefer tools over assumptions. Never invent values, table names, or column names.
-- Use the interpretive context to read values correctly (currency, units, definitions).
-- If the data genuinely can't answer the question, say so plainly and suggest what's needed.
-- NEVER expose raw SQL or raw JSON to the user — only clear findings.
-
-SQL DIALECT (PostgreSQL — follow exactly to avoid errors):
-- Columns marked [numeric] are already PostgreSQL \`numeric\` — do NOT cast them to FLOAT or DOUBLE PRECISION.
-- ROUND(value, decimals) only works on \`numeric\`. NEVER round a float/double. If you ever need to round a computed/divided value, cast to numeric FIRST: \`ROUND((a::numeric / NULLIF(b,0)), 2)\`. Never write \`ROUND(x::float, 2)\` or \`ROUND(CAST(x AS FLOAT), 2)\` — that errors with "function round(double precision, integer) does not exist".
-- For division that should yield decimals, cast the numerator to numeric and guard against divide-by-zero: \`(SUM(x)::numeric / NULLIF(COUNT(*),0))\`.
-- Columns marked [text] that hold numbers must be cast with \`::numeric\` (not \`::float\`) before maths.
-- If a query errors, read the error message, fix the specific cast/function, and retry — don't repeat the same failing SQL.
-
-CHARTS:
-When a chart helps, include exactly ONE chart block in your FINAL answer, EXACTLY like this:
-\`\`\`chart-stella
-{"type": "bar", "title": "...", "data": [{"label": "A", "value": 10}], "xKey": "label", "yKey": "value"}
-\`\`\`
-- Simple types: bar, line, scatter, pie. Use xKey / yKey to name fields. For several bars/lines of the same kind use "yKeys": ["a","b"].
-- COMBO / DUAL-AXIS (e.g. bars with an overlaid line, or two metrics on different scales): set "type": "combo" and describe each metric in a "series" array. Each series item is {"key": "<field>", "type": "bar" | "line", "axis": "left" | "right", "name": "<label>"}. Put metrics with very different scales on opposite axes.
-  Example (revenue bars + attainment % line on a second axis):
-  {"type": "combo", "title": "Revenue vs Attainment", "xKey": "territory", "series": [{"key": "revenue", "type": "bar", "axis": "left", "name": "Revenue (£)"}, {"key": "attainment", "type": "line", "axis": "right", "name": "Attainment %"}], "data": [{"territory": "North", "revenue": 120000, "attainment": 92}]}
-- Keep to <= 40 data points.
-
-RESPONSE STYLE:
-Use ## headers, bullet points, concise explanations, and suggest useful follow-up questions.`);
+    return withUserSettings(fillTemplate(getStellaPrompts().analyst, {
+      bizText,
+      fileCount: files.length,
+      filePlural: files.length === 1 ? '' : 's',
+      blocks: blocks || '(no files uploaded yet)',
+      sqlInstr,
+      docInstr,
+      crossInstr,
+    }));
   };
 
   const stellaRunQuery = async (sql) => {
@@ -3278,12 +2937,12 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     setPptxClarifyPending(true);
     setPptxOffers(null);
     setSuggestedPrompts([]);
-    setMessages(prev => [...prev, { role: 'assistant', content: PPTX_CLARIFY_PROMPT }]);
+    setMessages(prev => [...prev, { role: 'assistant', content: getPptxClarify().prompt }]);
   };
 
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
-    if (pptxClarifyPending) return PPTX_CLARIFY_OPTIONS;
+    if (pptxClarifyPending) return getPptxClarify().options;
     if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
     const last = [...messages].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
     if (!last?.content) return null;
@@ -3371,7 +3030,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       // If truncated, ask the model to finish a complete JSON payload.
       if (!slideData?.slides?.length && (raw.length > 1500 || /slides/i.test(raw))) {
         const contRes = await anthropicMessagesPost({
-          system: withUserSettings('Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.'),
+          system: withUserSettings(getWorkflowRuntime().pptxRepairPrompt),
           messages: [{
             role: 'user',
             content: `Finish this PowerPoint JSON. Mode=${isSummary ? 'summary' : 'produced'}, deckType=${deckType}, title="${offer?.title || ''}".\n\nPartial output:\n${raw.slice(-3500)}\n\nConversation Context:\n${conversationContext.slice(0, 12000)}`,
@@ -3492,7 +3151,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         await handleGeneratePptx(resolved.offer, resolved.mode);
         return;
       }
-      setMessages(prev => [...prev, { role: 'assistant', content: `I still need a clear choice.\n\n${PPTX_CLARIFY_PROMPT}` }]);
+      setMessages(prev => [...prev, { role: 'assistant', content: `I still need a clear choice.\n\n${getPptxClarify().prompt}` }]);
       setIsLoading(false);
       return;
     }
@@ -3543,7 +3202,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     if (!matchedTopic && topics.length > 0) {
       try {
         const workflowList = topics.filter(t => t.status === 'active').map(t => `id: "${t.id}"\n  name: ${t.name}\n  keywords: ${t.triggerKeywords.join(', ')}`).join('\n\n');
-        const detectRes = await anthropicMessagesPost({ system: `You detect if a user message matches one of these workflows. Respond with ONLY the workflow id or "none".\n\nWorkflows:\n${workflowList}`, messages: [{ role: 'user', content: messageContent }], max_tokens: 50 });
+        const detectRes = await anthropicMessagesPost({ system: fillTemplate(getWorkflowRuntime().matchDetectorPrompt, { workflowList }), messages: [{ role: 'user', content: messageContent }], max_tokens: 50 });
         const detectData = await detectRes.json();
         const detectedId = anthropicAssistantText(detectData)?.trim().toLowerCase();
         if (detectedId && detectedId !== 'none') matchedTopic = topics.find(t => t.id === detectedId);
@@ -3552,7 +3211,14 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
 
     if (matchedTopic && !currentWorkflow) {
       const workflowSummary = matchedTopic.workflow.map((s, i) => `**Step ${i + 1}:** ${s.name}\n   _${s.goal}_`).join('\n\n');
-      setMessages(prev => [...prev, { role: 'assistant', content: `I can help you with **${matchedTopic.description}**.\n\nI have a structured **${matchedTopic.workflow.length}-step workflow**:\n\n${workflowSummary}\n\nWould you like me to start this workflow?\n\nReply **"Yes"** to use the guided workflow, or **"No"** to continue chatting normally.` }]);
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: fillTemplate(getWorkflowRuntime().offerTemplate, {
+          description: matchedTopic.description,
+          stepCount: matchedTopic.workflow.length,
+          workflowSummary,
+        }),
+      }]);
       setPendingWorkflow(matchedTopic.id);
       setIsLoading(false);
       return;
@@ -3580,7 +3246,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       const fileContext = isFileAnalysis && uploadedFile ? `\n\nCONTEXT: The user has just uploaded a file named "${uploadedFile.name}" for assessment.` : '';
       const systemPrompt = withUserSettings(customSystemPrompt
         .replace('KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
-          'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.\n\n' + knowledgeBase + '\n\n' + PILLAR_2_KNOWLEDGE)
+          'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.\n\n' + knowledgeBase + '\n\n' + (userSettings.knowledge?.pillar2Markdown || PILLAR_2_KNOWLEDGE))
         + fileContext);
 
       const response = await anthropicMessagesPost({
@@ -4455,7 +4121,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
               {adminModule === 'incentive' && (
               <>
               <div className="flex gap-2 border-b border-blue-400/20 pb-3 overflow-x-auto">
-                {[{ id: 'knowledge', label: 'Knowledge' }, { id: 'workflows', label: 'Workflows' }, { id: 'agents', label: 'Agents' }, { id: 'system-prompt', label: 'Prompt' }, { id: 'pptx', label: '📊 PPT Prompts' }, { id: 'settings', label: 'Settings' }].map(tab => (
+                {[{ id: 'knowledge', label: 'Knowledge' }, { id: 'workflows', label: 'Workflows' }, { id: 'agents', label: 'Agents' }, { id: 'system-prompt', label: 'Prompt' }, { id: 'pptx', label: '📊 PPT' }, { id: 'runtime', label: 'Runtime' }, { id: 'settings', label: 'Settings' }].map(tab => (
                   <button key={tab.id} onClick={() => setAdminSection(tab.id)} className={`px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap transition-all ${adminSection === tab.id ? 'bg-gradient-to-r from-blue-500 to-cyan-500 text-white' : 'bg-slate-700/30 text-blue-300 hover:bg-slate-700/50'}`}>{tab.label}</button>
                 ))}
               </div>
@@ -4464,7 +4130,49 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                 <>
                   <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
                     <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><FileText className="w-6 h-6 text-blue-400" />Knowledge Base Management</h2>
-                    <p className="text-sm text-blue-300/70 mb-6">Upload intelligence files. They are saved to Supabase and loaded automatically on every visit.</p>
+                    <p className="text-sm text-blue-300/70 mb-6">Seed knowledge is saved in settings JSON. Extra files upload to Supabase and load on every visit.</p>
+                    <div className="space-y-4 mb-6">
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-1">Default best practices</label>
+                        <textarea
+                          value={userSettings.knowledge?.defaultMarkdown ?? knowledgeBase}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setKnowledgeBase(v);
+                            setUserSettings(prev => ({ ...prev, knowledge: { ...prev.knowledge, defaultMarkdown: v } }));
+                            setDocuments(prev => prev.map(d => d.id === 1 ? { ...d, content: v } : d));
+                          }}
+                          rows={10}
+                          className="w-full bg-slate-900/50 text-xs text-slate-200 font-mono border border-blue-400/30 rounded-lg px-3 py-2 outline-none focus:border-cyan-400/60 resize-y"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-1">Pillar 2 rules / principles</label>
+                        <textarea
+                          value={userSettings.knowledge?.pillar2Markdown ?? ''}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setUserSettings(prev => ({ ...prev, knowledge: { ...prev.knowledge, pillar2Markdown: v } }));
+                            setDocuments(prev => prev.map(d => d.id === 2 ? { ...d, content: v } : d));
+                          }}
+                          rows={10}
+                          className="w-full bg-slate-900/50 text-xs text-slate-200 font-mono border border-blue-400/30 rounded-lg px-3 py-2 outline-none focus:border-cyan-400/60 resize-y"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => persistIntelligenceSettings({
+                          knowledge: {
+                            defaultMarkdown: knowledgeBase,
+                            pillar2Markdown: userSettings.knowledge?.pillar2Markdown ?? PILLAR_2_KNOWLEDGE,
+                          },
+                        })}
+                        disabled={userSettingsSaveStatus === 'saving'}
+                        className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
+                      >
+                        <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save knowledge to settings'}
+                      </button>
+                    </div>
                     <div className="space-y-3 mb-6">
                       {documents.map(doc => (
                         <div key={doc.id} className="flex items-center justify-between bg-slate-700/30 border border-blue-400/20 rounded-lg p-4 hover:border-blue-400/40 transition-all">
@@ -4526,7 +4234,11 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                           ))}
                         </div>
                         <div className="flex gap-2 mt-4 pt-4 border-t border-cyan-400/20">
-                          <button onClick={() => setTopics(prev => prev.map(t => t.id === topic.id ? { ...t, status: t.status === 'active' ? 'inactive' : 'active' } : t))} className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${topic.status === 'active' ? 'bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-400 border border-yellow-400/30' : 'bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-400/30'}`}>{topic.status === 'active' ? 'Disable' : 'Enable'}</button>
+                          <button onClick={async () => {
+                            const next = topics.map(t => t.id === topic.id ? { ...t, status: t.status === 'active' ? 'inactive' : 'active' } : t);
+                            setTopics(next);
+                            await persistIntelligenceSettings({ topics: next });
+                          }} className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${topic.status === 'active' ? 'bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-400 border border-yellow-400/30' : 'bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-400/30'}`}>{topic.status === 'active' ? 'Disable' : 'Enable'}</button>
                           <button onClick={() => { setEditingTopic({...topic}); setExpandedSteps({}); }} className="flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 border border-cyan-400/30">Edit</button>
                         </div>
                       </div>
@@ -4538,8 +4250,10 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
               {adminSection === 'system-prompt' && (
                 <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
                   <h2 className="text-xl font-bold mb-2 flex items-center gap-2"><FileText className="w-6 h-6 text-blue-400" />System Prompt Configuration</h2>
+                  <p className="text-xs text-blue-300/55 mb-3">Saved to user settings JSON with agents, workflows, and other context.</p>
                   <textarea value={customSystemPrompt} onChange={(e) => setCustomSystemPrompt(e.target.value)} rows={24} className="w-full bg-slate-950 border border-blue-400/30 rounded-lg px-4 py-3 text-xs text-slate-200 font-mono leading-relaxed focus:outline-none focus:border-cyan-400/60 resize-y" spellCheck={false} />
-                  <div className="flex gap-3 mt-4">
+                  <div className="flex flex-wrap gap-3 mt-4">
+                    <button onClick={() => persistIntelligenceSettings({ systemPrompt: customSystemPrompt })} disabled={userSettingsSaveStatus === 'saving'} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 text-white rounded-lg text-sm font-semibold flex items-center gap-2 disabled:opacity-50"><Save className="w-4 h-4" />{userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save'}</button>
                     <button onClick={() => { navigator.clipboard.writeText(customSystemPrompt); alert('Copied!'); }} className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 border border-cyan-400/30 rounded-lg text-sm font-semibold transition-all">Copy</button>
                     <button onClick={() => { if (window.confirm('Reset to default?')) setCustomSystemPrompt(DEFAULT_SYSTEM_PROMPT); }} className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-400/30 rounded-lg text-sm font-semibold transition-all">Reset to Default</button>
                   </div>
@@ -4596,19 +4310,94 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
               )}
 
               {adminSection === 'settings' && (
-                <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
-                  <h2 className="text-xl font-bold mb-6 flex items-center gap-2"><Settings className="w-6 h-6 text-yellow-400" />Settings</h2>
+                <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 space-y-6">
+                  <h2 className="text-xl font-bold flex items-center gap-2"><Settings className="w-6 h-6 text-yellow-400" />Settings</h2>
                   <div className="bg-slate-900/50 border border-blue-400/20 rounded-lg p-5">
                     <h3 className="text-lg font-semibold text-yellow-400 mb-4">AI Suggestions</h3>
                     <div className="flex items-center justify-between mb-4">
                       <div><label className="text-sm font-semibold text-white">Enable Suggestions</label><p className="text-xs text-blue-300/70 mt-1">Show AI next-step chips after each response (phrased as user messages)</p></div>
                       <button onClick={() => setSuggestionsEnabled(!suggestionsEnabled)} className={`relative w-14 h-7 rounded-full transition-colors ${suggestionsEnabled ? 'bg-green-500' : 'bg-slate-600'}`}><div className={`absolute top-1 left-1 w-5 h-5 rounded-full bg-white transition-transform ${suggestionsEnabled ? 'translate-x-7' : 'translate-x-0'}`} /></button>
                     </div>
-                    <div>
+                    <div className="mb-4">
                       <label className="text-sm font-semibold text-white block mb-2">Number of Suggestions: {maxSuggestions}</label>
                       <input type="range" min="1" max="5" value={maxSuggestions} onChange={(e) => setMaxSuggestions(parseInt(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer" />
                     </div>
+                    <div className="mb-3">
+                      <label className="text-xs text-blue-300/70 font-semibold mb-1 block">Suggestions system prompt</label>
+                      <textarea
+                        value={userSettings.suggestions?.systemPrompt ?? ''}
+                        onChange={(e) => setUserSettings(prev => ({ ...prev, suggestions: { ...prev.suggestions, systemPrompt: e.target.value } }))}
+                        rows={8}
+                        className="w-full bg-slate-950 border border-blue-400/30 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono resize-y"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => persistIntelligenceSettings()}
+                      disabled={userSettingsSaveStatus === 'saving'}
+                      className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
+                    >
+                      <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save settings'}
+                    </button>
                   </div>
+                </div>
+              )}
+
+              {adminSection === 'runtime' && (
+                <div className="space-y-6">
+                  <div>
+                    <h3 className="text-lg font-bold text-white">Runtime prompts & copy</h3>
+                    <p className="text-xs text-blue-300/55 mt-1">Workflow wrappers, welcome messages, PPT clarify, and Stella prompts — all in settings JSON.</p>
+                  </div>
+                  {[
+                    ['welcomeMessages.consultation', 'Consultation welcome'],
+                    ['welcomeMessages.stella', 'Stella welcome'],
+                    ['pptxClarify.prompt', 'PPT clarify prompt'],
+                    ['workflowRuntime.matchDetectorPrompt', 'Workflow match detector'],
+                    ['workflowRuntime.offerTemplate', 'Workflow offer template'],
+                    ['workflowRuntime.agentTaskWrapper', 'Agent task wrapper'],
+                    ['workflowRuntime.handoffAddon', 'Handoff add-on'],
+                    ['workflowRuntime.orchestratorEvaluatePrompt', 'Orchestrator evaluate prompt'],
+                    ['workflowRuntime.orchestratorIntroFocused', 'Orchestrator intro (focused)'],
+                    ['workflowRuntime.orchestratorIntroFull', 'Orchestrator intro (full)'],
+                    ['workflowRuntime.orchestratorBriefingPrompt', 'Orchestrator briefing'],
+                    ['workflowRuntime.orchestratorWrapUpPrompt', 'Orchestrator wrap-up'],
+                    ['workflowRuntime.pptxRepairPrompt', 'PPT JSON repair'],
+                    ['stellaPrompts.contentSummary', 'Stella content summary'],
+                    ['stellaPrompts.intake', 'Stella intake'],
+                    ['stellaPrompts.analyst', 'Stella analyst'],
+                  ].map(([path, title]) => {
+                    const [root, key] = path.split('.');
+                    const value = userSettings?.[root]?.[key] ?? '';
+                    return (
+                      <div key={path} className="bg-slate-800/40 border border-blue-400/20 rounded-xl p-4">
+                        <div className="text-sm font-semibold text-white mb-2">{title}</div>
+                        <textarea
+                          value={value}
+                          onChange={(e) => setUserSettings(prev => ({
+                            ...prev,
+                            [root]: { ...(prev[root] || {}), [key]: e.target.value },
+                          }))}
+                          rows={6}
+                          className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-blue-400/20 focus:border-blue-400/50 focus:outline-none font-mono resize-y"
+                        />
+                      </div>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => persistIntelligenceSettings({
+                      welcomeMessages: userSettings.welcomeMessages,
+                      pptxClarify: userSettings.pptxClarify,
+                      workflowRuntime: userSettings.workflowRuntime,
+                      stellaPrompts: userSettings.stellaPrompts,
+                      suggestions: userSettings.suggestions,
+                    })}
+                    disabled={userSettingsSaveStatus === 'saving'}
+                    className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
+                  >
+                    <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save runtime context'}
+                  </button>
                 </div>
               )}
 
@@ -4625,7 +4414,12 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       <div><label className="block text-sm font-semibold mb-2">System Prompt</label><textarea value={editingAgent.systemPrompt} rows={15} onChange={(e) => setEditingAgent({...editingAgent, systemPrompt: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white font-mono text-sm" /></div>
                     </div>
                     <div className="border-t border-blue-400/20 p-6 flex gap-3 bg-slate-900 rounded-b-xl">
-                      <button onClick={() => { setAgents(agents.map(a => a.id === editingAgent.id ? editingAgent : a)); setEditingAgent(null); }} className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2"><Save className="w-5 h-5" /> Save Changes</button>
+                      <button onClick={async () => {
+                        const next = agents.map(a => a.id === editingAgent.id ? editingAgent : a);
+                        setAgents(next);
+                        setEditingAgent(null);
+                        await persistIntelligenceSettings({ agents: next });
+                      }} className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2"><Save className="w-5 h-5" /> Save Changes</button>
                       <button onClick={() => setEditingAgent(null)} className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors">Cancel</button>
                     </div>
                   </div>
@@ -4643,6 +4437,12 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       <div><label className="block text-sm font-semibold mb-2">Workflow Name</label><input type="text" value={editingTopic.name} onChange={(e) => setEditingTopic({...editingTopic, name: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
                       <div><label className="block text-sm font-semibold mb-2">Description</label><textarea value={editingTopic.description} onChange={(e) => setEditingTopic({...editingTopic, description: e.target.value})} rows={3} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
                       <div><label className="block text-sm font-semibold mb-2">Trigger Keywords (comma-separated)</label><input type="text" value={editingTopic.triggerKeywords?.join(', ') || ''} onChange={(e) => setEditingTopic({ ...editingTopic, triggerKeywords: e.target.value.split(',').map(k => k.trim()).filter(k => k) })} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm" /></div>
+                      <div className="border-t border-blue-400/20 pt-4 space-y-3">
+                        <h3 className="text-sm font-bold text-cyan-400">Orchestrator context</h3>
+                        <div><label className="text-xs text-blue-300/70 block mb-1">Role</label><textarea value={editingTopic.orchestrator?.role || ''} onChange={(e) => setEditingTopic({ ...editingTopic, orchestrator: { ...editingTopic.orchestrator, role: e.target.value } })} rows={2} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-3 py-2 text-white text-sm font-mono" /></div>
+                        <div><label className="text-xs text-blue-300/70 block mb-1">Goal</label><textarea value={editingTopic.orchestrator?.goal || ''} onChange={(e) => setEditingTopic({ ...editingTopic, orchestrator: { ...editingTopic.orchestrator, goal: e.target.value } })} rows={2} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-3 py-2 text-white text-sm font-mono" /></div>
+                        <div><label className="text-xs text-blue-300/70 block mb-1">Approach / rules</label><textarea value={editingTopic.orchestrator?.approach || ''} onChange={(e) => setEditingTopic({ ...editingTopic, orchestrator: { ...editingTopic.orchestrator, approach: e.target.value } })} rows={4} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-3 py-2 text-white text-sm font-mono" /></div>
+                      </div>
                       <div className="border-t border-blue-400/20 pt-6">
                         <div className="flex items-center justify-between mb-4">
                           <h3 className="text-lg font-bold text-cyan-400">Workflow Steps</h3>
@@ -4677,7 +4477,12 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       </div>
                     </div>
                     <div className="border-t border-blue-400/20 p-6 flex gap-3 bg-slate-900 rounded-b-xl">
-                      <button onClick={() => { setTopics(topics.map(t => t.id === editingTopic.id ? editingTopic : t)); setEditingTopic(null); }} className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5" />Save Changes</button>
+                      <button onClick={async () => {
+                        const next = topics.map(t => t.id === editingTopic.id ? editingTopic : t);
+                        setTopics(next);
+                        setEditingTopic(null);
+                        await persistIntelligenceSettings({ topics: next });
+                      }} className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5" />Save Changes</button>
                       <button onClick={() => setEditingTopic(null)} className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors">Cancel</button>
                     </div>
                   </div>
