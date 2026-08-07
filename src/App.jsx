@@ -4601,7 +4601,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                   <div className="bg-slate-900/50 border border-blue-400/20 rounded-lg p-5">
                     <h3 className="text-lg font-semibold text-yellow-400 mb-4">AI Suggestions</h3>
                     <div className="flex items-center justify-between mb-4">
-                      <div><label className="text-sm font-semibold text-white">Enable Suggestions</label><p className="text-xs text-blue-300/70 mt-1">Show AI-generated prompts after each response</p></div>
+                      <div><label className="text-sm font-semibold text-white">Enable Suggestions</label><p className="text-xs text-blue-300/70 mt-1">Show AI next-step chips after each response (phrased as user messages)</p></div>
                       <button onClick={() => setSuggestionsEnabled(!suggestionsEnabled)} className={`relative w-14 h-7 rounded-full transition-colors ${suggestionsEnabled ? 'bg-green-500' : 'bg-slate-600'}`}><div className={`absolute top-1 left-1 w-5 h-5 rounded-full bg-white transition-transform ${suggestionsEnabled ? 'translate-x-7' : 'translate-x-0'}`} /></button>
                     </div>
                     <div>
