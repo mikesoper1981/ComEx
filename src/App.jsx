@@ -13,10 +13,12 @@ import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFro
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
 import {
   DEFAULT_SYSTEM_PROMPT,
-  PILLAR_2_KNOWLEDGE,
   DEFAULT_INTELLIGENCE_CONTEXT,
   mergeIntelligenceContext,
   fillTemplate,
+  KNOWLEDGE_SEED_FILES,
+  isKnowledgeStorageFile,
+  buildKnowledgeBaseFromDocuments,
 } from './defaults';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
@@ -141,11 +143,12 @@ const DEFAULT_USER_SETTINGS = {
 };
 
 function mergeUserSettingsFields(raw = {}) {
-  const intel = mergeIntelligenceContext(raw);
+  const { knowledge: _legacyKnowledge, ...rest } = raw || {};
+  const intel = mergeIntelligenceContext(rest);
   return {
     ...DEFAULT_USER_SETTINGS,
-    ...raw,
-    pptxContext: mergePptxContext(raw.pptxContext),
+    ...rest,
+    pptxContext: mergePptxContext(rest.pptxContext),
     ...intel,
   };
 }
@@ -882,15 +885,10 @@ export default function CommercialExcellenceApp() {
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
   const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
   const [pptxTemplateError, setPptxTemplateError] = useState('');
-  const [knowledgeBase, setKnowledgeBase] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).knowledge.defaultMarkdown);
+  const [knowledgeBase, setKnowledgeBase] = useState('');
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
-  const [documents, setDocuments] = useState(() => {
-    const k = mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).knowledge;
-    return [
-      { id: 1, name: 'Default Best Practices', type: 'text', size: '12 KB', status: 'active', content: k.defaultMarkdown },
-      { id: 2, name: 'Pillar 2: Strategic Alignment & Principles', type: 'yaml', size: '45 KB', status: 'active', content: k.pillar2Markdown },
-    ];
-  });
+  const [documents, setDocuments] = useState([]);
+  const [knowledgeLoadStatus, setKnowledgeLoadStatus] = useState('idle'); // idle | loading | ready | error
   const [uploadedFile, setUploadedFile] = useState(null);
   const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
 
@@ -965,33 +963,82 @@ export default function CommercialExcellenceApp() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  // ── SUPABASE: Load intelligence files on startup ──
+  // ── SUPABASE: Load intelligence knowledge files on every visit ──
   useEffect(() => {
+    const applyDocs = (docs) => {
+      setDocuments(docs);
+      setKnowledgeBase(buildKnowledgeBaseFromDocuments(docs));
+      setKnowledgeLoadStatus('ready');
+    };
+
+    const toDoc = (name, content, sizeBytes = 0) => {
+      const isYaml = /\.ya?ml$/i.test(name);
+      return {
+        id: name,
+        name,
+        type: isYaml ? 'yaml' : 'text',
+        size: `${(Number(sizeBytes || 0) / 1024).toFixed(1)} KB`,
+        status: 'active',
+        content,
+        fromStorage: true,
+      };
+    };
+
+    const ensureSeedFiles = async (existingNames) => {
+      for (const fileName of KNOWLEDGE_SEED_FILES) {
+        if (existingNames.has(fileName)) continue;
+        try {
+          const res = await fetch(`/knowledge/${fileName}`);
+          if (!res.ok) continue;
+          const text = await res.text();
+          const blob = new Blob([text], { type: 'text/markdown' });
+          await supabase.storage.from('intelligence').upload(fileName, blob, {
+            upsert: true,
+            contentType: 'text/markdown',
+          });
+          existingNames.add(fileName);
+        } catch { /* seed optional if storage/public file unavailable */ }
+      }
+    };
+
     const loadIntelligenceFiles = async () => {
-      const { data, error } = await supabase.storage.from('intelligence').list();
-      if (error || !data) return;
-      for (const item of data) {
-        const { data: fileData, error: downloadError } = await supabase.storage
-          .from('intelligence')
-          .download(item.name);
-        if (downloadError || !fileData) continue;
-        const content = await fileData.text();
-        const isYaml = item.name.endsWith('.yml') || item.name.endsWith('.yaml');
-        setDocuments(prev => {
-          if (prev.find(d => d.name === item.name)) return prev;
-          return [...prev, {
-            id: Date.now() + Math.random(),
-            name: item.name,
-            type: isYaml ? 'yaml' : 'text',
-            size: `${((item.metadata?.size || 0) / 1024).toFixed(1)} KB`,
-            status: 'active',
-            content
-          }];
-        });
-        setKnowledgeBase(prev => {
-          if (prev.includes(item.name)) return prev;
-          return prev + `\n\n## Document: ${item.name}\n${content.substring(0, 10000)}`;
-        });
+      setKnowledgeLoadStatus('loading');
+      try {
+        const { data, error } = await supabase.storage.from('intelligence').list('', { limit: 200 });
+        if (error) throw error;
+        const names = new Set(
+          (data || [])
+            .map((item) => item.name)
+            .filter((n) => isKnowledgeStorageFile(n))
+        );
+        await ensureSeedFiles(names);
+
+        const { data: listed } = await supabase.storage.from('intelligence').list('', { limit: 200 });
+        const knowledgeItems = (listed || []).filter((item) => isKnowledgeStorageFile(item.name));
+        const docs = [];
+        for (const item of knowledgeItems) {
+          const { data: fileData, error: downloadError } = await supabase.storage
+            .from('intelligence')
+            .download(item.name);
+          if (downloadError || !fileData) continue;
+          const content = await fileData.text();
+          docs.push(toDoc(item.name, content, item.metadata?.size || content.length));
+        }
+        applyDocs(docs);
+      } catch (e) {
+        console.warn('Knowledge load failed:', e);
+        setKnowledgeLoadStatus('error');
+        // Fallback: try public seed files directly (no storage)
+        try {
+          const docs = [];
+          for (const fileName of KNOWLEDGE_SEED_FILES) {
+            const res = await fetch(`/knowledge/${fileName}`);
+            if (!res.ok) continue;
+            const content = await res.text();
+            docs.push(toDoc(fileName, content, content.length));
+          }
+          if (docs.length) applyDocs(docs);
+        } catch { /* leave empty */ }
       }
     };
     loadIntelligenceFiles();
@@ -1045,14 +1092,8 @@ export default function CommercialExcellenceApp() {
           setAgents(merged.agents);
           setTopics(merged.topics);
           setCustomSystemPrompt(merged.systemPrompt);
-          setKnowledgeBase(merged.knowledge.defaultMarkdown);
           setSuggestionsEnabled(merged.suggestions.enabled);
           setMaxSuggestions(merged.suggestions.max);
-          setDocuments((prev) => prev.map((d) => {
-            if (d.id === 1) return { ...d, content: merged.knowledge.defaultMarkdown };
-            if (d.id === 2) return { ...d, content: merged.knowledge.pillar2Markdown };
-            return d;
-          }));
           try {
             localStorage.setItem(
               userSettingsLocalKey(currentUser.id),
@@ -1425,11 +1466,6 @@ export default function CommercialExcellenceApp() {
       systemPrompt: customSystemPrompt,
       agents,
       topics,
-      knowledge: {
-        ...(userSettings.knowledge || {}),
-        defaultMarkdown: knowledgeBase,
-        pillar2Markdown: userSettings.knowledge?.pillar2Markdown ?? PILLAR_2_KNOWLEDGE,
-      },
       suggestions: {
         ...(userSettings.suggestions || {}),
         enabled: suggestionsEnabled,
@@ -1447,14 +1483,6 @@ export default function CommercialExcellenceApp() {
       systemPrompt: incoming.systemPrompt ?? customSystemPrompt,
       agents: incoming.agents ?? agents,
       topics: incoming.topics ?? topics,
-      knowledge: {
-        ...(userSettings.knowledge || {}),
-        ...(incoming.knowledge || {}),
-        defaultMarkdown: incoming.knowledge?.defaultMarkdown ?? knowledgeBase,
-        pillar2Markdown: incoming.knowledge?.pillar2Markdown
-          ?? userSettings.knowledge?.pillar2Markdown
-          ?? PILLAR_2_KNOWLEDGE,
-      },
       suggestions: {
         ...(userSettings.suggestions || {}),
         ...(incoming.suggestions || {}),
@@ -1466,12 +1494,13 @@ export default function CommercialExcellenceApp() {
       welcomeMessages: incoming.welcomeMessages ?? userSettings.welcomeMessages,
       pptxClarify: incoming.pptxClarify ?? userSettings.pptxClarify,
     });
+    // Knowledge is file-based — never persist markdown blobs into settings JSON
+    delete settings.knowledge;
     const doc = buildUserSettingsDocument(currentUser.id, settings);
     setUserSettings(settings);
     if (settings.agents) setAgents(settings.agents);
     if (settings.topics) setTopics(settings.topics);
     if (settings.systemPrompt != null) setCustomSystemPrompt(settings.systemPrompt);
-    if (settings.knowledge?.defaultMarkdown != null) setKnowledgeBase(settings.knowledge.defaultMarkdown);
     if (settings.suggestions) {
       setSuggestionsEnabled(!!settings.suggestions.enabled);
       setMaxSuggestions(settings.suggestions.max);
@@ -1542,11 +1571,13 @@ export default function CommercialExcellenceApp() {
   };
 
   const buildAgentKnowledge = (agent) => {
-    if (!agent.knowledgeFiles) return '';
-    return documents
-      .filter(d => agent.knowledgeFiles.includes(d.id) && d.status === 'active' && d.content)
-      .map(d => `## ${d.name}\n${d.content}`)
-      .join('\n\n');
+    const keys = agent.knowledgeFiles || [];
+    if (!keys.length) return '';
+    const active = documents.filter((d) => d.status === 'active' && d.content);
+    const selected = keys.includes('*')
+      ? active
+      : active.filter((d) => keys.some((k) => d.name === k || d.name.endsWith(`/${k}`) || d.id === k));
+    return selected.map((d) => `## ${d.name}\n${d.content}`).join('\n\n');
   };
 
   const runAgent = async (agent, step, messages) => {
@@ -1980,9 +2011,11 @@ ${isFocused
   const handleAdminFileUpload = async (event) => {
     const file = event.target.files[0];
     if (!file) return;
-    const isYaml = file.name.endsWith('.yml') || file.name.endsWith('.yaml');
-    console.log('Uploading to Supabase:', file.name, supabase); // ADD THIS LINE
-    // Upload to Supabase storage
+    if (!isKnowledgeStorageFile(file.name)) {
+      setMessages(prev => [...prev, { role: 'system', content: '❌ Knowledge files must be .md, .txt, .yml, or .yaml' }]);
+      event.target.value = '';
+      return;
+    }
     const { error } = await supabase.storage
       .from('intelligence')
       .upload(file.name, file, { upsert: true });
@@ -1996,25 +2029,23 @@ ${isFocused
 
     const reader = new FileReader();
     reader.onload = (e) => {
-      const content = e.target.result;
+      const content = String(e.target.result || '');
+      const isYaml = /\.ya?ml$/i.test(file.name);
       const newDoc = {
-        id: Date.now(),
+        id: file.name,
         name: file.name,
-        type: isYaml ? 'yaml' : file.type,
+        type: isYaml ? 'yaml' : 'text',
         size: `${(file.size / 1024).toFixed(1)} KB`,
         status: 'active',
-        content: content
+        content,
+        fromStorage: true,
       };
-      setDocuments(prev => [...prev, newDoc]);
-      if (isYaml) {
-        const pillarMatch = content.match(/pillar_name:\s*["']([^"']+)["']/);
-        const pillarName = pillarMatch ? pillarMatch[1] : file.name;
-        setKnowledgeBase(prev => prev + `\n\n## ${pillarName} (from ${file.name})\n${content.substring(0, 5000)}`);
-        setMessages(prev => [...prev, { role: 'system', content: `✅ Uploaded and saved to cloud: ${file.name}` }]);
-      } else {
-        setKnowledgeBase(prev => prev + `\n\n## Document: ${file.name}\n${content.substring(0, 10000)}`);
-        setMessages(prev => [...prev, { role: 'system', content: `✅ Uploaded and saved to cloud: ${file.name}` }]);
-      }
+      setDocuments((prev) => {
+        const next = [...prev.filter((d) => d.name !== file.name), newDoc];
+        setKnowledgeBase(buildKnowledgeBaseFromDocuments(next));
+        return next;
+      });
+      setMessages(prev => [...prev, { role: 'system', content: `✅ Uploaded and saved to cloud: ${file.name}` }]);
     };
     reader.readAsText(file);
     event.target.value = '';
@@ -2022,11 +2053,16 @@ ${isFocused
 
   // ── SUPABASE: Delete intelligence files ──
   const removeDocument = async (id) => {
-    const doc = documents.find(d => d.id === id);
-    if (doc && doc.id !== 1 && doc.id !== 2) {
+    const doc = documents.find(d => d.id === id || d.name === id);
+    if (!doc) return;
+    try {
       await supabase.storage.from('intelligence').remove([doc.name]);
-    }
-    setDocuments(prev => prev.filter(d => d.id !== id));
+    } catch { /* ignore */ }
+    setDocuments((prev) => {
+      const next = prev.filter((d) => d.id !== doc.id && d.name !== doc.name);
+      setKnowledgeBase(buildKnowledgeBaseFromDocuments(next));
+      return next;
+    });
   };
 
   // ── STELLA: Supabase storage helpers ──
@@ -3244,9 +3280,14 @@ ${isFocused
 
     try {
       const fileContext = isFileAnalysis && uploadedFile ? `\n\nCONTEXT: The user has just uploaded a file named "${uploadedFile.name}" for assessment.` : '';
+      const kb = knowledgeBase || buildKnowledgeBaseFromDocuments(documents);
       const systemPrompt = withUserSettings(customSystemPrompt
-        .replace('KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
-          'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.\n\n' + knowledgeBase + '\n\n' + (userSettings.knowledge?.pillar2Markdown || PILLAR_2_KNOWLEDGE))
+        .replace(
+          'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
+          kb
+            ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
+            : 'KNOWLEDGE BASE:\nNo knowledge files are loaded yet. Ask the user to upload intelligence files in Admin → Knowledge, or answer from conversation context only.'
+        )
         + fileContext);
 
       const response = await anthropicMessagesPost({
@@ -4130,50 +4171,18 @@ ${isFocused
                 <>
                   <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
                     <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><FileText className="w-6 h-6 text-blue-400" />Knowledge Base Management</h2>
-                    <p className="text-sm text-blue-300/70 mb-6">Seed knowledge is saved in settings JSON. Extra files upload to Supabase and load on every visit.</p>
-                    <div className="space-y-4 mb-6">
-                      <div>
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-1">Default best practices</label>
-                        <textarea
-                          value={userSettings.knowledge?.defaultMarkdown ?? knowledgeBase}
-                          onChange={(e) => {
-                            const v = e.target.value;
-                            setKnowledgeBase(v);
-                            setUserSettings(prev => ({ ...prev, knowledge: { ...prev.knowledge, defaultMarkdown: v } }));
-                            setDocuments(prev => prev.map(d => d.id === 1 ? { ...d, content: v } : d));
-                          }}
-                          rows={10}
-                          className="w-full bg-slate-900/50 text-xs text-slate-200 font-mono border border-blue-400/30 rounded-lg px-3 py-2 outline-none focus:border-cyan-400/60 resize-y"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-1">Pillar 2 rules / principles</label>
-                        <textarea
-                          value={userSettings.knowledge?.pillar2Markdown ?? ''}
-                          onChange={(e) => {
-                            const v = e.target.value;
-                            setUserSettings(prev => ({ ...prev, knowledge: { ...prev.knowledge, pillar2Markdown: v } }));
-                            setDocuments(prev => prev.map(d => d.id === 2 ? { ...d, content: v } : d));
-                          }}
-                          rows={10}
-                          className="w-full bg-slate-900/50 text-xs text-slate-200 font-mono border border-blue-400/30 rounded-lg px-3 py-2 outline-none focus:border-cyan-400/60 resize-y"
-                        />
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => persistIntelligenceSettings({
-                          knowledge: {
-                            defaultMarkdown: knowledgeBase,
-                            pillar2Markdown: userSettings.knowledge?.pillar2Markdown ?? PILLAR_2_KNOWLEDGE,
-                          },
-                        })}
-                        disabled={userSettingsSaveStatus === 'saving'}
-                        className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
-                      >
-                        <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save knowledge to settings'}
-                      </button>
-                    </div>
+                    <p className="text-sm text-blue-300/70 mb-2">
+                      Knowledge is <span className="text-cyan-300 font-semibold">not hardcoded</span>. Files in the Supabase <code className="text-cyan-300/80">intelligence</code> bucket are loaded on every visit and injected into chat/agents.
+                    </p>
+                    <p className="text-xs text-blue-300/50 mb-6">
+                      Status: {knowledgeLoadStatus === 'loading' ? 'Loading…' : knowledgeLoadStatus === 'ready' ? `${documents.length} file(s) loaded` : knowledgeLoadStatus === 'error' ? 'Storage error (tried public seed fallback)' : 'Idle'}
+                    </p>
                     <div className="space-y-3 mb-6">
+                      {documents.length === 0 && (
+                        <div className="text-xs text-amber-300/80 bg-amber-500/10 border border-amber-400/20 rounded-lg p-3">
+                          No knowledge files loaded yet. Upload .md / .txt / .yml files below (seed files: {KNOWLEDGE_SEED_FILES.join(', ')}).
+                        </div>
+                      )}
                       {documents.map(doc => (
                         <div key={doc.id} className="flex items-center justify-between bg-slate-700/30 border border-blue-400/20 rounded-lg p-4 hover:border-blue-400/40 transition-all">
                           <div className="flex items-center gap-3">
@@ -4185,15 +4194,13 @@ ${isFocused
                           </div>
                           <div className="flex items-center gap-2">
                             <span className="px-2 py-1 bg-green-500/20 text-green-400 text-xs rounded border border-green-400/30 flex items-center gap-1"><CheckCircle className="w-3 h-3" />Active</span>
-                            {doc.id !== 1 && doc.id !== 2 && (
-                              <button onClick={() => removeDocument(doc.id)} className="p-2 hover:bg-red-500/20 rounded transition-colors text-red-400"><Trash2 className="w-4 h-4" /></button>
-                            )}
+                            <button onClick={() => removeDocument(doc.id)} className="p-2 hover:bg-red-500/20 rounded transition-colors text-red-400"><Trash2 className="w-4 h-4" /></button>
                           </div>
                         </div>
                       ))}
                     </div>
                     <button onClick={() => adminFileInputRef.current?.click()} className="w-full py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Plus className="w-5 h-5" />Upload Intelligence File</button>
-                    <p className="text-xs text-blue-300/50 text-center mt-2">Supports: .yml, .yaml, .txt, .md files • Saved to Supabase cloud storage</p>
+                    <p className="text-xs text-blue-300/50 text-center mt-2">Supports: .yml, .yaml, .txt, .md • Saved to Supabase and reloaded every visit</p>
                     <input ref={adminFileInputRef} type="file" accept=".yml,.yaml,.txt,.md" onChange={handleAdminFileUpload} className="hidden" />
                   </div>
                 </>
@@ -4412,6 +4419,20 @@ ${isFocused
                       <div><label className="block text-sm font-semibold mb-2">Agent Name</label><input type="text" value={editingAgent.name} onChange={(e) => setEditingAgent({...editingAgent, name: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
                       <div><label className="block text-sm font-semibold mb-2">Role</label><input type="text" value={editingAgent.role} onChange={(e) => setEditingAgent({...editingAgent, role: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
                       <div><label className="block text-sm font-semibold mb-2">System Prompt</label><textarea value={editingAgent.systemPrompt} rows={15} onChange={(e) => setEditingAgent({...editingAgent, systemPrompt: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white font-mono text-sm" /></div>
+                      <div>
+                        <label className="block text-sm font-semibold mb-2">Knowledge files (comma-separated filenames, or * for all)</label>
+                        <input
+                          type="text"
+                          value={Array.isArray(editingAgent.knowledgeFiles) ? editingAgent.knowledgeFiles.join(', ') : ''}
+                          onChange={(e) => setEditingAgent({
+                            ...editingAgent,
+                            knowledgeFiles: e.target.value.split(',').map((s) => s.trim()).filter(Boolean),
+                          })}
+                          placeholder="default-best-practices.md, pillar-2-strategic-alignment.md"
+                          className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm"
+                        />
+                        <p className="text-xs text-blue-300/50 mt-1">Must match files loaded from the intelligence bucket.</p>
+                      </div>
                     </div>
                     <div className="border-t border-blue-400/20 p-6 flex gap-3 bg-slate-900 rounded-b-xl">
                       <button onClick={async () => {

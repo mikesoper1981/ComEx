@@ -1,4 +1,3 @@
-import { DEFAULT_KNOWLEDGE, PILLAR_2_KNOWLEDGE } from './knowledge';
 import { DEFAULT_SYSTEM_PROMPT } from './systemPrompt';
 import { DEFAULT_AGENTS } from './agents';
 import { DEFAULT_TOPICS } from './topics';
@@ -11,8 +10,6 @@ import {
 } from './runtimePrompts';
 
 export {
-  DEFAULT_KNOWLEDGE,
-  PILLAR_2_KNOWLEDGE,
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_AGENTS,
   DEFAULT_TOPICS,
@@ -23,20 +20,26 @@ export {
   DEFAULT_STELLA_PROMPTS,
 };
 
-/** Intelligence / AI config nested under user settings JSON. */
+/** Map legacy numeric knowledge file ids → storage filenames. */
+function normalizeKnowledgeFiles(files) {
+  if (!Array.isArray(files)) return [];
+  return files.map((f) => {
+    if (f === 1 || f === '1') return 'default-best-practices.md';
+    if (f === 2 || f === '2') return 'pillar-2-strategic-alignment.md';
+    return String(f);
+  });
+}
+
+/** Intelligence / AI config nested under user settings JSON (knowledge lives in storage files, not here). */
 export const DEFAULT_INTELLIGENCE_CONTEXT = {
   systemPrompt: DEFAULT_SYSTEM_PROMPT,
-  agents: DEFAULT_AGENTS.map((a) => ({ ...a, knowledgeFiles: [...(a.knowledgeFiles || [])] })),
+  agents: DEFAULT_AGENTS.map((a) => ({ ...a, knowledgeFiles: normalizeKnowledgeFiles(a.knowledgeFiles) })),
   topics: DEFAULT_TOPICS.map((t) => ({
     ...t,
     triggerKeywords: [...(t.triggerKeywords || [])],
     orchestrator: { ...(t.orchestrator || {}) },
     workflow: (t.workflow || []).map((s) => ({ ...s, agents: [...(s.agents || [])] })),
   })),
-  knowledge: {
-    defaultMarkdown: DEFAULT_KNOWLEDGE,
-    pillar2Markdown: PILLAR_2_KNOWLEDGE,
-  },
   welcomeMessages: { ...DEFAULT_WELCOME_MESSAGES },
   suggestions: { ...DEFAULT_SUGGESTIONS },
   pptxClarify: {
@@ -53,7 +56,7 @@ function cloneAgents(list) {
     name: a.name || '',
     role: a.role || '',
     systemPrompt: a.systemPrompt != null ? String(a.systemPrompt) : '',
-    knowledgeFiles: Array.isArray(a.knowledgeFiles) ? [...a.knowledgeFiles] : [],
+    knowledgeFiles: normalizeKnowledgeFiles(a.knowledgeFiles),
     status: a.status || 'active',
   }));
 }
@@ -94,14 +97,6 @@ export function mergeTopics(partial) {
     return cloneTopics(DEFAULT_TOPICS);
   }
   return cloneTopics(partial);
-}
-
-export function mergeKnowledge(partial) {
-  const k = partial && typeof partial === 'object' ? partial : {};
-  return {
-    defaultMarkdown: k.defaultMarkdown != null ? String(k.defaultMarkdown) : DEFAULT_KNOWLEDGE,
-    pillar2Markdown: k.pillar2Markdown != null ? String(k.pillar2Markdown) : PILLAR_2_KNOWLEDGE,
-  };
 }
 
 export function mergeWelcomeMessages(partial) {
@@ -157,7 +152,6 @@ export function mergeIntelligenceContext(raw = {}) {
     systemPrompt: raw.systemPrompt != null ? String(raw.systemPrompt) : DEFAULT_SYSTEM_PROMPT,
     agents: mergeAgents(raw.agents),
     topics: mergeTopics(raw.topics),
-    knowledge: mergeKnowledge(raw.knowledge),
     welcomeMessages: mergeWelcomeMessages(raw.welcomeMessages),
     suggestions: mergeSuggestions(raw.suggestions),
     pptxClarify: mergePptxClarify(raw.pptxClarify),
@@ -170,4 +164,26 @@ export function fillTemplate(template, vars = {}) {
   return String(template || '').replace(/\{\{(\w+)\}\}/g, (_, key) => (
     vars[key] != null ? String(vars[key]) : ''
   ));
+}
+
+/** Filenames under /knowledge (and intelligence bucket) that power the KB. */
+export const KNOWLEDGE_SEED_FILES = [
+  'default-best-practices.md',
+  'pillar-2-strategic-alignment.md',
+];
+
+export function isKnowledgeStorageFile(name) {
+  const n = String(name || '').toLowerCase();
+  if (!n || n.endsWith('/')) return false;
+  if (n.includes('/') && !n.startsWith('knowledge/')) return false;
+  if (n.endsWith('.json')) return false;
+  if (n.startsWith('users/') || n === 'user-settings.json') return false;
+  return /\.(md|txt|yml|yaml)$/i.test(n);
+}
+
+export function buildKnowledgeBaseFromDocuments(docs) {
+  return (docs || [])
+    .filter((d) => d.status === 'active' && d.content)
+    .map((d) => `## ${d.name}\n${d.content}`)
+    .join('\n\n');
 }

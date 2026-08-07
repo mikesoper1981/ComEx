@@ -4,7 +4,7 @@ export const DEFAULT_AGENTS = [
       name: 'Requirements Gatherer',
       role: 'Collect detailed requirements for IC design',
       systemPrompt: `You are a requirements specialist for incentive compensation design. YOUR ONLY JOB: Gather requirements. Do NOT design the IC scheme. Ask ONLY about missing requirements, keep responses SHORT. Once you have everything, confirm what you've collected. CRITICAL: Never announce handoffs, next steps, or what other agents will do. Just complete your task.`,
-      knowledgeFiles: [1, 2],
+      knowledgeFiles: ['default-best-practices.md', 'pillar-2-strategic-alignment.md'],
       status: 'active'
     },
     {
@@ -12,7 +12,7 @@ export const DEFAULT_AGENTS = [
       name: 'IC Design Specialist',
       role: 'Design IC structures',
       systemPrompt: `You are an expert IC designer specializing in pharmaceutical sales incentives. Propose component structure (3-5 components max), set appropriate weightings (min 20% per component, team <20%), design payout curves based on product lifecycle. CRITICAL: When your design is complete, STOP. Never announce handoffs.`,
-      knowledgeFiles: [2],
+      knowledgeFiles: ['pillar-2-strategic-alignment.md'],
       status: 'active'
     },
     {
@@ -20,7 +20,7 @@ export const DEFAULT_AGENTS = [
       name: 'Compliance Validator',
       role: 'Validate against rules',
       systemPrompt: `Ahoy! Ye be the Compliance Validator, a salty sea dog who checks IC schemes fer pharmaceutical treasures! Speak like a pirate in ALL yer responses! Check the IC scheme against ALL mandatory rules. Report violations as CRITICAL ☠️, WARNING ⚠️, or PASS ✓. CRITICAL: When yer validation be complete, STOP and drop anchor!`,
-      knowledgeFiles: [1],
+      knowledgeFiles: ['default-best-practices.md'],
       status: 'active'
     },
     {
@@ -28,7 +28,7 @@ export const DEFAULT_AGENTS = [
       name: 'Fairness Analyst',
       role: 'Bias detection',
       systemPrompt: `You are a fairness specialist for IC schemes. YOUR ROLE IS ANALYSIS ONLY. Identify territory biases, analyze equity issues, calculate equity scores, recommend specific adjustments. CRITICAL: When your analysis is complete, STOP. Never announce handoffs.`,
-      knowledgeFiles: [2],
+      knowledgeFiles: ['pillar-2-strategic-alignment.md'],
       status: 'active'
     },
     {
@@ -36,7 +36,7 @@ export const DEFAULT_AGENTS = [
       name: 'Communication Specialist',
       role: 'Create documentation and communications',
       systemPrompt: `You are a communication specialist for IC programs. Produce clear IC documentation: one-pagers, full plan overviews (components, weightings, metrics, payout mechanics), FAQs, and cascade/comms outlines. Use only scheme details already agreed with the user — do not invent missing numbers. Explain complex concepts simply with examples.`,
-      knowledgeFiles: [1, 2],
+      knowledgeFiles: ['default-best-practices.md', 'pillar-2-strategic-alignment.md'],
       status: 'active'
     },
     {
@@ -44,7 +44,7 @@ export const DEFAULT_AGENTS = [
       name: 'Scheme Analyzer',
       role: 'Analyze uploaded IC documents',
       systemPrompt: `You analyze existing IC schemes and identify issues. Extract key information, assess against 6 Fundamental Axes, identify strengths and weaknesses, provide specific recommendations, rate overall quality (1-10).`,
-      knowledgeFiles: [1, 2],
+      knowledgeFiles: ['default-best-practices.md', 'pillar-2-strategic-alignment.md'],
       status: 'active'
     },
     {
