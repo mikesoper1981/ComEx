@@ -1,13 +1,17 @@
 import { useState } from 'react';
 import { Lock } from 'lucide-react';
-
-const SESSION_KEY = 'comex_app_unlocked';
+import {
+  SESSION_UNLOCKED_KEY,
+  getHardcodedUser,
+  setCurrentUser,
+} from './auth';
 
 export default function PasswordGate({ children }) {
   const expected = import.meta.env.VITE_APP_PASSWORD;
+  const hardcodedUser = getHardcodedUser();
 
   const [unlocked, setUnlocked] = useState(
-    () => sessionStorage.getItem(SESSION_KEY) === '1'
+    () => sessionStorage.getItem(SESSION_UNLOCKED_KEY) === '1'
   );
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -21,7 +25,8 @@ export default function PasswordGate({ children }) {
     const a = password.trim();
     const b = String(expected ?? '').trim();
     if (a === b) {
-      sessionStorage.setItem(SESSION_KEY, '1');
+      // Bind session to the hardcoded user so settings/data can be scoped by userId.
+      setCurrentUser(hardcodedUser);
       setUnlocked(true);
       setError('');
       setPassword('');
@@ -42,8 +47,12 @@ export default function PasswordGate({ children }) {
         <h1 className="text-xl font-semibold text-center text-white tracking-tight mb-1">
           Sign in
         </h1>
-        <p className="text-sm text-blue-200/70 text-center mb-6">
+        <p className="text-sm text-blue-200/70 text-center mb-2">
           Enter the app password to continue.
+        </p>
+        <p className="text-xs text-blue-300/50 text-center mb-6">
+          Signing in as <span className="text-blue-200/80 font-medium">{hardcodedUser.name}</span>
+          <span className="text-blue-300/40"> ({hardcodedUser.id})</span>
         </p>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>

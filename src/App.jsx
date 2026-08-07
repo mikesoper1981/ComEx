@@ -1,6 +1,13 @@
 import React, { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers, UserCog } from 'lucide-react';
 import { supabase } from './supabase';
+import {
+  getCurrentUser,
+  setCurrentUser,
+  getHardcodedUser,
+  userSettingsLocalKey,
+  userSettingsRemotePath,
+} from './auth';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -102,8 +109,8 @@ const STELLA_STORAGE_CANDIDATES = [
   { bucket: 'intelligence', prefix: 'stella/' },
 ];
 
-const USER_SETTINGS_STORAGE_KEY = 'comex-user-settings';
-const USER_SETTINGS_FILE = 'user-settings.json';
+const LEGACY_USER_SETTINGS_STORAGE_KEY = 'comex-user-settings';
+const LEGACY_USER_SETTINGS_FILE = 'user-settings.json';
 
 const DEFAULT_USER_SETTINGS = {
   companyName: '',
@@ -116,6 +123,42 @@ const DEFAULT_USER_SETTINGS = {
   constraints: '',
   customContext: '',
 };
+
+/** Pull settings fields out of a stored document (new or legacy shape). */
+function normalizeLoadedUserSettings(parsed) {
+  if (!parsed || typeof parsed !== 'object') return { ...DEFAULT_USER_SETTINGS };
+  if (parsed.settings && typeof parsed.settings === 'object') {
+    return { ...DEFAULT_USER_SETTINGS, ...parsed.settings };
+  }
+  const { userId: _userId, updatedAt: _updatedAt, settings: _settings, ...fields } = parsed;
+  return { ...DEFAULT_USER_SETTINGS, ...fields };
+}
+
+/** Document shape saved to localStorage / Supabase — always includes userId. */
+function buildUserSettingsDocument(userId, settings) {
+  return {
+    userId,
+    updatedAt: new Date().toISOString(),
+    settings: { ...DEFAULT_USER_SETTINGS, ...settings },
+  };
+}
+
+function readLocalUserSettings(userId) {
+  try {
+    const scoped = localStorage.getItem(userSettingsLocalKey(userId));
+    if (scoped) {
+      const parsed = safeJsonParse(scoped);
+      if (parsed) return normalizeLoadedUserSettings(parsed);
+    }
+    // One-time legacy key (pre userId scoping).
+    const legacy = localStorage.getItem(LEGACY_USER_SETTINGS_STORAGE_KEY);
+    if (legacy) {
+      const parsed = safeJsonParse(legacy);
+      if (parsed) return normalizeLoadedUserSettings(parsed);
+    }
+  } catch { /* ignore */ }
+  return { ...DEFAULT_USER_SETTINGS };
+}
 
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
 function buildUserSettingsPromptBlock(settings) {
@@ -815,6 +858,15 @@ class MessageErrorBoundary extends React.Component {
 }
 
 export default function CommercialExcellenceApp() {
+  // Ensure older sessions (unlocked before userId existed) still have an identity.
+  const [currentUser] = useState(() => {
+    const existing = getCurrentUser();
+    if (existing?.id) {
+      setCurrentUser(existing);
+      return existing;
+    }
+    return setCurrentUser(getHardcodedUser());
+  });
   const [activeTab, setActiveTab] = useState('chat');
   const [showLanding, setShowLanding] = useState(true);
   const [messages, setMessages] = useState([
@@ -839,14 +891,7 @@ export default function CommercialExcellenceApp() {
     terminology: '',
   });
   const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
-  const [userSettings, setUserSettings] = useState(() => {
-    try {
-      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(USER_SETTINGS_STORAGE_KEY) : null;
-      const parsed = raw ? safeJsonParse(raw) : null;
-      if (parsed && typeof parsed === 'object') return { ...DEFAULT_USER_SETTINGS, ...parsed };
-    } catch { /* ignore */ }
-    return { ...DEFAULT_USER_SETTINGS };
-  });
+  const [userSettings, setUserSettings] = useState(() => readLocalUserSettings(getCurrentUser().id));
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
   const [knowledgeBase, setKnowledgeBase] = useState(DEFAULT_KNOWLEDGE);
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
@@ -1166,21 +1211,33 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
         } catch { /* try next candidate */ }
       }
 
-      // User settings (JSON in intelligence bucket; localStorage is the fast local source of truth).
+      // User settings scoped by current userId (users/<id>/settings.json).
       try {
-        const { data, error } = await supabase.storage.from('intelligence').download(USER_SETTINGS_FILE);
-        if (!error && data) {
-          const parsed = safeJsonParse(await data.text());
-          if (parsed && typeof parsed === 'object') {
-            const merged = { ...DEFAULT_USER_SETTINGS, ...parsed };
-            setUserSettings(merged);
-            try { localStorage.setItem(USER_SETTINGS_STORAGE_KEY, JSON.stringify(merged)); } catch { /* ignore */ }
-          }
+        const path = userSettingsRemotePath(currentUser.id);
+        let parsed = null;
+        {
+          const { data, error } = await supabase.storage.from('intelligence').download(path);
+          if (!error && data) parsed = safeJsonParse(await data.text());
         }
-      } catch { /* user-settings.json may not exist yet */ }
+        // Migrate legacy flat file once for the hardcoded default user.
+        if (!parsed && currentUser.id === getHardcodedUser().id) {
+          const { data, error } = await supabase.storage.from('intelligence').download(LEGACY_USER_SETTINGS_FILE);
+          if (!error && data) parsed = safeJsonParse(await data.text());
+        }
+        if (parsed && typeof parsed === 'object') {
+          const merged = normalizeLoadedUserSettings(parsed);
+          setUserSettings(merged);
+          try {
+            localStorage.setItem(
+              userSettingsLocalKey(currentUser.id),
+              JSON.stringify(buildUserSettingsDocument(currentUser.id, merged))
+            );
+          } catch { /* ignore */ }
+        }
+      } catch { /* per-user settings may not exist yet */ }
     };
     loadStella();
-  }, []);
+  }, [currentUser.id]);
 
   useEffect(() => {
     scrollToBottom();
@@ -1519,22 +1576,22 @@ Write the ACTUAL document — ready to hand to the audience. Use specific detail
   const withUserSettings = (system) => `${system || ''}${buildUserSettingsPromptBlock(userSettings)}`;
 
   const saveUserSettings = async (next) => {
-    const payload = { ...DEFAULT_USER_SETTINGS, ...(next || userSettings) };
-    setUserSettings(payload);
+    const settings = { ...DEFAULT_USER_SETTINGS, ...(next || userSettings) };
+    const doc = buildUserSettingsDocument(currentUser.id, settings);
+    setUserSettings(settings);
     setUserSettingsSaveStatus('saving');
     try {
-      localStorage.setItem(USER_SETTINGS_STORAGE_KEY, JSON.stringify(payload));
+      localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* private mode / quota — continue to cloud */ }
     try {
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
       const { error } = await supabase.storage
         .from('intelligence')
-        .upload(USER_SETTINGS_FILE, blob, { upsert: true, contentType: 'application/json' });
+        .upload(userSettingsRemotePath(currentUser.id), blob, { upsert: true, contentType: 'application/json' });
       if (error) throw error;
       setUserSettingsSaveStatus('saved');
       setTimeout(() => setUserSettingsSaveStatus('idle'), 3000);
     } catch {
-      // Local save is enough until login/DB exists; surface soft status.
       setUserSettingsSaveStatus('saved-local');
       setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
     }
@@ -3601,18 +3658,26 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
           ) : activeTab === 'user-settings' ? (
             <div className="overflow-y-auto h-full custom-scrollbar pr-1 sm:pr-2 space-y-4">
               <div className="bg-gradient-to-r from-blue-600 to-indigo-600 rounded-xl p-4 sm:p-5 text-white shadow-xl">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 bg-white/15 rounded-lg flex items-center justify-center"><UserCog className="w-5 h-5" /></div>
-                  <div>
-                    <h2 className="text-xl font-bold">User Settings</h2>
-                    <p className="text-blue-100 text-xs sm:text-sm">Preferences and context the AI must respect across Consultation, agents, and Stella.</p>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-white/15 rounded-lg flex items-center justify-center"><UserCog className="w-5 h-5" /></div>
+                    <div>
+                      <h2 className="text-xl font-bold">User Settings</h2>
+                      <p className="text-blue-100 text-xs sm:text-sm">Preferences and context the AI must respect across Consultation, agents, and Stella.</p>
+                    </div>
+                  </div>
+                  <div className="text-right text-xs text-blue-100/80">
+                    <div className="font-semibold text-white">{currentUser.name}</div>
+                    <div className="font-mono text-blue-200/70">userId: {currentUser.id}</div>
                   </div>
                 </div>
               </div>
 
               <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 sm:p-6">
                 <p className="text-xs text-blue-300/70 mb-5">
-                  Saved as JSON in this browser and to Supabase storage (<code className="text-cyan-300/80">{USER_SETTINGS_FILE}</code>). When you add user login later, this can move to a per-user database record.
+                  Saved per user as JSON in this browser and Supabase storage (
+                  <code className="text-cyan-300/80">{userSettingsRemotePath(currentUser.id)}</code>
+                  ). The document includes <code className="text-cyan-300/80">userId</code> so multiple users can coexist; swap the hardcoded login for real auth later without changing this shape.
                 </p>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
