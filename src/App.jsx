@@ -9,7 +9,7 @@ import {
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
 } from './auth';
-import { extractPptxThemeFromFile, getPptxGeneratorThemeFromUserSettings } from './pptxTheme';
+import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyTemplateChrome } from './pptxTheme';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -232,6 +232,31 @@ const PPTX_CLARIFY_PROMPT = `I can export a PowerPoint from **this conversation*
 3. **Full IC documentation pack** — plan overview, components/weightings, rules, and FAQs / comms outline based on what we designed here
 
 Reply with **1**, **2**, or **3** (or describe what you need).`;
+
+const PPTX_CLARIFY_OPTIONS = [
+  { value: '1', label: '📋 Session summary' },
+  { value: '2', label: '📄 Simple one-pager' },
+  { value: '3', label: '📚 Full IC documentation pack' },
+];
+
+/** Detect 1–3 numbered choices in an assistant prompt so we can show clickable buttons. */
+function extractChoiceOptions(text) {
+  if (!text) return null;
+  const opts = [];
+  const lines = String(text).split(/\n/);
+  for (const line of lines) {
+    const m = line.match(/^\s*(?:\*\*)?([1-3])(?:\*\*)?\s*[.:)\]]\s+(?:\*\*)?(.+?)(?:\*\*)?\s*$/);
+    if (!m) continue;
+    let label = m[2].replace(/\*\*/g, '').replace(/\s*—\s*.*$/, '').trim();
+    if (label.length > 56) label = `${label.slice(0, 53)}…`;
+    opts.push({ value: m[1], label: `${m[1]}. ${label}` });
+  }
+  // Deduplicate by value, keep order
+  const seen = new Set();
+  const unique = opts.filter((o) => (seen.has(o.value) ? false : (seen.add(o.value), true)));
+  if (unique.length >= 1 && unique.length <= 3) return unique;
+  return null;
+}
 
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
 function buildUserSettingsPromptBlock(settings) {
@@ -1714,7 +1739,6 @@ First slide must be type "title". Prefer tables for components/weights. Keep JSO
     setPptxTemplateError('');
     setPptxTemplateStatus('extracting');
     try {
-      // Style only — slide content is never read into the AI / export text.
       const theme = await extractPptxThemeFromFile(file);
       setPptxTemplateStatus('uploading');
       const storagePath = userPptxTemplateRemotePath(currentUser.id);
@@ -1728,13 +1752,7 @@ First slide must be type "title". Prefer tables for components/weights. Keep JSO
         uploadedAt: new Date().toISOString(),
         storagePath,
         storageBucket: 'intelligence',
-        theme: {
-          schemeName: theme.schemeName,
-          colors: theme.colors,
-          fonts: theme.fonts,
-          sourceFileName: theme.sourceFileName,
-          extractedAt: theme.extractedAt,
-        },
+        theme: themeToSettingsMeta(theme),
       };
       await saveUserSettings({ ...userSettings, pptxTemplate });
       setPptxTemplateStatus('idle');
@@ -3081,8 +3099,19 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
   const askPptxClarification = () => {
     setPptxClarifyPending(true);
     setPptxOffers(null);
+    setSuggestedPrompts([]);
     setMessages(prev => [...prev, { role: 'assistant', content: PPTX_CLARIFY_PROMPT }]);
   };
+
+  const choiceButtons = useMemo(() => {
+    if (isLoading || pptxGenerating) return null;
+    if (pptxClarifyPending) return PPTX_CLARIFY_OPTIONS;
+    if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
+    const last = [...messages].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
+    if (!last?.content) return null;
+    // Prefer explicit numbered 1–3 options in the latest prompt
+    return extractChoiceOptions(last.content);
+  }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision]);
 
   const offerFromClassification = (classified) => {
     if (!classified) return null;
@@ -3204,9 +3233,9 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       const pptx = new PptxGenJS();
       pptx.layout = 'LAYOUT_16x9';
       pptx.title = slideData.title || offer?.title || 'PowerPoint';
-      const theme = getPptxGeneratorThemeFromUserSettings(userSettings);
+      // Reload template PPTX from storage so logos / backgrounds / fonts are applied.
+      const theme = await loadFullPptxStyleForGeneration(userSettings, supabase);
       const BG_DARK = theme.bgDark;
-      const BG_LIGHT = theme.bgLight;
       const ACCENT = theme.accent;
       const TEXT_ON_DARK = theme.textOnDark;
       const TEXT_ON_DARK_MUTED = theme.textOnDarkMuted;
@@ -3215,6 +3244,10 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       const BORDER = theme.border;
       const FONT_HEADING = theme.headingFont;
       const FONT_BODY = theme.bodyFont;
+      const TITLE_SIZE = theme.titleFontSize || 36;
+      const HEADING_SIZE = theme.headingFontSize || 22;
+      const BODY_SIZE = theme.bodyFontSize || 14;
+      const hasTemplateChrome = !!(userSettings.pptxTemplate && (theme.logos?.length || theme.titleBackground || theme.contentBackground || theme.accentShapes?.length));
       const slides = Array.isArray(slideData.slides) ? slideData.slides.filter(s => s && (s.type || s.title)) : [];
       if (!slides.length) throw new Error('No slides returned');
 
@@ -3223,33 +3256,63 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         slide.bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
         slide.dataPoints = Array.isArray(slide.dataPoints) ? slide.dataPoints : [];
         const s = pptx.addSlide();
+        const isTitle = type === 'title';
 
-        if (type === 'title') {
-          s.background = { color: BG_DARK };
-          s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 0.18, h: 5.625, fill: { color: ACCENT }, line: { color: ACCENT } });
-          s.addText(slide.title || slideData.title || offer?.title || '', { x: 0.5, y: 1.4, w: 9, h: 1.6, fontSize: 36, bold: true, color: TEXT_ON_DARK, fontFace: FONT_HEADING, align: 'left', valign: 'middle' });
+        applyTemplateChrome(pptx, s, theme, { variant: isTitle ? 'title' : 'content' });
+
+        if (isTitle) {
+          // Default accent rail only when template didn't provide chrome bars
+          if (!hasTemplateChrome) {
+            s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 0.18, h: 5.625, fill: { color: ACCENT }, line: { color: ACCENT } });
+          }
+          s.addText(slide.title || slideData.title || offer?.title || '', {
+            x: 0.5, y: 1.4, w: 9, h: 1.6,
+            fontSize: TITLE_SIZE, bold: theme.titleBold !== false, color: TEXT_ON_DARK,
+            fontFace: FONT_HEADING, align: 'left', valign: 'middle',
+          });
           if (slide.subtitle || slideData.subtitle) {
-            s.addText(slide.subtitle || slideData.subtitle, { x: 0.5, y: 3.1, w: 8, h: 0.6, fontSize: 18, color: TEXT_ON_DARK_MUTED, fontFace: FONT_BODY, align: 'left' });
+            s.addText(slide.subtitle || slideData.subtitle, {
+              x: 0.5, y: 3.1, w: 8, h: 0.6,
+              fontSize: Math.max(14, Math.round(BODY_SIZE * 1.25)), color: TEXT_ON_DARK_MUTED,
+              fontFace: FONT_BODY, align: 'left',
+            });
           }
           const today = new Date().toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
           s.addText(today, { x: 6, y: 5.1, w: 3.7, h: 0.4, fontSize: 11, color: TEXT_MUTED, align: 'right', fontFace: FONT_BODY });
           return;
         }
 
-        s.background = { color: BG_LIGHT };
-        s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 10, h: 0.88, fill: { color: BG_DARK }, line: { color: BG_DARK } });
-        s.addText(slide.title || `Slide ${idx + 1}`, { x: 0.4, y: 0, w: 9.2, h: 0.88, fontSize: 20, bold: true, color: TEXT_ON_DARK, valign: 'middle', fontFace: FONT_HEADING });
-        s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0.88, w: 10, h: 0.05, fill: { color: ACCENT }, line: { color: ACCENT } });
+        // Content slides: header band unless template already has a top bar / full bg image
+        const templateHasTopBar = (theme.accentShapes || []).some(sh => sh.y < 0.3 && sh.w >= 8);
+        const contentHasBgImage = theme.contentBackground?.type === 'image';
+        if (!templateHasTopBar && !contentHasBgImage) {
+          s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 10, h: 0.88, fill: { color: BG_DARK }, line: { color: BG_DARK } });
+          s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0.88, w: 10, h: 0.05, fill: { color: ACCENT }, line: { color: ACCENT } });
+          s.addText(slide.title || `Slide ${idx + 1}`, {
+            x: 0.4, y: 0, w: 9.2, h: 0.88,
+            fontSize: HEADING_SIZE, bold: true, color: TEXT_ON_DARK, valign: 'middle', fontFace: FONT_HEADING,
+          });
+        } else {
+          s.addText(slide.title || `Slide ${idx + 1}`, {
+            x: 0.4, y: 0.25, w: 9.2, h: 0.7,
+            fontSize: HEADING_SIZE, bold: true,
+            color: contentHasBgImage ? TEXT_ON_DARK : TEXT_ON_LIGHT,
+            valign: 'middle', fontFace: FONT_HEADING,
+          });
+        }
 
-        let cursorY = 1.05;
+        let cursorY = (templateHasTopBar || contentHasBgImage) ? 1.1 : 1.05;
         if (slide.body) {
-          s.addText(String(slide.body), { x: 0.5, y: cursorY, w: 9, h: 0.7, fontSize: 13, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, align: 'left', valign: 'top' });
+          s.addText(String(slide.body), {
+            x: 0.5, y: cursorY, w: 9, h: 0.7,
+            fontSize: BODY_SIZE, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, align: 'left', valign: 'top',
+          });
           cursorY += 0.75;
         }
 
         if (slide.dataPoints.length) {
           const lines = slide.dataPoints.map(dp => `${dp.label || ''}: ${dp.value || ''}${dp.context ? ` (${dp.context})` : ''}`);
-          s.addText(lines.map((t, i) => ({ text: t, options: { bullet: true, breakLine: i < lines.length - 1, fontSize: 13, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 4 } })), {
+          s.addText(lines.map((t, i) => ({ text: t, options: { bullet: true, breakLine: i < lines.length - 1, fontSize: BODY_SIZE, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 4 } })), {
             x: 0.5, y: cursorY, w: 9, h: Math.min(1.6, 0.28 * lines.length + 0.2),
           });
           cursorY += Math.min(1.7, 0.28 * lines.length + 0.3);
@@ -3278,7 +3341,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
             colW: Array(colCount).fill(colW),
             border: [{ type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }, { type: 'solid', pt: 0.5, color: BORDER }],
             fontFace: FONT_BODY,
-            fontSize: 11,
+            fontSize: Math.max(10, BODY_SIZE - 2),
             color: TEXT_ON_LIGHT,
           });
           cursorY += tableH + 0.15;
@@ -3288,7 +3351,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
           const remaining = Math.max(0.8, 5.1 - cursorY);
           const bulletItems = slide.bullets.map((b, i) => ({
             text: String(b),
-            options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: 13, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 5 },
+            options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: BODY_SIZE, color: TEXT_ON_LIGHT, fontFace: FONT_BODY, paraSpaceAfter: 5 },
           }));
           s.addText(bulletItems, { x: 0.5, y: cursorY, w: 9, h: remaining });
         }
@@ -3300,7 +3363,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       const fileName = (slideData.title || offer?.title || 'powerpoint').replace(/[^a-z0-9]+/gi, '_').toLowerCase();
       await pptx.writeFile({ fileName: `${fileName}.pptx` });
       const themeNote = userSettings.pptxTemplate?.fileName
-        ? ` using template style from **${userSettings.pptxTemplate.fileName}**`
+        ? ` styled from **${userSettings.pptxTemplate.fileName}** (theme, fonts, backgrounds & logos)`
         : ' using the default ComEx style';
       setMessages(prev => [...prev, {
         role: 'assistant',
@@ -3734,7 +3797,25 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                   </div>
                 )}
 
-                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !isLoading && (
+                {choiceButtons && choiceButtons.length > 0 && !isLoading && !pptxGenerating && (
+                  <div className="mb-3">
+                    <div className="text-xs text-blue-300/70 mb-2">Choose an option (or type your own):</div>
+                    <div className="flex flex-wrap gap-2">
+                      {choiceButtons.map((opt) => (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); handleSubmit(e, opt.value); }}
+                          className="px-3 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/35 hover:border-cyan-400/55 rounded-lg text-xs text-cyan-100 font-semibold transition-all hover:scale-105 active:scale-95"
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !isLoading && !choiceButtons?.length && (
                   <div className="mb-3">
                     <div className="text-xs text-blue-300/70 mb-2 flex items-center gap-2"><span>💡 Suggested next steps:</span></div>
                     <div className="flex flex-wrap gap-2">
@@ -4122,7 +4203,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                 <div className="mt-8 pt-6 border-t border-blue-400/15">
                   <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
                   <p className="text-xs text-blue-300/60 mb-4">
-                    Upload a .pptx to drive export look &amp; feel (colours + fonts from the file theme). Slide content is ignored. Stored at{' '}
+                    Upload a branded .pptx. We use its slide master / layout design — colours, fonts, sizes, backgrounds, shading bars, and logos — and ignore slide text content. Stored at{' '}
                     <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>. Without a template, exports use the default ComEx style.
                   </p>
 
@@ -4134,6 +4215,8 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                           <div className="text-xs text-blue-300/50 mt-0.5">
                             Theme: {userSettings.pptxTemplate.theme?.schemeName || 'Custom'}
                             {userSettings.pptxTemplate.theme?.fonts?.heading ? ` · ${userSettings.pptxTemplate.theme.fonts.heading}` : ''}
+                            {userSettings.pptxTemplate.theme?.typography?.titleFontSize ? ` · title ${userSettings.pptxTemplate.theme.typography.titleFontSize}pt` : ''}
+                            {userSettings.pptxTemplate.theme?.logoCount ? ` · ${userSettings.pptxTemplate.theme.logoCount} logo(s)` : ''}
                             {userSettings.pptxTemplate.uploadedAt ? ` · ${new Date(userSettings.pptxTemplate.uploadedAt).toLocaleDateString('en-GB')}` : ''}
                           </div>
                         </div>
