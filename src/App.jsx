@@ -1226,17 +1226,24 @@ GROUNDING RULES (mandatory):
 - If something was not covered, omit it or write "Not discussed in this conversation" — never fill gaps from general knowledge.
 - Ignore any user settings that conflict with staying faithful to the chat transcript.
 
+LAYOUT RULES (mandatory — vary layouts; do NOT make every slide the same):
+- Pick the best layout for each slide's content via the "layout" field.
+- Allowed layouts: "title" | "section" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
+- title: opening slide only. section: chapter divider. bullets: narrative list. cards: 3–5 peer themes (use "Label: detail" bullets). table: comparisons / weights / metrics (require tableData). two_column: left bullets + right bullets (put left in "bullets", right in "bulletsRight"). process: ordered steps (3–6). callout: one key message in body + optional short bullets.
+- Mix layouts across the deck. Prefer a table when numbers/weights compare. Prefer cards for peer topics. Prefer process for sequences. Prefer callout for a single IC ask or decision.
+
 Output schema:
 {
   "title": "...",
   "subtitle": "...",
   "slides": [
-    { "type": "title|section|content|table|summary", "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "notes": "...",
+    { "type": "title|section|content|table|summary", "layout": "title|section|bullets|cards|table|two_column|process|callout",
+      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "notes": "...",
       "tableData": { "headers": ["Col1","Col2"], "rows": [["A","B"]] } }
   ]
 }
 
-Slide count: short chat = 4-6 slides, rich chat = 7-9. First slide must be type "title". Prefer bullets over charts. Include a table only when the conversation itself contains tabular structure (e.g. components + weights).`,
+Slide count: short chat = 4-6 slides, rich chat = 7-9. First slide must be layout "title". Keep JSON compact.`,
 
     produced: `You create a PowerPoint WORKING DOCUMENT from an IC / commercial excellence conversation — ready to distribute.
 Return ONLY valid JSON, no markdown.
@@ -1247,22 +1254,28 @@ GROUNDING RULES (mandatory):
 - If a section cannot be filled from the conversation, include a short slide noting what still needs confirmation — do not fabricate it.
 - Respect USER SETTINGS for terminology/currency only; never use them to invent missing scheme facts.
 
+LAYOUT RULES (mandatory — vary layouts; do NOT clone the same layout on every slide):
+- Set "layout" per slide to the best fit: "title" | "section" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
+- title: first slide. section: major section breaks. table: components/weights/metrics (always include tableData). cards: 3–5 themes as "Label: detail". process: step-by-step cascade or payout flow. two_column: e.g. rules vs exceptions, or do vs don't (bullets + bulletsRight). callout: the IC ask / decision. bullets: general narrative.
+- A strong deck mixes these. Never output 8 identical bullet slides.
+
 Deck types (follow the requested deckType):
-- ic_one_pager: 5-7 slides — title, scheme purpose, components/weights, key rules, how payout works, next steps
-- ic_doc_pack: 8-12 slides — title, executive overview, components & metrics, weightings table, payout mechanics, eligibility/rules, FAQs, manager talking points / cascade outline, open items
-- rep_comms / manager_briefing / ic_explainer / territory_report / general: structure appropriately for that audience using only chat facts
+- ic_one_pager: 5-7 slides — title, purpose (callout or bullets), components (table or cards), key rules (two_column or bullets), payout (process), next steps
+- ic_doc_pack: 8-12 slides — title, overview, components table, weightings, payout process, eligibility, FAQs (two_column or bullets), cascade (process), open items
+- rep_comms / manager_briefing / ic_explainer / territory_report / general: structure for that audience using only chat facts and varied layouts
 
 Output schema:
 {
   "title": "...",
   "subtitle": "...",
   "slides": [
-    { "type": "title|section|content|table|summary", "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "notes": "...",
+    { "type": "title|section|content|table|summary", "layout": "title|section|bullets|cards|table|two_column|process|callout",
+      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "notes": "...",
       "tableData": { "headers": ["Component","Weight","Metric"], "rows": [["Sales","40%","Net sales"]] } }
   ]
 }
 
-First slide must be type "title". Prefer tables for components/weights. Keep JSON compact — no chartData unless essential.`
+First slide must be layout "title". Keep JSON compact.`
   });
   const [maxSuggestions, setMaxSuggestions] = useState(3);
   const [hoveredCitation, setHoveredCitation] = useState(null);
@@ -3240,6 +3253,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
 
       slides.forEach((slide, idx) => {
         slide.bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
+        slide.bulletsRight = Array.isArray(slide.bulletsRight) ? slide.bulletsRight : [];
         slide.dataPoints = Array.isArray(slide.dataPoints) ? slide.dataPoints : [];
         if (!slide.type) slide.type = idx === 0 ? 'title' : 'content';
         renderSlideFromTheme(pptx, theme, slide, idx);
@@ -3247,12 +3261,9 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
 
       const fileName = (slideData.title || offer?.title || 'powerpoint').replace(/[^a-z0-9]+/gi, '_').toLowerCase();
       await pptx.writeFile({ fileName: `${fileName}.pptx` });
-      const themeNote = userSettings.pptxTemplate?.fileName
-        ? ` using **${userSettings.pptxTemplate.fileName}** background, colours & fonts`
-        : ' using the default ComEx style';
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `📊 **PowerPoint generated** — "${slideData.title || offer?.title}" (${slides.length} slides${isSummary ? ', conversation summary' : `, ${deckType}`})${themeNote}. Check your downloads folder.`,
+        content: `📊 **PowerPoint generated** — "${slideData.title || offer?.title}" (${slides.length} slides${isSummary ? ', conversation summary' : `, ${deckType}`}). Check your downloads folder.`,
       }]);
     } catch (e) {
       console.error('PPTX generation error:', e);
@@ -4088,7 +4099,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                 <div className="mt-8 pt-6 border-t border-blue-400/15">
                   <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
                   <p className="text-xs text-blue-300/60 mb-4">
-                    Upload a branded .pptx. Exports replay that slide’s layout, background, shapes, fonts and colours — nothing is invented. Template wording is ignored; your export content is mapped into the same slots. Without a template, ComEx uses its built-in default style. Stored at{' '}
+                    Upload a branded .pptx. Exports use its background, colours, fonts and shading — then choose a layout per slide based on the content (cards, table, process, two-column, etc.), not a clone of every template slide. Without a template, ComEx uses its built-in default style. Stored at{' '}
                     <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>.
                   </p>
 

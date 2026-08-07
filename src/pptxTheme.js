@@ -1,9 +1,9 @@
-import JSZip from 'jszip';
+﻿import JSZip from 'jszip';
 
 const EMU_PER_INCH = 914400;
 
 /**
- * ComEx default look — used ONLY when the user has not uploaded a template.
+ * ComEx default look â€” used ONLY when the user has not uploaded a template.
  * Never mixed into template-driven exports.
  */
 export const DEFAULT_PPTX_GENERATOR_THEME = {
@@ -254,7 +254,7 @@ function collectParagraphTexts(block) {
 }
 
 /**
- * Build a full visual blueprint from the uploaded slide — every filled shape,
+ * Build a full visual blueprint from the uploaded slide â€” every filled shape,
  * text slot (with live font/size/colour/position), background, and pictures.
  * Template wording is ignored; styles and layout are kept.
  */
@@ -349,13 +349,13 @@ export async function extractPptxThemeFromArrayBuffer(arrayBuffer, fileName = nu
           color: style.color || null,
         },
         paragraphCount: Math.max(1, paras.length),
-        // sample text length only — never used as export content
+        // sample text length only â€” never used as export content
         _sampleLen: paras.join(' ').length,
       });
     }
   }
 
-  // Pictures on the design slide (icons / logos) — keep positions for visual match
+  // Pictures on the design slide (icons / logos) â€” keep positions for visual match
   const pictures = [];
   const picBlocks = [...slideXml.matchAll(/<(?:\w+:)?pic\b[^>]*>[\s\S]*?<\/(?:\w+:)?pic>/gi)].map((m) => m[0]);
   for (const block of picBlocks) {
@@ -498,7 +498,7 @@ export async function extractPptxThemeFromFile(file) {
 
 export function themeToSettingsMeta(extracted) {
   if (!extracted) return null;
-  // Persist styles/layout metadata only — binary assets reload from storage on export
+  // Persist styles/layout metadata only â€” binary assets reload from storage on export
   const bp = extracted.blueprint;
   return {
     schemeName: extracted.schemeName,
@@ -527,7 +527,7 @@ export function resolvePptxGeneratorTheme(extracted) {
   if (!extracted?.blueprint && !extracted?.palette && !extracted?.colors) {
     return { ...DEFAULT_PPTX_GENERATOR_THEME };
   }
-  // Template path: values come from the upload only (nulls stay null — renderer uses slot styles)
+  // Template path: values come from the upload only (nulls stay null â€” renderer uses slot styles)
   const p = extracted.palette || {};
   const t = extracted.typography || {};
   const f = extracted.fonts || {};
@@ -588,22 +588,20 @@ export async function loadFullPptxStyleForGeneration(userSettings, supabaseClien
     return getPptxGeneratorThemeFromUserSettings(userSettings);
   }
 }
-
-function applyBackground(slide, theme) {
+function applyBackground(slide, theme, { layout } = {}) {
   if (theme.backgroundImage) {
     try {
       slide.background = { data: theme.backgroundImage };
       return;
     } catch { /* fall through */ }
   }
+  if (theme.useDefaultChrome) {
+    const dark = layout === 'title' || layout === 'section';
+    slide.background = { color: dark ? (theme.bgDark || '1E2761') : (theme.bgLight || 'FFFFFF') };
+    return;
+  }
   if (theme.bgDark) slide.background = { color: theme.bgDark };
   else if (theme.bgLight) slide.background = { color: theme.bgLight };
-}
-
-function fillFromShape(shape) {
-  if (!shape?.fill) return { type: 'none' };
-  if (shape.transparency > 0) return { color: shape.fill, transparency: shape.transparency };
-  return { color: shape.fill };
 }
 
 function styleOpts(style = {}, fallback = {}) {
@@ -615,26 +613,6 @@ function styleOpts(style = {}, fallback = {}) {
   };
 }
 
-function paintBlueprintChrome(pptx, slide, blueprint) {
-  if (!blueprint) return;
-  for (const shape of blueprint.chromeShapes || []) {
-    slide.addShape(pptxShapeName(pptx, shape.preset), {
-      x: shape.x,
-      y: shape.y,
-      w: shape.w,
-      h: shape.h,
-      fill: fillFromShape(shape),
-      line: { color: shape.fill, transparency: Math.min(100, (shape.transparency || 0) + 5) },
-      rectRadius: String(shape.preset || '').includes('round') ? 0.06 : 0,
-    });
-  }
-  for (const pic of blueprint.pictures || []) {
-    try {
-      slide.addImage({ data: pic.data, x: pic.x, y: pic.y, w: pic.w, h: pic.h });
-    } catch { /* skip */ }
-  }
-}
-
 function splitBullet(text) {
   const s = String(text || '').trim();
   const colon = s.indexOf(':');
@@ -644,261 +622,470 @@ function splitBullet(text) {
   return { heading: null, body: s };
 }
 
-/**
- * Render one slide by replaying the uploaded slide blueprint and filling its text slots.
- * When no blueprint exists, falls back to the ComEx default chrome only.
- */
-export function renderSlideFromTheme(pptx, theme, slide, idx = 0) {
-  if (theme?.blueprint && !theme.useDefaultChrome) {
-    return renderFromBlueprint(pptx, theme, slide, idx);
-  }
-  return renderDefaultSlide(pptx, theme || DEFAULT_PPTX_GENERATOR_THEME, slide, idx);
+function panelFill(theme) {
+  const color = theme.cardFill || (theme.useDefaultChrome ? 'FFFFFF' : 'FFFFFF');
+  const transparency = theme.cardTransparency || 0;
+  if (transparency > 0) return { color, transparency };
+  return { color };
 }
 
-function renderFromBlueprint(pptx, theme, slide, idx) {
+function titleStyleFromTheme(theme) {
+  return styleOpts(theme.blueprint?.titleSlot?.style, {
+    fontSize: theme.titleFontSize || 28,
+    color: theme.textOnDark || 'FFFFFF',
+    fontFace: theme.headingFont || 'Calibri',
+    bold: theme.titleBold !== false,
+  });
+}
+
+function subtitleStyleFromTheme(theme) {
+  return styleOpts(theme.blueprint?.subtitleSlot?.style, {
+    fontSize: theme.subtitleFontSize || 13,
+    color: theme.subtitleColor || theme.textOnDark || 'CFE6F5',
+    fontFace: theme.bodyFont || 'Calibri',
+  });
+}
+
+function bodyStyleFromTheme(theme) {
+  const sample = theme.blueprint?.cardColumns?.find((c) => c.body)?.body?.style
+    || theme.blueprint?.cardColumns?.find((c) => c.title)?.title?.style;
+  return styleOpts(sample, {
+    fontSize: theme.bodyFontSize || theme.cardBodyFontSize || 13,
+    color: theme.textOnLight || (theme.contentTextLight ? 'FFFFFF' : '1E293B'),
+    fontFace: theme.bodyFont || 'Calibri',
+  });
+}
+
+function cardTitleStyleFromTheme(theme) {
+  const sample = theme.blueprint?.cardColumns?.find((c) => c.title)?.title?.style;
+  return styleOpts(sample, {
+    fontSize: theme.cardTitleFontSize || 14,
+    color: theme.textOnLight || (theme.contentTextLight ? 'FFFFFF' : '1E293B'),
+    fontFace: theme.cardHeadingFont || theme.headingFont || 'Calibri',
+    bold: true,
+  });
+}
+
+function contentTop(theme, hasSubtitle) {
   const bp = theme.blueprint;
-  const s = pptx.addSlide();
-  applyBackground(s, theme);
-  paintBlueprintChrome(pptx, s, bp);
+  if (hasSubtitle && bp?.subtitleSlot) return bp.subtitleSlot.y + bp.subtitleSlot.h + 0.25;
+  if (bp?.titleSlot) return bp.titleSlot.y + bp.titleSlot.h + 0.3;
+  return hasSubtitle ? 1.55 : 1.2;
+}
 
-  const title = slide.title || (idx === 0 ? '' : `Slide ${idx + 1}`);
-  const subtitle = slide.subtitle || '';
+function addTitleAndSubtitle(pptx, slide, theme, { title, subtitle }) {
+  const W = theme.slideWidth || 10;
+  const bp = theme.blueprint;
+  const ts = titleStyleFromTheme(theme);
+  const titleBox = bp?.titleSlot || { x: 0.5, y: 0.3, w: W - 1, h: 0.7 };
+  if (title) {
+    slide.addText(String(title), {
+      x: titleBox.x, y: titleBox.y, w: titleBox.w, h: titleBox.h,
+      fontSize: Math.min(ts.fontSize || 28, 30),
+      bold: true,
+      color: ts.color,
+      fontFace: ts.fontFace,
+      align: 'left',
+      valign: 'middle',
+    });
+  }
+  if (subtitle) {
+    const ss = subtitleStyleFromTheme(theme);
+    const subBox = bp?.subtitleSlot || { x: 0.5, y: titleBox.y + titleBox.h + 0.05, w: W - 1, h: 0.35 };
+    slide.addText(String(subtitle), {
+      x: subBox.x, y: subBox.y, w: subBox.w, h: subBox.h,
+      fontSize: ss.fontSize,
+      color: ss.color,
+      fontFace: ss.fontFace,
+      align: 'left',
+      valign: 'middle',
+    });
+  }
+}
+
+function addPanel(pptx, slide, theme, { x, y, w, h }) {
+  slide.addShape(pptx.shapes.ROUNDED_RECTANGLE, {
+    x, y, w, h,
+    fill: panelFill(theme),
+    line: { color: theme.cardFill || 'FFFFFF', transparency: Math.min(95, (theme.cardTransparency || 0) + 5) },
+    rectRadius: 0.06,
+  });
+}
+
+function inferLayout(slide, idx) {
+  const explicit = String(slide.layout || '').toLowerCase().trim();
+  const allowed = new Set(['title', 'section', 'bullets', 'cards', 'table', 'two_column', 'process', 'callout']);
+  if (allowed.has(explicit)) return explicit;
+
+  const type = String(slide.type || '').toLowerCase();
+  if (type === 'title' || idx === 0) return 'title';
+  if (type === 'section') return 'section';
+  if (type === 'table' || (slide.tableData?.headers?.length && slide.tableData?.rows?.length)) return 'table';
+  if (Array.isArray(slide.bulletsRight) && slide.bulletsRight.length) return 'two_column';
+  if (type === 'summary' && slide.body && !(slide.bullets?.length > 3)) return 'callout';
+
   const bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
-  const dataPoints = Array.isArray(slide.dataPoints) ? slide.dataPoints : [];
-  const body = slide.body ? String(slide.body) : '';
-  const table = slide.tableData;
+  const labeled = bullets.filter((b) => splitBullet(b).heading).length;
+  if (bullets.length >= 3 && bullets.length <= 5 && labeled >= Math.ceil(bullets.length * 0.6)) return 'cards';
+  if (bullets.length >= 3 && bullets.length <= 6 && /step|phase|then|first|second|1\.|2\./i.test(bullets.join(' '))) return 'process';
+  if (slide.body && bullets.length <= 2) return 'callout';
+  return 'bullets';
+}
 
-  if (bp.titleSlot && title) {
-    const st = styleOpts(bp.titleSlot.style, { fontSize: theme.titleFontSize, color: theme.textOnDark, fontFace: theme.headingFont, bold: true });
-    s.addText(title, {
-      x: bp.titleSlot.x, y: bp.titleSlot.y, w: bp.titleSlot.w, h: bp.titleSlot.h,
-      fontSize: st.fontSize, bold: st.bold, color: st.color, fontFace: st.fontFace,
-      align: 'left', valign: 'middle',
+/**
+ * Template supplies background, colours, fonts, panel shading.
+ * Layout is chosen from slide.layout / content â€” not a clone of the template slide.
+ */
+export function renderSlideFromTheme(pptx, theme, slide, idx = 0) {
+  const t = !theme || theme.useDefaultChrome
+    ? { ...DEFAULT_PPTX_GENERATOR_THEME, ...(theme || {}) }
+    : theme;
+  const layout = inferLayout(slide, idx);
+  const s = pptx.addSlide();
+  applyBackground(s, t, { layout });
+
+  if (layout === 'title') return renderLayoutTitle(pptx, s, t, slide);
+  if (layout === 'section') return renderLayoutSection(pptx, s, t, slide);
+  if (layout === 'table') return renderLayoutTable(pptx, s, t, slide, idx);
+  if (layout === 'cards') return renderLayoutCards(pptx, s, t, slide, idx);
+  if (layout === 'two_column') return renderLayoutTwoColumn(pptx, s, t, slide, idx);
+  if (layout === 'process') return renderLayoutProcess(pptx, s, t, slide, idx);
+  if (layout === 'callout') return renderLayoutCallout(pptx, s, t, slide, idx);
+  return renderLayoutBullets(pptx, s, t, slide, idx);
+}
+
+function renderLayoutTitle(pptx, s, theme, slide) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  const ts = titleStyleFromTheme(theme);
+  const ss = subtitleStyleFromTheme(theme);
+  const bp = theme.blueprint;
+  const panelY = Math.max(2.0, (bp?.subtitleSlot?.y || 1.2) + 0.7);
+  addPanel(pptx, s, theme, { x: 0.5, y: panelY, w: W - 1, h: Math.max(2.2, H - panelY - 0.4) });
+
+  s.addText(slide.title || '', {
+    x: bp?.titleSlot?.x ?? 0.5,
+    y: bp?.titleSlot?.y ?? 0.45,
+    w: bp?.titleSlot?.w ?? (W - 1),
+    h: bp?.titleSlot?.h ?? 0.9,
+    fontSize: ts.fontSize || 32,
+    bold: true,
+    color: ts.color,
+    fontFace: ts.fontFace,
+    align: 'left',
+    valign: 'middle',
+  });
+  if (slide.subtitle) {
+    s.addText(String(slide.subtitle), {
+      x: bp?.subtitleSlot?.x ?? 0.5,
+      y: bp?.subtitleSlot?.y ?? 1.25,
+      w: bp?.subtitleSlot?.w ?? (W - 1),
+      h: bp?.subtitleSlot?.h ?? 0.4,
+      fontSize: ss.fontSize,
+      color: ss.color,
+      fontFace: ss.fontFace,
+      align: 'left',
+      valign: 'middle',
     });
   }
-
-  if (bp.subtitleSlot && subtitle) {
-    const st = styleOpts(bp.subtitleSlot.style, { fontSize: theme.subtitleFontSize, color: theme.subtitleColor, fontFace: theme.bodyFont });
-    s.addText(String(subtitle), {
-      x: bp.subtitleSlot.x, y: bp.subtitleSlot.y, w: bp.subtitleSlot.w, h: bp.subtitleSlot.h,
-      fontSize: st.fontSize, bold: st.bold, color: st.color, fontFace: st.fontFace,
-      align: 'left', valign: 'middle',
-    });
-  }
-
-  const columns = bp.cardColumns || [];
-  const hasTable = table && Array.isArray(table.headers) && Array.isArray(table.rows) && table.headers.length;
-
-  // Build content units for columns: prefer structured bullets, else body / data points
-  let units = [];
-  if (bullets.length) {
-    units = bullets.map((b) => splitBullet(b));
-  } else if (dataPoints.length) {
-    units = dataPoints.map((dp) => ({
-      heading: dp.label || null,
-      body: `${dp.value || ''}${dp.context ? ` (${dp.context})` : ''}`.trim(),
-    }));
-  } else if (body) {
-    units = [{ heading: null, body }];
-  }
-
-  if (hasTable && columns.length) {
-    // Use first column body area (or span of panels) for the table — styles from template body/accent
-    const first = columns[0];
-    const last = columns[columns.length - 1];
-    const x = first.title?.x ?? first.body?.x ?? bp.panelShapes?.[0]?.x ?? 0.5;
-    const y = first.title?.y ?? first.body?.y ?? bp.panelShapes?.[0]?.y ?? 1.8;
-    const right = (last.body || last.title || bp.panelShapes?.[bp.panelShapes.length - 1] || { x: x + 4, w: 4 });
-    const w = Math.max(2, (right.x + right.w) - x);
-    const bodyStyle = styleOpts(first.body?.style || first.title?.style, {
-      fontSize: theme.bodyFontSize,
-      color: theme.textOnLight,
-      fontFace: theme.bodyFont,
-    });
-    const headerFill = theme.accent || theme.bgDark;
-    const colCount = table.headers.length;
-    const colW = w / colCount;
-    const headerRow = table.headers.map((h) => ({
-      text: String(h ?? ''),
-      options: {
-        bold: true,
-        color: theme.textOnDark || bodyStyle.color,
-        fill: headerFill ? { color: headerFill } : undefined,
-        align: 'center',
-        valign: 'middle',
-      },
-    }));
-    const bodyRows = table.rows.slice(0, 10).map((row) => {
-      const cells = Array.isArray(row) ? row : [row];
-      return Array.from({ length: colCount }, (_, i) => ({
-        text: String(cells[i] ?? ''),
-        options: { color: bodyStyle.color, align: 'left', valign: 'middle' },
-      }));
-    });
-    // Optional intro body above table in title row of first column
-    if (body && first.title) {
-      const ts = styleOpts(first.title.style, { fontSize: theme.cardTitleFontSize, color: theme.textOnLight, fontFace: theme.cardHeadingFont, bold: true });
-      s.addText(body, {
-        x: first.title.x, y: first.title.y, w: w, h: first.title.h,
-        fontSize: ts.fontSize, bold: ts.bold, color: ts.color, fontFace: ts.fontFace, valign: 'middle',
-      });
-    }
-    s.addTable([headerRow, ...bodyRows], {
-      x,
-      y: y + (first.title ? first.title.h + 0.1 : 0),
-      w,
-      colW: Array(colCount).fill(colW),
-      fontFace: bodyStyle.fontFace,
-      fontSize: bodyStyle.fontSize,
-      color: bodyStyle.color,
-      border: [
-        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
-        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
-        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
-        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'FFFFFF' },
-      ],
-    });
-  } else if (columns.length && units.length) {
-    const n = Math.min(columns.length, units.length);
-    for (let i = 0; i < n; i++) {
-      const col = columns[i];
-      const unit = units[i];
-      const titleStyle = styleOpts(col.title?.style, {
-        fontSize: theme.cardTitleFontSize,
-        color: theme.textOnLight,
-        fontFace: theme.cardHeadingFont,
-        bold: true,
-      });
-      const bodyStyle = styleOpts(col.body?.style, {
-        fontSize: theme.cardBodyFontSize || theme.bodyFontSize,
-        color: theme.textOnLight,
-        fontFace: theme.bodyFont,
-      });
-
-      const heading = unit.heading || null;
-      const bodyText = unit.body || '';
-
-      if (col.title) {
-        s.addText(heading || `Point ${i + 1}`, {
-          x: col.title.x, y: col.title.y, w: col.title.w, h: col.title.h,
-          fontSize: titleStyle.fontSize, bold: true, color: titleStyle.color, fontFace: titleStyle.fontFace, valign: 'top',
-        });
-      }
-
-      if (col.body) {
-        const textForBody = col.title
-          ? bodyText
-          : (heading && bodyText ? `${heading}: ${bodyText}` : (bodyText || heading || ''));
-        if (!textForBody) continue;
-        const lines = String(textForBody).split(/\n+/).map((l) => l.trim()).filter(Boolean);
-        const use = lines.slice(0, Math.max(1, col.body.paragraphCount || 6));
-        s.addText(use.map((line, li) => ({
-          text: String(line),
-          options: {
-            bullet: use.length > 1,
-            breakLine: li < use.length - 1,
-            fontSize: bodyStyle.fontSize,
-            color: bodyStyle.color,
-            fontFace: bodyStyle.fontFace,
-            paraSpaceAfter: 6,
-          },
-        })), {
-          x: col.body.x, y: col.body.y, w: col.body.w, h: col.body.h,
-          valign: 'top',
-        });
-      }
-    }
-
-    if (units.length > columns.length && columns.length) {
-      const last = columns[columns.length - 1];
-      const slot = last.body || last.title;
-      if (slot) {
-        const st = styleOpts(slot.style, { fontSize: theme.bodyFontSize, color: theme.textOnLight, fontFace: theme.bodyFont });
-        const extra = units.slice(columns.length).map((u) => (u.heading ? `${u.heading}: ${u.body}` : u.body)).filter(Boolean);
-        if (extra.length) {
-          s.addText(extra.map((line, li) => ({
-            text: String(line),
-            options: { bullet: true, breakLine: li < extra.length - 1, fontSize: st.fontSize, color: st.color, fontFace: st.fontFace, paraSpaceAfter: 4 },
-          })), {
-            x: slot.x,
-            y: slot.y + slot.h * 0.55,
-            w: slot.w,
-            h: slot.h * 0.4,
-          });
-        }
-      }
-    }
-  } else if (body || bullets.length) {
-    // No card columns — write into largest text area below subtitle using subtitle/body styles from template
-    const slot = bp.subtitleSlot || bp.titleSlot;
-    const y = slot ? slot.y + slot.h + 0.3 : 1.8;
-    const st = styleOpts(bp.cardColumns?.[0]?.body?.style || bp.subtitleSlot?.style, {
-      fontSize: theme.bodyFontSize,
-      color: theme.textOnLight || theme.subtitleColor,
-      fontFace: theme.bodyFont,
-    });
-    const lines = bullets.length ? bullets : [body];
-    s.addText(lines.map((line, li) => ({
+  const bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
+  const bs = bodyStyleFromTheme(theme);
+  if (slide.body || bullets.length) {
+    const lines = bullets.length ? bullets : [slide.body];
+    s.addText(lines.map((line, i) => ({
       text: String(line),
-      options: { bullet: bullets.length > 0, breakLine: li < lines.length - 1, fontSize: st.fontSize, color: st.color, fontFace: st.fontFace, paraSpaceAfter: 6 },
+      options: {
+        bullet: bullets.length > 0,
+        breakLine: i < lines.length - 1,
+        fontSize: bs.fontSize,
+        color: bs.color,
+        fontFace: bs.fontFace,
+        paraSpaceAfter: 8,
+      },
     })), {
-      x: 0.5, y, w: (bp.slideWidth || theme.slideWidth) - 1, h: (bp.slideHeight || theme.slideHeight) - y - 0.4,
+      x: 0.8, y: panelY + 0.35, w: W - 1.6, h: Math.max(1.5, H - panelY - 0.8),
     });
   }
-
   if (slide.notes) s.addNotes(String(slide.notes));
   return s;
 }
 
-/** Default ComEx chrome — only when no user template is uploaded. */
-function renderDefaultSlide(pptx, theme, slide, idx) {
-  const s = pptx.addSlide();
+function renderLayoutSection(pptx, s, theme, slide) {
   const W = theme.slideWidth || 10;
   const H = theme.slideHeight || 5.625;
-  const isTitle = (slide.type === 'title') || idx === 0;
-  s.background = { color: isTitle ? theme.bgDark : theme.bgLight };
-
-  if (isTitle) {
-    s.addText(slide.title || '', {
-      x: 0.5, y: 1.8, w: W - 1, h: 1,
-      fontSize: theme.titleFontSize || 28, bold: true, color: theme.textOnDark,
-      fontFace: theme.headingFont || 'Calibri', align: 'center',
+  const ts = titleStyleFromTheme(theme);
+  const ss = subtitleStyleFromTheme(theme);
+  s.addText(slide.title || '', {
+    x: 0.8, y: H * 0.35, w: W - 1.6, h: 0.9,
+    fontSize: ts.fontSize || 32, bold: true, color: ts.color, fontFace: ts.fontFace, align: 'left',
+  });
+  if (slide.subtitle || slide.body) {
+    s.addText(String(slide.subtitle || slide.body), {
+      x: 0.8, y: H * 0.35 + 1.0, w: W - 1.6, h: 0.6,
+      fontSize: ss.fontSize, color: ss.color, fontFace: ss.fontFace,
     });
-    if (slide.subtitle) {
-      s.addText(String(slide.subtitle), {
-        x: 0.5, y: 2.9, w: W - 1, h: 0.5,
-        fontSize: theme.subtitleFontSize || 14, color: theme.subtitleColor || theme.textOnDark,
-        fontFace: theme.bodyFont || 'Calibri', align: 'center',
-      });
-    }
-    return s;
   }
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
 
-  s.addShape(pptx.shapes.RECTANGLE, {
-    x: 0, y: 0, w: W, h: 0.85,
-    fill: { color: theme.bgDark }, line: { color: theme.bgDark },
-  });
-  s.addText(slide.title || `Slide ${idx + 1}`, {
-    x: 0.5, y: 0.2, w: W - 1, h: 0.5,
-    fontSize: 22, bold: true, color: theme.textOnDark, fontFace: theme.headingFont || 'Calibri', valign: 'middle',
-  });
-
-  let y = 1.2;
-  const textColor = theme.textOnLight;
-  const fontBody = theme.bodyFont || 'Calibri';
-  const bodySize = theme.bodyFontSize || 14;
-
+function renderLayoutBullets(pptx, s, theme, slide, idx) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  addTitleAndSubtitle(pptx, s, theme, { title: slide.title || `Slide ${idx + 1}`, subtitle: slide.subtitle });
+  const top = contentTop(theme, !!slide.subtitle);
+  addPanel(pptx, s, theme, { x: 0.5, y: top, w: W - 1, h: H - top - 0.35 });
+  const bs = bodyStyleFromTheme(theme);
+  let y = top + 0.3;
   if (slide.body) {
     s.addText(String(slide.body), {
-      x: 0.5, y, w: W - 1, h: 0.7, fontSize: bodySize, color: textColor, fontFace: fontBody,
+      x: 0.8, y, w: W - 1.6, h: 0.7,
+      fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, valign: 'top',
     });
     y += 0.8;
   }
-  if (Array.isArray(slide.bullets) && slide.bullets.length) {
-    s.addText(slide.bullets.map((b, i) => ({
+  const bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
+  if (bullets.length) {
+    s.addText(bullets.map((b, i) => ({
       text: String(b),
-      options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: bodySize, color: textColor, fontFace: fontBody, paraSpaceAfter: 6 },
-    })), { x: 0.5, y, w: W - 1, h: H - y - 0.4 });
+      options: { bullet: true, breakLine: i < bullets.length - 1, fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, paraSpaceAfter: 7 },
+    })), { x: 0.8, y, w: W - 1.6, h: Math.max(0.8, H - y - 0.5) });
+  }
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
+
+function renderLayoutCards(pptx, s, theme, slide, idx) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  addTitleAndSubtitle(pptx, s, theme, { title: slide.title || `Slide ${idx + 1}`, subtitle: slide.subtitle });
+  const top = contentTop(theme, !!slide.subtitle);
+  const bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
+  const units = (bullets.length ? bullets : (slide.body ? [slide.body] : [])).map(splitBullet);
+  const n = Math.min(5, Math.max(2, units.length || 2));
+  const gap = 0.2;
+  const side = 0.5;
+  const cardW = (W - side * 2 - gap * (n - 1)) / n;
+  const cardH = H - top - 0.35;
+  const ct = cardTitleStyleFromTheme(theme);
+  const bs = bodyStyleFromTheme(theme);
+  const accent = theme.accent || theme.bgDark;
+
+  for (let i = 0; i < n; i++) {
+    const x = side + i * (cardW + gap);
+    const unit = units[i] || { heading: null, body: '' };
+    addPanel(pptx, s, theme, { x, y: top, w: cardW, h: cardH });
+    if (accent) {
+      s.addShape(pptx.shapes.RECTANGLE, {
+        x, y: top, w: cardW, h: 0.08,
+        fill: { color: accent },
+        line: { color: accent },
+      });
+    }
+    s.addText(unit.heading || `Point ${i + 1}`, {
+      x: x + 0.15, y: top + 0.3, w: cardW - 0.3, h: 0.85,
+      fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace, valign: 'top',
+    });
+    if (unit.body) {
+      s.addText(String(unit.body), {
+        x: x + 0.15, y: top + 1.25, w: cardW - 0.3, h: cardH - 1.5,
+        fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, valign: 'top',
+      });
+    }
+  }
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
+
+function renderLayoutTable(pptx, s, theme, slide, idx) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  addTitleAndSubtitle(pptx, s, theme, { title: slide.title || `Slide ${idx + 1}`, subtitle: slide.subtitle });
+  const top = contentTop(theme, !!slide.subtitle);
+  addPanel(pptx, s, theme, { x: 0.5, y: top, w: W - 1, h: H - top - 0.35 });
+  const bs = bodyStyleFromTheme(theme);
+  let y = top + 0.25;
+  if (slide.body) {
+    s.addText(String(slide.body), {
+      x: 0.75, y, w: W - 1.5, h: 0.55,
+      fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace,
+    });
+    y += 0.65;
+  }
+  const table = slide.tableData;
+  if (table?.headers?.length && Array.isArray(table.rows)) {
+    const colCount = table.headers.length;
+    const tableW = W - 1.5;
+    const colW = tableW / colCount;
+    const headerFill = theme.accent || theme.bgDark || '4472C4';
+    const headerRow = table.headers.map((h) => ({
+      text: String(h ?? ''),
+      options: { bold: true, color: theme.textOnDark || 'FFFFFF', fill: { color: headerFill }, align: 'center', valign: 'middle' },
+    }));
+    const bodyRows = table.rows.slice(0, 12).map((row, rowIdx) => {
+      const cells = Array.isArray(row) ? row : [row];
+      const rowFill = theme.contentTextLight || theme.cardTransparency > 0
+        ? { color: 'FFFFFF', transparency: rowIdx % 2 === 0 ? 88 : 92 }
+        : { color: rowIdx % 2 === 0 ? 'F8FAFC' : 'FFFFFF' };
+      return Array.from({ length: colCount }, (_, i) => ({
+        text: String(cells[i] ?? ''),
+        options: { color: bs.color, fill: rowFill, align: 'left', valign: 'middle' },
+      }));
+    });
+    s.addTable([headerRow, ...bodyRows], {
+      x: 0.75, y, w: tableW, colW: Array(colCount).fill(colW),
+      fontFace: bs.fontFace,
+      fontSize: Math.max(11, (bs.fontSize || 13) - 1),
+      color: bs.color,
+      border: [
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'CBD5E1' },
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'CBD5E1' },
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'CBD5E1' },
+        { type: 'solid', pt: 0.5, color: theme.border || theme.accent || 'CBD5E1' },
+      ],
+    });
+  } else {
+    const bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
+    if (bullets.length) {
+      s.addText(bullets.map((b, i) => ({
+        text: String(b),
+        options: { bullet: true, breakLine: i < bullets.length - 1, fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, paraSpaceAfter: 6 },
+      })), { x: 0.75, y, w: W - 1.5, h: H - y - 0.5 });
+    }
+  }
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
+
+function renderLayoutTwoColumn(pptx, s, theme, slide, idx) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  addTitleAndSubtitle(pptx, s, theme, { title: slide.title || `Slide ${idx + 1}`, subtitle: slide.subtitle });
+  const top = contentTop(theme, !!slide.subtitle);
+  const gap = 0.25;
+  const colW = (W - 1 - gap) / 2;
+  const cardH = H - top - 0.35;
+  const left = Array.isArray(slide.bullets) ? slide.bullets : [];
+  const right = Array.isArray(slide.bulletsRight) ? slide.bulletsRight : [];
+  const bs = bodyStyleFromTheme(theme);
+  const ct = cardTitleStyleFromTheme(theme);
+
+  addPanel(pptx, s, theme, { x: 0.5, y: top, w: colW, h: cardH });
+  addPanel(pptx, s, theme, { x: 0.5 + colW + gap, y: top, w: colW, h: cardH });
+
+  s.addText(slide.leftTitle || 'Overview', {
+    x: 0.7, y: top + 0.25, w: colW - 0.4, h: 0.4,
+    fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace,
+  });
+  s.addText(slide.rightTitle || 'Detail', {
+    x: 0.7 + colW + gap, y: top + 0.25, w: colW - 0.4, h: 0.4,
+    fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace,
+  });
+
+  const writeList = (items, x, allowBody) => {
+    if (!items.length && allowBody && slide.body) {
+      s.addText(String(slide.body), {
+        x, y: top + 0.75, w: colW - 0.4, h: cardH - 1,
+        fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace,
+      });
+      return;
+    }
+    if (!items.length) return;
+    s.addText(items.map((b, i) => ({
+      text: String(b),
+      options: { bullet: true, breakLine: i < items.length - 1, fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, paraSpaceAfter: 6 },
+    })), { x, y: top + 0.75, w: colW - 0.4, h: cardH - 1 });
+  };
+  writeList(left, 0.7, true);
+  writeList(right, 0.7 + colW + gap, false);
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
+
+function renderLayoutProcess(pptx, s, theme, slide, idx) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  addTitleAndSubtitle(pptx, s, theme, { title: slide.title || `Slide ${idx + 1}`, subtitle: slide.subtitle });
+  const top = contentTop(theme, !!slide.subtitle);
+  const steps = (Array.isArray(slide.bullets) && slide.bullets.length
+    ? slide.bullets
+    : (slide.body ? String(slide.body).split(/\n+/).filter(Boolean) : [])).map(splitBullet);
+  const n = Math.min(6, Math.max(2, steps.length || 2));
+  const gap = 0.18;
+  const side = 0.5;
+  const boxW = (W - side * 2 - gap * (n - 1)) / n;
+  const boxH = Math.min(3.8, H - top - 0.5);
+  const bs = bodyStyleFromTheme(theme);
+  const ct = cardTitleStyleFromTheme(theme);
+  const accent = theme.accent || theme.bgDark || '4472C4';
+
+  for (let i = 0; i < n; i++) {
+    const x = side + i * (boxW + gap);
+    const step = steps[i] || { heading: null, body: '' };
+    addPanel(pptx, s, theme, { x, y: top, w: boxW, h: boxH });
+    s.addShape(pptx.shapes.OVAL, {
+      x: x + boxW / 2 - 0.28, y: top + 0.25, w: 0.56, h: 0.56,
+      fill: { color: accent },
+      line: { color: accent },
+    });
+    s.addText(String(i + 1), {
+      x: x + boxW / 2 - 0.28, y: top + 0.25, w: 0.56, h: 0.56,
+      fontSize: 16, bold: true, color: theme.textOnDark || 'FFFFFF', fontFace: ct.fontFace,
+      align: 'center', valign: 'middle',
+    });
+    s.addText(step.heading || `Step ${i + 1}`, {
+      x: x + 0.12, y: top + 1.0, w: boxW - 0.24, h: 0.7,
+      fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace, align: 'center', valign: 'top',
+    });
+    if (step.body) {
+      s.addText(String(step.body), {
+        x: x + 0.12, y: top + 1.75, w: boxW - 0.24, h: boxH - 2.0,
+        fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, align: 'center', valign: 'top',
+      });
+    }
+    if (i < n - 1 && pptx.shapes.RIGHT_ARROW) {
+      try {
+        s.addShape(pptx.shapes.RIGHT_ARROW, {
+          x: x + boxW + 0.02, y: top + boxH / 2 - 0.12, w: Math.max(0.12, gap - 0.04), h: 0.24,
+          fill: { color: accent, transparency: 30 },
+          line: { color: accent, transparency: 40 },
+        });
+      } catch { /* optional */ }
+    }
+  }
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
+
+function renderLayoutCallout(pptx, s, theme, slide, idx) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  addTitleAndSubtitle(pptx, s, theme, { title: slide.title || `Slide ${idx + 1}`, subtitle: slide.subtitle });
+  const top = contentTop(theme, !!slide.subtitle);
+  const accent = theme.accent || theme.bgDark || '4472C4';
+  addPanel(pptx, s, theme, { x: 0.5, y: top, w: W - 1, h: H - top - 0.35 });
+  s.addShape(pptx.shapes.RECTANGLE, {
+    x: 0.5, y: top, w: 0.12, h: H - top - 0.35,
+    fill: { color: accent },
+    line: { color: accent },
+  });
+  const bs = bodyStyleFromTheme(theme);
+  const ct = cardTitleStyleFromTheme(theme);
+  let y = top + 0.4;
+  if (slide.body) {
+    s.addText(String(slide.body), {
+      x: 1.0, y, w: W - 1.8, h: 1.4,
+      fontSize: Math.max(ct.fontSize || 14, (bs.fontSize || 13) + 2),
+      bold: true, color: ct.color, fontFace: ct.fontFace, valign: 'top',
+    });
+    y += 1.5;
+  }
+  const bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
+  if (bullets.length) {
+    s.addText(bullets.map((b, i) => ({
+      text: String(b),
+      options: { bullet: true, breakLine: i < bullets.length - 1, fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, paraSpaceAfter: 6 },
+    })), { x: 1.0, y, w: W - 1.8, h: Math.max(0.8, H - y - 0.5) });
   }
   if (slide.notes) s.addNotes(String(slide.notes));
   return s;
@@ -906,7 +1093,7 @@ function renderDefaultSlide(pptx, theme, slide, idx) {
 
 /** @deprecated use renderSlideFromTheme */
 export function renderTitleSlide(pptx, theme, opts) {
-  return renderSlideFromTheme(pptx, theme, { type: 'title', ...opts }, 0);
+  return renderSlideFromTheme(pptx, theme, { type: 'title', layout: 'title', ...opts }, 0);
 }
 
 /** @deprecated use renderSlideFromTheme */
