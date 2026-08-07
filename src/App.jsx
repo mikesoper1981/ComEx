@@ -160,6 +160,75 @@ function readLocalUserSettings(userId) {
   return { ...DEFAULT_USER_SETTINGS };
 }
 
+const PPTX_EXPORT_INTENT_RE = /\b(powerpoint|power\s*point|pptx?)\b|\b(export|generate|create|make|download)\b.{0,40}\b(powerpoint|power\s*point|pptx?|presentation|slides?|deck|one[\s-]?pager|documentation pack|working document)\b|\b(session summary)\b.{0,20}\b(export|powerpoint|pptx?|deck|slides?)\b|\b(export|generate|create|make)\b.{0,30}\b(one[\s-]?pager|ic documentation|documentation pack|comms? plan)\b/i;
+
+/** Classify a user message about PowerPoint / document export. */
+function classifyPptxRequest(message) {
+  const m = String(message || '').toLowerCase().trim();
+  if (!m || !PPTX_EXPORT_INTENT_RE.test(m)) return null;
+
+  const wantsSummary = /\b(summary|recap|summarise|summarize|session summary|what we (discussed|talked|covered))\b/.test(m);
+  const wantsOnePager = /one[\s-]?pager|single page|simple overview|simple one pager/.test(m);
+  const wantsFullPack = /full (ic )?doc|complete doc|documentation pack|all (the )?docs|comms plan|communication plan|manager briefing|rep (comms|communication)|cascade/.test(m);
+  const wantsProduced = wantsOnePager || wantsFullPack || /\b(working document|artefact|artifact|distribute|hand ?out|send to (the )?team|ic plan|documentation)\b/.test(m);
+
+  if (wantsSummary && !wantsProduced) {
+    return { clear: true, mode: 'summary', deckType: 'session_summary', title: 'Session Summary', description: 'Recap of this conversation only' };
+  }
+  if (wantsOnePager) {
+    return { clear: true, mode: 'produced', deckType: 'ic_one_pager', title: 'IC One-Pager', description: 'Simple one-page IC overview' };
+  }
+  if (wantsFullPack) {
+    return { clear: true, mode: 'produced', deckType: 'ic_doc_pack', title: 'IC Documentation Pack', description: 'Full IC documentation (overview, components, rules, FAQs / comms)' };
+  }
+  if (wantsProduced) {
+    return { clear: false, mode: 'produced', deckType: 'general', title: 'Working Document', description: 'Document derived from this conversation' };
+  }
+  return { clear: false, mode: null, deckType: null, title: null, description: null };
+}
+
+function buildPptxConversationContext(messageList, { maxMessages = 30, maxCharsPerMsg = 1800 } = {}) {
+  return (messageList || [])
+    .filter(m => ['user', 'assistant', 'orchestrator'].includes(m.role) && m.content)
+    .slice(-maxMessages)
+    .map(m => `${m.role}: ${String(m.content).substring(0, maxCharsPerMsg)}`)
+    .join('\n\n');
+}
+
+function parsePptxSlidePayload(raw, fallbackTitle) {
+  const cleaned = String(raw || '').replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+  const tryBuild = (parsed) => {
+    if (!parsed) return null;
+    if (Array.isArray(parsed)) return { title: fallbackTitle, subtitle: '', slides: parsed };
+    if (Array.isArray(parsed.slides)) return { title: parsed.title || fallbackTitle, subtitle: parsed.subtitle || '', slides: parsed.slides };
+    const key = Object.keys(parsed).find(k => Array.isArray(parsed[k]) && parsed[k][0]?.type);
+    if (key) return { title: parsed.title || fallbackTitle, subtitle: parsed.subtitle || '', slides: parsed[key] };
+    return null;
+  };
+
+  let slideData = tryBuild(safeJsonParse(cleaned)) || tryBuild(extractJsonObject(cleaned));
+  if (slideData?.slides?.length) return slideData;
+
+  // Truncation repair: close the last complete slide object.
+  const lastObj = cleaned.lastIndexOf('},');
+  const lastArr = cleaned.lastIndexOf('}]');
+  const cut = Math.max(lastObj, lastArr);
+  if (cut > 100) {
+    const repaired = cleaned.substring(0, cut + 1) + (cleaned.includes('"slides"') ? ']}' : ']');
+    slideData = tryBuild(safeJsonParse(repaired)) || tryBuild(extractJsonObject(repaired));
+    if (slideData?.slides?.length) return slideData;
+  }
+  return null;
+}
+
+const PPTX_CLARIFY_PROMPT = `I can export a PowerPoint from **this conversation**. What would you like?
+
+1. **Session summary** — factual recap of what we discussed (nothing invented outside this chat)
+2. **Simple one-pager** — short IC overview ready to share
+3. **Full IC documentation pack** — plan overview, components/weightings, rules, and FAQs / comms outline based on what we designed here
+
+Reply with **1**, **2**, or **3** (or describe what you need).`;
+
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
 function buildUserSettingsPromptBlock(settings) {
   if (!settings || typeof settings !== 'object') return '';
@@ -818,8 +887,10 @@ References:
 1. [Document Name]: [specific section or topic you referenced]
 2. [Document Name]: [specific section or topic you referenced]
 
-CRITICAL - POWERPOINT CREATION:
-When the user asks for a PowerPoint or a presentation, let them know the app will generate it automatically via the 📊 Generate button that appears in the interface after conversations with sufficient content. Do not attempt to create files yourself.
+CRITICAL - POWERPOINT / DOCUMENT EXPORT:
+Do NOT draft slide decks or invent PPT file contents in chat.
+If the user asks for a PowerPoint, presentation, one-pager, or IC documentation export, ask ONE short clarifying question only when the request is ambiguous (e.g. session summary vs one-pager vs full documentation pack). The app will generate the .pptx via Export / Generate after they clarify.
+Never invent scheme details that were not discussed in the conversation.
 
 RESPONSE FORMATTING - CRITICAL:
 Always use rich formatting to make responses visually engaging:
@@ -829,7 +900,7 @@ Always use rich formatting to make responses visually engaging:
 3. USE markdown tables for comparisons, component breakdowns, rule checklists
 4. USE **bold** for key terms, numbers, important rules
 5. USE emoji icons liberally: ✅ ❌ ⚠️ 🎯 📊 💡 🚀 📈
-6. Always end scheme designs with: "Would you like me to create a PowerPoint presentation? 📊"
+6. After a complete scheme design, briefly offer export: "I can export a session summary or IC documentation as PowerPoint — say which you prefer, or use 📊 Export."
 
 Format responses conversationally and practically.`;
 
@@ -937,7 +1008,7 @@ export default function CommercialExcellenceApp() {
       id: 'communication_agent',
       name: 'Communication Specialist',
       role: 'Create documentation and communications',
-      systemPrompt: `You are a communication specialist for IC programs. Write clear, comprehensive IC plan documents, FAQs, announcement emails. Explain complex concepts simply with examples and calculations.`,
+      systemPrompt: `You are a communication specialist for IC programs. Produce clear IC documentation: one-pagers, full plan overviews (components, weightings, metrics, payout mechanics), FAQs, and cascade/comms outlines. Use only scheme details already agreed with the user — do not invent missing numbers. Explain complex concepts simply with examples.`,
       knowledgeFiles: [1, 2],
       status: 'active'
     },
@@ -1102,39 +1173,65 @@ export default function CommercialExcellenceApp() {
   const [suggestionsEnabled, setSuggestionsEnabled] = useState(true);
   const [pptxOffers, setPptxOffers] = useState(null);
   const [pptxGenerating, setPptxGenerating] = useState(false);
+  const [pptxClarifyPending, setPptxClarifyPending] = useState(false);
   const [pptxPrompts, setPptxPrompts] = useState({
-    intentDetection: `You detect PowerPoint export opportunities in pharmaceutical sales conversations. Respond ONLY with valid JSON, no markdown.
+    intentDetection: `You detect PowerPoint export opportunities in pharmaceutical sales / IC conversations. Respond ONLY with valid JSON, no markdown.
 
 Return:
 {
   "offer": true/false,
-  "summaryDeck": { "title": "...", "description": "..." },
-  "producedDeck": { "title": "...", "description": "...", "deckType": "rep_comms|manager_briefing|ic_explainer|territory_report|general", "hasRealData": true/false }
+  "summaryDeck": { "title": "...", "description": "Factual recap of this conversation only" },
+  "producedDeck": { "title": "...", "description": "...", "deckType": "ic_one_pager|ic_doc_pack|rep_comms|manager_briefing|ic_explainer|territory_report|general", "hasRealData": true/false }
 }
 
-Offer whenever there is substantive content. Default to offering. hasRealData true if specific numbers, product names, or territory names are present.`,
+Offer when there is substantive IC/territory content worth exporting. Prefer deckType ic_doc_pack after a scheme design, ic_one_pager for short overviews. hasRealData true only if specific numbers/names appear in the conversation.`,
 
-    summary: `You generate structured PowerPoint summarising a pharmaceutical commercial excellence conversation.
+    summary: `You create a PowerPoint that summarises ONLY the conversation provided in Context.
 Return ONLY valid JSON, no markdown.
 
-Slide schema:
-{ "type": "title|section|content|data|table|chart|summary", "title": "...", "subtitle": "...", "bullets": ["..."], "dataPoints": [{"label":"...","value":"...","context":"..."}], "body": "...", "notes": "...",
-  "tableData": { "headers": ["Col1","Col2"], "rows": [["A","B"],["C","D"]] },
-  "chartData": { "chartType": "bar|line", "title": "...", "labels": ["0%","50%","100%"], "series": [{"name":"Payout","values":[0,6000,12000]}] }
+GROUNDING RULES (mandatory):
+- Use ONLY facts, decisions, numbers, names, and recommendations that appear in Context.
+- Do NOT invent products, territories, weightings, payouts, quotas, or best-practice claims that were not discussed.
+- If something was not covered, omit it or write "Not discussed in this conversation" — never fill gaps from general knowledge.
+- Ignore any user settings that conflict with staying faithful to the chat transcript.
+
+Output schema:
+{
+  "title": "...",
+  "subtitle": "...",
+  "slides": [
+    { "type": "title|section|content|table|summary", "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "notes": "...",
+      "tableData": { "headers": ["Col1","Col2"], "rows": [["A","B"]] } }
+  ]
 }
 
-Decide slide count from conversation length — short = 4-6, detailed = 8-10. First slide must be type "title".`,
+Slide count: short chat = 4-6 slides, rich chat = 7-9. First slide must be type "title". Prefer bullets over charts. Include a table only when the conversation itself contains tabular structure (e.g. components + weights).`,
 
-    produced: `You generate structured PowerPoint for an ACTUAL WORKING DOCUMENT — ready to distribute.
+    produced: `You create a PowerPoint WORKING DOCUMENT from an IC / commercial excellence conversation — ready to distribute.
 Return ONLY valid JSON, no markdown.
 
-Slide schema:
-{ "type": "title|section|content|data|table|chart|summary", "title": "...", "subtitle": "...", "bullets": ["..."], "dataPoints": [{"label":"...","value":"...","context":"..."}], "body": "...", "notes": "...",
-  "tableData": { "headers": ["Col1","Col2","Col3"], "rows": [["A","B","C"]] },
-  "chartData": { "chartType": "bar|line", "title": "Chart title", "labels": ["0%","50%","100%","150%"], "series": [{"name":"Payout £","values":[0,3000,6000,9000]}] }
+GROUNDING RULES (mandatory):
+- Base every slide on the Conversation Context. Do not invent scheme details, numbers, products, or rules that were not agreed or stated there.
+- You MAY organise and phrase content professionally (headings, FAQs) but content must come from the chat.
+- If a section cannot be filled from the conversation, include a short slide noting what still needs confirmation — do not fabricate it.
+- Respect USER SETTINGS for terminology/currency only; never use them to invent missing scheme facts.
+
+Deck types (follow the requested deckType):
+- ic_one_pager: 5-7 slides — title, scheme purpose, components/weights, key rules, how payout works, next steps
+- ic_doc_pack: 8-12 slides — title, executive overview, components & metrics, weightings table, payout mechanics, eligibility/rules, FAQs, manager talking points / cascade outline, open items
+- rep_comms / manager_briefing / ic_explainer / territory_report / general: structure appropriately for that audience using only chat facts
+
+Output schema:
+{
+  "title": "...",
+  "subtitle": "...",
+  "slides": [
+    { "type": "title|section|content|table|summary", "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "notes": "...",
+      "tableData": { "headers": ["Component","Weight","Metric"], "rows": [["Sales","40%","Net sales"]] } }
+  ]
 }
 
-Write the ACTUAL document — ready to hand to the audience. Use specific details from the conversation. First slide must be type "title".`
+First slide must be type "title". Prefer tables for components/weights. Keep JSON compact — no chartData unless essential.`
   });
   const [maxSuggestions, setMaxSuggestions] = useState(3);
   const [hoveredCitation, setHoveredCitation] = useState(null);
@@ -2920,43 +3017,110 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     }
   };
 
-  const handleGeneratePptx = async (offer, mode = 'summary') => {
+  const askPptxClarification = () => {
+    setPptxClarifyPending(true);
     setPptxOffers(null);
+    setMessages(prev => [...prev, { role: 'assistant', content: PPTX_CLARIFY_PROMPT }]);
+  };
+
+  const offerFromClassification = (classified) => {
+    if (!classified) return null;
+    if (classified.mode === 'summary') {
+      return {
+        title: classified.title || 'Session Summary',
+        description: classified.description || 'Factual recap of this conversation',
+      };
+    }
+    return {
+      title: classified.title || 'Working Document',
+      description: classified.description || 'Document based on this conversation',
+      deckType: classified.deckType || 'general',
+      hasRealData: true,
+    };
+  };
+
+  const resolvePptxClarificationReply = (messageContent) => {
+    const m = String(messageContent || '').toLowerCase().trim();
+    if (/^(1|one)\b/.test(m) || /\bsummary\b/.test(m) || /\brecap\b/.test(m)) {
+      return { mode: 'summary', offer: { title: 'Session Summary', description: 'Factual recap of this conversation' } };
+    }
+    if (/^(2|two)\b/.test(m) || /one[\s-]?pager|simple/.test(m)) {
+      return { mode: 'produced', offer: { title: 'IC One-Pager', description: 'Simple one-page IC overview', deckType: 'ic_one_pager', hasRealData: true } };
+    }
+    if (/^(3|three)\b/.test(m) || /full|pack|documentation|comms/.test(m)) {
+      return { mode: 'produced', offer: { title: 'IC Documentation Pack', description: 'Full IC documentation from this conversation', deckType: 'ic_doc_pack', hasRealData: true } };
+    }
+    const classified = classifyPptxRequest(messageContent);
+    if (classified?.clear) {
+      return { mode: classified.mode, offer: offerFromClassification(classified) };
+    }
+    return null;
+  };
+
+  const handleGeneratePptx = async (offer, mode = 'summary') => {
+    const savedOffers = pptxOffers;
+    setPptxOffers(null);
+    setPptxClarifyPending(false);
     setPptxGenerating(true);
-    const conversationSummary = messages.slice(-16).filter(m => ['user','assistant','orchestrator'].includes(m.role)).map(m => `${m.role}: ${m.content.substring(0, 500)}`).join('\n');
+
     const isSummary = mode === 'summary';
+    const deckType = offer?.deckType || (isSummary ? 'session_summary' : 'general');
+    const conversationContext = buildPptxConversationContext(messages);
     const systemPrompt = withUserSettings(isSummary ? pptxPrompts.summary : pptxPrompts.produced);
+    const userContent = [
+      `Export mode: ${isSummary ? 'SESSION SUMMARY (chat facts only)' : 'PRODUCED WORKING DOCUMENT'}`,
+      `Requested title: "${offer?.title || (isSummary ? 'Session Summary' : 'Working Document')}"`,
+      `deckType: ${deckType}`,
+      `hasRealData hint: ${offer?.hasRealData ? 'true' : 'false'}`,
+      '',
+      'Conversation Context (ONLY source of truth — do not invent beyond this):',
+      conversationContext || '(empty conversation)',
+    ].join('\n');
+
     try {
+      if (!conversationContext.trim()) {
+        throw new Error('No conversation content to export yet. Continue the discussion, then try again.');
+      }
+
       const res = await anthropicMessagesPost({
         system: systemPrompt,
-        messages: [{ role: 'user', content: `Document requested: "${offer.title}"\n\nContext:\n${conversationSummary}` }],
-        max_tokens: isSummary ? 2500 : 4096,
+        messages: [{ role: 'user', content: userContent }],
+        max_tokens: isSummary ? 4096 : 8192,
       });
-      const data = await res.json();
-      if (data.error) throw new Error(`API error: ${data.error.message}`);
-      const raw = anthropicAssistantText(data)?.trim() || '';
-      if (!raw) throw new Error('Empty response from API');
-      const cleaned = raw.replace(/```json|```/g, '').trim();
-      let slideData;
-      try {
-        const parsed = JSON.parse(cleaned);
-        if (Array.isArray(parsed)) { slideData = { title: offer.title, subtitle: '', slides: parsed }; }
-        else if (Array.isArray(parsed.slides)) { slideData = parsed; }
-        else {
-          const possibleSlidesKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]) && parsed[k].length > 0 && parsed[k][0]?.type);
-          if (possibleSlidesKey) { slideData = { title: parsed.title || offer.title, subtitle: parsed.subtitle || '', slides: parsed[possibleSlidesKey] }; }
-          else { throw new Error('No slides array found'); }
-        }
-      } catch (parseErr) {
-        const lastGoodSlide = cleaned.lastIndexOf('},');
-        const lastGoodFinal = cleaned.lastIndexOf('}]');
-        const cutPoint = Math.max(lastGoodSlide, lastGoodFinal);
-        if (cutPoint > 100) {
-          const repaired = cleaned.substring(0, cutPoint + 1) + ']}';
-          const parsed = JSON.parse(repaired);
-          slideData = { title: offer.title, subtitle: '', slides: Array.isArray(parsed.slides) ? parsed.slides : (Array.isArray(parsed) ? parsed : []) };
-        } else { throw new Error(`Could not parse slide JSON: ${parseErr.message}`); }
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`API error ${res.status}: ${errText.substring(0, 200)}`);
       }
+      const data = await res.json();
+      if (data.error) throw new Error(`API error: ${data.error.message || JSON.stringify(data.error)}`);
+
+      let raw = anthropicAssistantText(data)?.trim() || '';
+      if (!raw) throw new Error('Empty response from API');
+
+      let slideData = parsePptxSlidePayload(raw, offer?.title || 'PowerPoint');
+
+      // If truncated, ask the model to finish a complete JSON payload.
+      if (!slideData?.slides?.length && (raw.length > 1500 || /slides/i.test(raw))) {
+        const contRes = await anthropicMessagesPost({
+          system: withUserSettings('Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.'),
+          messages: [{
+            role: 'user',
+            content: `Finish this PowerPoint JSON. Mode=${isSummary ? 'summary' : 'produced'}, deckType=${deckType}, title="${offer?.title || ''}".\n\nPartial output:\n${raw.slice(-3500)}\n\nConversation Context:\n${conversationContext.slice(0, 12000)}`,
+          }],
+          max_tokens: 8192,
+        });
+        if (contRes.ok) {
+          const contData = await contRes.json();
+          const contRaw = anthropicAssistantText(contData)?.trim() || '';
+          if (contRaw) {
+            raw = contRaw;
+            slideData = parsePptxSlidePayload(contRaw, offer?.title || 'PowerPoint');
+          }
+        }
+      }
+
+      if (!slideData?.slides?.length) throw new Error('Could not parse slide JSON from the model response');
+
       const getPptxGen = () => window.PptxGenJS || window.pptxgen || window.PptxGenJs;
       if (!getPptxGen()) {
         await new Promise((resolve, reject) => {
@@ -2975,49 +3139,112 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       }
       const PptxGenJS = getPptxGen();
       if (!PptxGenJS) throw new Error('PptxGenJS library not available');
+
       const pptx = new PptxGenJS();
       pptx.layout = 'LAYOUT_16x9';
-      pptx.title = slideData.title;
-      const BG_DARK = '1E2761', BG_MID = '0D1B4B', BG_LIGHT = 'FFFFFF', ACCENT = '60A5FA', ACCENT2 = '34D399';
+      pptx.title = slideData.title || offer?.title || 'PowerPoint';
+      const BG_DARK = '1E2761', BG_LIGHT = 'FFFFFF', ACCENT = '60A5FA';
       const TEXT_LIGHT = 'CADCFC', TEXT_WHITE = 'FFFFFF', TEXT_DARK = '1E2761', TEXT_MUTED = '94A3B8';
-      const slides = Array.isArray(slideData.slides) ? slideData.slides : [];
+      const slides = Array.isArray(slideData.slides) ? slideData.slides.filter(s => s && (s.type || s.title)) : [];
       if (!slides.length) throw new Error('No slides returned');
+
       slides.forEach((slide, idx) => {
-        if (!slide || !slide.type) return;
+        const type = slide.type || 'content';
         slide.bullets = Array.isArray(slide.bullets) ? slide.bullets : [];
         slide.dataPoints = Array.isArray(slide.dataPoints) ? slide.dataPoints : [];
         const s = pptx.addSlide();
-        if (slide.type === 'title') {
+
+        if (type === 'title') {
           s.background = { color: BG_DARK };
           s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 0.18, h: 5.625, fill: { color: ACCENT }, line: { color: ACCENT } });
-          s.addText(slide.title || slideData.title, { x: 0.5, y: 1.4, w: 9, h: 1.6, fontSize: 40, bold: true, color: TEXT_WHITE, fontFace: 'Calibri', align: 'left', valign: 'middle' });
-          if (slide.subtitle || slideData.subtitle) s.addText(slide.subtitle || slideData.subtitle, { x: 0.5, y: 3.1, w: 8, h: 0.6, fontSize: 18, color: TEXT_LIGHT, fontFace: 'Calibri', align: 'left' });
+          s.addText(slide.title || slideData.title || offer?.title || '', { x: 0.5, y: 1.4, w: 9, h: 1.6, fontSize: 36, bold: true, color: TEXT_WHITE, fontFace: 'Calibri', align: 'left', valign: 'middle' });
+          if (slide.subtitle || slideData.subtitle) {
+            s.addText(slide.subtitle || slideData.subtitle, { x: 0.5, y: 3.1, w: 8, h: 0.6, fontSize: 18, color: TEXT_LIGHT, fontFace: 'Calibri', align: 'left' });
+          }
           const today = new Date().toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
           s.addText(today, { x: 6, y: 5.1, w: 3.7, h: 0.4, fontSize: 11, color: TEXT_MUTED, align: 'right', fontFace: 'Calibri' });
-        } else {
-          s.background = { color: BG_LIGHT };
-          s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 10, h: 0.88, fill: { color: BG_DARK }, line: { color: BG_DARK } });
-          s.addText(slide.title, { x: 0.4, y: 0, w: 9.2, h: 0.88, fontSize: 22, bold: true, color: TEXT_WHITE, valign: 'middle', fontFace: 'Calibri' });
-          s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0.88, w: 10, h: 0.05, fill: { color: ACCENT }, line: { color: ACCENT } });
-          if (slide.body) s.addText(slide.body, { x: 0.5, y: 1.05, w: 9, h: 0.8, fontSize: 14, color: TEXT_DARK, fontFace: 'Calibri', align: 'left' });
-          if (slide.bullets?.length) {
-            const startY = slide.body ? 1.95 : 1.1;
-            const bulletItems = slide.bullets.map((b, i) => ({ text: b, options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: 14, color: TEXT_DARK, fontFace: 'Calibri', paraSpaceAfter: 6 } }));
-            s.addText(bulletItems, { x: 0.5, y: startY, w: 9, h: 4.2 - startY });
-          }
-          if (slide.notes) s.addNotes(slide.notes);
-          s.addText(`${idx + 1}`, { x: 9.5, y: 5.3, w: 0.4, h: 0.2, fontSize: 9, color: TEXT_MUTED, align: 'right', fontFace: 'Calibri' });
+          return;
         }
+
+        s.background = { color: BG_LIGHT };
+        s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 10, h: 0.88, fill: { color: BG_DARK }, line: { color: BG_DARK } });
+        s.addText(slide.title || `Slide ${idx + 1}`, { x: 0.4, y: 0, w: 9.2, h: 0.88, fontSize: 20, bold: true, color: TEXT_WHITE, valign: 'middle', fontFace: 'Calibri' });
+        s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0.88, w: 10, h: 0.05, fill: { color: ACCENT }, line: { color: ACCENT } });
+
+        let cursorY = 1.05;
+        if (slide.body) {
+          s.addText(String(slide.body), { x: 0.5, y: cursorY, w: 9, h: 0.7, fontSize: 13, color: TEXT_DARK, fontFace: 'Calibri', align: 'left', valign: 'top' });
+          cursorY += 0.75;
+        }
+
+        if (slide.dataPoints.length) {
+          const lines = slide.dataPoints.map(dp => `${dp.label || ''}: ${dp.value || ''}${dp.context ? ` (${dp.context})` : ''}`);
+          s.addText(lines.map((t, i) => ({ text: t, options: { bullet: true, breakLine: i < lines.length - 1, fontSize: 13, color: TEXT_DARK, fontFace: 'Calibri', paraSpaceAfter: 4 } })), {
+            x: 0.5, y: cursorY, w: 9, h: Math.min(1.6, 0.28 * lines.length + 0.2),
+          });
+          cursorY += Math.min(1.7, 0.28 * lines.length + 0.3);
+        }
+
+        const table = slide.tableData;
+        if (table && Array.isArray(table.headers) && Array.isArray(table.rows) && table.headers.length) {
+          const colCount = table.headers.length;
+          const colW = Math.min(9.2 / colCount, 3.2);
+          const headerRow = table.headers.map(h => ({
+            text: String(h ?? ''),
+            options: { bold: true, color: TEXT_WHITE, fill: { color: BG_DARK }, align: 'center', valign: 'middle' },
+          }));
+          const bodyRows = table.rows.slice(0, 12).map(row => {
+            const cells = Array.isArray(row) ? row : [row];
+            return Array.from({ length: colCount }, (_, i) => ({
+              text: String(cells[i] ?? ''),
+              options: { color: TEXT_DARK, align: 'left', valign: 'middle' },
+            }));
+          });
+          const tableH = Math.min(3.6, 0.35 * (bodyRows.length + 1) + 0.2);
+          s.addTable([headerRow, ...bodyRows], {
+            x: 0.4,
+            y: cursorY,
+            w: colW * colCount,
+            colW: Array(colCount).fill(colW),
+            border: [{ type: 'solid', pt: 0.5, color: 'CBD5E1' }, { type: 'solid', pt: 0.5, color: 'CBD5E1' }, { type: 'solid', pt: 0.5, color: 'CBD5E1' }, { type: 'solid', pt: 0.5, color: 'CBD5E1' }],
+            fontFace: 'Calibri',
+            fontSize: 11,
+            color: TEXT_DARK,
+          });
+          cursorY += tableH + 0.15;
+        }
+
+        if (slide.bullets.length) {
+          const remaining = Math.max(0.8, 5.1 - cursorY);
+          const bulletItems = slide.bullets.map((b, i) => ({
+            text: String(b),
+            options: { bullet: true, breakLine: i < slide.bullets.length - 1, fontSize: 13, color: TEXT_DARK, fontFace: 'Calibri', paraSpaceAfter: 5 },
+          }));
+          s.addText(bulletItems, { x: 0.5, y: cursorY, w: 9, h: remaining });
+        }
+
+        if (slide.notes) s.addNotes(String(slide.notes));
+        s.addText(`${idx + 1}`, { x: 9.5, y: 5.3, w: 0.4, h: 0.2, fontSize: 9, color: TEXT_MUTED, align: 'right', fontFace: 'Calibri' });
       });
-      const fileName = (slideData.title || offer.title).replace(/[^a-z0-9]/gi, '_').toLowerCase();
+
+      const fileName = (slideData.title || offer?.title || 'powerpoint').replace(/[^a-z0-9]+/gi, '_').toLowerCase();
       await pptx.writeFile({ fileName: `${fileName}.pptx` });
-      setMessages(prev => [...prev, { role: 'assistant', content: `📊 **PowerPoint generated** — "${slideData.title}" (${slides.length} slides) downloaded. Check your downloads folder.` }]);
-      setPptxGenerating(false);
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `📊 **PowerPoint generated** — "${slideData.title || offer?.title}" (${slides.length} slides${isSummary ? ', conversation summary' : `, ${deckType}`}) downloaded. Check your downloads folder.`,
+      }]);
     } catch (e) {
       console.error('PPTX generation error:', e);
-      setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Could not generate PowerPoint: ${e.message || 'Unknown error'}.` }]);
+      setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Could not generate PowerPoint: ${e.message || 'Unknown error'}. You can try again, or tell me whether you want a **session summary**, **one-pager**, or **full documentation pack**.` }]);
+      if (savedOffers) setPptxOffers(savedOffers);
+    } finally {
       setPptxGenerating(false);
     }
+  };
+
+  const startPptxExportFromUi = () => {
+    // Ambiguous export from the button → clarify in main chat.
+    askPptxClarification();
   };
 
   const handleTerritoryStructureUpload = (event) => {
@@ -3044,6 +3271,29 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     setInput('');
     setOrchestratorDecision(null);
     setPendingButtonAction(null);
+
+    // Resolve pending PPT export clarification before normal chat routing.
+    if (pptxClarifyPending && !currentWorkflow) {
+      setMessages(prev => [...prev, { role: 'user', content: messageContent }]);
+      const lower = messageContent.toLowerCase();
+      if (/\b(cancel|never mind|no thanks|forget it)\b/.test(lower)) {
+        setPptxClarifyPending(false);
+        setMessages(prev => [...prev, { role: 'assistant', content: 'No problem — export cancelled. You can use **📊 Export as PowerPoint** again whenever you want.' }]);
+        setIsLoading(false);
+        return;
+      }
+      const resolved = resolvePptxClarificationReply(messageContent);
+      if (resolved?.mode && resolved.offer) {
+        setPptxClarifyPending(false);
+        setIsLoading(false);
+        await handleGeneratePptx(resolved.offer, resolved.mode);
+        return;
+      }
+      setMessages(prev => [...prev, { role: 'assistant', content: `I still need a clear choice.\n\n${PPTX_CLARIFY_PROMPT}` }]);
+      setIsLoading(false);
+      return;
+    }
+
     setPptxOffers(null);
     setMessages(prev => [...prev, { role: 'user', content: messageContent }]);
     setIsLoading(true);
@@ -3056,6 +3306,19 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         else { await runWorkflowStep(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []); }
         return;
       }
+    }
+
+    // Intercept PowerPoint / documentation export requests.
+    const pptIntent = classifyPptxRequest(messageContent);
+    if (pptIntent) {
+      if (pptIntent.clear && pptIntent.mode) {
+        setIsLoading(false);
+        await handleGeneratePptx(offerFromClassification(pptIntent), pptIntent.mode);
+        return;
+      }
+      setIsLoading(false);
+      askPptxClarification();
+      return;
     }
 
     const msg = messageContent.toLowerCase();
@@ -3362,23 +3625,37 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                         <div className="p-3 flex flex-col gap-2">
                           <div className="text-xs font-semibold text-violet-200">📋 Session Summary</div>
                           <div className="text-xs text-slate-400 flex-1">{pptxOffers.summary.title}</div>
+                          <div className="text-[10px] text-slate-500">Facts from this chat only</div>
                           <button onClick={() => handleGeneratePptx(pptxOffers.summary, 'summary')} className="mt-1 px-3 py-1.5 bg-violet-500/20 hover:bg-violet-500/35 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold transition-all">✨ Generate</button>
                         </div>
                       )}
                       {pptxOffers.produced && (
                         <div className="p-3 flex flex-col gap-2">
-                          <div className="text-xs font-semibold text-emerald-300">📄 Produced Document</div>
+                          <div className="text-xs font-semibold text-emerald-300">📄 Working Document</div>
                           <div className="text-xs text-slate-400 flex-1">{pptxOffers.produced.title}</div>
-                          <button onClick={() => handleGeneratePptx(pptxOffers.produced, 'produced')} className="mt-1 px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/30 rounded-lg text-xs text-emerald-200 font-semibold transition-all">✨ Generate</button>
+                          <div className="text-[10px] text-slate-500">{pptxOffers.produced.deckType === 'ic_one_pager' ? 'One-pager' : pptxOffers.produced.deckType === 'ic_doc_pack' ? 'Full IC pack' : 'Based on this conversation'}</div>
+                          <button
+                            onClick={() => {
+                              const dt = pptxOffers.produced.deckType;
+                              if (!dt || dt === 'general') {
+                                askPptxClarification();
+                              } else {
+                                handleGeneratePptx(pptxOffers.produced, 'produced');
+                              }
+                            }}
+                            className="mt-1 px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/30 rounded-lg text-xs text-emerald-200 font-semibold transition-all"
+                          >
+                            ✨ Generate
+                          </button>
                         </div>
                       )}
                     </div>
                   </div>
                 )}
 
-                {!currentWorkflow && !pptxOffers && !pptxGenerating && messages.filter(m => m.role === 'assistant' || m.role === 'orchestrator').length > 0 && (
+                {!currentWorkflow && !pptxOffers && !pptxGenerating && !pptxClarifyPending && messages.filter(m => m.role === 'assistant' || m.role === 'orchestrator').length > 0 && (
                   <div className="mb-3 flex justify-end">
-                    <button onClick={() => setPptxOffers({ summary: { title: 'Session Summary Deck', description: 'Structured recap of this conversation' }, produced: { title: 'Working Document', description: 'An actual artefact ready to distribute', deckType: 'general', hasRealData: false } })} className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-400/20 hover:border-violet-400/40 rounded-lg text-xs text-violet-300/60 hover:text-violet-300 transition-all">
+                    <button onClick={startPptxExportFromUi} className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-400/20 hover:border-violet-400/40 rounded-lg text-xs text-violet-300/60 hover:text-violet-300 transition-all">
                       📊 Export as PowerPoint
                     </button>
                   </div>
