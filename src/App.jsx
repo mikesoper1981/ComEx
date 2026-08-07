@@ -9,7 +9,7 @@ import {
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
 } from './auth';
-import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyTemplateChrome } from './pptxTheme';
+import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyTemplateChrome, applyContentHeader } from './pptxTheme';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -3235,6 +3235,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       pptx.title = slideData.title || offer?.title || 'PowerPoint';
       // Reload template PPTX from storage so logos / backgrounds / fonts are applied.
       const theme = await loadFullPptxStyleForGeneration(userSettings, supabase);
+      const hasTemplate = !!userSettings.pptxTemplate;
       const BG_DARK = theme.bgDark;
       const ACCENT = theme.accent;
       const TEXT_ON_DARK = theme.textOnDark;
@@ -3246,8 +3247,8 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       const FONT_BODY = theme.bodyFont;
       const TITLE_SIZE = theme.titleFontSize || 36;
       const HEADING_SIZE = theme.headingFontSize || 22;
+      const SUBTITLE_SIZE = theme.subtitleFontSize || 18;
       const BODY_SIZE = theme.bodyFontSize || 14;
-      const hasTemplateChrome = !!(userSettings.pptxTemplate && (theme.logos?.length || theme.titleBackground || theme.contentBackground || theme.accentShapes?.length));
       const slides = Array.isArray(slideData.slides) ? slideData.slides.filter(s => s && (s.type || s.title)) : [];
       if (!slides.length) throw new Error('No slides returned');
 
@@ -3261,19 +3262,18 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
         applyTemplateChrome(pptx, s, theme, { variant: isTitle ? 'title' : 'content' });
 
         if (isTitle) {
-          // Default accent rail only when template didn't provide chrome bars
-          if (!hasTemplateChrome) {
+          if (!hasTemplate || theme.useDefaultChrome) {
             s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 0.18, h: 5.625, fill: { color: ACCENT }, line: { color: ACCENT } });
           }
           s.addText(slide.title || slideData.title || offer?.title || '', {
-            x: 0.5, y: 1.4, w: 9, h: 1.6,
+            x: 0.5, y: 1.35, w: 9, h: 1.7,
             fontSize: TITLE_SIZE, bold: theme.titleBold !== false, color: TEXT_ON_DARK,
             fontFace: FONT_HEADING, align: 'left', valign: 'middle',
           });
           if (slide.subtitle || slideData.subtitle) {
             s.addText(slide.subtitle || slideData.subtitle, {
-              x: 0.5, y: 3.1, w: 8, h: 0.6,
-              fontSize: Math.max(14, Math.round(BODY_SIZE * 1.25)), color: TEXT_ON_DARK_MUTED,
+              x: 0.5, y: 3.15, w: 8.5, h: 0.7,
+              fontSize: SUBTITLE_SIZE, color: TEXT_ON_DARK_MUTED,
               fontFace: FONT_BODY, align: 'left',
             });
           }
@@ -3282,26 +3282,19 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
           return;
         }
 
-        // Content slides: header band unless template already has a top bar / full bg image
-        const templateHasTopBar = (theme.accentShapes || []).some(sh => sh.y < 0.3 && sh.w >= 8);
-        const contentHasBgImage = theme.contentBackground?.type === 'image';
-        if (!templateHasTopBar && !contentHasBgImage) {
+        let cursorY;
+        if (hasTemplate && !theme.useDefaultChrome) {
+          cursorY = applyContentHeader(pptx, s, theme, slide.title || `Slide ${idx + 1}`);
+        } else {
           s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0, w: 10, h: 0.88, fill: { color: BG_DARK }, line: { color: BG_DARK } });
           s.addShape(pptx.shapes.RECTANGLE, { x: 0, y: 0.88, w: 10, h: 0.05, fill: { color: ACCENT }, line: { color: ACCENT } });
           s.addText(slide.title || `Slide ${idx + 1}`, {
             x: 0.4, y: 0, w: 9.2, h: 0.88,
             fontSize: HEADING_SIZE, bold: true, color: TEXT_ON_DARK, valign: 'middle', fontFace: FONT_HEADING,
           });
-        } else {
-          s.addText(slide.title || `Slide ${idx + 1}`, {
-            x: 0.4, y: 0.25, w: 9.2, h: 0.7,
-            fontSize: HEADING_SIZE, bold: true,
-            color: contentHasBgImage ? TEXT_ON_DARK : TEXT_ON_LIGHT,
-            valign: 'middle', fontFace: FONT_HEADING,
-          });
+          cursorY = 1.05;
         }
 
-        let cursorY = (templateHasTopBar || contentHasBgImage) ? 1.1 : 1.05;
         if (slide.body) {
           s.addText(String(slide.body), {
             x: 0.5, y: cursorY, w: 9, h: 0.7,
@@ -3363,7 +3356,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       const fileName = (slideData.title || offer?.title || 'powerpoint').replace(/[^a-z0-9]+/gi, '_').toLowerCase();
       await pptx.writeFile({ fileName: `${fileName}.pptx` });
       const themeNote = userSettings.pptxTemplate?.fileName
-        ? ` styled from **${userSettings.pptxTemplate.fileName}** (theme, fonts, backgrounds & logos)`
+        ? ` styled from **${userSettings.pptxTemplate.fileName}** (sampled slide colours, fonts & logos)`
         : ' using the default ComEx style';
       setMessages(prev => [...prev, {
         role: 'assistant',
@@ -4203,8 +4196,8 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                 <div className="mt-8 pt-6 border-t border-blue-400/15">
                   <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
                   <p className="text-xs text-blue-300/60 mb-4">
-                    Upload a branded .pptx. We use its slide master / layout design — colours, fonts, sizes, backgrounds, shading bars, and logos — and ignore slide text content. Stored at{' '}
-                    <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>. Without a template, exports use the default ComEx style.
+                    Upload a branded .pptx. We sample completed slides (and masters if present) for real colours, shading, title/subtitle/body fonts & sizes, backgrounds, and logos — slide text content is ignored. Re-upload after changing your template. Stored at{' '}
+                    <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>.
                   </p>
 
                   {userSettings.pptxTemplate ? (
@@ -4241,17 +4234,18 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
                       {(() => {
                         const gen = getPptxGeneratorThemeFromUserSettings(userSettings);
                         const swatches = [
-                          ['Dark', gen.bgDark],
-                          ['Light', gen.bgLight],
+                          ['Header', gen.bgDark],
+                          ['Slide', gen.bgLight],
                           ['Accent', gen.accent],
-                          ['Text', gen.textOnLight],
+                          ['Title text', gen.textOnDark],
+                          ['Body text', gen.textOnLight],
                         ];
                         return (
                           <div className="flex flex-wrap gap-3 items-center">
                             {swatches.map(([label, hex]) => (
                               <div key={label} className="flex items-center gap-2 text-xs text-blue-200/70">
                                 <span className="w-6 h-6 rounded border border-white/20 shadow-inner" style={{ backgroundColor: `#${hex}` }} title={`#${hex}`} />
-                                <span>{label}</span>
+                                <span>{label} <span className="text-blue-300/40 font-mono">#{hex}</span></span>
                               </div>
                             ))}
                             <span className="text-[10px] text-emerald-400/80 font-semibold">Active for exports</span>
