@@ -1102,7 +1102,7 @@ export default function CommercialExcellenceApp() {
       orchestrator: {
         role: 'You are the Workflow Orchestrator for IC scheme design.',
         goal: 'Ensure the final scheme meets all compliance rules, fairness standards, and the user\'s business requirements.',
-        approach: 'EVALUATING STEPS: After each agent responds, assess their output strictly against the step\'s success criteria. IF WAITING FOR USER: If an agent has asked the user a question, set proceedToNext to false. WORKFLOW END: Only mark workflowComplete when all steps have passed.'
+        approach: 'EVALUATING STEPS: After each agent responds, assess their output strictly against the step\'s success criteria. IF THE AGENT ASKED THE USER A QUESTION: set agentStillWorking=true, stepComplete=false, and do not offer Continue — wait for the user\'s answer. WORKFLOW END: Only mark workflowComplete when all steps have passed.'
       },
       workflow: [
         { step: 1, name: 'Gather Requirements', agents: ['requirements_agent'], goal: 'Collect all necessary information', successCriteria: 'Clear answers to: How many reps? What products? Strategic priorities?' },
@@ -1804,16 +1804,30 @@ Step ${step.step}: ${step.name}
 Goal: ${step.goal}
 Success criteria: ${step.successCriteria}
 
+If you still need information from the user, ask clear questions and wait — do not claim the step is finished.
 Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`);
     return await callAnthropic(system, messages, 3000);
   };
 
+  /** True when the agent is clearly waiting on the user (questions / clarification). */
+  const agentResponseAwaitsUser = (text) => {
+    if (!text) return false;
+    const t = String(text);
+    const qMarks = (t.match(/\?/g) || []).length;
+    if (qMarks >= 2) return true;
+    if (/(?:^|\n)\s*(?:\d+[\.\)]\s+|[-*•]\s+).{0,120}\?/m.test(t) && qMarks >= 1) return true;
+    if (qMarks >= 1 && /\b(please (tell|confirm|clarify|provide|answer|share)|could you|can you|would you|let me know|before (we|I) (proceed|continue)|need (a few|more|the following)|clarif(?:y|ication)|which of the following|how many|what (is|are) (the|your))\b/i.test(t)) {
+      return true;
+    }
+    return false;
+  };
+
   const orchestratorEvaluate = async (topic, step, agentResponse, workflowContext) => {
     const orch = topic.orchestrator;
-    const allAgentsList = agents.map(a => `${a.id}: ${a.name}`).join('\n');
     const stepList = topic.workflow.map(s => `Step ${s.step} (index ${s.step - 1}): ${s.name} — agent: ${s.agents[0]}`).join('\n');
     const system = withUserSettings(`${orch.role}
 Overall goal: ${orch.goal}
+${orch.approach ? `\nApproach rules:\n${orch.approach}` : ''}
 
 Workflow steps:
 ${stepList}
@@ -1831,9 +1845,13 @@ Respond in JSON only:
   "workflowComplete": false
 }
 
+CRITICAL — waiting on the user:
+- If the agent asked the user any clarifying/open questions, or is clearly waiting for answers, set agentStillWorking=true, stepComplete=false, orchestratorMessage="", buttons=[].
+- Do NOT say the stage is finished and do NOT offer Continue/Proceed while questions are unanswered.
+- Only set agentStillWorking=false when the agent has produced a substantive deliverable for this step's success criteria AND is not asking the user for more input.
+
 If agentStillWorking is true, set orchestratorMessage to "" and buttons to [].
-When agentStillWorking is false, always write orchestratorMessage and 2-4 buttons.
-Always include at least one "proceed" path and one "refine/revisit" path.`);
+When agentStillWorking is false, write orchestratorMessage and 2-4 buttons (include at least one "proceed" and one "refine/revisit" path).`);
 
     const contextStr = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output.substring(0, 300)}`).join('\n\n');
     const userContent = `Workflow: ${topic.name}
@@ -1841,15 +1859,34 @@ Step ${step.step}/${topic.workflow.length}: ${step.name}
 Success criteria: ${step.successCriteria}
 
 Agent response:
-${agentResponse.substring(0, 1200)}
+${agentResponse.substring(0, 2000)}
 
 Previous context:
-${contextStr || 'None'}`;
+${contextStr || 'None'}
+
+Reminder: if the agent response contains unanswered questions for the user, agentStillWorking must be true.`;
 
     const raw = await callAnthropic(system, [{ role: 'user', content: userContent }], 1200);
     try {
-      return JSON.parse(raw.replace(/```json|```/g, '').trim());
+      const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+      if (agentResponseAwaitsUser(agentResponse)) {
+        return {
+          ...parsed,
+          agentStillWorking: true,
+          stepComplete: false,
+          buttons: [],
+          orchestratorMessage: '',
+          workflowComplete: false,
+        };
+      }
+      return parsed;
     } catch {
+      if (agentResponseAwaitsUser(agentResponse)) {
+        return {
+          agentStillWorking: true, stepComplete: false, rerouteToStep: null, rerouteBriefing: '', handoffs: [],
+          buttons: [], orchestratorMessage: '', workflowComplete: false,
+        };
+      }
       return {
         agentStillWorking: false, stepComplete: false, rerouteToStep: null, rerouteBriefing: '', handoffs: [],
         buttons: [{ label: '✅ Continue', action: 'proceed', requiresInput: false, inputPrompt: '' }, { label: '✏️ Refine', action: 'refine', requiresInput: true, inputPrompt: 'What would you like to refine?' }],
@@ -1938,6 +1975,20 @@ ${isFocused
       const updatedStepMessages = [...fullMessages, { role: 'assistant', content: agentResponse }];
       logActivity('orchestrator', `Evaluating Step ${stepIndex + 1} after user reply`);
       const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext);
+
+      if (evaluation.agentStillWorking) {
+        setOrchestratorDecision(null);
+        setCurrentWorkflow(prev => prev ? {
+          ...prev,
+          currentStep: stepIndex,
+          waitingForUser: true,
+          awaitingAgentReply: true,
+          stepMessages: updatedStepMessages,
+        } : null);
+        setIsLoading(false);
+        return;
+      }
+
       const handoffMatches = [...agentResponse.matchAll(/REQUIRES_HANDOFF:\s*(\S+)\s*-\s*(.+)/gi)];
       const allHandoffs = [...handoffMatches.map(m => ({ agentId: m[1], task: m[2] })), ...(evaluation.handoffs || [])];
       const handoffOutputs = [];
@@ -1958,7 +2009,14 @@ ${isFocused
         return;
       }
       postOrchestratorDecision(evaluation, topic, stepIndex, updatedContext, userReply);
-      setCurrentWorkflow(prev => prev ? { ...prev, currentStep: stepIndex, context: updatedContext, waitingForUser: true, stepMessages: updatedStepMessages } : null);
+      setCurrentWorkflow(prev => prev ? {
+        ...prev,
+        currentStep: stepIndex,
+        context: updatedContext,
+        waitingForUser: true,
+        awaitingAgentReply: false,
+        stepMessages: updatedStepMessages,
+      } : null);
       setIsLoading(false);
     } catch (err) {
       setMessages(prev => [...prev, { role: 'system', content: `⚠️ Error: ${err.message}` }]);
@@ -1967,7 +2025,10 @@ ${isFocused
   };
 
   const postOrchestratorDecision = (evaluation, topic, stepIndex, updatedContext, userMessage) => {
-    if (evaluation.agentStillWorking) return;
+    if (evaluation.agentStillWorking) {
+      setOrchestratorDecision(null);
+      return;
+    }
     if (evaluation.orchestratorMessage) setMessages(prev => [...prev, { role: 'orchestrator', content: evaluation.orchestratorMessage }]);
     const buttons = evaluation.buttons || [];
     if (buttons.length > 0) {
@@ -2068,6 +2129,21 @@ ${isFocused
       const agentHandoffs = handoffMatches.map(m => ({ agentId: m[1], task: m[2] }));
       logActivity('orchestrator', `Evaluating Step ${stepIndex + 1}`);
       const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext);
+
+      if (evaluation.agentStillWorking) {
+        setOrchestratorDecision(null);
+        logActivity('orchestrator', `Step ${stepIndex + 1} waiting for user answers`);
+        setCurrentWorkflow(prev => prev ? {
+          ...prev,
+          currentStep: stepIndex,
+          waitingForUser: true,
+          awaitingAgentReply: true,
+          stepMessages: initialStepMessages,
+        } : null);
+        setIsLoading(false);
+        return;
+      }
+
       const allHandoffs = [...agentHandoffs, ...(evaluation.handoffs || [])];
       const handoffOutputs = [];
       for (const handoff of allHandoffs) {
@@ -2089,7 +2165,14 @@ ${isFocused
       }
       logActivity('orchestrator', `Step ${stepIndex + 1} awaiting user decision`);
       postOrchestratorDecision(evaluation, topic, stepIndex, updatedContext, userMessage);
-      setCurrentWorkflow(prev => prev ? { ...prev, currentStep: stepIndex, context: updatedContext, waitingForUser: true, stepMessages: initialStepMessages } : null);
+      setCurrentWorkflow(prev => prev ? {
+        ...prev,
+        currentStep: stepIndex,
+        context: updatedContext,
+        waitingForUser: true,
+        awaitingAgentReply: false,
+        stepMessages: initialStepMessages,
+      } : null);
       setIsLoading(false);
     } catch (err) {
       setMessages(prev => [...prev, { role: 'system', content: `⚠️ Orchestrator error: ${err.message}` }]);
@@ -3344,9 +3427,16 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
     if (currentWorkflow) {
       const topic = topics.find(t => t.id === currentWorkflow.topicId);
       if (topic) {
-        if (orchestratorDecision) { await handleOrchestratorAction('custom', orchestratorDecision, messageContent); return; }
-        if (currentWorkflow.waitingForUser) { await continueAgentWithUserReply(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []); }
-        else { await runWorkflowStep(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []); }
+        // Prefer answering the specialist agent when it asked clarifying questions
+        if (currentWorkflow.awaitingAgentReply || (currentWorkflow.waitingForUser && !orchestratorDecision)) {
+          await continueAgentWithUserReply(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []);
+          return;
+        }
+        if (orchestratorDecision) {
+          await handleOrchestratorAction('custom', orchestratorDecision, messageContent);
+          return;
+        }
+        await runWorkflowStep(topic, currentWorkflow.currentStep, messageContent, currentWorkflow.context || []);
         return;
       }
     }
