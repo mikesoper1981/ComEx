@@ -714,10 +714,11 @@ function addPanel(pptx, slide, theme, { x, y, w, h }) {
 
 function inferLayout(slide, idx) {
   const explicit = String(slide.layout || '').toLowerCase().trim();
-  const allowed = new Set(['title', 'section', 'bullets', 'cards', 'table', 'two_column', 'process', 'callout']);
+  const allowed = new Set(['title', 'section', 'bullets', 'cards', 'table', 'two_column', 'process', 'callout', 'one_pager']);
   if (allowed.has(explicit)) return explicit;
 
   const type = String(slide.type || '').toLowerCase();
+  if (type === 'one_pager' || type === 'one-pager' || type === 'scheme_snapshot') return 'one_pager';
   if (type === 'title' || idx === 0) return 'title';
   if (type === 'section') return 'section';
   if (type === 'table' || (slide.tableData?.headers?.length && slide.tableData?.rows?.length)) return 'table';
@@ -734,7 +735,7 @@ function inferLayout(slide, idx) {
 
 /**
  * Template supplies background, colours, fonts, panel shading.
- * Layout is chosen from slide.layout / content â€” not a clone of the template slide.
+ * Layout is chosen from slide.layout / content — not a clone of the template slide.
  */
 export function renderSlideFromTheme(pptx, theme, slide, idx = 0) {
   const t = !theme || theme.useDefaultChrome
@@ -746,6 +747,7 @@ export function renderSlideFromTheme(pptx, theme, slide, idx = 0) {
 
   if (layout === 'title') return renderLayoutTitle(pptx, s, t, slide);
   if (layout === 'section') return renderLayoutSection(pptx, s, t, slide);
+  if (layout === 'one_pager') return renderLayoutOnePager(pptx, s, t, slide, idx);
   if (layout === 'table') return renderLayoutTable(pptx, s, t, slide, idx);
   if (layout === 'cards') return renderLayoutCards(pptx, s, t, slide, idx);
   if (layout === 'two_column') return renderLayoutTwoColumn(pptx, s, t, slide, idx);
@@ -825,6 +827,128 @@ function renderLayoutSection(pptx, s, theme, slide) {
       fontSize: ss.fontSize, color: ss.color, fontFace: ss.fontFace,
     });
   }
+  if (slide.notes) s.addNotes(String(slide.notes));
+  return s;
+}
+
+/** Dense single-slide IC scheme snapshot: purpose + components table + rules + payout. */
+function renderLayoutOnePager(pptx, s, theme, slide, idx) {
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  addTitleAndSubtitle(pptx, s, theme, {
+    title: slide.title || 'IC Scheme One-Pager',
+    subtitle: slide.subtitle || 'Scheme at a glance',
+  });
+  const top = contentTop(theme, true);
+  const gap = 0.18;
+  const leftW = (W - 1 - gap) * 0.58;
+  const rightW = (W - 1 - gap) * 0.42;
+  const panelH = H - top - 0.35;
+  const bs = bodyStyleFromTheme(theme);
+  const ct = cardTitleStyleFromTheme(theme);
+  const accent = theme.accent || theme.bgDark || '4472C4';
+
+  addPanel(pptx, s, theme, { x: 0.5, y: top, w: leftW, h: panelH });
+  addPanel(pptx, s, theme, { x: 0.5 + leftW + gap, y: top, w: rightW, h: panelH });
+
+  // Left: purpose + components table
+  let y = top + 0.2;
+  s.addText('Purpose', {
+    x: 0.7, y, w: leftW - 0.4, h: 0.32,
+    fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace,
+  });
+  y += 0.35;
+  if (slide.body) {
+    s.addText(String(slide.body), {
+      x: 0.7, y, w: leftW - 0.4, h: 0.7,
+      fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, valign: 'top',
+    });
+    y += 0.75;
+  }
+  s.addText('Components & weightings', {
+    x: 0.7, y, w: leftW - 0.4, h: 0.32,
+    fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace,
+  });
+  y += 0.38;
+
+  const table = slide.tableData;
+  if (table?.headers?.length && Array.isArray(table.rows)) {
+    const colCount = table.headers.length;
+    const tableW = leftW - 0.4;
+    const colW = tableW / colCount;
+    const headerRow = table.headers.map((h) => ({
+      text: String(h ?? ''),
+      options: { bold: true, color: theme.textOnDark || 'FFFFFF', fill: { color: accent }, align: 'center', valign: 'middle' },
+    }));
+    const bodyRows = table.rows.slice(0, 8).map((row, rowIdx) => {
+      const cells = Array.isArray(row) ? row : [row];
+      const rowFill = theme.contentTextLight || theme.cardTransparency > 0
+        ? { color: 'FFFFFF', transparency: rowIdx % 2 === 0 ? 88 : 92 }
+        : { color: rowIdx % 2 === 0 ? 'F8FAFC' : 'FFFFFF' };
+      return Array.from({ length: colCount }, (_, i) => ({
+        text: String(cells[i] ?? ''),
+        options: { color: bs.color, fill: rowFill, align: 'left', valign: 'middle' },
+      }));
+    });
+    s.addTable([headerRow, ...bodyRows], {
+      x: 0.7, y, w: tableW, colW: Array(colCount).fill(colW),
+      fontFace: bs.fontFace,
+      fontSize: Math.max(10, (bs.fontSize || 13) - 2),
+      color: bs.color,
+      border: [
+        { type: 'solid', pt: 0.5, color: theme.border || accent },
+        { type: 'solid', pt: 0.5, color: theme.border || accent },
+        { type: 'solid', pt: 0.5, color: theme.border || accent },
+        { type: 'solid', pt: 0.5, color: theme.border || accent },
+      ],
+    });
+  } else if (Array.isArray(slide.bullets) && slide.bullets.length) {
+    s.addText(slide.bullets.slice(0, 6).map((b, i) => ({
+      text: String(b),
+      options: { bullet: true, breakLine: i < Math.min(5, slide.bullets.length - 1), fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, paraSpaceAfter: 4 },
+    })), { x: 0.7, y, w: leftW - 0.4, h: panelH - (y - top) - 0.25 });
+  }
+
+  // Right: rules + payout
+  const rx = 0.5 + leftW + gap + 0.2;
+  let ry = top + 0.2;
+  s.addText('Key rules', {
+    x: rx, y: ry, w: rightW - 0.4, h: 0.32,
+    fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace,
+  });
+  ry += 0.38;
+  const rules = Array.isArray(slide.bulletsRight) && slide.bulletsRight.length
+    ? slide.bulletsRight
+    : (Array.isArray(slide.rules) ? slide.rules : []);
+  if (rules.length) {
+    const ruleH = Math.min(panelH * 0.45, 0.32 * rules.length + 0.2);
+    s.addText(rules.slice(0, 6).map((b, i) => ({
+      text: String(b),
+      options: { bullet: true, breakLine: i < Math.min(5, rules.length - 1), fontSize: Math.max(10, (bs.fontSize || 13) - 1), color: bs.color, fontFace: bs.fontFace, paraSpaceAfter: 4 },
+    })), { x: rx, y: ry, w: rightW - 0.4, h: ruleH });
+    ry += ruleH + 0.2;
+  }
+  s.addText('Payout / mechanics', {
+    x: rx, y: ry, w: rightW - 0.4, h: 0.32,
+    fontSize: ct.fontSize, bold: true, color: ct.color, fontFace: ct.fontFace,
+  });
+  ry += 0.38;
+  const payout = slide.payout || slide.callout || '';
+  const payoutBullets = Array.isArray(slide.payoutBullets) ? slide.payoutBullets : [];
+  if (payout) {
+    s.addText(String(payout), {
+      x: rx, y: ry, w: rightW - 0.4, h: 0.9,
+      fontSize: bs.fontSize, color: bs.color, fontFace: bs.fontFace, valign: 'top',
+    });
+    ry += 0.95;
+  }
+  if (payoutBullets.length) {
+    s.addText(payoutBullets.slice(0, 4).map((b, i) => ({
+      text: String(b),
+      options: { bullet: true, breakLine: i < Math.min(3, payoutBullets.length - 1), fontSize: Math.max(10, (bs.fontSize || 13) - 1), color: bs.color, fontFace: bs.fontFace, paraSpaceAfter: 3 },
+    })), { x: rx, y: ry, w: rightW - 0.4, h: Math.max(0.6, top + panelH - ry - 0.2) });
+  }
+
   if (slide.notes) s.addNotes(String(slide.notes));
   return s;
 }

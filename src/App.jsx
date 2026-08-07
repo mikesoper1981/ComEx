@@ -225,6 +225,60 @@ function parsePptxSlidePayload(raw, fallbackTitle) {
   return null;
 }
 
+/** Ensure produced IC decks include a dense one-pager slide (slide 2). */
+function ensureIcOnePagerSlide(slideData, { force = false } = {}) {
+  if (!slideData || !Array.isArray(slideData.slides) || !slideData.slides.length) return slideData;
+  const slides = [...slideData.slides];
+  const hasOnePager = slides.some((s) => {
+    const layout = String(s?.layout || '').toLowerCase();
+    const type = String(s?.type || '').toLowerCase();
+    return layout === 'one_pager' || type === 'one_pager' || type === 'one-pager' || /one[\s-]?pager/i.test(String(s?.title || ''));
+  });
+  if (hasOnePager) {
+    // Normalize existing one-pager to layout one_pager
+    return {
+      ...slideData,
+      slides: slides.map((s) => {
+        const layout = String(s?.layout || '').toLowerCase();
+        const type = String(s?.type || '').toLowerCase();
+        if (layout === 'one_pager' || type === 'one_pager' || type === 'one-pager' || /one[\s-]?pager/i.test(String(s?.title || ''))) {
+          return { ...s, layout: 'one_pager', type: s.type || 'one_pager' };
+        }
+        return s;
+      }),
+    };
+  }
+  if (!force) return slideData;
+
+  // Build from the richest table + bullets already in the deck
+  const withTable = slides.find((s) => s?.tableData?.headers?.length && s?.tableData?.rows?.length);
+  const withRules = slides.find((s) => (s?.bulletsRight?.length || s?.bullets?.length) && s !== withTable);
+  const purposeSlide = slides.find((s) => s?.body && String(s.body).length > 20) || slides[1] || slides[0];
+  const onePager = {
+    type: 'one_pager',
+    layout: 'one_pager',
+    title: 'IC Scheme One-Pager',
+    subtitle: 'Scheme at a glance',
+    body: purposeSlide?.body || purposeSlide?.subtitle || 'Incentive scheme overview from this conversation.',
+    tableData: withTable?.tableData || {
+      headers: ['Component', 'Weight', 'Metric'],
+      rows: (withTable?.bullets || slides.flatMap((s) => s.bullets || [])).slice(0, 5).map((b) => {
+        const parts = String(b).split(':');
+        return parts.length > 1 ? [parts[0].trim(), '', parts.slice(1).join(':').trim()] : [String(b), '', ''];
+      }),
+    },
+    bulletsRight: withRules?.bulletsRight?.length
+      ? withRules.bulletsRight
+      : (withRules?.bullets || []).slice(0, 5),
+    payout: slides.find((s) => /payout|attainment|mechanics/i.test(String(s?.title || '')))?.body || '',
+    payoutBullets: slides.find((s) => /payout|attainment|mechanics/i.test(String(s?.title || '')))?.bullets?.slice(0, 4) || [],
+  };
+
+  const insertAt = String(slides[0]?.layout || slides[0]?.type || '').toLowerCase() === 'title' ? 1 : 0;
+  slides.splice(insertAt, 0, onePager);
+  return { ...slideData, slides };
+}
+
 const PPTX_CLARIFY_PROMPT = `I can export a PowerPoint from **this conversation**. What would you like?
 
 1. **Session summary** — factual recap of what we discussed (nothing invented outside this chat)
@@ -1228,22 +1282,30 @@ GROUNDING RULES (mandatory):
 
 LAYOUT RULES (mandatory — vary layouts; do NOT make every slide the same):
 - Pick the best layout for each slide's content via the "layout" field.
-- Allowed layouts: "title" | "section" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
-- title: opening slide only. section: chapter divider. bullets: narrative list. cards: 3–5 peer themes (use "Label: detail" bullets). table: comparisons / weights / metrics (require tableData). two_column: left bullets + right bullets (put left in "bullets", right in "bulletsRight"). process: ordered steps (3–6). callout: one key message in body + optional short bullets.
+- Allowed layouts: "title" | "section" | "one_pager" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
+- title: opening slide only. one_pager: dense single-slide IC scheme snapshot (REQUIRED as slide 2 whenever an IC scheme was designed). section: chapter divider. bullets: narrative list. cards: 3–5 peer themes (use "Label: detail" bullets). table: comparisons / weights / metrics (require tableData). two_column: left bullets + right bullets (put left in "bullets", right in "bulletsRight"). process: ordered steps (3–6). callout: one key message in body + optional short bullets.
 - Mix layouts across the deck. Prefer a table when numbers/weights compare. Prefer cards for peer topics. Prefer process for sequences. Prefer callout for a single IC ask or decision.
+
+ONE-PAGER SLIDE (mandatory when scheme details exist in Context):
+- Slide 2 MUST use layout "one_pager" with title like "IC Scheme One-Pager".
+- body = scheme purpose (1–2 sentences).
+- tableData = components with headers e.g. ["Component","Weight","Metric"] and rows from the conversation.
+- bulletsRight = key eligibility / caps / gates / rules (short).
+- payout or payoutBullets = how payout / attainment works (short).
+- Do not invent missing cells — use "TBC" only if truly not discussed.
 
 Output schema:
 {
   "title": "...",
   "subtitle": "...",
   "slides": [
-    { "type": "title|section|content|table|summary", "layout": "title|section|bullets|cards|table|two_column|process|callout",
-      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "notes": "...",
+    { "type": "title|section|content|table|summary|one_pager", "layout": "title|section|one_pager|bullets|cards|table|two_column|process|callout",
+      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "payout": "...", "payoutBullets": ["..."], "notes": "...",
       "tableData": { "headers": ["Col1","Col2"], "rows": [["A","B"]] } }
   ]
 }
 
-Slide count: short chat = 4-6 slides, rich chat = 7-9. First slide must be layout "title". Keep JSON compact.`,
+Slide count: short chat = 4-6 slides, rich chat = 7-9. First slide must be layout "title"; second should be "one_pager" when an IC scheme was discussed. Keep JSON compact.`,
 
     produced: `You create a PowerPoint WORKING DOCUMENT from an IC / commercial excellence conversation — ready to distribute.
 Return ONLY valid JSON, no markdown.
@@ -1255,27 +1317,36 @@ GROUNDING RULES (mandatory):
 - Respect USER SETTINGS for terminology/currency only; never use them to invent missing scheme facts.
 
 LAYOUT RULES (mandatory — vary layouts; do NOT clone the same layout on every slide):
-- Set "layout" per slide to the best fit: "title" | "section" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
-- title: first slide. section: major section breaks. table: components/weights/metrics (always include tableData). cards: 3–5 themes as "Label: detail". process: step-by-step cascade or payout flow. two_column: e.g. rules vs exceptions, or do vs don't (bullets + bulletsRight). callout: the IC ask / decision. bullets: general narrative.
+- Set "layout" per slide to the best fit: "title" | "section" | "one_pager" | "bullets" | "cards" | "table" | "two_column" | "process" | "callout"
+- title: first slide. one_pager: REQUIRED as slide 2 for every IC documentation export — the full scheme on one page. section: major section breaks. table: components/weights/metrics (always include tableData). cards: 3–5 themes as "Label: detail". process: step-by-step cascade or payout flow. two_column: e.g. rules vs exceptions (bullets + bulletsRight). callout: the IC ask / decision. bullets: general narrative.
 - A strong deck mixes these. Never output 8 identical bullet slides.
 
+ONE-PAGER SLIDE (mandatory — never skip):
+- Always include exactly one slide with layout "one_pager" immediately after the title slide.
+- title: "IC Scheme One-Pager" (or similar).
+- body: purpose of the scheme (1–2 sentences from the chat).
+- tableData: Component / Weight / Metric (and Threshold if discussed) — one row per component.
+- bulletsRight: key rules (eligibility, caps, gates, thresholds) — short bullets.
+- payout or payoutBullets: payout / attainment mechanics in brief.
+- This slide must stand alone as a printable one-page scheme overview. Later slides can go deeper.
+
 Deck types (follow the requested deckType):
-- ic_one_pager: 5-7 slides — title, purpose (callout or bullets), components (table or cards), key rules (two_column or bullets), payout (process), next steps
-- ic_doc_pack: 8-12 slides — title, overview, components table, weightings, payout process, eligibility, FAQs (two_column or bullets), cascade (process), open items
-- rep_comms / manager_briefing / ic_explainer / territory_report / general: structure for that audience using only chat facts and varied layouts
+- ic_one_pager: title, one_pager, then 3–5 supporting slides (rules detail, payout, next steps) — still include the one_pager slide
+- ic_doc_pack: title, one_pager, then deeper slides — components detail, payout process, eligibility, FAQs, cascade, open items
+- rep_comms / manager_briefing / ic_explainer / territory_report / general: still include one_pager as slide 2 whenever IC scheme facts exist; otherwise structure for that audience
 
 Output schema:
 {
   "title": "...",
   "subtitle": "...",
   "slides": [
-    { "type": "title|section|content|table|summary", "layout": "title|section|bullets|cards|table|two_column|process|callout",
-      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "notes": "...",
+    { "type": "title|section|content|table|summary|one_pager", "layout": "title|section|one_pager|bullets|cards|table|two_column|process|callout",
+      "title": "...", "subtitle": "...", "body": "...", "bullets": ["..."], "bulletsRight": ["..."], "payout": "...", "payoutBullets": ["..."], "notes": "...",
       "tableData": { "headers": ["Component","Weight","Metric"], "rows": [["Sales","40%","Net sales"]] } }
   ]
 }
 
-First slide must be layout "title". Keep JSON compact.`
+First slide must be layout "title". Second slide must be layout "one_pager" when documenting an IC scheme. Keep JSON compact.`
   });
   const [maxSuggestions, setMaxSuggestions] = useState(3);
   const [hoveredCitation, setHoveredCitation] = useState(null);
@@ -3317,6 +3388,7 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       `Requested title: "${offer?.title || (isSummary ? 'Session Summary' : 'Working Document')}"`,
       `deckType: ${deckType}`,
       `hasRealData hint: ${offer?.hasRealData ? 'true' : 'false'}`,
+      !isSummary ? 'REQUIRED: Include layout "one_pager" as slide 2 (IC scheme on a single page: purpose, components table, key rules, payout).' : 'If an IC scheme was designed in this chat, include layout "one_pager" as slide 2.',
       '',
       'Conversation Context (ONLY source of truth — do not invent beyond this):',
       conversationContext || '(empty conversation)',
@@ -3365,6 +3437,9 @@ Use ## headers, bullet points, concise explanations, and suggest useful follow-u
       }
 
       if (!slideData?.slides?.length) throw new Error('Could not parse slide JSON from the model response');
+
+      const wantsOnePager = !isSummary || /incentive|scheme|component|weighting|payout|ic\b/i.test(conversationContext.slice(0, 6000));
+      slideData = ensureIcOnePagerSlide(slideData, { force: wantsOnePager });
 
       const getPptxGen = () => window.PptxGenJS || window.pptxgen || window.PptxGenJs;
       if (!getPptxGen()) {
