@@ -1723,17 +1723,38 @@ First slide must be layout "title". Second slide must be layout "one_pager" when
   const generateSuggestions = async (conversationHistory) => {
     if (!suggestionsEnabled || conversationHistory.length === 0) { setSuggestedPrompts([]); return; }
     try {
-      const recentMessages = conversationHistory.slice(-6).map(m => `${m.role}: ${m.content.substring(0, 300)}`).join('\n');
+      const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
+      const n = Math.min(Math.max(1, maxSuggestions), 5);
       const response = await anthropicMessagesPost({
-        system: `You generate short follow-up questions for pharmaceutical sales/IC conversations. Respond ONLY with a JSON array of strings, no other text. Max 3 items, max 10 words each.${buildUserSettingsPromptBlock(userSettings)}`,
-        messages: [{ role: 'user', content: `Recent conversation:\n${recentMessages}\n\nGenerate 2-3 follow-up questions: ["Q1", "Q2"]` }],
-        max_tokens: 200,
+        system: `You write clickable NEXT USER MESSAGES for a pharmaceutical sales / IC chat UI.
+Each suggestion is sent verbatim as the user's next message — so it must read as something the USER would say, not something the assistant would ask.
+
+Rules (mandatory):
+- Write in first person as the user (I / we / my / our), or as a clear user instruction/decision.
+- Ground every suggestion in the recent conversation — reference the actual scheme, products, open questions, or next step being discussed.
+- Do NOT write assistant-style clarifying questions (bad: "What is your IC budget?", "How many reps do you have?").
+- DO write actionable user replies that advance the work (good: "Set the IC budget at £2.5m", "Use 40/30/30 weightings for sales/access/KAM", "Approve this design and move to compliance", "Export a one-pager of this scheme").
+- If a value is unknown, use a clear placeholder the user can edit mentally, e.g. "Update the IC budget to [amount]" — still as a user statement, not a question to the AI.
+- No hardcoded generic IC trivia. No duplicates. Max 12 words each when possible.
+- Respond ONLY with a JSON array of strings, length ${n}.${buildUserSettingsPromptBlock(userSettings)}`,
+        messages: [{
+          role: 'user',
+          content: `Recent conversation:\n${recentMessages}\n\nReturn ${n} user-next-message suggestions as a JSON array.`,
+        }],
+        max_tokens: 300,
       });
       const data = await response.json();
       const text = anthropicAssistantText(data)?.trim();
       if (text) {
         const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
-        if (Array.isArray(parsed)) setSuggestedPrompts(parsed.slice(0, maxSuggestions));
+        if (Array.isArray(parsed)) {
+          const cleaned = parsed
+            .map((p) => String(p || '').trim())
+            .filter(Boolean)
+            // Drop assistant-style interrogatives that slipped through
+            .filter((p) => !/^(what|how many|which|who|when|where|do you|can you|could you|please (tell|confirm|provide|share))\b/i.test(p));
+          setSuggestedPrompts(cleaned.slice(0, n));
+        }
       }
     } catch (e) { setSuggestedPrompts([]); }
   };
