@@ -15,6 +15,36 @@ Return:
 
 Offer when there is substantive IC/territory content worth exporting. Prefer deckType ic_doc_pack after a scheme design, ic_one_pager for short overviews. hasRealData true only if specific numbers/names appear in the conversation.`,
 
+  messageClassify: `You classify a SINGLE user message for routing in an IC / commercial excellence chat app. Respond ONLY with valid JSON, no markdown.
+
+Return exactly one of these shapes:
+
+1) Export a PowerPoint / deck FROM THIS CONVERSATION:
+{
+  "kind": "export",
+  "clear": true/false,
+  "mode": "summary"|"produced"|null,
+  "deckType": "session_summary|ic_one_pager|ic_doc_pack|general|null",
+  "title": "...",
+  "description": "..."
+}
+
+2) Assess / analyse an existing IC scheme or uploaded proposal (NOT an export):
+{ "kind": "assessment" }
+
+3) Neither:
+{ "kind": "none" }
+
+CRITICAL RULES:
+- kind=export ONLY when the user clearly wants to export, download, generate, or create a PowerPoint / presentation / slides / deck / one-pager / documentation pack / session summary FROM the chat.
+- Filenames that contain .pptx / .ppt / PowerPoint (e.g. an uploaded proposal) are NOT export intent by themselves.
+- Assessing, analysing, reviewing, or evaluating an IC scheme / proposal / uploaded document is kind=assessment — even if the file is a .pptx.
+- "Assess my IC", "analyse this scheme", "review my proposal" → assessment.
+- "Export as PowerPoint", "create a one-pager of what we designed", "download a session summary deck" → export.
+- If export is requested but the deck type is ambiguous, set clear=false and mode/deckType null.
+- If export is clear: summary → mode "summary", deckType "session_summary"; one-pager → mode "produced", deckType "ic_one_pager"; full IC documentation pack → mode "produced", deckType "ic_doc_pack".
+- When unsure between export and assessment, prefer assessment if they are talking about reviewing an uploaded file; otherwise kind=none (do not guess export).`,
+
   summary: `You create a PowerPoint that summarises ONLY the conversation provided in Context.
 Return ONLY valid JSON, no markdown.
 
@@ -99,6 +129,7 @@ export function getPptxContext(settings) {
   const c = settings?.pptxContext && typeof settings.pptxContext === 'object' ? settings.pptxContext : {};
   return {
     intentDetection: String(c.intentDetection ?? DEFAULT_PPTX_CONTEXT.intentDetection),
+    messageClassify: String(c.messageClassify ?? DEFAULT_PPTX_CONTEXT.messageClassify),
     summary: String(c.summary ?? DEFAULT_PPTX_CONTEXT.summary),
     produced: String(c.produced ?? DEFAULT_PPTX_CONTEXT.produced),
   };
@@ -108,6 +139,7 @@ export function mergePptxContext(partial) {
   const c = partial && typeof partial === 'object' ? partial : {};
   return {
     intentDetection: c.intentDetection != null ? String(c.intentDetection) : DEFAULT_PPTX_CONTEXT.intentDetection,
+    messageClassify: c.messageClassify != null ? String(c.messageClassify) : DEFAULT_PPTX_CONTEXT.messageClassify,
     summary: c.summary != null ? String(c.summary) : DEFAULT_PPTX_CONTEXT.summary,
     produced: c.produced != null ? String(c.produced) : DEFAULT_PPTX_CONTEXT.produced,
   };

@@ -192,48 +192,6 @@ function readLocalUserSettings(userId) {
   return { ...DEFAULT_USER_SETTINGS };
 }
 
-const PPTX_EXPORT_INTENT_RE = /\b(export|download)\b.{0,50}\b(powerpoint|power\s*point|pptx?|presentation|slides?|deck|one[\s-]?pager|documentation pack|working document|session summary)\b|\b(generate|create|make|produce)\b.{0,40}\b(powerpoint|power\s*point|pptx|presentation|slide deck|slides|deck|one[\s-]?pager|documentation pack)\b|\b(export as (powerpoint|pptx|presentation)|powerpoint export|pptx export)\b|\b(session summary)\b.{0,20}\b(export|download|powerpoint|pptx|deck|slides?)\b|\b(export|generate|create|make)\b.{0,30}\b(one[\s-]?pager|ic documentation|documentation pack|comms? plan)\b/i;
-
-/** True when the message is about assessing/reviewing an uploaded proposal — not exporting a deck. */
-function isIcAssessmentRequest(message) {
-  const m = String(message || '').toLowerCase();
-  if (!m) return false;
-  if (/\b(export|download)\b.{0,30}\b(powerpoint|pptx|presentation|deck|slides?)\b/.test(m)) return false;
-  return /\b(assess(?:ment|ing)?|analy[sz]e|review|evaluate)\b.{0,60}\b(ic|incentive|scheme|proposal|plan|document)\b|\bassess my ic\b|\banaly[sz]e (my |the )?(ic|scheme|proposal)\b|\breview (my |the )?(ic|scheme|proposal)\b/.test(m);
-}
-
-/** Classify a user message about PowerPoint / document export (conversation → downloadable deck). */
-function classifyPptxRequest(message) {
-  const raw = String(message || '').toLowerCase().trim();
-  if (!raw) return null;
-
-  // Assessing an uploaded .pptx/.pdf is not an export request (filenames often contain "pptx").
-  if (isIcAssessmentRequest(raw)) return null;
-
-  // Strip filenames so "scheme.pptx" / "plan.pdf" never alone look like export intent.
-  const m = raw.replace(/\b[\w.-]+\.(pptx?|pdf|docx?)\b/gi, ' ');
-  if (!PPTX_EXPORT_INTENT_RE.test(m)) return null;
-
-  const wantsSummary = /\b(summary|recap|summarise|summarize|session summary|what we (discussed|talked|covered))\b/.test(m);
-  const wantsOnePager = /one[\s-]?pager|single page|simple overview|simple one pager/.test(m);
-  const wantsFullPack = /full (ic )?doc|complete doc|documentation pack|all (the )?docs|comms plan|communication plan|manager briefing|rep (comms|communication)|cascade/.test(m);
-  const wantsProduced = wantsOnePager || wantsFullPack || /\b(working document|artefact|artifact|distribute|hand ?out|send to (the )?team|ic plan|documentation)\b/.test(m);
-
-  if (wantsSummary && !wantsProduced) {
-    return { clear: true, mode: 'summary', deckType: 'session_summary', title: 'Session Summary', description: 'Recap of this conversation only' };
-  }
-  if (wantsOnePager) {
-    return { clear: true, mode: 'produced', deckType: 'ic_one_pager', title: 'IC One-Pager', description: 'Simple one-page IC overview' };
-  }
-  if (wantsFullPack) {
-    return { clear: true, mode: 'produced', deckType: 'ic_doc_pack', title: 'IC Documentation Pack', description: 'Full IC documentation (overview, components, rules, FAQs / comms)' };
-  }
-  if (wantsProduced) {
-    return { clear: false, mode: 'produced', deckType: 'general', title: 'Working Document', description: 'Document derived from this conversation' };
-  }
-  return { clear: false, mode: null, deckType: null, title: null, description: null };
-}
-
 function buildPptxConversationContext(messageList, { maxMessages = 30, maxCharsPerMsg = 1800 } = {}) {
   return (messageList || [])
     .filter(m => ['user', 'assistant', 'orchestrator'].includes(m.role) && m.content)
@@ -3022,19 +2980,54 @@ ${isFocused
     };
   };
 
-  const resolvePptxClarificationReply = (messageContent) => {
+  /** Route a user message using pptxContext.messageClassify from settings JSON (no hardcoded intent rules). */
+  const classifyUserMessageIntent = async (messageContent) => {
+    const text = String(messageContent || '').trim();
+    if (!text) return { kind: 'none' };
+    try {
+      const pptxCtx = getPptxContext(userSettings);
+      const raw = await callAnthropic(
+        `${pptxCtx.messageClassify}${buildUserSettingsPromptBlock(userSettings)}`,
+        [{ role: 'user', content: `User message:\n${text}` }],
+        350,
+      );
+      const parsed = extractJsonObject(raw)
+        || safeJsonParse(String(raw || '').replace(/```json|```/gi, '').trim());
+      if (!parsed || typeof parsed !== 'object') return { kind: 'none' };
+      const kind = String(parsed.kind || 'none').toLowerCase();
+      if (kind === 'assessment') return { kind: 'assessment' };
+      if (kind === 'export') {
+        const mode = parsed.mode === 'summary' || parsed.mode === 'produced' ? parsed.mode : null;
+        return {
+          kind: 'export',
+          clear: !!parsed.clear && !!mode,
+          mode,
+          deckType: parsed.deckType || null,
+          title: parsed.title || null,
+          description: parsed.description || null,
+        };
+      }
+      return { kind: 'none' };
+    } catch (e) {
+      console.warn('classifyUserMessageIntent error:', e);
+      return { kind: 'none' };
+    }
+  };
+
+  const resolvePptxClarificationReply = async (messageContent) => {
     const m = String(messageContent || '').toLowerCase().trim();
-    if (/^(1|one)\b/.test(m) || /\bsummary\b/.test(m) || /\brecap\b/.test(m)) {
+    // Structural mapping to the numbered clarify UI options (labels live in settings pptxClarify).
+    if (/^(1|one)\b/.test(m)) {
       return { mode: 'summary', offer: { title: 'Session Summary', description: 'Factual recap of this conversation' } };
     }
-    if (/^(2|two)\b/.test(m) || /one[\s-]?pager|simple/.test(m)) {
+    if (/^(2|two)\b/.test(m)) {
       return { mode: 'produced', offer: { title: 'IC One-Pager', description: 'Simple one-page IC overview', deckType: 'ic_one_pager', hasRealData: true } };
     }
-    if (/^(3|three)\b/.test(m) || /full|pack|documentation|comms/.test(m)) {
+    if (/^(3|three)\b/.test(m)) {
       return { mode: 'produced', offer: { title: 'IC Documentation Pack', description: 'Full IC documentation from this conversation', deckType: 'ic_doc_pack', hasRealData: true } };
     }
-    const classified = classifyPptxRequest(messageContent);
-    if (classified?.clear) {
+    const classified = await classifyUserMessageIntent(messageContent);
+    if (classified.kind === 'export' && classified.clear && classified.mode) {
       return { mode: classified.mode, offer: offerFromClassification(classified) };
     }
     return null;
@@ -3200,7 +3193,7 @@ ${isFocused
         setIsLoading(false);
         return;
       }
-      const resolved = resolvePptxClarificationReply(messageContent);
+      const resolved = await resolvePptxClarificationReply(messageContent);
       if (resolved?.mode && resolved.offer) {
         setPptxClarifyPending(false);
         setIsLoading(false);
@@ -3254,28 +3247,26 @@ ${isFocused
       }
     }
 
-    // Intercept PowerPoint / documentation export requests (skip for assessment uploads).
+    // PPT export vs IC assessment — classified via settings pptxContext.messageClassify (not hardcoded regex).
     if (!isFileAnalysis) {
-      const pptIntent = classifyPptxRequest(messageContent);
-      if (pptIntent) {
-        if (pptIntent.clear && pptIntent.mode) {
+      const routed = await classifyUserMessageIntent(messageContent);
+      if (routed.kind === 'export') {
+        if (routed.clear && routed.mode) {
           setIsLoading(false);
-          await handleGeneratePptx(offerFromClassification(pptIntent), pptIntent.mode);
+          await handleGeneratePptx(offerFromClassification(routed), routed.mode);
           return;
         }
         setIsLoading(false);
         askPptxClarification();
         return;
       }
-    }
-
-    // Typed "Assess my IC" / similar → Analyze Existing IC (even without a fresh upload).
-    if (!currentWorkflow && isIcAssessmentRequest(messageContent)) {
-      const analyzeTopic = topics.find((t) => t.id === 'analyze_ic' && t.status === 'active');
-      if (analyzeTopic) {
-        setPendingWorkflow(null);
-        await launchWorkflowDirect('analyze_ic', messageContent);
-        return;
+      if (routed.kind === 'assessment' && !currentWorkflow) {
+        const analyzeTopic = topics.find((t) => t.id === 'analyze_ic' && t.status === 'active');
+        if (analyzeTopic) {
+          setPendingWorkflow(null);
+          await launchWorkflowDirect('analyze_ic', messageContent);
+          return;
+        }
       }
     }
 
@@ -4135,7 +4126,8 @@ ${isFocused
                     Guidance used when offering and generating PowerPoint exports. Saved in your settings JSON with everything else — not hardcoded in the app.
                   </p>
                   {[
-                    ['intentDetection', 'Intent detection', 'When to offer an export after a conversation.'],
+                    ['intentDetection', 'Offer detection (after chat)', 'When to offer an export after a conversation.'],
+                    ['messageClassify', 'Message classify (export vs assess)', 'Routes a typed user message: export / assessment / neither.'],
                     ['summary', 'Session summary', 'System prompt for conversation-summary decks.'],
                     ['produced', 'Produced document', 'System prompt for working documents / IC packs.'],
                   ].map(([key, title, desc]) => (
@@ -4148,7 +4140,7 @@ ${isFocused
                           ...prev,
                           pptxContext: { ...mergePptxContext(prev.pptxContext), [key]: e.target.value },
                         }))}
-                        rows={key === 'intentDetection' ? 6 : 10}
+                        rows={key === 'intentDetection' || key === 'messageClassify' ? 8 : 10}
                         className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-xs font-mono outline-none focus:border-blue-400 resize-y"
                       />
                     </div>
@@ -4322,7 +4314,7 @@ ${isFocused
                       Same fields as User Settings → PowerPoint context. Saved to this user’s settings JSON (local + Supabase).
                     </p>
                   </div>
-                  {[['intentDetection', 'Intent Detection', 'Decides when to offer a PowerPoint export.'], ['summary', 'Session Summary', 'Used when generating a summary deck.'], ['produced', 'Produced Document', 'Used when generating a working document.']].map(([key, title, desc]) => (
+                  {[['intentDetection', 'Offer Detection (after chat)', 'Decides when to offer a PowerPoint export.'], ['messageClassify', 'Message Classify (export vs assess)', 'Routes typed messages: export, assessment, or neither.'], ['summary', 'Session Summary', 'Used when generating a summary deck.'], ['produced', 'Produced Document', 'Used when generating a working document.']].map(([key, title, desc]) => (
                     <div key={key} className="bg-slate-800/40 border border-blue-400/20 rounded-xl p-4">
                       <div className="text-sm font-semibold text-white mb-1">{title}</div>
                       <p className="text-xs text-blue-300/50 mb-3">{desc}</p>
