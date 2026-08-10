@@ -2560,8 +2560,21 @@ ${introInstr}`);
           handoffOutputs.push({ agent: handoffAgent.name, output: handoffResponse.substring(0, 500) });
         }
       }
-      const updatedContext = [...workflowContext, { step: `Step ${step.step}: ${step.name}`, agent: agent.name, output: agentResponse.substring(0, 12000), handoffs: handoffOutputs }];
-      await finishWorkflowStep(evaluation, topic, stepIndex, updatedContext, userReply, updatedStepMessages);
+      const updatedContext = [...workflowContext, {
+        step: `Step ${step.step}: ${step.name}`,
+        agent: agent.name,
+        output: agentResponse.substring(0, topic.id === 'analyze_ic' ? 20000 : 12000),
+        handoffs: handoffOutputs,
+      }];
+      await finishWorkflowStep(
+        evaluation,
+        topic,
+        stepIndex,
+        updatedContext,
+        userReply,
+        updatedStepMessages,
+        currentWorkflow?.focusedContext ?? null,
+      );
     } catch (err) {
       setMessages(prev => [...prev, { role: 'system', content: `⚠️ Error: ${err.message}` }]);
       setIsLoading(false);
@@ -2611,7 +2624,7 @@ ${introInstr}`);
   };
 
   /** After a step finishes (not waiting on clarifying answers): wrap up, auto-advance, or show Continue. */
-  const finishWorkflowStep = async (evaluation, topic, stepIndex, updatedContext, userMessage, stepMessages) => {
+  const finishWorkflowStep = async (evaluation, topic, stepIndex, updatedContext, userMessage, stepMessages, focusedContext = null) => {
     const isLastStep = stepIndex >= topic.workflow.length - 1;
     if (evaluation.workflowComplete && isLastStep) {
       if (evaluation.orchestratorMessage) setMessages(prev => [...prev, { role: 'orchestrator', content: evaluation.orchestratorMessage }]);
@@ -2639,8 +2652,9 @@ ${introInstr}`);
         waitingForUser: false,
         awaitingAgentReply: false,
         stepMessages: [],
+        focusedContext: focusedContext ?? prev.focusedContext,
       } : null);
-      await advanceToNextStep(topic, stepIndex, updatedContext, userMessage);
+      await advanceToNextStep(topic, stepIndex, updatedContext, userMessage, focusedContext);
       return;
     }
     logActivity('orchestrator', `Step ${stepIndex + 1} awaiting user decision`);
@@ -2652,6 +2666,7 @@ ${introInstr}`);
       waitingForUser: true,
       awaitingAgentReply: false,
       stepMessages: stepMessages || [],
+      focusedContext: focusedContext ?? prev.focusedContext,
     } : null);
     setIsLoading(false);
   };
@@ -2661,21 +2676,22 @@ ${introInstr}`);
     setIsLoading(true);
     const { topic, stepIndex, context, userMessage, rerouteToStep, rerouteBriefing } = decision;
     const effectiveInput = typedInput || userMessage;
+    const focusedContext = currentWorkflow?.focusedContext ?? null;
     const normalized = normalizeOrchestratorAction(action);
     if (normalized === 'proceed') {
       setCurrentWorkflow(prev => prev ? { ...prev, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
-      await advanceToNextStep(topic, stepIndex, context, effectiveInput);
+      await advanceToNextStep(topic, stepIndex, context, effectiveInput, focusedContext);
     } else if (normalized === 'redesign' || normalized === 'send_back') {
       const targetIdx = (rerouteToStep !== null && rerouteToStep !== undefined) ? rerouteToStep : Math.max(0, stepIndex - 1);
       const targetStep = topic.workflow[targetIdx];
       const targetAgent = agents.find(a => a.id === targetStep?.agents[0]);
       setMessages(prev => [...prev, { role: 'orchestrator', content: `🔄 Routing back to **${targetStep?.name}** (${targetAgent?.name}) for rework.` }]);
       setCurrentWorkflow(prev => prev ? { ...prev, currentStep: targetIdx, context, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
-      await runWorkflowStep(topic, targetIdx, rerouteBriefing || effectiveInput, context);
+      await runWorkflowStep(topic, targetIdx, rerouteBriefing || effectiveInput, context, focusedContext);
     } else if (normalized === 'override') {
       setMessages(prev => [...prev, { role: 'orchestrator', content: `⚠️ Override accepted. Proceeding with noted risks.` }]);
       setCurrentWorkflow(prev => prev ? { ...prev, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
-      await advanceToNextStep(topic, stepIndex, context, effectiveInput);
+      await advanceToNextStep(topic, stepIndex, context, effectiveInput, focusedContext);
     } else {
       // refine / unknown → rework current step with the user's feedback (never silently "continue")
       const briefing = typedInput
@@ -2683,18 +2699,25 @@ ${introInstr}`);
         : `User instruction: ${action}. Please refine your work accordingly.`;
       setMessages(prev => [...prev, { role: 'orchestrator', content: `✏️ Refining **${topic.workflow[stepIndex]?.name || 'this step'}** with your feedback.` }]);
       setCurrentWorkflow(prev => prev ? { ...prev, currentStep: stepIndex, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
-      await runWorkflowStep(topic, stepIndex, briefing, context);
+      await runWorkflowStep(topic, stepIndex, briefing, context, focusedContext);
     }
     setIsLoading(false);
   };
 
-  const advanceToNextStep = async (topic, completedStepIndex, updatedContext, userMessage) => {
+  const advanceToNextStep = async (topic, completedStepIndex, updatedContext, userMessage, focusedContext = null) => {
     const nextStep = completedStepIndex + 1;
     if (nextStep < topic.workflow.length) {
-      setCurrentWorkflow(prev => prev ? { ...prev, currentStep: nextStep, context: updatedContext, waitingForUser: false, stepMessages: [] } : null);
+      setCurrentWorkflow(prev => prev ? {
+        ...prev,
+        currentStep: nextStep,
+        context: updatedContext,
+        waitingForUser: false,
+        stepMessages: [],
+        focusedContext: focusedContext ?? prev.focusedContext,
+      } : null);
       setTimeout(async () => {
         setIsLoading(true);
-        await runWorkflowStep(topic, nextStep, userMessage, updatedContext);
+        await runWorkflowStep(topic, nextStep, userMessage, updatedContext, focusedContext);
         setIsLoading(false);
       }, 800);
     } else {
@@ -2747,8 +2770,14 @@ Do NOT run a full compliance checklist (Step 2), narrative report (Step 3), or r
 ${topic.autoAdvance
   ? 'AUTO-ADVANCE is ON: do not ask clarifying questions and wait. Use ONLY facts evidenced in the document/images. NEVER invent or assume missing details — list INFORMATION GAPS (treat material gaps as critical findings) and continue.'
   : 'Only ask short numbered clarifying questions for gaps that are truly missing from the extracted text (user will reply 1 = … 2 = …).'}`;
-        } else if (workflowContext.length > 0) {
-          const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
+        } else {
+          // Pass prior step outputs DIRECTLY — do not rely on a short orchestrator rebrief (it drops findings).
+          const perStepCap = agentId === 'assessment_summary_agent' ? 18000 : 10000;
+          const priorFindings = (workflowContext || []).map((c) => {
+            const body = String(c.output || '').slice(0, perStepCap);
+            const handoffs = (c.handoffs || []).map((h) => `  - ${h.agent}: ${String(h.output || '').slice(0, 800)}`).join('\n');
+            return `### ${c.step} — ${c.agent}\n${body}${handoffs ? `\nHandoffs:\n${handoffs}` : ''}`;
+          }).join('\n\n');
           const proposalBundle = String(focusedContext || '');
           const textPart = proposalBundle.match(/EXTRACTED DOCUMENT \/ SLIDE TEXT:[\s\S]*?(?=\n\nEXTRACTED FROM |\s*$)/)?.[0]
             || proposalBundle.slice(0, 12000);
@@ -2761,9 +2790,29 @@ ${topic.autoAdvance
             structuredPart.slice(0, 8000),
             visionPart.slice(0, 14000),
           ].filter(Boolean).join('\n\n');
-          const briefingSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.briefingPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt}`);
-          const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nUploaded proposal (slide text + scheme image/chart extracts — use BOTH):\n${proposalExcerpt}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing. Remind the agent to use BOTH slide text and image/chart extracts — do not invent missing scheme details.`;
-          taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 400);
+
+          const isFinalSummary = agentId === 'assessment_summary_agent' || stepIndex === (topic.workflow.length - 1);
+          const stepInstruction = isFinalSummary
+            ? `INSTRUCTION: This is the FINAL step (Assessment Summary). You HAVE prior specialist outputs below — use them.
+1) Write a short executive summary of findings (strengths, weaknesses, compliance issues, information gaps).
+2) Produce a markdown Recommendations table: | Priority | Recommendation | Rationale / explanation | Evidence basis | Severity if unaddressed |
+3) Include INFORMATION GAPS as recommendation rows when material facts were missing.
+4) End with Next actions.
+Do NOT claim you lack prior context if PRIOR STEP FINDINGS is non-empty. Do NOT invent numbers not present in findings or proposal extracts.`
+            : `INSTRUCTION: This is Step ${step.step} of ${topic.workflow.length} (${step.name}).
+Goal: ${step.goal}
+Success criteria: ${step.successCriteria}
+Use PRIOR STEP FINDINGS and the proposal extracts. Do not repeat earlier steps wholesale; advance this step's goal. Never invent missing scheme details — flag INFORMATION GAPS.`;
+
+          taskBriefing = `User request: ${userMessage}
+
+## PRIOR STEP FINDINGS (authoritative inputs from earlier specialists)
+${priorFindings || '(none yet)'}
+
+## UPLOADED PROPOSAL EXTRACTS (slide text + scheme images/charts)
+${proposalExcerpt || '(no proposal extract)'}
+
+${stepInstruction}`;
         }
       } else if (isTerritoryWorkflow && isStructureStep && territoryStructures.length > 0) {
         const activeStruct = territoryStructures.find(s => s.id === selectedTerritoryStructure) || territoryStructures[0];
@@ -2817,8 +2866,13 @@ ${topic.autoAdvance
           handoffOutputs.push({ agent: handoffAgent.name, output: handoffResponse.substring(0, 500) });
         }
       }
-      const updatedContext = [...workflowContext, { step: `Step ${step.step}: ${step.name}`, agent: agent.name, output: agentResponse.substring(0, 12000), handoffs: handoffOutputs }];
-      await finishWorkflowStep(evaluation, topic, stepIndex, updatedContext, userMessage, initialStepMessages);
+      const updatedContext = [...workflowContext, {
+        step: `Step ${step.step}: ${step.name}`,
+        agent: agent.name,
+        output: agentResponse.substring(0, isAnalyzeWorkflow ? 20000 : 12000),
+        handoffs: handoffOutputs,
+      }];
+      await finishWorkflowStep(evaluation, topic, stepIndex, updatedContext, userMessage, initialStepMessages, focusedContext);
     } catch (err) {
       setMessages(prev => [...prev, { role: 'system', content: `⚠️ Orchestrator error: ${err.message}` }]);
       setIsLoading(false);
