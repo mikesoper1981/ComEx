@@ -581,11 +581,42 @@ function heuristicImagePurpose(img, usageEntry) {
     return { purpose: 'icon', relevant: false, reason: 'Small embedded asset with no meaningful slide footprint' };
   }
 
-  if (img.bytes > 90000 || pxArea > 500000) {
-    return { purpose: 'scheme_content', relevant: true, reason: 'Large screenshot — likely table or payout scale', heuristicOnly: true };
-  }
-
+  // Large size alone is NOT proof of scheme content (stock photos are often large).
+  // Always send ambiguous images to the vision classifier.
   return null;
+}
+
+const SCHEME_IMAGE_PURPOSES = new Set(['payment_scale', 'table', 'chart', 'scheme_diagram']);
+const IGNORE_IMAGE_PURPOSES = new Set(['logo', 'decorative', 'stock_photo', 'icon']);
+
+function normalizeImageClassification(row, fallbackName) {
+  const purpose = String(row?.purpose || 'other').toLowerCase().replace(/\s+/g, '_');
+  let relevant = row?.relevant === true;
+  if (IGNORE_IMAGE_PURPOSES.has(purpose)) relevant = false;
+  else if (SCHEME_IMAGE_PURPOSES.has(purpose)) relevant = true;
+  else if (purpose === 'other' || purpose === 'scheme_content') {
+    // "other" / vague labels: only keep if the model explicitly said relevant
+    // AND the reason hints at numbers/tables (otherwise treat as decorative).
+    const reason = String(row?.reason || '').toLowerCase();
+    const looksNumeric = /table|payout|scale|attain|weight|threshold|%|percent|multiplier|grid|excel|chart|curve|cap|accelerator/.test(reason);
+    relevant = row?.relevant === true && looksNumeric;
+    if (!looksNumeric) {
+      return {
+        purpose: relevant ? purpose : 'decorative',
+        relevant: false,
+        reason: String(row?.reason || 'No clear scheme numbers — ignored'),
+        name: fallbackName,
+      };
+    }
+  } else {
+    relevant = false;
+  }
+  return {
+    purpose,
+    relevant,
+    reason: String(row?.reason || (relevant ? 'Scheme content' : 'Not scheme-relevant')),
+    name: fallbackName,
+  };
 }
 
 function parseJsonArrayFromModel(text) {
@@ -603,7 +634,7 @@ function parseJsonArrayFromModel(text) {
  * Returns images to send to full vision extract plus ignored inventory for chat previews.
  */
 async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = {}) {
-  if (!images?.length) return { relevant: [], ignored: [] };
+  if (!images?.length) return { relevant: [], ignored: [], classifications: [] };
 
   const needsVision = [];
   const decided = [];
@@ -611,16 +642,14 @@ async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = 
   for (const img of images) {
     const usageEntry = usageMap[img.name];
     const heuristic = heuristicImagePurpose(img, usageEntry);
-    if (heuristic && !heuristic.heuristicOnly) {
-      decided.push({ img, ...heuristic });
-    } else if (heuristic?.heuristicOnly) {
-      decided.push({ img, purpose: heuristic.purpose, relevant: true, reason: heuristic.reason });
+    if (heuristic) {
+      decided.push({ img, purpose: heuristic.purpose, relevant: heuristic.relevant, reason: heuristic.reason });
     } else {
       needsVision.push(img);
     }
   }
 
-  const batchSize = 4;
+  const batchSize = 3;
   for (let i = 0; i < needsVision.length; i += batchSize) {
     const batch = needsVision.slice(i, i + batchSize);
     const content = [
@@ -630,7 +659,10 @@ async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = 
       })),
       {
         type: 'text',
-        text: `Classify these ${batch.length} proposal image(s). Filenames: ${batch.map((img) => img.name).join(', ')}`,
+        text: `Classify these ${batch.length} proposal image(s). Filenames in order: ${batch.map((img) => img.name).join(', ')}.
+
+Default relevant=false. Only relevant=true when you can SEE scheme numbers, payout/attainment scales, weight tables, or IC charts with readable data.
+Photos of people, products, buildings, landscapes, logos, icons, and decorative graphics are NOT relevant.`,
       },
     ];
     try {
@@ -645,23 +677,29 @@ async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = 
       const byName = Object.fromEntries(
         (Array.isArray(parsed) ? parsed : []).map((row) => [String(row.name || '').toLowerCase(), row]),
       );
-      for (const img of batch) {
-        const row = byName[img.name.toLowerCase()] || byName[img.name.split('.')[0].toLowerCase()];
+      for (let bi = 0; bi < batch.length; bi++) {
+        const img = batch[bi];
+        const row = byName[img.name.toLowerCase()]
+          || byName[img.name.split('.')[0].toLowerCase()]
+          || (Array.isArray(parsed) ? parsed[bi] : null);
         if (row) {
-          decided.push({
-            img,
-            purpose: String(row.purpose || 'other'),
-            relevant: row.relevant !== false,
-            reason: String(row.reason || 'Vision classification'),
-          });
+          const norm = normalizeImageClassification(row, img.name);
+          decided.push({ img, purpose: norm.purpose, relevant: norm.relevant, reason: norm.reason });
         } else {
-          decided.push({ img, purpose: 'other', relevant: true, reason: 'No classification returned — included to be safe' });
+          decided.push({ img, purpose: 'decorative', relevant: false, reason: 'No classification — ignored by default' });
         }
       }
     } catch (err) {
       console.warn('Image purpose classification failed:', err);
+      // On failure, include larger images only (possible payment-scale screenshots); skip small ones
       for (const img of batch) {
-        decided.push({ img, purpose: 'other', relevant: true, reason: 'Classification failed — included to be safe' });
+        const keep = (img.bytes || 0) > 80000 || (img.dimensions && img.dimensions.width * img.dimensions.height > 400000);
+        decided.push({
+          img,
+          purpose: keep ? 'other' : 'decorative',
+          relevant: keep,
+          reason: keep ? 'Classification failed — large image kept as possible scheme content' : 'Classification failed — small image ignored',
+        });
       }
     }
   }
@@ -672,7 +710,7 @@ async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = 
     bytes: d.img.bytes,
     included: false,
     reason: d.reason,
-    kind: d.purpose === 'logo' ? 'logo' : d.purpose === 'icon' ? 'icon' : 'decorative',
+    kind: IGNORE_IMAGE_PURPOSES.has(d.purpose) ? d.purpose : 'decorative',
     purpose: d.purpose,
     src: `data:${d.img.mediaType};base64,${d.img.base64}`,
   }));
@@ -1547,6 +1585,7 @@ export default function CommercialExcellenceApp() {
   const [documents, setDocuments] = useState([]);
   const [knowledgeLoadStatus, setKnowledgeLoadStatus] = useState('idle'); // idle | loading | ready | error
   const [uploadedFile, setUploadedFile] = useState(null);
+  const [imageLightbox, setImageLightbox] = useState(null); // { src, name, purpose, reason, included }
   const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
 
   const [topics, setTopics] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).topics);
@@ -4497,14 +4536,41 @@ ${topic.autoAdvance
                             {message.imagePreviews.map((img, i) => (
                               <figure
                                 key={`${img.name}-${i}`}
-                                className={`rounded-lg overflow-hidden border text-left ${
+                                role={img.src ? 'button' : undefined}
+                                tabIndex={img.src ? 0 : undefined}
+                                onClick={() => {
+                                  if (!img.src) return;
+                                  setImageLightbox({
+                                    src: img.src,
+                                    name: img.name,
+                                    purpose: img.purpose || img.kind,
+                                    reason: img.reason,
+                                    included: img.included,
+                                    sourceFormat: img.sourceFormat,
+                                  });
+                                }}
+                                onKeyDown={(e) => {
+                                  if (!img.src) return;
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    setImageLightbox({
+                                      src: img.src,
+                                      name: img.name,
+                                      purpose: img.purpose || img.kind,
+                                      reason: img.reason,
+                                      included: img.included,
+                                      sourceFormat: img.sourceFormat,
+                                    });
+                                  }
+                                }}
+                                className={`rounded-lg overflow-hidden border text-left ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''} ${
                                   img.included
                                     ? 'border-emerald-400/40 bg-slate-900/40'
-                                    : ['logo', 'decorative', 'icon'].includes(img.kind)
+                                    : ['logo', 'decorative', 'icon', 'stock_photo'].includes(img.kind || img.purpose)
                                       ? 'border-slate-500/50 bg-slate-900/30'
                                       : 'border-amber-400/40 bg-amber-950/30'
                                 }`}
-                                title={img.included ? (img.reason || 'Included for scheme extract') : (img.reason || 'Skipped')}
+                                title={img.src ? `Click to enlarge — ${img.included ? (img.reason || 'Included') : (img.reason || 'Skipped')}` : (img.reason || 'Skipped')}
                               >
                                 {img.src ? (
                                   <img
@@ -5731,6 +5797,49 @@ ${topic.autoAdvance
             </div>
           )}
           </MessageErrorBoundary>
+        </div>
+      )}
+
+      {imageLightbox?.src && (
+        <div
+          className="fixed inset-0 z-[80] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Preview ${imageLightbox.name}`}
+          onClick={() => setImageLightbox(null)}
+        >
+          <div
+            className="relative max-w-5xl w-full max-h-[90vh] bg-slate-900 border border-blue-400/30 rounded-xl shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 px-4 py-3 border-b border-blue-400/20">
+              <div className="min-w-0">
+                <div className="font-semibold text-white truncate">{imageLightbox.name}</div>
+                <div className="text-xs text-slate-300 mt-0.5">
+                  {imageLightbox.included ? '✓ Included for vision' : '✗ Ignored'}
+                  {' · '}
+                  {purposeLabel(imageLightbox.purpose)}
+                  {imageLightbox.sourceFormat ? ` · from ${String(imageLightbox.sourceFormat).toUpperCase()}` : ''}
+                  {imageLightbox.reason ? ` — ${imageLightbox.reason}` : ''}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setImageLightbox(null)}
+                className="flex-shrink-0 p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200"
+                aria-label="Close preview"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-4 overflow-auto max-h-[calc(90vh-4.5rem)] bg-slate-950/60 flex items-center justify-center">
+              <img
+                src={imageLightbox.src}
+                alt={imageLightbox.name}
+                className="max-w-full max-h-[75vh] object-contain rounded-md"
+              />
+            </div>
+          </div>
         </div>
       )}
     </div>

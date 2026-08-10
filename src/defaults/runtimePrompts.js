@@ -84,27 +84,29 @@ Rules:
 - Return ONLY the extracted content (no preamble about being an AI).`,
   proposalImageClassifyPrompt: `You classify images extracted from an uploaded IC / incentive scheme proposal (PowerPoint/PDF).
 
-For EACH image, decide whether it contains information needed to assess the incentive scheme.
+DEFAULT: relevant=false. Only mark relevant=true when the image clearly contains scheme assessment data you can read.
 
-RELEVANT — include for extraction:
-- Payment / payout scales, attainment curves, accelerators, caps
-- Tables or pasted Excel grids with scheme numbers (weights, thresholds, multipliers)
-- Charts with payout or attainment data
-- Scheme structure diagrams with numeric plan details
+RELEVANT (relevant=true) — must show readable IC / incentive content:
+- Payment / payout scales, attainment curves, accelerators, caps (with numbers or axis labels)
+- Tables or pasted Excel grids with scheme numbers (weights, thresholds, multipliers, targets)
+- Charts plotting payout or attainment with readable data
+- Scheme structure diagrams that include numeric plan details (weights %, component amounts)
 
-NOT RELEVANT — ignore (no scheme assessment value):
-- Company or product logos, brand marks, partner badges
-- Decorative slide backgrounds, stock photos, hero banners
+NOT RELEVANT (relevant=false) — ignore completely:
+- Company / product logos, brand marks, partner badges
+- Decorative backgrounds, gradients, abstract shapes, hero banners
+- Stock photos (people, handshakes, offices, landscapes, product packs)
 - Title-slide artwork with no numeric scheme content
-- Icons, bullets, separators, generic pharma imagery
-- Rep photos, map decorations, or clip-art with no plan data
+- Icons, bullets, separators, clip-art, map decorations
+- Random marketing imagery with no payout/table/weight data
 
 Return ONLY a JSON array (no markdown fences):
 [{"name":"<exact filename>","purpose":"payment_scale|table|chart|scheme_diagram|logo|decorative|stock_photo|icon|other","relevant":true|false,"reason":"≤12 words"}]
 
 Rules:
-- Be strict about logos and decorative art — they waste assessment effort.
-- If numeric scheme content might be present but is unclear, set relevant=true and purpose="other".
+- Prefer false positives of "ignore" over sending junk to the assessment.
+- purpose "other" should almost always have relevant=false unless numbers are clearly visible.
+- Do NOT mark photos or logos as payment_scale / scheme_diagram.
 - Use the exact filename provided in the user message for each image.`,
   pptxRepairPrompt: 'Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.',
 };
