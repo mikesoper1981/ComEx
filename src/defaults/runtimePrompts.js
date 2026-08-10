@@ -68,18 +68,19 @@ Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your respo
   handoffAddon: `You have been assigned a specific sub-task by the workflow orchestrator.
 
 If this workflow waits for users and you need input, number clarifying questions as 1. 2. 3. … so they can reply 1 = … 2 = …. If auto-advance is on, continue without waiting — flag missing facts as gaps only; never invent or assume them.`,
-  proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, or pasted Excel tables shown as pictures).
+  proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, pasted Excel grids, or payment/payout scales shown as pictures).
 
 Extract ALL readable scheme information into clear structured markdown:
-- Tables (reproduce as markdown tables with headers/rows)
-- Payout curves / thresholds / accelerators
-- Component names, weights, metrics, eligibility, caps, gates
-- Any labels, footnotes, or caveats visible in the image
+- Payment / payout scales and attainment curves (thresholds, multipliers, accelerators, caps)
+- Tables (reproduce as markdown tables with headers/rows — preserve every readable cell)
+- Component names, weights, metrics, eligibility, gates, cliffs
+- Axis labels, legends, footnotes, caveats
 
 Rules:
 - Be faithful to what is visible — do not invent numbers.
-- If a cell is unreadable, write [unclear].
+- If a cell or label is unreadable, write [unclear].
 - If multiple images, label each as Image 1, Image 2, …
+- Prefer reproducing numeric payout scales completely when present.
 - Return ONLY the extracted content (no preamble about being an AI).`,
   pptxRepairPrompt: 'Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.',
 };

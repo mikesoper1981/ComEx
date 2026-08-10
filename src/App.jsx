@@ -466,19 +466,27 @@ async function extractProposalText(file) {
   });
 }
 
-/** Extract embedded images from a .pptx (pasted Excel tables, charts, screenshots). */
-async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 8, minBytes = 4000 } = {}) {
+/** Extract embedded images from a .pptx (pasted Excel tables, charts, screenshots).
+ * Prefers the largest rasters (payment scales are usually big screenshots, not tiny icons).
+ */
+async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 12, minBytes = 2500 } = {}) {
   const zip = await JSZip.loadAsync(await fileOrBlob.arrayBuffer());
-  const mediaPaths = Object.keys(zip.files)
-    .filter((n) => /^ppt\/media\//i.test(n) && /\.(png|jpe?g|gif|webp)$/i.test(n))
-    .sort();
-  const out = [];
-  for (const path of mediaPaths) {
-    if (out.length >= maxImages) break;
+  const mediaPaths = Object.keys(zip.files).filter((n) => /^ppt\/media\//i.test(n));
+  const vectorPaths = mediaPaths.filter((n) => /\.(emf|wmf|svg)$/i.test(n));
+  const rasterPaths = mediaPaths.filter((n) => /\.(png|jpe?g|gif|webp)$/i.test(n));
+
+  const candidates = [];
+  for (const path of rasterPaths) {
     const entry = zip.file(path);
     if (!entry) continue;
     const buf = await entry.async('uint8array');
-    if (!buf || buf.byteLength < minBytes) continue; // skip tiny icons
+    if (!buf || buf.byteLength < minBytes) continue;
+    candidates.push({ path, buf });
+  }
+  candidates.sort((a, b) => b.buf.byteLength - a.buf.byteLength);
+
+  const out = [];
+  for (const { path, buf } of candidates.slice(0, maxImages)) {
     let binary = '';
     const chunk = 0x8000;
     for (let i = 0; i < buf.length; i += chunk) {
@@ -492,11 +500,23 @@ async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 8, minBytes =
       : 'image/png';
     out.push({ name: path.split('/').pop(), mediaType, base64: b64, bytes: buf.byteLength });
   }
-  return out;
+
+  const notes = [];
+  if (vectorPaths.length) {
+    notes.push(`${vectorPaths.length} vector graphic(s) (EMF/WMF/SVG) could not be vision-read — if the payout scale is a chart, re-save the deck as PDF or paste it as a PNG screenshot.`);
+  }
+  if (candidates.length === 0 && rasterPaths.length === 0 && mediaPaths.length === 0) {
+    notes.push('No embedded images found in the PowerPoint media folder.');
+  } else if (candidates.length === 0 && rasterPaths.length > 0) {
+    notes.push('Embedded rasters were too small (icons) to treat as scheme content.');
+  } else if (candidates.length > maxImages) {
+    notes.push(`Read the ${maxImages} largest of ${candidates.length} images (by file size).`);
+  }
+  return { images: out, notes };
 }
 
 /** Render PDF pages to JPEG for vision (tables/charts that aren't in the text layer). */
-async function extractPdfPageImages(fileOrBlob, { maxPages = 6, scale = 1.4 } = {}) {
+async function extractPdfPageImages(fileOrBlob, { maxPages = 8, scale = 1.5 } = {}) {
   const pdfjs = await import('pdfjs-dist');
   try { pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl; } catch { /* ignore */ }
   const buf = await fileOrBlob.arrayBuffer();
@@ -512,7 +532,7 @@ async function extractPdfPageImages(fileOrBlob, { maxPages = 6, scale = 1.4 } = 
     const ctx = canvas.getContext('2d');
     if (!ctx) continue;
     await page.render({ canvasContext: ctx, viewport }).promise;
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
     const base64 = dataUrl.split(',')[1];
     if (base64) {
       out.push({
@@ -523,20 +543,19 @@ async function extractPdfPageImages(fileOrBlob, { maxPages = 6, scale = 1.4 } = 
       });
     }
   }
-  return out;
+  return { images: out, notes: out.length ? [`Rendered ${out.length} of ${doc.numPages} PDF page(s) for vision.`] : ['PDF page render produced no images.'] };
 }
 
 async function extractProposalImages(file, { textLength = 0 } = {}) {
   const name = String(file?.name || '').toLowerCase();
   if (name.endsWith('.pdf') || file?.type?.includes('pdf')) {
-    // Sparse text → more pages (likely scanned / image tables). Dense text → fewer page renders.
-    const maxPages = textLength < 400 ? 8 : textLength < 2000 ? 6 : 4;
-    return extractPdfPageImages(file, { maxPages, scale: textLength < 400 ? 1.5 : 1.25 });
+    const maxPages = textLength < 400 ? 10 : textLength < 2000 ? 8 : 6;
+    return extractPdfPageImages(file, { maxPages, scale: textLength < 400 ? 1.6 : 1.4 });
   }
   if (name.endsWith('.pptx') || file?.type?.includes('presentation')) {
     return extractPptxEmbeddedImages(file);
   }
-  return [];
+  return { images: [], notes: [] };
 }
 
 /**
@@ -558,13 +577,13 @@ async function interpretProposalImages(images, systemPrompt) {
       })),
       {
         type: 'text',
-        text: `Extract all readable IC / payout / table content from these ${batch.length} image(s): ${batch.map((i) => i.name).join(', ')}.`,
+        text: `Extract ALL readable IC / payout-scale / attainment / table content from these ${batch.length} image(s): ${batch.map((i) => i.name).join(', ')}. Pay special attention to payment scales, payout curves, threshold tables, and pasted Excel grids.`,
       },
     ];
     const res = await anthropicMessagesPost({
       system: systemPrompt,
       messages: [{ role: 'user', content }],
-      max_tokens: 3500,
+      max_tokens: 4000,
     });
     if (!res.ok) {
       const errText = await res.text();
@@ -2183,14 +2202,14 @@ ${introInstr}`);
 
 User request: ${userMessage}
 
-INSTRUCTION: This is ONLY Step 1 of 3 (Extract & Analyze). Your job:
-1) Extract scheme structure from the uploaded proposal (text + any image/table extracts)
+INSTRUCTION: This is ONLY Step 1 of 4 (Extract & Analyze). Your job:
+1) Extract scheme structure from the uploaded proposal (text + any image/table/payout-scale extracts)
 2) Assess against the 6 Fundamental Axes / best practices
-3) Note strengths and gaps briefly
+3) Note strengths and gaps briefly — treat missing payment-scale evidence as an information gap if images were not readable
 
-Do NOT run a full compliance checklist (Step 2) and do NOT write the final assessment report (Step 3). Stop when extract + axes assessment is done.
+Do NOT run a full compliance checklist (Step 2), narrative report (Step 3), or recommendations table (Step 4). Stop when extract + axes assessment is done.
 ${topic.autoAdvance
-  ? 'AUTO-ADVANCE is ON: do not ask clarifying questions and wait. Use ONLY facts evidenced in the document. NEVER invent or assume missing details — list INFORMATION GAPS (treat material gaps as critical findings) and continue.'
+  ? 'AUTO-ADVANCE is ON: do not ask clarifying questions and wait. Use ONLY facts evidenced in the document/images. NEVER invent or assume missing details — list INFORMATION GAPS (treat material gaps as critical findings) and continue.'
   : 'Only ask short numbered clarifying questions for gaps that are truly missing from the extracted text (user will reply 1 = … 2 = …).'}`;
         } else if (workflowContext.length > 0) {
           const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
@@ -2288,14 +2307,26 @@ ${topic.autoAdvance
 
       let visionText = '';
       let imageCount = 0;
+      let imageNotes = [];
       try {
-        const images = await extractProposalImages(file, { textLength: extractedText.length });
+        const extracted = await extractProposalImages(file, { textLength: extractedText.length });
+        const images = extracted.images || [];
+        imageNotes = extracted.notes || [];
         imageCount = images.length;
         if (images.length) {
+          setMessages((prev) => [...prev, {
+            role: 'system',
+            content: `🖼️ Found **${images.length}** image(s) to read (${images.map((i) => `${i.name} ${(i.bytes / 1024).toFixed(0)}KB`).join(', ')})${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}`,
+          }]);
           visionText = await interpretProposalImages(
             images,
             withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
           );
+        } else {
+          setMessages((prev) => [...prev, {
+            role: 'system',
+            content: `⚠️ No readable raster images found for vision.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''} Continuing with text extract.`,
+          }]);
         }
       } catch (visionErr) {
         console.warn('Proposal image interpretation failed:', visionErr);
@@ -2352,10 +2383,13 @@ ${topic.autoAdvance
         `File: ${file.name}`,
         `Type: ${fileType}`,
         `Stored at: intelligence/${storagePath}`,
-        imageCount ? `Images interpreted: ${imageCount}` : null,
+        imageCount ? `Images interpreted: ${imageCount}` : 'Images interpreted: 0',
+        imageNotes.length ? `Image notes: ${imageNotes.join(' ')}` : null,
         '',
         cappedText ? 'EXTRACTED DOCUMENT TEXT:\n' + cappedText : 'EXTRACTED DOCUMENT TEXT: (little or no text layer — rely on image extract below)',
-        cappedVision ? `\n\nEXTRACTED FROM IMAGES (tables, charts, pasted Excel, screenshots):\n${cappedVision}` : '',
+        cappedVision
+          ? `\n\nEXTRACTED FROM IMAGES — PAYOUT SCALES / TABLES / CHARTS / SCREENSHOTS (treat as primary evidence for curves and tables):\n${cappedVision}`
+          : '\n\nEXTRACTED FROM IMAGES: (none — if a payment scale was only a chart/EMF, re-upload as PDF or PNG screenshot)',
       ].filter((line) => line != null).join('\n');
 
       const bits = [

@@ -99,10 +99,47 @@ function cloneTopics(list) {
 }
 
 export function mergeAgents(partial) {
-  if (!Array.isArray(partial) || partial.length === 0) {
-    return cloneAgents(DEFAULT_AGENTS);
+  const defaults = cloneAgents(DEFAULT_AGENTS);
+  if (!Array.isArray(partial) || partial.length === 0) return defaults;
+  const saved = cloneAgents(partial);
+  const byId = new Map(saved.map((a) => [a.id, a]));
+  // Backfill any new factory agents missing from older saved settings
+  for (const d of defaults) {
+    if (!byId.has(d.id)) byId.set(d.id, d);
   }
-  return cloneAgents(partial);
+  const ordered = defaults.map((d) => byId.get(d.id)).filter(Boolean);
+  for (const a of saved) {
+    if (!defaults.some((d) => d.id === a.id)) ordered.push(a);
+  }
+  return ordered;
+}
+
+function mergeWorkflowSteps(saved, defaults) {
+  if (!Array.isArray(defaults) || !defaults.length) {
+    return Array.isArray(saved) ? saved : [];
+  }
+  if (!Array.isArray(saved) || !saved.length) return defaults.map((s) => ({ ...s, agents: [...(s.agents || [])] }));
+  const maxSaved = Math.max(...saved.map((s) => Number(s.step) || 0), 0);
+  const out = saved.map((s) => ({
+    step: s.step,
+    name: s.name || '',
+    agents: Array.isArray(s.agents) ? [...s.agents] : [],
+    goal: s.goal || '',
+    successCriteria: s.successCriteria || '',
+  }));
+  // Append newer factory steps (e.g. Analyze IC step 4) when saved workflows are older
+  for (const d of defaults) {
+    if (Number(d.step) > maxSaved) {
+      out.push({
+        step: d.step,
+        name: d.name || '',
+        agents: Array.isArray(d.agents) ? [...d.agents] : [],
+        goal: d.goal || '',
+        successCriteria: d.successCriteria || '',
+      });
+    }
+  }
+  return out.sort((a, b) => (Number(a.step) || 0) - (Number(b.step) || 0));
 }
 
 export function mergeTopics(partial) {
@@ -120,7 +157,6 @@ export function mergeTopics(partial) {
         orchestrator: cloneOrchestrator({
           ...d.orchestrator,
           ...(t.orchestrator || {}),
-          // Prefer saved non-empty strings; otherwise keep factory defaults
           role: t.orchestrator?.role || d.orchestrator?.role,
           goal: t.orchestrator?.goal || d.orchestrator?.goal,
           approach: t.orchestrator?.approach || d.orchestrator?.approach,
@@ -131,7 +167,7 @@ export function mergeTopics(partial) {
           wrapUpPrompt: t.orchestrator?.wrapUpPrompt || d.orchestrator?.wrapUpPrompt,
           evalFallbackMessage: t.orchestrator?.evalFallbackMessage || d.orchestrator?.evalFallbackMessage,
         }),
-        workflow: Array.isArray(t.workflow) && t.workflow.length ? t.workflow : d.workflow,
+        workflow: mergeWorkflowSteps(t.workflow, d.workflow),
       };
     }),
   );

@@ -59,6 +59,27 @@ When done with extract + axes, STOP. If the workflow waits for users and you nee
       status: 'active'
     },
     {
+      id: 'assessment_summary_agent',
+      name: 'Assessment Summary',
+      role: 'Summarise IC assessment findings into a recommendations table',
+      systemPrompt: `You are the final IC assessment summariser.
+
+YOUR ONLY JOB for this step:
+1) Briefly summarise prior specialists' findings (extract/axes, compliance, and any report notes) in a short executive summary.
+2) Produce a markdown **Recommendations** table with columns:
+   | Priority | Recommendation | Rationale / explanation | Evidence basis | Severity if unaddressed |
+3) Include INFORMATION GAPS as rows when material facts were missing from the proposal (do not invent answers for those gaps).
+4) End with a short "Next actions" bullet list for the user.
+
+Rules:
+- Use ONLY facts and findings from prior workflow context and the uploaded proposal extracts.
+- NEVER invent scheme numbers, weights, or payout values.
+- Prefer concrete, actionable recommendations.
+- When finished, STOP. Do not announce further handoffs.`,
+      knowledgeFiles: ['default-best-practices.md', 'pillar-2-strategic-alignment.md'],
+      status: 'active'
+    },
+    {
       id: 'territory_structure_agent',
       name: 'Territory Structure Analyst',
       role: 'Collect and map current territory structure',
