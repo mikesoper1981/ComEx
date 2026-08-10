@@ -192,12 +192,27 @@ function readLocalUserSettings(userId) {
   return { ...DEFAULT_USER_SETTINGS };
 }
 
-const PPTX_EXPORT_INTENT_RE = /\b(powerpoint|power\s*point|pptx?)\b|\b(export|generate|create|make|download)\b.{0,40}\b(powerpoint|power\s*point|pptx?|presentation|slides?|deck|one[\s-]?pager|documentation pack|working document)\b|\b(session summary)\b.{0,20}\b(export|powerpoint|pptx?|deck|slides?)\b|\b(export|generate|create|make)\b.{0,30}\b(one[\s-]?pager|ic documentation|documentation pack|comms? plan)\b/i;
+const PPTX_EXPORT_INTENT_RE = /\b(export|download)\b.{0,50}\b(powerpoint|power\s*point|pptx?|presentation|slides?|deck|one[\s-]?pager|documentation pack|working document|session summary)\b|\b(generate|create|make|produce)\b.{0,40}\b(powerpoint|power\s*point|pptx|presentation|slide deck|slides|deck|one[\s-]?pager|documentation pack)\b|\b(export as (powerpoint|pptx|presentation)|powerpoint export|pptx export)\b|\b(session summary)\b.{0,20}\b(export|download|powerpoint|pptx|deck|slides?)\b|\b(export|generate|create|make)\b.{0,30}\b(one[\s-]?pager|ic documentation|documentation pack|comms? plan)\b/i;
 
-/** Classify a user message about PowerPoint / document export. */
+/** True when the message is about assessing/reviewing an uploaded proposal — not exporting a deck. */
+function isIcAssessmentRequest(message) {
+  const m = String(message || '').toLowerCase();
+  if (!m) return false;
+  if (/\b(export|download)\b.{0,30}\b(powerpoint|pptx|presentation|deck|slides?)\b/.test(m)) return false;
+  return /\b(assess(?:ment|ing)?|analy[sz]e|review|evaluate)\b.{0,60}\b(ic|incentive|scheme|proposal|plan|document)\b|\bassess my ic\b|\banaly[sz]e (my |the )?(ic|scheme|proposal)\b|\breview (my |the )?(ic|scheme|proposal)\b/.test(m);
+}
+
+/** Classify a user message about PowerPoint / document export (conversation → downloadable deck). */
 function classifyPptxRequest(message) {
-  const m = String(message || '').toLowerCase().trim();
-  if (!m || !PPTX_EXPORT_INTENT_RE.test(m)) return null;
+  const raw = String(message || '').toLowerCase().trim();
+  if (!raw) return null;
+
+  // Assessing an uploaded .pptx/.pdf is not an export request (filenames often contain "pptx").
+  if (isIcAssessmentRequest(raw)) return null;
+
+  // Strip filenames so "scheme.pptx" / "plan.pdf" never alone look like export intent.
+  const m = raw.replace(/\b[\w.-]+\.(pptx?|pdf|docx?)\b/gi, ' ');
+  if (!PPTX_EXPORT_INTENT_RE.test(m)) return null;
 
   const wantsSummary = /\b(summary|recap|summarise|summarize|session summary|what we (discussed|talked|covered))\b/.test(m);
   const wantsOnePager = /one[\s-]?pager|single page|simple overview|simple one pager/.test(m);
@@ -1998,11 +2013,16 @@ ${isFocused
     const file = event.target.files[0];
     if (!file) return;
     setUploadedFile(file);
-    const fileType = file.type.includes('pdf') ? 'PDF' : file.type.includes('presentation') || file.type.includes('powerpoint') ? 'PowerPoint' : 'document';
-    setMessages(prev => [...prev, { role: 'system', content: `📎 File uploaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)\n\nAnalyzing this ${fileType} incentive scheme proposal...` }]);
+    const fileType = file.type.includes('pdf') ? 'PDF' : file.type.includes('presentation') || file.type.includes('powerpoint') || /\.pptx?$/i.test(file.name) ? 'PowerPoint' : 'document';
+    setShowLanding(false);
+    setActiveTab('chat');
+    setMessages(prev => [...prev, {
+      role: 'system',
+      content: `📎 File uploaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)\n\nStarting **Analyze Existing IC** for this ${fileType} proposal…`,
+    }]);
     setTimeout(() => {
-      const analysisPrompt = `Please provide a comprehensive assessment of the uploaded incentive scheme document "${file.name}". Evaluate it against the 6 Fundamental Axes.`;
-      handleSubmit(null, analysisPrompt, true);
+      // Explicit assessment prompt — must route to analyze_ic, never PPT export
+      handleSubmit(null, 'Assess my IC', true);
     }, 800);
     event.target.value = '';
   };
@@ -3196,6 +3216,21 @@ ${isFocused
     setMessages(prev => [...prev, { role: 'user', content: messageContent }]);
     setIsLoading(true);
 
+    // Uploaded IC proposal → always Analyze Existing IC workflow (never PPT export).
+    if (isFileAnalysis && !currentWorkflow) {
+      const analyzeTopic = topics.find((t) => t.id === 'analyze_ic' && t.status === 'active');
+      if (analyzeTopic) {
+        const fileName = uploadedFile?.name;
+        const workflowMessage = fileName
+          ? `Assess my IC. The user uploaded "${fileName}" for assessment against best practices and the 6 Fundamental Axes. Extract the scheme from that proposal and analyse it.`
+          : messageContent;
+        setPendingWorkflow(null);
+        setPptxClarifyPending(false);
+        await launchWorkflowDirect('analyze_ic', workflowMessage);
+        return;
+      }
+    }
+
     if (currentWorkflow) {
       const topic = topics.find(t => t.id === currentWorkflow.topicId);
       if (topic) {
@@ -3219,17 +3254,29 @@ ${isFocused
       }
     }
 
-    // Intercept PowerPoint / documentation export requests.
-    const pptIntent = classifyPptxRequest(messageContent);
-    if (pptIntent) {
-      if (pptIntent.clear && pptIntent.mode) {
+    // Intercept PowerPoint / documentation export requests (skip for assessment uploads).
+    if (!isFileAnalysis) {
+      const pptIntent = classifyPptxRequest(messageContent);
+      if (pptIntent) {
+        if (pptIntent.clear && pptIntent.mode) {
+          setIsLoading(false);
+          await handleGeneratePptx(offerFromClassification(pptIntent), pptIntent.mode);
+          return;
+        }
         setIsLoading(false);
-        await handleGeneratePptx(offerFromClassification(pptIntent), pptIntent.mode);
+        askPptxClarification();
         return;
       }
-      setIsLoading(false);
-      askPptxClarification();
-      return;
+    }
+
+    // Typed "Assess my IC" / similar → Analyze Existing IC (even without a fresh upload).
+    if (!currentWorkflow && isIcAssessmentRequest(messageContent)) {
+      const analyzeTopic = topics.find((t) => t.id === 'analyze_ic' && t.status === 'active');
+      if (analyzeTopic) {
+        setPendingWorkflow(null);
+        await launchWorkflowDirect('analyze_ic', messageContent);
+        return;
+      }
     }
 
     const msg = messageContent.toLowerCase();
@@ -4420,18 +4467,53 @@ ${isFocused
                       <div><label className="block text-sm font-semibold mb-2">Role</label><input type="text" value={editingAgent.role} onChange={(e) => setEditingAgent({...editingAgent, role: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
                       <div><label className="block text-sm font-semibold mb-2">System Prompt</label><textarea value={editingAgent.systemPrompt} rows={15} onChange={(e) => setEditingAgent({...editingAgent, systemPrompt: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white font-mono text-sm" /></div>
                       <div>
-                        <label className="block text-sm font-semibold mb-2">Knowledge files (comma-separated filenames, or * for all)</label>
-                        <input
-                          type="text"
-                          value={Array.isArray(editingAgent.knowledgeFiles) ? editingAgent.knowledgeFiles.join(', ') : ''}
-                          onChange={(e) => setEditingAgent({
-                            ...editingAgent,
-                            knowledgeFiles: e.target.value.split(',').map((s) => s.trim()).filter(Boolean),
-                          })}
-                          placeholder="default-best-practices.md, pillar-2-strategic-alignment.md"
-                          className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm"
-                        />
-                        <p className="text-xs text-blue-300/50 mt-1">Must match files loaded from the intelligence bucket.</p>
+                        <label className="block text-sm font-semibold mb-2">Knowledge files</label>
+                        <p className="text-xs text-blue-300/50 mb-2">Select intelligence files from the loaded knowledge base to pass as guidance to this agent.</p>
+                        {documents.length === 0 ? (
+                          <div className="text-xs text-amber-300/80 bg-amber-500/10 border border-amber-400/20 rounded-lg p-3">
+                            No knowledge files loaded yet. Upload files in Admin → Knowledge first.
+                          </div>
+                        ) : (
+                          <div className="bg-slate-800 border border-blue-400/30 rounded-lg p-3 space-y-2 max-h-48 overflow-y-auto">
+                            <label className="flex items-center gap-2 text-sm text-cyan-200 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={(editingAgent.knowledgeFiles || []).includes('*')}
+                                onChange={(e) => setEditingAgent({
+                                  ...editingAgent,
+                                  knowledgeFiles: e.target.checked ? ['*'] : [],
+                                })}
+                                className="rounded border-blue-400/40"
+                              />
+                              All loaded knowledge files
+                            </label>
+                            <div className="border-t border-blue-400/15 pt-2 space-y-1.5">
+                              {documents.map((doc) => {
+                                const all = (editingAgent.knowledgeFiles || []).includes('*');
+                                const checked = all || (editingAgent.knowledgeFiles || []).includes(doc.name);
+                                return (
+                                  <label key={doc.name} className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+                                    <input
+                                      type="checkbox"
+                                      disabled={all}
+                                      checked={checked}
+                                      onChange={(e) => {
+                                        const prev = (editingAgent.knowledgeFiles || []).filter((f) => f !== '*');
+                                        const next = e.target.checked
+                                          ? [...new Set([...prev, doc.name])]
+                                          : prev.filter((f) => f !== doc.name);
+                                        setEditingAgent({ ...editingAgent, knowledgeFiles: next });
+                                      }}
+                                      className="rounded border-blue-400/40"
+                                    />
+                                    <span className="truncate">{doc.name}</span>
+                                    <span className="text-[10px] text-blue-300/40 ml-auto flex-shrink-0">{doc.size}</span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                     <div className="border-t border-blue-400/20 p-6 flex gap-3 bg-slate-900 rounded-b-xl">

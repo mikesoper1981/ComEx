@@ -22,7 +22,7 @@ export const DEFAULT_TOPICS = [
       id: 'analyze_ic',
       name: 'Analyze Existing IC',
       description: 'Assess uploaded IC documents against best practices',
-      triggerKeywords: ['analyze scheme', 'assess ic', 'review plan', 'evaluate incentive'],
+      triggerKeywords: ['analyze scheme', 'assess ic', 'assess my ic', 'review plan', 'evaluate incentive', 'assess proposal'],
       orchestrator: {
         role: 'You are the Workflow Orchestrator for IC scheme analysis.',
         goal: 'Produce a complete assessment covering scheme structure, compliance, and fairness.',
