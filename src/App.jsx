@@ -466,63 +466,195 @@ async function extractProposalText(file) {
   });
 }
 
-/** Extract embedded images from a .pptx (pasted Excel tables, charts, screenshots).
+function uint8ToBase64(buf) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < buf.length; i += chunk) {
+    binary += String.fromCharCode(...buf.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function rasterMediaType(path) {
+  const ext = String(path).split('.').pop().toLowerCase();
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'webp') return 'image/webp';
+  return 'image/png';
+}
+
+/** Pull numeric/category caches from native PowerPoint chart XML (not an image). */
+function parsePptxChartXml(xml, chartName) {
+  const seriesBlocks = [...String(xml).matchAll(/<c:ser\b[\s\S]*?<\/c:ser>/gi)];
+  if (!seriesBlocks.length) return null;
+  const lines = [`Chart: ${chartName}`];
+  seriesBlocks.forEach((m, idx) => {
+    const block = m[0];
+    const title =
+      block.match(/<c:tx>[\s\S]*?<c:v>([^<]*)<\/c:v>/i)?.[1]
+      || block.match(/<a:t>([^<]*)<\/a:t>/i)?.[1]
+      || `Series ${idx + 1}`;
+    const catBlock = block.match(/<c:cat>[\s\S]*?<\/c:cat>/i)?.[0] || '';
+    const valBlock = block.match(/<c:val>[\s\S]*?<\/c:val>/i)?.[0] || '';
+    const cats = [...catBlock.matchAll(/<c:v>([^<]*)<\/c:v>/gi)].map((x) => x[1].trim()).filter(Boolean);
+    const vals = [...valBlock.matchAll(/<c:v>([^<]*)<\/c:v>/gi)].map((x) => x[1].trim()).filter(Boolean);
+    if (!vals.length && !cats.length) return;
+    lines.push(`  ${title}:`);
+    const n = Math.max(cats.length, vals.length);
+    for (let i = 0; i < n; i++) {
+      lines.push(`    ${cats[i] || `pt${i + 1}`}: ${vals[i] ?? '—'}`);
+    }
+  });
+  return lines.length > 1 ? lines.join('\n') : null;
+}
+
+/** Native charts + embedded Excel workbooks inside a .pptx (payment scales often live here, not as PNGs). */
+async function extractPptxStructuredExtras(zip) {
+  const notes = [];
+  const parts = [];
+
+  const chartPaths = Object.keys(zip.files)
+    .filter((n) => /^ppt\/charts\/chart\d+\.xml$/i.test(n))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/chart(\d+)/i)?.[1] || '0', 10);
+      const nb = parseInt(b.match(/chart(\d+)/i)?.[1] || '0', 10);
+      return na - nb;
+    });
+  for (const path of chartPaths) {
+    try {
+      const xml = await zip.file(path).async('text');
+      const parsed = parsePptxChartXml(xml, path.split('/').pop());
+      if (parsed) parts.push(parsed);
+    } catch { /* ignore one chart */ }
+  }
+  if (chartPaths.length) {
+    notes.push(parts.length
+      ? `Parsed ${parts.length} native PowerPoint chart(s) for numeric series.`
+      : `Found ${chartPaths.length} chart XML file(s) but no readable series caches.`);
+  }
+
+  const embPaths = Object.keys(zip.files).filter((n) =>
+    /^ppt\/embeddings\//i.test(n) && /\.xlsx?$/i.test(n) && !zip.files[n].dir,
+  );
+  if (embPaths.length) {
+    try {
+      const xlsxMod = await import('xlsx');
+      const XLSX = xlsxMod?.default || xlsxMod;
+      for (const path of embPaths.slice(0, 4)) {
+        const buf = await zip.file(path).async('arraybuffer');
+        const wb = XLSX.read(buf, { type: 'array' });
+        const sheetName = wb.SheetNames?.[0];
+        if (!sheetName) continue;
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '' });
+        const preview = rows.slice(0, 40).map((r) => (Array.isArray(r) ? r.join('\t') : String(r))).join('\n');
+        if (preview.trim()) {
+          parts.push(`Embedded workbook ${path.split('/').pop()} (sheet "${sheetName}"):\n${preview}`);
+        }
+      }
+      notes.push(`Read ${Math.min(embPaths.length, 4)} embedded Excel workbook(s) from the deck.`);
+    } catch (err) {
+      notes.push(`Embedded Excel found but could not be parsed (${err.message || 'xlsx error'}).`);
+    }
+  }
+
+  return { text: parts.join('\n\n').trim(), notes };
+}
+
+/**
+ * Extract embedded images from a .pptx (pasted Excel tables, charts, screenshots).
  * Prefers the largest rasters (payment scales are usually big screenshots, not tiny icons).
+ * Also inventories skipped media so the chat can show what was NOT sent to vision.
  */
-async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 12, minBytes = 2500 } = {}) {
+async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes = 1200 } = {}) {
   const zip = await JSZip.loadAsync(await fileOrBlob.arrayBuffer());
-  const mediaPaths = Object.keys(zip.files).filter((n) => /^ppt\/media\//i.test(n));
+  const mediaPaths = Object.keys(zip.files).filter((n) => /^ppt\/media\//i.test(n) && !zip.files[n].dir);
   const vectorPaths = mediaPaths.filter((n) => /\.(emf|wmf|svg)$/i.test(n));
   const rasterPaths = mediaPaths.filter((n) => /\.(png|jpe?g|gif|webp)$/i.test(n));
+  const otherPaths = mediaPaths.filter((n) => !vectorPaths.includes(n) && !rasterPaths.includes(n));
+
+  const skipped = [];
+  for (const path of vectorPaths) {
+    const entry = zip.file(path);
+    const bytes = entry ? (await entry.async('uint8array')).byteLength : 0;
+    skipped.push({
+      name: path.split('/').pop(),
+      bytes,
+      reason: 'Vector (EMF/WMF/SVG) — vision API cannot read this format',
+      kind: 'vector',
+    });
+  }
+  for (const path of otherPaths) {
+    skipped.push({
+      name: path.split('/').pop(),
+      bytes: 0,
+      reason: 'Unsupported media type for vision',
+      kind: 'other',
+    });
+  }
 
   const candidates = [];
   for (const path of rasterPaths) {
     const entry = zip.file(path);
     if (!entry) continue;
     const buf = await entry.async('uint8array');
-    if (!buf || buf.byteLength < minBytes) continue;
+    if (!buf) continue;
+    if (buf.byteLength < minBytes) {
+      skipped.push({
+        name: path.split('/').pop(),
+        bytes: buf.byteLength,
+        reason: `Too small (< ${minBytes} B) — treated as icon/decoration`,
+        kind: 'tiny',
+      });
+      continue;
+    }
     candidates.push({ path, buf });
   }
   candidates.sort((a, b) => b.buf.byteLength - a.buf.byteLength);
 
   const out = [];
   for (const { path, buf } of candidates.slice(0, maxImages)) {
-    let binary = '';
-    const chunk = 0x8000;
-    for (let i = 0; i < buf.length; i += chunk) {
-      binary += String.fromCharCode(...buf.subarray(i, i + chunk));
-    }
-    const b64 = btoa(binary);
-    const ext = path.split('.').pop().toLowerCase();
-    const mediaType = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
-      : ext === 'gif' ? 'image/gif'
-      : ext === 'webp' ? 'image/webp'
-      : 'image/png';
-    out.push({ name: path.split('/').pop(), mediaType, base64: b64, bytes: buf.byteLength });
+    out.push({
+      name: path.split('/').pop(),
+      mediaType: rasterMediaType(path),
+      base64: uint8ToBase64(buf),
+      bytes: buf.byteLength,
+    });
+  }
+  for (const { path, buf } of candidates.slice(maxImages)) {
+    skipped.push({
+      name: path.split('/').pop(),
+      bytes: buf.byteLength,
+      reason: `Not among the ${maxImages} largest rasters sent to vision`,
+      kind: 'capped',
+    });
   }
 
-  const notes = [];
+  const structured = await extractPptxStructuredExtras(zip);
+
+  const notes = [...(structured.notes || [])];
   if (vectorPaths.length) {
-    notes.push(`${vectorPaths.length} vector graphic(s) (EMF/WMF/SVG) could not be vision-read — if the payout scale is a chart, re-save the deck as PDF or paste it as a PNG screenshot.`);
+    notes.push(`${vectorPaths.length} vector graphic(s) (EMF/WMF/SVG) cannot be vision-read — re-save as PDF or paste the scale as a PNG screenshot.`);
   }
   if (candidates.length === 0 && rasterPaths.length === 0 && mediaPaths.length === 0) {
     notes.push('No embedded images found in the PowerPoint media folder.');
   } else if (candidates.length === 0 && rasterPaths.length > 0) {
     notes.push('Embedded rasters were too small (icons) to treat as scheme content.');
   } else if (candidates.length > maxImages) {
-    notes.push(`Read the ${maxImages} largest of ${candidates.length} images (by file size).`);
+    notes.push(`Sending the ${maxImages} largest of ${candidates.length} raster images to vision (by file size).`);
   }
-  return { images: out, notes };
+
+  return { images: out, skipped, notes, structuredText: structured.text || '' };
 }
 
 /** Render PDF pages to JPEG for vision (tables/charts that aren't in the text layer). */
-async function extractPdfPageImages(fileOrBlob, { maxPages = 8, scale = 1.5 } = {}) {
+async function extractPdfPageImages(fileOrBlob, { maxPages = 12, scale = 1.5 } = {}) {
   const pdfjs = await import('pdfjs-dist');
   try { pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl; } catch { /* ignore */ }
   const buf = await fileOrBlob.arrayBuffer();
   const doc = await pdfjs.getDocument({ data: buf }).promise;
   const limit = Math.min(doc.numPages, maxPages);
   const out = [];
+  const skipped = [];
   for (let p = 1; p <= limit; p++) {
     const page = await doc.getPage(p);
     const viewport = page.getViewport({ scale });
@@ -543,19 +675,25 @@ async function extractPdfPageImages(fileOrBlob, { maxPages = 8, scale = 1.5 } = 
       });
     }
   }
-  return { images: out, notes: out.length ? [`Rendered ${out.length} of ${doc.numPages} PDF page(s) for vision.`] : ['PDF page render produced no images.'] };
+  for (let p = limit + 1; p <= doc.numPages; p++) {
+    skipped.push({ name: `page-${p}`, bytes: 0, reason: `Beyond first ${maxPages} pages rendered for vision`, kind: 'capped' });
+  }
+  const notes = out.length
+    ? [`Rendered ${out.length} of ${doc.numPages} PDF page(s) for vision.`]
+    : ['PDF page render produced no images.'];
+  return { images: out, skipped, notes, structuredText: '' };
 }
 
 async function extractProposalImages(file, { textLength = 0 } = {}) {
   const name = String(file?.name || '').toLowerCase();
   if (name.endsWith('.pdf') || file?.type?.includes('pdf')) {
-    const maxPages = textLength < 400 ? 10 : textLength < 2000 ? 8 : 6;
+    const maxPages = textLength < 400 ? 14 : textLength < 2000 ? 10 : 8;
     return extractPdfPageImages(file, { maxPages, scale: textLength < 400 ? 1.6 : 1.4 });
   }
   if (name.endsWith('.pptx') || file?.type?.includes('presentation')) {
     return extractPptxEmbeddedImages(file);
   }
-  return { images: [], notes: [] };
+  return { images: [], skipped: [], notes: [], structuredText: '' };
 }
 
 /**
@@ -2306,27 +2444,49 @@ ${topic.autoAdvance
       }]);
 
       let visionText = '';
+      let structuredText = '';
       let imageCount = 0;
       let imageNotes = [];
+      let imagePreviews = [];
       try {
         const extracted = await extractProposalImages(file, { textLength: extractedText.length });
         const images = extracted.images || [];
+        const skipped = extracted.skipped || [];
         imageNotes = extracted.notes || [];
+        structuredText = extracted.structuredText || '';
         imageCount = images.length;
-        if (images.length) {
+        imagePreviews = [
+          ...images.map((img) => ({
+            name: img.name,
+            bytes: img.bytes,
+            included: true,
+            src: `data:${img.mediaType};base64,${img.base64}`,
+          })),
+          ...skipped.map((s) => ({
+            name: s.name,
+            bytes: s.bytes || 0,
+            included: false,
+            reason: s.reason,
+            kind: s.kind,
+          })),
+        ];
+        if (images.length || skipped.length || structuredText) {
+          const skipSummary = skipped.length
+            ? `\n_Skipped ${skipped.length}: ${skipped.slice(0, 6).map((s) => `${s.name} (${s.kind || 'skip'})`).join(', ')}${skipped.length > 6 ? '…' : ''}_`
+            : '';
           setMessages((prev) => [...prev, {
             role: 'system',
-            content: `🖼️ Found **${images.length}** image(s) to read (${images.map((i) => `${i.name} ${(i.bytes / 1024).toFixed(0)}KB`).join(', ')})${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}`,
+            content: images.length
+              ? `🖼️ **Images for vision:** ${images.length} included${skipped.length ? `, ${skipped.length} skipped` : ''}${structuredText ? '; also parsed native charts / embedded Excel' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`
+              : `⚠️ **No raster images sent to vision**${skipped.length ? ` (${skipped.length} media skipped)` : ''}${structuredText ? '; using native chart / Excel extracts instead' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`,
+            imagePreviews,
           }]);
+        }
+        if (images.length) {
           visionText = await interpretProposalImages(
             images,
             withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
           );
-        } else {
-          setMessages((prev) => [...prev, {
-            role: 'system',
-            content: `⚠️ No readable raster images found for vision.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''} Continuing with text extract.`,
-          }]);
         }
       } catch (visionErr) {
         console.warn('Proposal image interpretation failed:', visionErr);
@@ -2336,7 +2496,7 @@ ${topic.autoAdvance
         }]);
       }
 
-      if ((!extractedText || extractedText.length < 40) && !visionText) {
+      if ((!extractedText || extractedText.length < 40) && !visionText && !structuredText) {
         throw new Error('Could not extract usable text or image content. Try a text-based PDF/.pptx, or ensure tables/charts are visible in the file.');
       }
 
@@ -2350,6 +2510,7 @@ ${topic.autoAdvance
       try {
         const combinedPersist = [
           extractedText && `=== DOCUMENT TEXT ===\n${extractedText}`,
+          structuredText && `=== NATIVE CHARTS / EMBEDDED SPREADSHEETS ===\n${structuredText}`,
           visionText && `=== IMAGE / VISION EXTRACT ===\n${visionText}`,
         ].filter(Boolean).join('\n\n');
         const textBlob = new Blob([combinedPersist || extractedText], { type: 'text/plain' });
@@ -2364,6 +2525,9 @@ ${topic.autoAdvance
       const cappedVision = visionText.length > 40000
         ? `${visionText.slice(0, 40000)}\n\n[… vision extract truncated …]`
         : visionText;
+      const cappedStructured = structuredText.length > 30000
+        ? `${structuredText.slice(0, 30000)}\n\n[… structured extract truncated …]`
+        : structuredText;
 
       const proposalMeta = {
         name: file.name,
@@ -2373,6 +2537,7 @@ ${topic.autoAdvance
         storageBucket: 'intelligence',
         extractedText: cappedText,
         visionExtract: cappedVision || null,
+        structuredExtract: cappedStructured || null,
         imageCount,
         uploadedAt: new Date().toISOString(),
       };
@@ -2386,15 +2551,19 @@ ${topic.autoAdvance
         imageCount ? `Images interpreted: ${imageCount}` : 'Images interpreted: 0',
         imageNotes.length ? `Image notes: ${imageNotes.join(' ')}` : null,
         '',
-        cappedText ? 'EXTRACTED DOCUMENT TEXT:\n' + cappedText : 'EXTRACTED DOCUMENT TEXT: (little or no text layer — rely on image extract below)',
+        cappedText ? 'EXTRACTED DOCUMENT TEXT:\n' + cappedText : 'EXTRACTED DOCUMENT TEXT: (little or no text layer — rely on image/chart extracts below)',
+        cappedStructured
+          ? `\n\nEXTRACTED FROM NATIVE CHARTS / EMBEDDED SPREADSHEETS (payment-scale series often live here):\n${cappedStructured}`
+          : null,
         cappedVision
           ? `\n\nEXTRACTED FROM IMAGES — PAYOUT SCALES / TABLES / CHARTS / SCREENSHOTS (treat as primary evidence for curves and tables):\n${cappedVision}`
-          : '\n\nEXTRACTED FROM IMAGES: (none — if a payment scale was only a chart/EMF, re-upload as PDF or PNG screenshot)',
+          : '\n\nEXTRACTED FROM IMAGES: (none — if a payment scale was only EMF/WMF, re-upload as PDF or PNG screenshot)',
       ].filter((line) => line != null).join('\n');
 
       const bits = [
-        `${Math.round((cappedText.length + cappedVision.length) / 1000)}k chars`,
+        `${Math.round((cappedText.length + cappedVision.length + cappedStructured.length) / 1000)}k chars`,
         imageCount ? `${imageCount} image${imageCount === 1 ? '' : 's'} read` : null,
+        cappedStructured ? 'charts/Excel parsed' : null,
       ].filter(Boolean).join(', ');
 
       setMessages((prev) => [...prev, {
@@ -2405,7 +2574,7 @@ ${topic.autoAdvance
 
       await launchWorkflowDirect(
         'analyze_ic',
-        'Assess my IC using the uploaded proposal document provided in context. Extract the scheme from that document text AND any image/table extracts — do not ask the user to restate details already present.',
+        'Assess my IC using the uploaded proposal document provided in context. Extract the scheme from that document text AND any image/table/chart extracts — do not ask the user to restate details already present.',
         focusedContext,
       );
     } catch (err) {
@@ -3946,6 +4115,33 @@ ${topic.autoAdvance
                         <div className="text-sm leading-relaxed">
                           {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : formatMarkdown(message.content)}
                         </div>
+                        {Array.isArray(message.imagePreviews) && message.imagePreviews.length > 0 && (
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {message.imagePreviews.map((img, i) => (
+                              <figure
+                                key={`${img.name}-${i}`}
+                                className={`rounded-lg overflow-hidden border text-left ${img.included ? 'border-emerald-400/40 bg-slate-900/40' : 'border-amber-400/40 bg-amber-950/30'}`}
+                                title={img.included ? 'Included in vision read' : (img.reason || 'Skipped')}
+                              >
+                                {img.included && img.src ? (
+                                  <img
+                                    src={img.src}
+                                    alt={img.name}
+                                    className="block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50"
+                                  />
+                                ) : (
+                                  <div className="h-20 w-[120px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
+                                    {img.kind === 'vector' ? 'Vector — not vision-readable' : (img.reason || 'Skipped')}
+                                  </div>
+                                )}
+                                <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px] truncate">
+                                  {img.included ? '✓ ' : '✗ '}{img.name}
+                                  {img.bytes ? ` · ${(img.bytes / 1024).toFixed(0)}KB` : ''}
+                                </figcaption>
+                              </figure>
+                            ))}
+                          </div>
+                        )}
                         {index === messages.length - 1 && pendingWorkflow && message.content.includes('Would you like me to start this workflow') && (
                           <div className="flex gap-2 mt-4">
                             <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, Start Workflow</button>
