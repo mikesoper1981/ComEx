@@ -483,6 +483,228 @@ function rasterMediaType(path) {
   return 'image/png';
 }
 
+function readRasterDimensions(buf, mediaType) {
+  if (!buf || buf.length < 24) return null;
+  if (mediaType === 'image/png' || (buf[0] === 0x89 && buf[1] === 0x50)) {
+    const w = ((buf[16] << 24) | (buf[17] << 16) | (buf[18] << 8) | buf[19]) >>> 0;
+    const h = ((buf[20] << 24) | (buf[21] << 16) | (buf[22] << 8) | buf[23]) >>> 0;
+    if (w > 0 && h > 0 && w < 30000 && h < 30000) return { width: w, height: h };
+  }
+  if (mediaType === 'image/jpeg' || (buf[0] === 0xff && buf[1] === 0xd8)) {
+    let i = 2;
+    while (i < buf.length - 8) {
+      if (buf[i] !== 0xff) { i++; continue; }
+      const marker = buf[i + 1];
+      if (marker === 0xc0 || marker === 0xc2) {
+        const h = (buf[i + 5] << 8) | buf[i + 6];
+        const w = (buf[i + 7] << 8) | buf[i + 8];
+        if (w > 0 && h > 0) return { width: w, height: h };
+        break;
+      }
+      const len = (buf[i + 2] << 8) | buf[i + 3];
+      i += 2 + Math.max(len, 2);
+    }
+  }
+  return null;
+}
+
+/** Map media filename → slide placement hints (size, master vs content). */
+async function buildPptxImageUsageMap(zip) {
+  const usage = {};
+  const partPaths = [
+    ...Object.keys(zip.files).filter((n) => /^ppt\/slides\/slide\d+\.xml$/i.test(n)),
+    ...Object.keys(zip.files).filter((n) => /^ppt\/slideMasters\/slideMaster\d+\.xml$/i.test(n)),
+    ...Object.keys(zip.files).filter((n) => /^ppt\/slideLayouts\/slideLayout\d+\.xml$/i.test(n)),
+  ];
+  for (const partPath of partPaths) {
+    const onMaster = /slideMasters|slideLayouts/i.test(partPath);
+    const relsPath = partPath.replace(/^(ppt\/[^/]+)\/([^/]+)$/, '$1/_rels/$2.rels');
+    const rels = {};
+    try {
+      const relsXml = await zip.file(relsPath).async('text');
+      for (const m of relsXml.matchAll(/Id="([^"]+)"[^>]*Target="([^"]+)"/g)) {
+        rels[m[1]] = m[2].replace(/^\.\.\//, 'ppt/');
+      }
+    } catch { /* no rels */ }
+    try {
+      const xml = await zip.file(partPath).async('text');
+      for (const block of xml.matchAll(/<p:pic[\s\S]*?<\/p:pic>/gi)) {
+        const pic = block[0];
+        const rId = pic.match(/r:embed="([^"]+)"/i)?.[1];
+        if (!rId || !rels[rId]) continue;
+        const name = rels[rId].split('/').pop();
+        const cx = parseInt(pic.match(/<a:ext[^>]*cx="(\d+)"/i)?.[1] || '0', 10);
+        const cy = parseInt(pic.match(/<a:ext[^>]*cy="(\d+)"/i)?.[1] || '0', 10);
+        const x = parseInt(pic.match(/<a:off[^>]*x="(-?\d+)"/i)?.[1] || '0', 10);
+        const y = parseInt(pic.match(/<a:off[^>]*y="(-?\d+)"/i)?.[1] || '0', 10);
+        if (!usage[name]) usage[name] = { placements: [], onMaster: false };
+        if (onMaster) usage[name].onMaster = true;
+        usage[name].placements.push({ cx, cy, x, y, part: partPath });
+      }
+    } catch { /* ignore part */ }
+  }
+  return usage;
+}
+
+const SLIDE_EMU_W = 12192000;
+const SLIDE_EMU_H = 6858000;
+const SLIDE_EMU_AREA = SLIDE_EMU_W * SLIDE_EMU_H;
+
+function heuristicImagePurpose(img, usageEntry) {
+  const dims = img.dimensions;
+  const pxArea = dims ? dims.width * dims.height : 0;
+
+  if (pxArea > 0 && pxArea < 100 * 100 && img.bytes < 20000) {
+    return { purpose: 'icon', relevant: false, reason: 'Tiny pixel dimensions — icon or bullet art' };
+  }
+
+  const placements = usageEntry?.placements || [];
+  if (placements.length) {
+    const p = placements.reduce((best, cur) => ((cur.cx * cur.cy) > (best.cx * best.cy) ? cur : best), placements[0]);
+    const areaRatio = (p.cx * p.cy) / SLIDE_EMU_AREA;
+    const maxSide = Math.max(p.cx, p.cy);
+    const minSide = Math.min(p.cx, p.cy);
+
+    if (areaRatio > 0.82) {
+      return { purpose: 'decorative', relevant: false, reason: 'Covers most of the slide — likely background art' };
+    }
+    if (usageEntry.onMaster && areaRatio > 0.25) {
+      return { purpose: 'decorative', relevant: false, reason: 'Large image on slide master/layout — theme decoration' };
+    }
+    if (areaRatio < 0.025 && img.bytes < 60000 && maxSide < 1200000) {
+      return { purpose: 'logo', relevant: false, reason: 'Small header/corner placement — likely logo or badge' };
+    }
+    if (areaRatio < 0.012 && minSide < 400000) {
+      return { purpose: 'logo', relevant: false, reason: 'Very small on-slide footprint — logo/icon' };
+    }
+  } else if (img.bytes < 6000) {
+    return { purpose: 'icon', relevant: false, reason: 'Small embedded asset with no meaningful slide footprint' };
+  }
+
+  if (img.bytes > 90000 || pxArea > 500000) {
+    return { purpose: 'scheme_content', relevant: true, reason: 'Large screenshot — likely table or payout scale', heuristicOnly: true };
+  }
+
+  return null;
+}
+
+function parseJsonArrayFromModel(text) {
+  const raw = String(text || '').trim();
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : raw;
+  const start = candidate.indexOf('[');
+  const end = candidate.lastIndexOf(']');
+  if (start === -1 || end <= start) return [];
+  return JSON.parse(candidate.slice(start, end + 1));
+}
+
+/**
+ * Classify proposal images by purpose; filter out logos, decoration, icons.
+ * Returns images to send to full vision extract plus ignored inventory for chat previews.
+ */
+async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = {}) {
+  if (!images?.length) return { relevant: [], ignored: [] };
+
+  const needsVision = [];
+  const decided = [];
+
+  for (const img of images) {
+    const usageEntry = usageMap[img.name];
+    const heuristic = heuristicImagePurpose(img, usageEntry);
+    if (heuristic && !heuristic.heuristicOnly) {
+      decided.push({ img, ...heuristic });
+    } else if (heuristic?.heuristicOnly) {
+      decided.push({ img, purpose: heuristic.purpose, relevant: true, reason: heuristic.reason });
+    } else {
+      needsVision.push(img);
+    }
+  }
+
+  const batchSize = 4;
+  for (let i = 0; i < needsVision.length; i += batchSize) {
+    const batch = needsVision.slice(i, i + batchSize);
+    const content = [
+      ...batch.map((img) => ({
+        type: 'image',
+        source: { type: 'base64', media_type: img.mediaType, data: img.base64 },
+      })),
+      {
+        type: 'text',
+        text: `Classify these ${batch.length} proposal image(s). Filenames: ${batch.map((img) => img.name).join(', ')}`,
+      },
+    ];
+    try {
+      const res = await anthropicMessagesPost({
+        system: classifyPrompt,
+        messages: [{ role: 'user', content }],
+        max_tokens: 1200,
+      });
+      if (!res.ok) throw new Error(`Classify ${res.status}`);
+      const data = await res.json();
+      const parsed = parseJsonArrayFromModel(anthropicAssistantText(data));
+      const byName = Object.fromEntries(
+        (Array.isArray(parsed) ? parsed : []).map((row) => [String(row.name || '').toLowerCase(), row]),
+      );
+      for (const img of batch) {
+        const row = byName[img.name.toLowerCase()] || byName[img.name.split('.')[0].toLowerCase()];
+        if (row) {
+          decided.push({
+            img,
+            purpose: String(row.purpose || 'other'),
+            relevant: row.relevant !== false,
+            reason: String(row.reason || 'Vision classification'),
+          });
+        } else {
+          decided.push({ img, purpose: 'other', relevant: true, reason: 'No classification returned — included to be safe' });
+        }
+      }
+    } catch (err) {
+      console.warn('Image purpose classification failed:', err);
+      for (const img of batch) {
+        decided.push({ img, purpose: 'other', relevant: true, reason: 'Classification failed — included to be safe' });
+      }
+    }
+  }
+
+  const relevant = decided.filter((d) => d.relevant).map((d) => d.img);
+  const ignored = decided.filter((d) => !d.relevant).map((d) => ({
+    name: d.img.name,
+    bytes: d.img.bytes,
+    included: false,
+    reason: d.reason,
+    kind: d.purpose === 'logo' ? 'logo' : d.purpose === 'icon' ? 'icon' : 'decorative',
+    purpose: d.purpose,
+    src: `data:${d.img.mediaType};base64,${d.img.base64}`,
+  }));
+
+  return {
+    relevant,
+    ignored,
+    classifications: decided.map((d) => ({
+      name: d.img.name,
+      purpose: d.purpose,
+      relevant: d.relevant,
+      reason: d.reason,
+    })),
+  };
+}
+
+function purposeLabel(purpose) {
+  const map = {
+    payment_scale: 'Payout scale',
+    table: 'Table',
+    chart: 'Chart',
+    scheme_diagram: 'Scheme diagram',
+    scheme_content: 'Scheme content',
+    logo: 'Logo',
+    decorative: 'Decorative',
+    stock_photo: 'Stock photo',
+    icon: 'Icon',
+    other: 'Other',
+  };
+  return map[purpose] || purpose || 'Unknown';
+}
+
 /** Pull numeric/category caches from native PowerPoint chart XML (not an image). */
 function parsePptxChartXml(xml, chartName) {
   const seriesBlocks = [...String(xml).matchAll(/<c:ser\b[\s\S]*?<\/c:ser>/gi)];
@@ -567,6 +789,7 @@ async function extractPptxStructuredExtras(zip) {
  */
 async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes = 1200 } = {}) {
   const zip = await JSZip.loadAsync(await fileOrBlob.arrayBuffer());
+  const usageMap = await buildPptxImageUsageMap(zip);
   const mediaPaths = Object.keys(zip.files).filter((n) => /^ppt\/media\//i.test(n) && !zip.files[n].dir);
   const vectorPaths = mediaPaths.filter((n) => /\.(emf|wmf|svg)$/i.test(n));
   const rasterPaths = mediaPaths.filter((n) => /\.(png|jpe?g|gif|webp)$/i.test(n));
@@ -598,6 +821,7 @@ async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes 
     if (!entry) continue;
     const buf = await entry.async('uint8array');
     if (!buf) continue;
+    const mediaType = rasterMediaType(path);
     if (buf.byteLength < minBytes) {
       skipped.push({
         name: path.split('/').pop(),
@@ -607,27 +831,15 @@ async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes 
       });
       continue;
     }
-    candidates.push({ path, buf });
-  }
-  candidates.sort((a, b) => b.buf.byteLength - a.buf.byteLength);
-
-  const out = [];
-  for (const { path, buf } of candidates.slice(0, maxImages)) {
-    out.push({
+    candidates.push({
       name: path.split('/').pop(),
-      mediaType: rasterMediaType(path),
+      mediaType,
       base64: uint8ToBase64(buf),
       bytes: buf.byteLength,
+      dimensions: readRasterDimensions(buf, mediaType),
     });
   }
-  for (const { path, buf } of candidates.slice(maxImages)) {
-    skipped.push({
-      name: path.split('/').pop(),
-      bytes: buf.byteLength,
-      reason: `Not among the ${maxImages} largest rasters sent to vision`,
-      kind: 'capped',
-    });
-  }
+  candidates.sort((a, b) => b.bytes - a.bytes);
 
   const structured = await extractPptxStructuredExtras(zip);
 
@@ -639,11 +851,11 @@ async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes 
     notes.push('No embedded images found in the PowerPoint media folder.');
   } else if (candidates.length === 0 && rasterPaths.length > 0) {
     notes.push('Embedded rasters were too small (icons) to treat as scheme content.');
-  } else if (candidates.length > maxImages) {
-    notes.push(`Sending the ${maxImages} largest of ${candidates.length} raster images to vision (by file size).`);
+  } else if (candidates.length) {
+    notes.push(`Found ${candidates.length} raster image(s); classifying purpose before vision read.`);
   }
 
-  return { images: out, skipped, notes, structuredText: structured.text || '' };
+  return { candidates, skipped, notes, structuredText: structured.text || '', usageMap };
 }
 
 /** Render PDF pages to JPEG for vision (tables/charts that aren't in the text layer). */
@@ -679,9 +891,41 @@ async function extractPdfPageImages(fileOrBlob, { maxPages = 12, scale = 1.5 } =
     skipped.push({ name: `page-${p}`, bytes: 0, reason: `Beyond first ${maxPages} pages rendered for vision`, kind: 'capped' });
   }
   const notes = out.length
-    ? [`Rendered ${out.length} of ${doc.numPages} PDF page(s) for vision.`]
+    ? [`Rendered ${out.length} of ${doc.numPages} PDF page(s); classifying purpose before vision read.`]
     : ['PDF page render produced no images.'];
-  return { images: out, skipped, notes, structuredText: '' };
+  return { candidates: out, skipped, notes, structuredText: '', usageMap: {} };
+}
+
+async function finalizeProposalImages(extracted, classifyPrompt, { maxImages = 24 } = {}) {
+  const candidates = extracted.candidates || extracted.images || [];
+  const skipped = [...(extracted.skipped || [])];
+  const usageMap = extracted.usageMap || {};
+
+  const { relevant, ignored, classifications } = await filterProposalImagesByPurpose(
+    candidates,
+    classifyPrompt,
+    usageMap,
+  );
+
+  const classByName = Object.fromEntries(classifications.map((c) => [c.name, c]));
+  const images = relevant.slice(0, maxImages);
+  for (const img of relevant.slice(maxImages)) {
+    skipped.push({
+      name: img.name,
+      bytes: img.bytes,
+      reason: `Relevant but beyond ${maxImages}-image extract limit`,
+      kind: 'capped',
+      purpose: classByName[img.name]?.purpose,
+    });
+  }
+
+  return {
+    images,
+    skipped: [...skipped, ...ignored],
+    classifications,
+    notes: extracted.notes || [],
+    structuredText: extracted.structuredText || '',
+  };
 }
 
 async function extractProposalImages(file, { textLength = 0 } = {}) {
@@ -693,7 +937,7 @@ async function extractProposalImages(file, { textLength = 0 } = {}) {
   if (name.endsWith('.pptx') || file?.type?.includes('presentation')) {
     return extractPptxEmbeddedImages(file);
   }
-  return { images: [], skipped: [], notes: [], structuredText: '' };
+  return { candidates: [], skipped: [], notes: [], structuredText: '', usageMap: {} };
 }
 
 /**
@@ -2440,7 +2684,7 @@ ${topic.autoAdvance
 
       setMessages((prev) => [...prev, {
         role: 'system',
-        content: '🖼️ Reading embedded images / page visuals (payout tables, charts, screenshots)…',
+        content: '🖼️ Scanning embedded images — detecting logos/decoration vs scheme content (tables, payout scales)…',
       }]);
 
       let visionText = '';
@@ -2450,16 +2694,26 @@ ${topic.autoAdvance
       let imagePreviews = [];
       try {
         const extracted = await extractProposalImages(file, { textLength: extractedText.length });
-        const images = extracted.images || [];
-        const skipped = extracted.skipped || [];
-        imageNotes = extracted.notes || [];
-        structuredText = extracted.structuredText || '';
+        const finalized = await finalizeProposalImages(
+          extracted,
+          withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt),
+        );
+        const images = finalized.images || [];
+        const skipped = finalized.skipped || [];
+        const classifications = finalized.classifications || [];
+        imageNotes = finalized.notes || [];
+        structuredText = finalized.structuredText || '';
         imageCount = images.length;
+
+        const classByName = Object.fromEntries(classifications.map((c) => [c.name, c]));
+        const ignoredPurpose = skipped.filter((s) => ['logo', 'decorative', 'icon'].includes(s.kind));
         imagePreviews = [
           ...images.map((img) => ({
             name: img.name,
             bytes: img.bytes,
             included: true,
+            purpose: classByName[img.name]?.purpose || 'scheme_content',
+            reason: classByName[img.name]?.reason,
             src: `data:${img.mediaType};base64,${img.base64}`,
           })),
           ...skipped.map((s) => ({
@@ -2468,17 +2722,23 @@ ${topic.autoAdvance
             included: false,
             reason: s.reason,
             kind: s.kind,
+            purpose: s.purpose,
+            src: s.src,
           })),
         ];
+
         if (images.length || skipped.length || structuredText) {
+          const purposeBits = ignoredPurpose.length
+            ? ` · ignored ${ignoredPurpose.length} non-scheme (${ignoredPurpose.map((s) => purposeLabel(s.purpose || s.kind)).slice(0, 4).join(', ')}${ignoredPurpose.length > 4 ? '…' : ''})`
+            : '';
           const skipSummary = skipped.length
-            ? `\n_Skipped ${skipped.length}: ${skipped.slice(0, 6).map((s) => `${s.name} (${s.kind || 'skip'})`).join(', ')}${skipped.length > 6 ? '…' : ''}_`
+            ? `\n_Skipped ${skipped.length} total${purposeBits}_`
             : '';
           setMessages((prev) => [...prev, {
             role: 'system',
             content: images.length
-              ? `🖼️ **Images for vision:** ${images.length} included${skipped.length ? `, ${skipped.length} skipped` : ''}${structuredText ? '; also parsed native charts / embedded Excel' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`
-              : `⚠️ **No raster images sent to vision**${skipped.length ? ` (${skipped.length} media skipped)` : ''}${structuredText ? '; using native chart / Excel extracts instead' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`,
+              ? `🖼️ **Scheme images for vision:** ${images.length} included${ignoredPurpose.length ? `, ${ignoredPurpose.length} ignored as logo/decoration` : ''}${structuredText ? '; also parsed native charts / embedded Excel' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`
+              : `⚠️ **No scheme-relevant images** for vision${ignoredPurpose.length ? ` (${ignoredPurpose.length} logo/decorative images ignored)` : ''}${structuredText ? '; using native chart / Excel extracts instead' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`,
             imagePreviews,
           }]);
         }
@@ -2548,7 +2808,8 @@ ${topic.autoAdvance
         `File: ${file.name}`,
         `Type: ${fileType}`,
         `Stored at: intelligence/${storagePath}`,
-        imageCount ? `Images interpreted: ${imageCount}` : 'Images interpreted: 0',
+        imageCount ? `Scheme-relevant images interpreted: ${imageCount}` : 'Scheme-relevant images interpreted: 0',
+        ignoredPurpose.length ? `Non-scheme images ignored: ${ignoredPurpose.length} (logos, decoration, icons)` : null,
         imageNotes.length ? `Image notes: ${imageNotes.join(' ')}` : null,
         '',
         cappedText ? 'EXTRACTED DOCUMENT TEXT:\n' + cappedText : 'EXTRACTED DOCUMENT TEXT: (little or no text layer — rely on image/chart extracts below)',
@@ -4120,23 +4381,32 @@ ${topic.autoAdvance
                             {message.imagePreviews.map((img, i) => (
                               <figure
                                 key={`${img.name}-${i}`}
-                                className={`rounded-lg overflow-hidden border text-left ${img.included ? 'border-emerald-400/40 bg-slate-900/40' : 'border-amber-400/40 bg-amber-950/30'}`}
-                                title={img.included ? 'Included in vision read' : (img.reason || 'Skipped')}
+                                className={`rounded-lg overflow-hidden border text-left ${
+                                  img.included
+                                    ? 'border-emerald-400/40 bg-slate-900/40'
+                                    : ['logo', 'decorative', 'icon'].includes(img.kind)
+                                      ? 'border-slate-500/50 bg-slate-900/30'
+                                      : 'border-amber-400/40 bg-amber-950/30'
+                                }`}
+                                title={img.included ? (img.reason || 'Included for scheme extract') : (img.reason || 'Skipped')}
                               >
-                                {img.included && img.src ? (
+                                {img.src ? (
                                   <img
                                     src={img.src}
                                     alt={img.name}
-                                    className="block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50"
+                                    className={`block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50 ${img.included ? '' : 'opacity-60 grayscale-[35%]'}`}
                                   />
                                 ) : (
                                   <div className="h-20 w-[120px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
                                     {img.kind === 'vector' ? 'Vector — not vision-readable' : (img.reason || 'Skipped')}
                                   </div>
                                 )}
-                                <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px] truncate">
-                                  {img.included ? '✓ ' : '✗ '}{img.name}
-                                  {img.bytes ? ` · ${(img.bytes / 1024).toFixed(0)}KB` : ''}
+                                <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px]">
+                                  <div className="truncate">{img.included ? '✓ ' : '✗ '}{img.name}</div>
+                                  <div className={`truncate ${img.included ? 'text-emerald-300/90' : 'text-slate-400'}`}>
+                                    {purposeLabel(img.purpose || img.kind)}
+                                    {img.bytes ? ` · ${(img.bytes / 1024).toFixed(0)}KB` : ''}
+                                  </div>
                                 </figcaption>
                               </figure>
                             ))}
@@ -5043,6 +5313,7 @@ ${topic.autoAdvance
                     ['workflowRuntime.autoAdvanceClarifyingPolicy', 'Auto-advance policy (do not wait)'],
                     ['workflowRuntime.handoffAddon', 'Handoff add-on'],
                     ['workflowRuntime.proposalImageInterpretPrompt', 'Proposal image / vision extract'],
+                    ['workflowRuntime.proposalImageClassifyPrompt', 'Proposal image purpose classifier'],
                     ['workflowRuntime.pptxRepairPrompt', 'PPT JSON repair'],
                   ].map(([path, title]) => {
                     const [root, key] = path.split('.');

@@ -82,6 +82,30 @@ Rules:
 - If multiple images, label each as Image 1, Image 2, …
 - Prefer reproducing numeric payout scales completely when present.
 - Return ONLY the extracted content (no preamble about being an AI).`,
+  proposalImageClassifyPrompt: `You classify images extracted from an uploaded IC / incentive scheme proposal (PowerPoint/PDF).
+
+For EACH image, decide whether it contains information needed to assess the incentive scheme.
+
+RELEVANT — include for extraction:
+- Payment / payout scales, attainment curves, accelerators, caps
+- Tables or pasted Excel grids with scheme numbers (weights, thresholds, multipliers)
+- Charts with payout or attainment data
+- Scheme structure diagrams with numeric plan details
+
+NOT RELEVANT — ignore (no scheme assessment value):
+- Company or product logos, brand marks, partner badges
+- Decorative slide backgrounds, stock photos, hero banners
+- Title-slide artwork with no numeric scheme content
+- Icons, bullets, separators, generic pharma imagery
+- Rep photos, map decorations, or clip-art with no plan data
+
+Return ONLY a JSON array (no markdown fences):
+[{"name":"<exact filename>","purpose":"payment_scale|table|chart|scheme_diagram|logo|decorative|stock_photo|icon|other","relevant":true|false,"reason":"≤12 words"}]
+
+Rules:
+- Be strict about logos and decorative art — they waste assessment effort.
+- If numeric scheme content might be present but is unclear, set relevant=true and purpose="other".
+- Use the exact filename provided in the user message for each image.`,
   pptxRepairPrompt: 'Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.',
 };
 
