@@ -61,13 +61,13 @@ Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your respo
 - Tell the user they can reply as 1 = … 2 = ….
 - Do not claim the step is finished while questions are unanswered.`,
   autoAdvanceClarifyingPolicy: `AUTO-ADVANCE MODE (do not wait on the user):
-- Do NOT ask clarifying questions and stop. Proceed with whatever information is available.
-- Where facts are missing, state clear ASSUMPTIONS / GAPS and continue.
-- Recommendations must explain what is incomplete and why conclusions are tentative.
-- Never invent precise numbers that were not provided — mark them as unknown / assumed.`,
+- Do NOT ask clarifying questions and stop. Continue the assessment with only what is evidenced.
+- NEVER invent, guess, or assume missing facts, numbers, weights, metrics, eligibility, or payout values.
+- Where information is missing, record it as an INFORMATION GAP (and treat material gaps as critical findings in an IC assessment).
+- Recommendations and scores must be based only on available evidence; explain how gaps limit confidence or create risk — do not fill gaps with made-up content.`,
   handoffAddon: `You have been assigned a specific sub-task by the workflow orchestrator.
 
-If this workflow waits for users and you need input, number clarifying questions as 1. 2. 3. … so they can reply 1 = … 2 = …. If auto-advance is on, proceed with gaps noted instead of waiting.`,
+If this workflow waits for users and you need input, number clarifying questions as 1. 2. 3. … so they can reply 1 = … 2 = …. If auto-advance is on, continue without waiting — flag missing facts as gaps only; never invent or assume them.`,
   proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, or pasted Excel tables shown as pictures).
 
 Extract ALL readable scheme information into clear structured markdown:

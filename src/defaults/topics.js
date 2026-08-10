@@ -70,7 +70,7 @@ export const DEFAULT_TOPICS = [
     orchestrator: withOrchestratorPrompts({
       role: 'You are the Workflow Orchestrator for IC scheme analysis.',
       goal: 'Produce a complete assessment covering scheme structure (step 1), compliance (step 2), and a ranked report (step 3). All three specialists must run.',
-        approach: 'AUTO-ADVANCE PIPELINE: Do not wait for clarifying answers — specialists proceed with available proposal facts and must document ASSUMPTIONS / GAPS. Never mark workflowComplete until Step 3 has finished. After Step 1 or 2, set workflowComplete=false and proceed. EVALUATING STEPS: Judge each agent only against THAT step\'s success criteria.',
+        approach: 'AUTO-ADVANCE PIPELINE: Do not wait for clarifying answers. Specialists use ONLY evidenced proposal facts — NEVER invent or assume missing details. Missing information must be recorded as INFORMATION GAPS (often critical findings). Never mark workflowComplete until Step 3 has finished. After Step 1 or 2, set workflowComplete=false and proceed. EVALUATING STEPS: Judge each agent only against THAT step\'s success criteria.',
       introFull: 'Introduce yourself briefly as the IC analysis orchestrator (1-2 sentences) and state that specialists will extract, check compliance, then report. Do NOT list the workflow steps yourself — they are appended separately.',
     }),
     workflow: [

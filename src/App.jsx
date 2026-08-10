@@ -1798,8 +1798,8 @@ ${clarifyingPolicy}`);
       ev.stepComplete = true;
       if (!ev.orchestratorMessage) {
         ev.orchestratorMessage = isLastStep
-          ? 'Proceeding with available information (gaps/assumptions noted). Wrapping up…'
-          : 'Proceeding with available information (gaps/assumptions noted). Advancing to the next specialist…';
+          ? 'Continuing with evidenced information only (information gaps flagged — no assumptions). Wrapping up…'
+          : 'Continuing with evidenced information only (information gaps flagged — no assumptions). Advancing to the next specialist…';
       }
     }
 
@@ -1849,7 +1849,7 @@ ${evaluatePrompt}`);
     const userContent = `Workflow: ${topic.name}
 Current step: ${step.step} of ${topic.workflow.length} — ${step.name}
 Is last step: ${isLastStep ? 'YES' : 'NO (more specialists must still run)'}
-Auto-advance: ${topic.autoAdvance ? 'YES (never wait for clarifying answers — proceed with available info)' : 'NO (wait if clarifying questions are unanswered)'}
+Auto-advance: ${topic.autoAdvance ? 'YES (do not wait — continue using only evidenced facts; flag missing info as gaps; NEVER invent or assume)' : 'NO (wait if clarifying questions are unanswered)'}
 Success criteria for THIS step only: ${step.successCriteria}
 
 Agent response:
@@ -1859,9 +1859,9 @@ Previous context:
 ${contextStr || 'None'}
 
 Rules:
-- If Auto-advance is YES: set agentStillWorking=false even if the agent mentioned gaps or questions — the pipeline continues with assumptions/gaps noted.
+- If Auto-advance is YES: set agentStillWorking=false even if gaps were flagged — the pipeline continues. Gaps are findings, not reasons to invent facts.
 - If Auto-advance is NO and the agent asked unanswered clarifying questions, agentStillWorking=true.
-- workflowComplete may be true ONLY when Is last step is YES and this step's success criteria are met (or best-effort deliverable under auto-advance).
+- workflowComplete may be true ONLY when Is last step is YES and this step's success criteria are met (or best-effort deliverable under auto-advance, with gaps listed).
 - If Is last step is NO, workflowComplete MUST be false.`;
 
     const raw = await callAnthropic(system, [{ role: 'user', content: userContent }], 1200);
@@ -2190,7 +2190,7 @@ INSTRUCTION: This is ONLY Step 1 of 3 (Extract & Analyze). Your job:
 
 Do NOT run a full compliance checklist (Step 2) and do NOT write the final assessment report (Step 3). Stop when extract + axes assessment is done.
 ${topic.autoAdvance
-  ? 'AUTO-ADVANCE is ON: do not ask clarifying questions and wait. Proceed with available document facts; list ASSUMPTIONS / GAPS for anything missing.'
+  ? 'AUTO-ADVANCE is ON: do not ask clarifying questions and wait. Use ONLY facts evidenced in the document. NEVER invent or assume missing details — list INFORMATION GAPS (treat material gaps as critical findings) and continue.'
   : 'Only ask short numbered clarifying questions for gaps that are truly missing from the extracted text (user will reply 1 = … 2 = …).'}`;
         } else if (workflowContext.length > 0) {
           const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
@@ -4955,7 +4955,7 @@ ${topic.autoAdvance
                               <span className="font-semibold">Auto-advance</span>
                               <span className="block text-xs text-blue-300/60 mt-0.5">
                                 {editingTopic.autoAdvance
-                                  ? 'On: continue through all agents with available info — do not wait for clarifying answers. Gaps/assumptions should be explained in the output.'
+                                  ? 'On: continue through all agents without waiting. Never invent missing facts — flag them as information gaps (often critical in an assessment).'
                                   : 'Off: if an agent asks clarifying questions, the workflow waits until the user answers before continuing.'}
                               </span>
                             </span>

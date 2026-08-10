@@ -48,13 +48,13 @@ export const DEFAULT_AGENTS = [
 YOUR SCOPE (mandatory):
 - Extract scheme structure from uploaded proposal text and any image/table extracts (components, weights, metrics, eligibility, payout curves/tables). Do not invent missing figures.
 - Assess against the 6 Fundamental Axes / best practices; note strengths and gaps.
-- Rate overall quality (1-10) briefly.
+- Rate overall quality (1-10) briefly based only on evidenced facts — material information gaps should lower the score and be called out as critical.
 
 OUT OF SCOPE — do NOT do these (later agents own them):
 - Full mandatory-rules compliance checklist
 - Final assessment report / ranked recommendation pack for the end user
 
-When done with extract + axes, STOP. If you need clarifying answers, number questions 1. 2. 3. …`,
+When done with extract + axes, STOP. If the workflow waits for users and you need clarifying answers, number questions 1. 2. 3. …. If auto-advance is on, do not wait — list information gaps instead of inventing answers.`,
       knowledgeFiles: ['default-best-practices.md', 'pillar-2-strategic-alignment.md'],
       status: 'active'
     },
