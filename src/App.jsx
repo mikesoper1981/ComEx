@@ -2844,6 +2844,7 @@ ${topic.autoAdvance
       let visionText = '';
       let structuredText = '';
       let imageCount = 0;
+      let ignoredPurposeCount = 0;
       let imageNotes = [];
       let imagePreviews = [];
       try {
@@ -2860,7 +2861,10 @@ ${topic.autoAdvance
         imageCount = images.length;
 
         const classByName = Object.fromEntries(classifications.map((c) => [c.name, c]));
-        const ignoredPurpose = skipped.filter((s) => ['logo', 'decorative', 'icon'].includes(s.kind));
+        const ignoredPurpose = skipped.filter((s) =>
+          ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
+        );
+        ignoredPurposeCount = ignoredPurpose.length;
         imagePreviews = [
           ...images.map((img) => ({
             name: img.name,
@@ -2963,34 +2967,40 @@ ${topic.autoAdvance
         `File: ${file.name}`,
         `Type: ${fileType}`,
         `Stored at: intelligence/${storagePath}`,
+        `Slide/document text chars: ${cappedText.length}`,
         imageCount ? `Scheme-relevant images interpreted: ${imageCount}` : 'Scheme-relevant images interpreted: 0',
-        ignoredPurpose.length ? `Non-scheme images ignored: ${ignoredPurpose.length} (logos, decoration, icons)` : null,
+        ignoredPurposeCount ? `Non-scheme images ignored: ${ignoredPurposeCount} (logos, decoration, icons)` : null,
         imageNotes.length ? `Image notes: ${imageNotes.join(' ')}` : null,
         '',
-        cappedText ? 'EXTRACTED DOCUMENT TEXT:\n' + cappedText : 'EXTRACTED DOCUMENT TEXT: (little or no text layer — rely on image/chart extracts below)',
+        'Use BOTH sections below: slide text AND image/chart extracts. Do not ignore either source.',
+        '',
+        cappedText
+          ? `EXTRACTED DOCUMENT / SLIDE TEXT:\n${cappedText}`
+          : 'EXTRACTED DOCUMENT / SLIDE TEXT: (little or no text layer — rely on image/chart extracts below)',
         cappedStructured
           ? `\n\nEXTRACTED FROM NATIVE CHARTS / EMBEDDED SPREADSHEETS (payment-scale series often live here):\n${cappedStructured}`
           : null,
         cappedVision
-          ? `\n\nEXTRACTED FROM IMAGES — PAYOUT SCALES / TABLES / CHARTS / SCREENSHOTS (treat as primary evidence for curves and tables):\n${cappedVision}`
-          : '\n\nEXTRACTED FROM IMAGES: (none — if charts failed conversion, export the deck as PDF and re-upload)',
+          ? `\n\nEXTRACTED FROM SCHEME IMAGES — PAYOUT SCALES / TABLES / CHARTS / SCREENSHOTS (treat as primary evidence for curves and tables):\n${cappedVision}`
+          : '\n\nEXTRACTED FROM SCHEME IMAGES: (none after purpose filter / conversion)',
       ].filter((line) => line != null).join('\n');
 
       const bits = [
-        `${Math.round((cappedText.length + cappedVision.length + cappedStructured.length) / 1000)}k chars`,
-        imageCount ? `${imageCount} image${imageCount === 1 ? '' : 's'} read` : null,
+        cappedText ? `${Math.round(cappedText.length / 1000)}k text` : null,
+        cappedVision ? `${Math.round(cappedVision.length / 1000)}k image extract` : null,
+        imageCount ? `${imageCount} scheme image${imageCount === 1 ? '' : 's'}` : null,
         cappedStructured ? 'charts/Excel parsed' : null,
       ].filter(Boolean).join(', ');
 
       setMessages((prev) => [...prev, {
         role: 'system',
-        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${bits}).\n\nStarting **Analyze Existing IC** with this document as context…`,
+        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${bits || 'minimal extract'}).\n\nPassing **slide text + scheme image extracts** into **Analyze Existing IC**…`,
       }]);
       setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
 
       await launchWorkflowDirect(
         'analyze_ic',
-        'Assess my IC using the uploaded proposal document provided in context. Extract the scheme from that document text AND any image/table/chart extracts — do not ask the user to restate details already present.',
+        'Assess my IC using the uploaded proposal. Use BOTH the extracted slide/document text AND any scheme image/table/chart extracts in context — do not ask the user to restate details already present in either source.',
         focusedContext,
       );
     } catch (err) {
