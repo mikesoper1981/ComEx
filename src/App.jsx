@@ -1734,18 +1734,24 @@ export default function CommercialExcellenceApp() {
     return selected.map((d) => `## ${d.name}\n${d.content}`).join('\n\n');
   };
 
-  const runAgent = async (agent, step, messages) => {
+  const runAgent = async (agent, step, messages, { autoAdvance = false } = {}) => {
     const knowledge = buildAgentKnowledge(agent);
-    const taskBlock = fillTemplate(getWorkflowRuntime().agentTaskWrapper, {
+    const rt = getWorkflowRuntime();
+    const taskBlock = fillTemplate(rt.agentTaskWrapper, {
       stepNumber: step.step,
       stepName: step.name,
       stepGoal: step.goal,
       successCriteria: step.successCriteria,
     });
+    const clarifyingPolicy = autoAdvance
+      ? (rt.autoAdvanceClarifyingPolicy || '')
+      : (rt.waitForClarifyingPolicy || '');
     const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 
-${taskBlock}`);
+${taskBlock}
+
+${clarifyingPolicy}`);
     return await callAnthropic(system, messages, 3000);
   };
 
@@ -1785,6 +1791,18 @@ ${taskBlock}`);
     const ev = evaluation && typeof evaluation === 'object' ? { ...evaluation } : {};
     // Never end the whole workflow before the last specialist has run
     if (!isLastStep) ev.workflowComplete = false;
+
+    // Auto-advance: never block on clarifying questions — continue with available info
+    if (topic.autoAdvance && ev.agentStillWorking) {
+      ev.agentStillWorking = false;
+      ev.stepComplete = true;
+      if (!ev.orchestratorMessage) {
+        ev.orchestratorMessage = isLastStep
+          ? 'Proceeding with available information (gaps/assumptions noted). Wrapping up…'
+          : 'Proceeding with available information (gaps/assumptions noted). Advancing to the next specialist…';
+      }
+    }
+
     if (ev.agentStillWorking) {
       ev.stepComplete = false;
       ev.buttons = [];
@@ -1793,7 +1811,7 @@ ${taskBlock}`);
       return ev;
     }
     // Intermediate steps: ensure a clear proceed path to the next agent
-    if (!isLastStep) {
+    if (!isLastStep && !topic.autoAdvance) {
       const buttons = Array.isArray(ev.buttons) ? [...ev.buttons] : [];
       const hasProceed = buttons.some((b) => normalizeOrchestratorAction(b.action) === 'proceed');
       if (!hasProceed) {
@@ -1831,6 +1849,7 @@ ${evaluatePrompt}`);
     const userContent = `Workflow: ${topic.name}
 Current step: ${step.step} of ${topic.workflow.length} — ${step.name}
 Is last step: ${isLastStep ? 'YES' : 'NO (more specialists must still run)'}
+Auto-advance: ${topic.autoAdvance ? 'YES (never wait for clarifying answers — proceed with available info)' : 'NO (wait if clarifying questions are unanswered)'}
 Success criteria for THIS step only: ${step.successCriteria}
 
 Agent response:
@@ -1840,15 +1859,16 @@ Previous context:
 ${contextStr || 'None'}
 
 Rules:
-- If the agent asked unanswered clarifying questions, agentStillWorking=true.
-- workflowComplete may be true ONLY when Is last step is YES and this step's success criteria are met.
-- If Is last step is NO, workflowComplete MUST be false — offer proceed to the next specialist.`;
+- If Auto-advance is YES: set agentStillWorking=false even if the agent mentioned gaps or questions — the pipeline continues with assumptions/gaps noted.
+- If Auto-advance is NO and the agent asked unanswered clarifying questions, agentStillWorking=true.
+- workflowComplete may be true ONLY when Is last step is YES and this step's success criteria are met (or best-effort deliverable under auto-advance).
+- If Is last step is NO, workflowComplete MUST be false.`;
 
     const raw = await callAnthropic(system, [{ role: 'user', content: userContent }], 1200);
     let parsed;
     try {
       parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-      if (agentResponseAwaitsUser(agentResponse)) {
+      if (!topic.autoAdvance && agentResponseAwaitsUser(agentResponse)) {
         parsed = {
           ...parsed,
           agentStillWorking: true,
@@ -1859,7 +1879,7 @@ Rules:
         };
       }
     } catch {
-      if (agentResponseAwaitsUser(agentResponse)) {
+      if (!topic.autoAdvance && agentResponseAwaitsUser(agentResponse)) {
         parsed = {
           agentStillWorking: true, stepComplete: false, rerouteToStep: null, rerouteBriefing: '', handoffs: [],
           buttons: [], orchestratorMessage: '', workflowComplete: false,
@@ -1952,7 +1972,7 @@ ${introInstr}`);
     try {
       const priorMessages = currentWorkflow?.stepMessages || [];
       const fullMessages = [...priorMessages, { role: 'user', content: userReply }];
-      const agentResponse = await runAgent(agent, step, fullMessages);
+      const agentResponse = await runAgent(agent, step, fullMessages, { autoAdvance: !!topic.autoAdvance });
       setMessages(prev => [...prev, { role: 'assistant', content: `**[${agent.name}]**\n\n${agentResponse}` }]);
       const updatedStepMessages = [...fullMessages, { role: 'assistant', content: agentResponse }];
       logActivity('orchestrator', `Evaluating Step ${stepIndex + 1} after user reply`);
@@ -2043,10 +2063,15 @@ ${introInstr}`);
       await wrapUpWorkflow(topic, updatedContext);
       return;
     }
-    // Pipeline workflows (e.g. Analyze IC) advance automatically so later specialists always run
-    if (topic.autoAdvance && !isLastStep) {
-      const next = topic.workflow[stepIndex + 1];
+    // Auto-advance pipelines: always continue to next step or wrap up — never pause for Continue / clarifying
+    if (topic.autoAdvance) {
       setOrchestratorDecision(null);
+      if (isLastStep) {
+        if (evaluation.orchestratorMessage) setMessages(prev => [...prev, { role: 'orchestrator', content: evaluation.orchestratorMessage }]);
+        await wrapUpWorkflow(topic, updatedContext);
+        return;
+      }
+      const next = topic.workflow[stepIndex + 1];
       setMessages(prev => [...prev, {
         role: 'orchestrator',
         content: evaluation.orchestratorMessage
@@ -2164,7 +2189,9 @@ INSTRUCTION: This is ONLY Step 1 of 3 (Extract & Analyze). Your job:
 3) Note strengths and gaps briefly
 
 Do NOT run a full compliance checklist (Step 2) and do NOT write the final assessment report (Step 3). Stop when extract + axes assessment is done.
-Do NOT ask the user to re-provide information already in the document. Only ask short numbered clarifying questions for gaps that are truly missing.`;
+${topic.autoAdvance
+  ? 'AUTO-ADVANCE is ON: do not ask clarifying questions and wait. Proceed with available document facts; list ASSUMPTIONS / GAPS for anything missing.'
+  : 'Only ask short numbered clarifying questions for gaps that are truly missing from the extracted text (user will reply 1 = … 2 = …).'}`;
         } else if (workflowContext.length > 0) {
           const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
           const briefingSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.briefingPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt}`);
@@ -2187,7 +2214,7 @@ Do NOT ask the user to re-provide information already in the document. Only ask 
       }
       const initialMessages = [{ role: 'user', content: taskBriefing }];
       logActivity('agent', `Running ${agent.name}`);
-      const agentResponse = await runAgent(agent, step, initialMessages);
+      const agentResponse = await runAgent(agent, step, initialMessages, { autoAdvance: !!topic.autoAdvance });
       setMessages(prev => [...prev, { role: 'assistant', content: `**[${agent.name}]**\n\n${agentResponse}` }]);
       const initialStepMessages = [...initialMessages, { role: 'assistant', content: agentResponse }];
       const handoffMatches = [...agentResponse.matchAll(/REQUIRES_HANDOFF:\s*(\S+)\s*-\s*(.+)/gi)];
@@ -4782,6 +4809,8 @@ Do NOT ask the user to re-provide information already in the document. Only ask 
                     ['workflowRuntime.matchDetectorPrompt', 'Workflow match detector'],
                     ['workflowRuntime.offerTemplate', 'Workflow offer template'],
                     ['workflowRuntime.agentTaskWrapper', 'Agent task wrapper'],
+                    ['workflowRuntime.waitForClarifyingPolicy', 'Wait-for-answers policy (auto-advance off)'],
+                    ['workflowRuntime.autoAdvanceClarifyingPolicy', 'Auto-advance policy (do not wait)'],
                     ['workflowRuntime.handoffAddon', 'Handoff add-on'],
                     ['workflowRuntime.proposalImageInterpretPrompt', 'Proposal image / vision extract'],
                     ['workflowRuntime.pptxRepairPrompt', 'PPT JSON repair'],
@@ -4920,9 +4949,16 @@ Do NOT ask the user to re-provide information already in the document. Only ask 
                           <div><label className="block text-sm font-semibold mb-2">Workflow Name</label><input type="text" value={editingTopic.name} onChange={(e) => setEditingTopic({...editingTopic, name: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
                           <div><label className="block text-sm font-semibold mb-2">Description</label><textarea value={editingTopic.description} onChange={(e) => setEditingTopic({...editingTopic, description: e.target.value})} rows={3} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
                           <div><label className="block text-sm font-semibold mb-2">Trigger Keywords (comma-separated)</label><input type="text" value={editingTopic.triggerKeywords?.join(', ') || ''} onChange={(e) => setEditingTopic({ ...editingTopic, triggerKeywords: e.target.value.split(',').map(k => k.trim()).filter(k => k) })} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm" /></div>
-                          <label className="flex items-center gap-2 text-sm text-blue-100 cursor-pointer">
-                            <input type="checkbox" checked={!!editingTopic.autoAdvance} onChange={(e) => setEditingTopic({ ...editingTopic, autoAdvance: e.target.checked })} className="rounded border-blue-400/40" />
-                            Auto-advance between steps (no Continue click required)
+                          <label className="flex items-start gap-2 text-sm text-blue-100 cursor-pointer">
+                            <input type="checkbox" checked={!!editingTopic.autoAdvance} onChange={(e) => setEditingTopic({ ...editingTopic, autoAdvance: e.target.checked })} className="rounded border-blue-400/40 mt-0.5" />
+                            <span>
+                              <span className="font-semibold">Auto-advance</span>
+                              <span className="block text-xs text-blue-300/60 mt-0.5">
+                                {editingTopic.autoAdvance
+                                  ? 'On: continue through all agents with available info — do not wait for clarifying answers. Gaps/assumptions should be explained in the output.'
+                                  : 'Off: if an agent asks clarifying questions, the workflow waits until the user answers before continuing.'}
+                              </span>
+                            </span>
                           </label>
                         </>
                       )}

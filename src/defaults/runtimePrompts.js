@@ -47,7 +47,7 @@ Success criteria: {{successCriteria}}
 
 If you still need information from the user, ask clarifying questions and wait — do not claim the step is finished.
 
-CLARIFYING QUESTIONS (mandatory formatting):
+CLARIFYING QUESTIONS (mandatory formatting when the workflow waits for the user):
 - Put every question the user must answer in a clearly numbered list: 1. 2. 3. …
 - One question per number. Do not bury questions inside paragraphs.
 - Prefer a short intro sentence, then the numbered list, then stop and wait.
@@ -56,9 +56,18 @@ CLARIFYING QUESTIONS (mandatory formatting):
 - Numbering must stay stable so answers map clearly.
 
 Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`,
+  waitForClarifyingPolicy: `CLARIFYING QUESTIONS (this workflow waits for the user):
+- If information is missing, ask numbered clarifying questions 1. 2. 3. … and STOP — do not invent answers.
+- Tell the user they can reply as 1 = … 2 = ….
+- Do not claim the step is finished while questions are unanswered.`,
+  autoAdvanceClarifyingPolicy: `AUTO-ADVANCE MODE (do not wait on the user):
+- Do NOT ask clarifying questions and stop. Proceed with whatever information is available.
+- Where facts are missing, state clear ASSUMPTIONS / GAPS and continue.
+- Recommendations must explain what is incomplete and why conclusions are tentative.
+- Never invent precise numbers that were not provided — mark them as unknown / assumed.`,
   handoffAddon: `You have been assigned a specific sub-task by the workflow orchestrator.
 
-If you ask the user clarifying questions, number them clearly as 1. 2. 3. … (one question per number) so they can reply 1 = … 2 = …. Do not invent answers.`,
+If this workflow waits for users and you need input, number clarifying questions as 1. 2. 3. … so they can reply 1 = … 2 = …. If auto-advance is on, proceed with gaps noted instead of waiting.`,
   proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, or pasted Excel tables shown as pictures).
 
 Extract ALL readable scheme information into clear structured markdown:
