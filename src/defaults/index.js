@@ -1,6 +1,6 @@
 import { DEFAULT_SYSTEM_PROMPT } from './systemPrompt';
 import { DEFAULT_AGENTS } from './agents';
-import { DEFAULT_TOPICS } from './topics';
+import { DEFAULT_TOPICS, DEFAULT_ORCHESTRATOR_PROMPTS } from './topics';
 import {
   DEFAULT_WELCOME_MESSAGES,
   DEFAULT_PPTX_CLARIFY,
@@ -13,6 +13,7 @@ export {
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_AGENTS,
   DEFAULT_TOPICS,
+  DEFAULT_ORCHESTRATOR_PROMPTS,
   DEFAULT_WELCOME_MESSAGES,
   DEFAULT_PPTX_CLARIFY,
   DEFAULT_SUGGESTIONS,
@@ -61,17 +62,29 @@ function cloneAgents(list) {
   }));
 }
 
+function cloneOrchestrator(orch) {
+  const o = orch && typeof orch === 'object' ? orch : {};
+  return {
+    role: o.role != null ? String(o.role) : '',
+    goal: o.goal != null ? String(o.goal) : '',
+    approach: o.approach != null ? String(o.approach) : '',
+    evaluatePrompt: o.evaluatePrompt != null ? String(o.evaluatePrompt) : DEFAULT_ORCHESTRATOR_PROMPTS.evaluatePrompt,
+    introFull: o.introFull != null ? String(o.introFull) : DEFAULT_ORCHESTRATOR_PROMPTS.introFull,
+    introFocused: o.introFocused != null ? String(o.introFocused) : DEFAULT_ORCHESTRATOR_PROMPTS.introFocused,
+    briefingPrompt: o.briefingPrompt != null ? String(o.briefingPrompt) : DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt,
+    wrapUpPrompt: o.wrapUpPrompt != null ? String(o.wrapUpPrompt) : DEFAULT_ORCHESTRATOR_PROMPTS.wrapUpPrompt,
+    evalFallbackMessage: o.evalFallbackMessage != null ? String(o.evalFallbackMessage) : DEFAULT_ORCHESTRATOR_PROMPTS.evalFallbackMessage,
+  };
+}
+
 function cloneTopics(list) {
   return (Array.isArray(list) ? list : []).map((t) => ({
     id: t.id,
     name: t.name || '',
     description: t.description || '',
     triggerKeywords: Array.isArray(t.triggerKeywords) ? [...t.triggerKeywords] : [],
-    orchestrator: {
-      role: t.orchestrator?.role || '',
-      goal: t.orchestrator?.goal || '',
-      approach: t.orchestrator?.approach || '',
-    },
+    autoAdvance: !!t.autoAdvance,
+    orchestrator: cloneOrchestrator(t.orchestrator),
     workflow: Array.isArray(t.workflow)
       ? t.workflow.map((s) => ({
           step: s.step,
@@ -96,7 +109,32 @@ export function mergeTopics(partial) {
   if (!Array.isArray(partial) || partial.length === 0) {
     return cloneTopics(DEFAULT_TOPICS);
   }
-  return cloneTopics(partial);
+  const defaultById = Object.fromEntries(DEFAULT_TOPICS.map((t) => [t.id, t]));
+  return cloneTopics(
+    partial.map((t) => {
+      const d = defaultById[t.id];
+      if (!d) return t;
+      return {
+        ...t,
+        autoAdvance: t.autoAdvance !== undefined ? t.autoAdvance : d.autoAdvance,
+        orchestrator: cloneOrchestrator({
+          ...d.orchestrator,
+          ...(t.orchestrator || {}),
+          // Prefer saved non-empty strings; otherwise keep factory defaults
+          role: t.orchestrator?.role || d.orchestrator?.role,
+          goal: t.orchestrator?.goal || d.orchestrator?.goal,
+          approach: t.orchestrator?.approach || d.orchestrator?.approach,
+          evaluatePrompt: t.orchestrator?.evaluatePrompt || d.orchestrator?.evaluatePrompt,
+          introFull: t.orchestrator?.introFull || d.orchestrator?.introFull,
+          introFocused: t.orchestrator?.introFocused || d.orchestrator?.introFocused,
+          briefingPrompt: t.orchestrator?.briefingPrompt || d.orchestrator?.briefingPrompt,
+          wrapUpPrompt: t.orchestrator?.wrapUpPrompt || d.orchestrator?.wrapUpPrompt,
+          evalFallbackMessage: t.orchestrator?.evalFallbackMessage || d.orchestrator?.evalFallbackMessage,
+        }),
+        workflow: Array.isArray(t.workflow) && t.workflow.length ? t.workflow : d.workflow,
+      };
+    }),
+  );
 }
 
 export function mergeWelcomeMessages(partial) {

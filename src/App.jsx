@@ -14,8 +14,11 @@ import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFro
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
 import {
   DEFAULT_SYSTEM_PROMPT,
+  DEFAULT_PPTX_CLARIFY,
+  DEFAULT_ORCHESTRATOR_PROMPTS,
   DEFAULT_INTELLIGENCE_CONTEXT,
   mergeIntelligenceContext,
+  mergeTopics,
   fillTemplate,
   KNOWLEDGE_SEED_FILES,
   isKnowledgeStorageFile,
@@ -138,9 +141,9 @@ const DEFAULT_USER_SETTINGS = {
   customContext: '',
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
-  // PowerPoint generation guidance — editable in User Settings; persisted with settings JSON
+  // PowerPoint generation guidance — edited in Admin → PPT; persisted in settings JSON
   pptxContext: { ...DEFAULT_PPTX_CONTEXT },
-  // Agents, workflows, system prompt, knowledge, Stella/runtime prompts — all editable + persisted
+  // Agents, workflows, system prompt, knowledge, Stella/runtime prompts — Admin only
   ...DEFAULT_INTELLIGENCE_CONTEXT,
 };
 
@@ -282,22 +285,22 @@ function ensureIcOnePagerSlide(slideData, { force = false } = {}) {
   return { ...slideData, slides };
 }
 
-/** Detect 1–3 numbered choices in an assistant prompt so we can show clickable buttons. */
+/** Detect numbered 1–9 choices in an assistant prompt so we can show clickable buttons. */
 function extractChoiceOptions(text) {
   if (!text) return null;
   const opts = [];
   const lines = String(text).split(/\n/);
   for (const line of lines) {
-    const m = line.match(/^\s*(?:\*\*)?([1-3])(?:\*\*)?\s*[.:)\]]\s+(?:\*\*)?(.+?)(?:\*\*)?\s*$/);
+    const m = line.match(/^\s*(?:\*\*)?([1-9])(?:\*\*)?\s*[.:)\]]\s+(?:\*\*)?(.+?)(?:\*\*)?\s*$/);
     if (!m) continue;
     let label = m[2].replace(/\*\*/g, '').replace(/\s*—\s*.*$/, '').trim();
-    if (label.length > 56) label = `${label.slice(0, 53)}…`;
+    if (label.length > 72) label = `${label.slice(0, 69)}…`;
     opts.push({ value: m[1], label: `${m[1]}. ${label}` });
   }
   // Deduplicate by value, keep order
   const seen = new Set();
   const unique = opts.filter((o) => (seen.has(o.value) ? false : (seen.add(o.value), true)));
-  if (unique.length >= 1 && unique.length <= 3) return unique;
+  if (unique.length >= 1 && unique.length <= 9) return unique;
   return null;
 }
 
@@ -453,6 +456,118 @@ async function extractProposalText(file) {
     reader.onerror = () => reject(new Error('Could not read file'));
     reader.readAsText(file);
   });
+}
+
+/** Extract embedded images from a .pptx (pasted Excel tables, charts, screenshots). */
+async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 8, minBytes = 4000 } = {}) {
+  const zip = await JSZip.loadAsync(await fileOrBlob.arrayBuffer());
+  const mediaPaths = Object.keys(zip.files)
+    .filter((n) => /^ppt\/media\//i.test(n) && /\.(png|jpe?g|gif|webp)$/i.test(n))
+    .sort();
+  const out = [];
+  for (const path of mediaPaths) {
+    if (out.length >= maxImages) break;
+    const entry = zip.file(path);
+    if (!entry) continue;
+    const buf = await entry.async('uint8array');
+    if (!buf || buf.byteLength < minBytes) continue; // skip tiny icons
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < buf.length; i += chunk) {
+      binary += String.fromCharCode(...buf.subarray(i, i + chunk));
+    }
+    const b64 = btoa(binary);
+    const ext = path.split('.').pop().toLowerCase();
+    const mediaType = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+      : ext === 'gif' ? 'image/gif'
+      : ext === 'webp' ? 'image/webp'
+      : 'image/png';
+    out.push({ name: path.split('/').pop(), mediaType, base64: b64, bytes: buf.byteLength });
+  }
+  return out;
+}
+
+/** Render PDF pages to JPEG for vision (tables/charts that aren't in the text layer). */
+async function extractPdfPageImages(fileOrBlob, { maxPages = 6, scale = 1.4 } = {}) {
+  const pdfjs = await import('pdfjs-dist');
+  try { pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl; } catch { /* ignore */ }
+  const buf = await fileOrBlob.arrayBuffer();
+  const doc = await pdfjs.getDocument({ data: buf }).promise;
+  const limit = Math.min(doc.numPages, maxPages);
+  const out = [];
+  for (let p = 1; p <= limit; p++) {
+    const page = await doc.getPage(p);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) continue;
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+    const base64 = dataUrl.split(',')[1];
+    if (base64) {
+      out.push({
+        name: `page-${p}.jpg`,
+        mediaType: 'image/jpeg',
+        base64,
+        bytes: Math.round(base64.length * 0.75),
+      });
+    }
+  }
+  return out;
+}
+
+async function extractProposalImages(file, { textLength = 0 } = {}) {
+  const name = String(file?.name || '').toLowerCase();
+  if (name.endsWith('.pdf') || file?.type?.includes('pdf')) {
+    // Sparse text → more pages (likely scanned / image tables). Dense text → fewer page renders.
+    const maxPages = textLength < 400 ? 8 : textLength < 2000 ? 6 : 4;
+    return extractPdfPageImages(file, { maxPages, scale: textLength < 400 ? 1.5 : 1.25 });
+  }
+  if (name.endsWith('.pptx') || file?.type?.includes('presentation')) {
+    return extractPptxEmbeddedImages(file);
+  }
+  return [];
+}
+
+/**
+ * Send proposal images to the vision model (prompt from workflowRuntime.proposalImageInterpretPrompt).
+ * Batches to stay within request size limits.
+ */
+async function interpretProposalImages(images, systemPrompt) {
+  if (!images?.length) return '';
+  const batches = [];
+  const size = 2;
+  for (let i = 0; i < images.length; i += size) batches.push(images.slice(i, i + size));
+  const parts = [];
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const content = [
+      ...batch.map((img) => ({
+        type: 'image',
+        source: { type: 'base64', media_type: img.mediaType, data: img.base64 },
+      })),
+      {
+        type: 'text',
+        text: `Extract all readable IC / payout / table content from these ${batch.length} image(s): ${batch.map((i) => i.name).join(', ')}.`,
+      },
+    ];
+    const res = await anthropicMessagesPost({
+      system: systemPrompt,
+      messages: [{ role: 'user', content }],
+      max_tokens: 3500,
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Vision API ${res.status}: ${errText.substring(0, 180)}`);
+    }
+    const data = await res.json();
+    if (data.error) throw new Error(data.error.message || 'Vision extraction failed');
+    const text = anthropicAssistantText(data)?.trim();
+    if (text) parts.push(batches.length > 1 ? `### Image batch ${b + 1}\n${text}` : text);
+  }
+  return parts.join('\n\n').trim();
 }
 
 function stellaExtractedTextPath(storagePath) {
@@ -959,6 +1074,7 @@ export default function CommercialExcellenceApp() {
   const [adminModule, setAdminModule] = useState('incentive'); // incentive | territory | stella
   const [editingWorkflowId, setEditingWorkflowId] = useState(null);
   const [editingTopic, setEditingTopic] = useState(null);
+  const [editingTopicTab, setEditingTopicTab] = useState('basics'); // basics | orchestrator | steps
   const [expandedSteps, setExpandedSteps] = useState({});
   const [editingAgent, setEditingAgent] = useState(null);
   const [suggestedPrompts, setSuggestedPrompts] = useState([]);
@@ -1613,23 +1729,75 @@ ${taskBlock}`);
     return await callAnthropic(system, messages, 3000);
   };
 
-  /** True when the agent is clearly waiting on the user (questions / clarification). */
+  const normalizeOrchestratorAction = (action) => {
+    const a = String(action || '').toLowerCase().trim().replace(/[\s-]+/g, '_');
+    if (['proceed', 'continue', 'next', 'advance', 'approve', 'accept', 'yes', 'ok', 'okay', 'go', 'go_ahead', 'move_on', 'confirm'].includes(a)) {
+      return 'proceed';
+    }
+    if (['override', 'force', 'ignore_risk', 'ignore'].includes(a)) return 'override';
+    if (['redesign', 'send_back', 'rollback', 'rework', 'restart'].includes(a)) return 'redesign';
+    if (['refine', 'revise', 'edit', 'update', 'custom', 'change', 'tweak', 'adjust'].includes(a)) return 'refine';
+    return a || 'proceed';
+  };
+
+  /** True when the agent is clearly waiting on the user (clarifying questions). */
   const agentResponseAwaitsUser = (text) => {
     if (!text) return false;
     const t = String(text);
-    const qMarks = (t.match(/\?/g) || []).length;
-    if (qMarks >= 2) return true;
-    if (/(?:^|\n)\s*(?:\d+[\.\)]\s+|[-*•]\s+).{0,120}\?/m.test(t) && qMarks >= 1) return true;
-    if (qMarks >= 1 && /\b(please (tell|confirm|clarify|provide|answer|share)|could you|can you|would you|let me know|before (we|I) (proceed|continue)|need (a few|more|the following)|clarif(?:y|ication)|which of the following|how many|what (is|are) (the|your))\b/i.test(t)) {
+    // Numbered clarifying list with at least one question mark (1. …? 2. …?)
+    const numberedQs = [...t.matchAll(/(?:^|\n)\s*(?:\*\*)?([1-9])(?:\*\*)?\s*[.:)\]]\s+.+\?/gm)];
+    if (numberedQs.length >= 1) return true;
+    // Explicit "waiting on you" phrasing near a question
+    if (/\b(please (tell|confirm|clarify|provide|answer|share|reply)|before (we|I) (proceed|continue)|I need (you to|a few|more|the following)|clarif(?:y|ication) (questions?|needed)|which of the following)\b/i.test(t)
+      && (t.match(/\?/g) || []).length >= 1) {
+      return true;
+    }
+    // Trailing single ask after a short response (not a long report that mentions "what's working")
+    const trimmed = t.trim();
+    if (trimmed.length < 900 && /\?\s*$/.test(trimmed) && (trimmed.match(/\?/g) || []).length <= 2) {
       return true;
     }
     return false;
   };
 
-  const orchestratorEvaluate = async (topic, step, agentResponse, workflowContext) => {
-    const orch = topic.orchestrator;
+  const normalizeOrchestratorEvaluation = (evaluation, topic, stepIndex) => {
+    const isLastStep = stepIndex >= (topic.workflow?.length || 1) - 1;
+    const ev = evaluation && typeof evaluation === 'object' ? { ...evaluation } : {};
+    // Never end the whole workflow before the last specialist has run
+    if (!isLastStep) ev.workflowComplete = false;
+    if (ev.agentStillWorking) {
+      ev.stepComplete = false;
+      ev.buttons = [];
+      ev.orchestratorMessage = '';
+      ev.workflowComplete = false;
+      return ev;
+    }
+    // Intermediate steps: ensure a clear proceed path to the next agent
+    if (!isLastStep) {
+      const buttons = Array.isArray(ev.buttons) ? [...ev.buttons] : [];
+      const hasProceed = buttons.some((b) => normalizeOrchestratorAction(b.action) === 'proceed');
+      if (!hasProceed) {
+        buttons.unshift({ label: '✅ Continue to next step', action: 'proceed', requiresInput: false, inputPrompt: '' });
+      }
+      if (!buttons.some((b) => normalizeOrchestratorAction(b.action) === 'refine')) {
+        buttons.push({ label: '✏️ Refine', action: 'refine', requiresInput: true, inputPrompt: 'What would you like to refine?' });
+      }
+      ev.buttons = buttons;
+      if (!ev.orchestratorMessage) {
+        const next = topic.workflow[stepIndex + 1];
+        ev.orchestratorMessage = next
+          ? `Step ${stepIndex + 1} is done. Next up: **${next.name}** (${next.goal}).`
+          : (topic.orchestrator?.evalFallbackMessage || DEFAULT_ORCHESTRATOR_PROMPTS.evalFallbackMessage);
+      }
+    }
+    return ev;
+  };
+
+  const orchestratorEvaluate = async (topic, step, agentResponse, workflowContext, stepIndex = 0) => {
+    const orch = topic.orchestrator || {};
     const stepList = topic.workflow.map(s => `Step ${s.step} (index ${s.step - 1}): ${s.name} — agent: ${s.agents[0]}`).join('\n');
-    const rt = getWorkflowRuntime();
+    const isLastStep = stepIndex >= topic.workflow.length - 1;
+    const evaluatePrompt = orch.evaluatePrompt || DEFAULT_ORCHESTRATOR_PROMPTS.evaluatePrompt;
     const system = withUserSettings(`${orch.role}
 Overall goal: ${orch.goal}
 ${orch.approach ? `\nApproach rules:\n${orch.approach}` : ''}
@@ -1637,12 +1805,13 @@ ${orch.approach ? `\nApproach rules:\n${orch.approach}` : ''}
 Workflow steps:
 ${stepList}
 
-${rt.orchestratorEvaluatePrompt}`);
+${evaluatePrompt}`);
 
     const contextStr = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output.substring(0, 300)}`).join('\n\n');
     const userContent = `Workflow: ${topic.name}
-Step ${step.step}/${topic.workflow.length}: ${step.name}
-Success criteria: ${step.successCriteria}
+Current step: ${step.step} of ${topic.workflow.length} — ${step.name}
+Is last step: ${isLastStep ? 'YES' : 'NO (more specialists must still run)'}
+Success criteria for THIS step only: ${step.successCriteria}
 
 Agent response:
 ${agentResponse.substring(0, 2000)}
@@ -1650,13 +1819,17 @@ ${agentResponse.substring(0, 2000)}
 Previous context:
 ${contextStr || 'None'}
 
-Reminder: if the agent response contains unanswered questions for the user, agentStillWorking must be true.`;
+Rules:
+- If the agent asked unanswered clarifying questions, agentStillWorking=true.
+- workflowComplete may be true ONLY when Is last step is YES and this step's success criteria are met.
+- If Is last step is NO, workflowComplete MUST be false — offer proceed to the next specialist.`;
 
     const raw = await callAnthropic(system, [{ role: 'user', content: userContent }], 1200);
+    let parsed;
     try {
-      const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+      parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
       if (agentResponseAwaitsUser(agentResponse)) {
-        return {
+        parsed = {
           ...parsed,
           agentStillWorking: true,
           stepComplete: false,
@@ -1665,21 +1838,22 @@ Reminder: if the agent response contains unanswered questions for the user, agen
           workflowComplete: false,
         };
       }
-      return parsed;
     } catch {
       if (agentResponseAwaitsUser(agentResponse)) {
-        return {
+        parsed = {
           agentStillWorking: true, stepComplete: false, rerouteToStep: null, rerouteBriefing: '', handoffs: [],
           buttons: [], orchestratorMessage: '', workflowComplete: false,
         };
+      } else {
+        parsed = {
+          agentStillWorking: false, stepComplete: true, rerouteToStep: null, rerouteBriefing: '', handoffs: [],
+          buttons: [{ label: '✅ Continue', action: 'proceed', requiresInput: false, inputPrompt: '' }, { label: '✏️ Refine', action: 'refine', requiresInput: true, inputPrompt: 'What would you like to refine?' }],
+          orchestratorMessage: orch.evalFallbackMessage || DEFAULT_ORCHESTRATOR_PROMPTS.evalFallbackMessage,
+          workflowComplete: false,
+        };
       }
-      return {
-        agentStillWorking: false, stepComplete: false, rerouteToStep: null, rerouteBriefing: '', handoffs: [],
-        buttons: [{ label: '✅ Continue', action: 'proceed', requiresInput: false, inputPrompt: '' }, { label: '✏️ Refine', action: 'refine', requiresInput: true, inputPrompt: 'What would you like to refine?' }],
-        orchestratorMessage: rt.orchestratorEvalFallbackMessage,
-        workflowComplete: false
-      };
     }
+    return normalizeOrchestratorEvaluation(parsed, topic, stepIndex);
   };
 
   const executeHandoff = async (agentId, task) => {
@@ -1706,14 +1880,15 @@ ${getWorkflowRuntime().handoffAddon}`);
       const stepsBlock = topic.workflow
         .map((s) => `**Step ${s.step}: ${s.name}** — ${s.goal}`)
         .join('\n');
-      const introSystem = withUserSettings(`${topic.orchestrator.role}
-${isFocused
-  ? getWorkflowRuntime().orchestratorIntroFocused
-  : getWorkflowRuntime().orchestratorIntroFull
-}`);
+      const orch = topic.orchestrator || {};
+      const introInstr = isFocused
+        ? (orch.introFocused || DEFAULT_ORCHESTRATOR_PROMPTS.introFocused)
+        : (orch.introFull || DEFAULT_ORCHESTRATOR_PROMPTS.introFull);
+      const introSystem = withUserSettings(`${orch.role}
+${introInstr}`);
       const introLead = await callAnthropic(
         introSystem,
-        [{ role: 'user', content: `The user wants to: ${userMessage}\n\nOverall orchestrator goal: ${topic.orchestrator.goal}` }],
+        [{ role: 'user', content: `The user wants to: ${userMessage}\n\nOverall orchestrator goal: ${orch.goal}` }],
         400,
       );
       const handoff = `I'll now hand you to **${firstAgent?.name || 'the first specialist'}** to begin.`;
@@ -1761,7 +1936,7 @@ ${isFocused
       setMessages(prev => [...prev, { role: 'assistant', content: `**[${agent.name}]**\n\n${agentResponse}` }]);
       const updatedStepMessages = [...fullMessages, { role: 'assistant', content: agentResponse }];
       logActivity('orchestrator', `Evaluating Step ${stepIndex + 1} after user reply`);
-      const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext);
+      const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext, stepIndex);
 
       if (evaluation.agentStillWorking) {
         setOrchestratorDecision(null);
@@ -1789,37 +1964,12 @@ ${isFocused
           handoffOutputs.push({ agent: handoffAgent.name, output: handoffResponse.substring(0, 500) });
         }
       }
-      const updatedContext = [...workflowContext, { step: `Step ${step.step}: ${step.name}`, agent: agent.name, output: agentResponse.substring(0, 800), handoffs: handoffOutputs }];
-      if (evaluation.workflowComplete) {
-        if (evaluation.orchestratorMessage) setMessages(prev => [...prev, { role: 'orchestrator', content: evaluation.orchestratorMessage }]);
-        await wrapUpWorkflow(topic, updatedContext);
-        return;
-      }
-      postOrchestratorDecision(evaluation, topic, stepIndex, updatedContext, userReply);
-      setCurrentWorkflow(prev => prev ? {
-        ...prev,
-        currentStep: stepIndex,
-        context: updatedContext,
-        waitingForUser: true,
-        awaitingAgentReply: false,
-        stepMessages: updatedStepMessages,
-      } : null);
-      setIsLoading(false);
+      const updatedContext = [...workflowContext, { step: `Step ${step.step}: ${step.name}`, agent: agent.name, output: agentResponse.substring(0, 12000), handoffs: handoffOutputs }];
+      await finishWorkflowStep(evaluation, topic, stepIndex, updatedContext, userReply, updatedStepMessages);
     } catch (err) {
       setMessages(prev => [...prev, { role: 'system', content: `⚠️ Error: ${err.message}` }]);
       setIsLoading(false);
     }
-  };
-
-  const normalizeOrchestratorAction = (action) => {
-    const a = String(action || '').toLowerCase().trim().replace(/[\s-]+/g, '_');
-    if (['proceed', 'continue', 'next', 'advance', 'approve', 'accept', 'yes', 'ok', 'okay', 'go', 'go_ahead', 'move_on', 'confirm'].includes(a)) {
-      return 'proceed';
-    }
-    if (['override', 'force', 'ignore_risk', 'ignore'].includes(a)) return 'override';
-    if (['redesign', 'send_back', 'rollback', 'rework', 'restart'].includes(a)) return 'redesign';
-    if (['refine', 'revise', 'edit', 'update', 'custom', 'change', 'tweak', 'adjust'].includes(a)) return 'refine';
-    return a || 'proceed';
   };
 
   /** Map a free-text reply to an orchestrator decision action while Continue buttons are showing. */
@@ -1862,6 +2012,47 @@ ${isFocused
         rerouteBriefing: evaluation.rerouteBriefing,
       });
     }
+  };
+
+  /** After a step finishes (not waiting on clarifying answers): wrap up, auto-advance, or show Continue. */
+  const finishWorkflowStep = async (evaluation, topic, stepIndex, updatedContext, userMessage, stepMessages) => {
+    const isLastStep = stepIndex >= topic.workflow.length - 1;
+    if (evaluation.workflowComplete && isLastStep) {
+      if (evaluation.orchestratorMessage) setMessages(prev => [...prev, { role: 'orchestrator', content: evaluation.orchestratorMessage }]);
+      await wrapUpWorkflow(topic, updatedContext);
+      return;
+    }
+    // Pipeline workflows (e.g. Analyze IC) advance automatically so later specialists always run
+    if (topic.autoAdvance && !isLastStep) {
+      const next = topic.workflow[stepIndex + 1];
+      setOrchestratorDecision(null);
+      setMessages(prev => [...prev, {
+        role: 'orchestrator',
+        content: evaluation.orchestratorMessage
+          || `✅ Step ${stepIndex + 1} complete. Advancing to **${next?.name}**…`,
+      }]);
+      setCurrentWorkflow(prev => prev ? {
+        ...prev,
+        currentStep: stepIndex,
+        context: updatedContext,
+        waitingForUser: false,
+        awaitingAgentReply: false,
+        stepMessages: [],
+      } : null);
+      await advanceToNextStep(topic, stepIndex, updatedContext, userMessage);
+      return;
+    }
+    logActivity('orchestrator', `Step ${stepIndex + 1} awaiting user decision`);
+    postOrchestratorDecision(evaluation, topic, stepIndex, updatedContext, userMessage);
+    setCurrentWorkflow(prev => prev ? {
+      ...prev,
+      currentStep: stepIndex,
+      context: updatedContext,
+      waitingForUser: true,
+      awaitingAgentReply: false,
+      stepMessages: stepMessages || [],
+    } : null);
+    setIsLoading(false);
   };
 
   const handleOrchestratorAction = async (action, decision, typedInput = null) => {
@@ -1911,7 +2102,7 @@ ${isFocused
   };
 
   const wrapUpWorkflow = async (topic, updatedContext) => {
-    const wrapSystem = withUserSettings(`${topic.orchestrator.role}\n${getWorkflowRuntime().orchestratorWrapUpPrompt}`);
+    const wrapSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.wrapUpPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.wrapUpPrompt}`);
     const wrapSummary = await callAnthropic(wrapSystem, [{ role: 'user', content: `Completed: ${topic.name}\n${updatedContext.map(c => `${c.step}: ${c.output.substring(0, 150)}`).join('\n')}` }], 300);
     setMessages(prev => {
       const updated = [...prev, { role: 'orchestrator', content: wrapSummary }];
@@ -1946,10 +2137,16 @@ ${isFocused
 
 User request: ${userMessage}
 
-INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract components, weightings, metrics, eligibility, payout mechanics, and any other scheme details from that text. Assess against the 6 Fundamental Axes / best practices. Do NOT ask the user to re-provide information that is already in the document. Only ask short clarifying questions for gaps that are truly missing from the extracted text.`;
+INSTRUCTION: This is ONLY Step 1 of 3 (Extract & Analyze). Your job:
+1) Extract scheme structure from the uploaded proposal (text + any image/table extracts)
+2) Assess against the 6 Fundamental Axes / best practices
+3) Note strengths and gaps briefly
+
+Do NOT run a full compliance checklist (Step 2) and do NOT write the final assessment report (Step 3). Stop when extract + axes assessment is done.
+Do NOT ask the user to re-provide information already in the document. Only ask short numbered clarifying questions for gaps that are truly missing.`;
         } else if (workflowContext.length > 0) {
           const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
-          const briefingSystem = withUserSettings(`${topic.orchestrator.role}\n${getWorkflowRuntime().orchestratorBriefingPrompt}`);
+          const briefingSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.briefingPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt}`);
           const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nUploaded proposal excerpt (still available):\n${String(focusedContext).slice(0, 6000)}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing. Remind the agent to use the uploaded proposal facts — do not invent missing scheme details.`;
           taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 400);
         }
@@ -1963,7 +2160,7 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
         }
       } else if (workflowContext.length > 0) {
         const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
-        const briefingSystem = withUserSettings(`${topic.orchestrator.role}\n${getWorkflowRuntime().orchestratorBriefingPrompt}`);
+        const briefingSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.briefingPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt}`);
         const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing.`;
         taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 300);
       }
@@ -1975,7 +2172,7 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
       const handoffMatches = [...agentResponse.matchAll(/REQUIRES_HANDOFF:\s*(\S+)\s*-\s*(.+)/gi)];
       const agentHandoffs = handoffMatches.map(m => ({ agentId: m[1], task: m[2] }));
       logActivity('orchestrator', `Evaluating Step ${stepIndex + 1}`);
-      const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext);
+      const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext, stepIndex);
 
       if (evaluation.agentStillWorking) {
         setOrchestratorDecision(null);
@@ -2004,23 +2201,8 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
           handoffOutputs.push({ agent: handoffAgent.name, output: handoffResponse.substring(0, 500) });
         }
       }
-      const updatedContext = [...workflowContext, { step: `Step ${step.step}: ${step.name}`, agent: agent.name, output: agentResponse.substring(0, 800), handoffs: handoffOutputs }];
-      if (evaluation.workflowComplete) {
-        if (evaluation.orchestratorMessage) setMessages(prev => [...prev, { role: 'orchestrator', content: evaluation.orchestratorMessage }]);
-        await wrapUpWorkflow(topic, updatedContext);
-        return;
-      }
-      logActivity('orchestrator', `Step ${stepIndex + 1} awaiting user decision`);
-      postOrchestratorDecision(evaluation, topic, stepIndex, updatedContext, userMessage);
-      setCurrentWorkflow(prev => prev ? {
-        ...prev,
-        currentStep: stepIndex,
-        context: updatedContext,
-        waitingForUser: true,
-        awaitingAgentReply: false,
-        stepMessages: initialStepMessages,
-      } : null);
-      setIsLoading(false);
+      const updatedContext = [...workflowContext, { step: `Step ${step.step}: ${step.name}`, agent: agent.name, output: agentResponse.substring(0, 12000), handoffs: handoffOutputs }];
+      await finishWorkflowStep(evaluation, topic, stepIndex, updatedContext, userMessage, initialStepMessages);
     } catch (err) {
       setMessages(prev => [...prev, { role: 'system', content: `⚠️ Orchestrator error: ${err.message}` }]);
       setIsLoading(false);
@@ -2043,14 +2225,39 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
     setIsLoading(true);
     setMessages((prev) => [...prev, {
       role: 'system',
-      content: `📎 Processing **${file.name}** (${(file.size / 1024).toFixed(1)} KB) — extracting text and saving to cloud…`,
+      content: `📎 Processing **${file.name}** (${(file.size / 1024).toFixed(1)} KB) — extracting text, images, and saving to cloud…`,
     }]);
 
     try {
       const extractedRaw = await extractProposalText(file);
       const extractedText = String(extractedRaw || '').trim();
-      if (!extractedText || extractedText.length < 40) {
-        throw new Error('Could not extract usable text from this file. Try a text-based PDF or .pptx (not a scanned image-only deck).');
+
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: '🖼️ Reading embedded images / page visuals (payout tables, charts, screenshots)…',
+      }]);
+
+      let visionText = '';
+      let imageCount = 0;
+      try {
+        const images = await extractProposalImages(file, { textLength: extractedText.length });
+        imageCount = images.length;
+        if (images.length) {
+          visionText = await interpretProposalImages(
+            images,
+            withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
+          );
+        }
+      } catch (visionErr) {
+        console.warn('Proposal image interpretation failed:', visionErr);
+        setMessages((prev) => [...prev, {
+          role: 'system',
+          content: `⚠️ Image reading skipped: ${visionErr.message || 'vision failed'}. Continuing with text extract.`,
+        }]);
+      }
+
+      if ((!extractedText || extractedText.length < 40) && !visionText) {
+        throw new Error('Could not extract usable text or image content. Try a text-based PDF/.pptx, or ensure tables/charts are visible in the file.');
       }
 
       const storagePath = userProposalRemotePath(currentUser.id, file.name);
@@ -2059,17 +2266,24 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
         .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
       if (uploadError) throw new Error(uploadError.message || 'Cloud upload failed');
 
-      // Persist extracted text next to the original for reuse / debugging
+      // Persist extracts next to the original for reuse / debugging
       try {
-        const textBlob = new Blob([extractedText], { type: 'text/plain' });
+        const combinedPersist = [
+          extractedText && `=== DOCUMENT TEXT ===\n${extractedText}`,
+          visionText && `=== IMAGE / VISION EXTRACT ===\n${visionText}`,
+        ].filter(Boolean).join('\n\n');
+        const textBlob = new Blob([combinedPersist || extractedText], { type: 'text/plain' });
         await supabase.storage
           .from('intelligence')
           .upload(`${storagePath}.extracted.txt`, textBlob, { upsert: true, contentType: 'text/plain' });
       } catch { /* non-fatal */ }
 
-      const capped = extractedText.length > 90000
-        ? `${extractedText.slice(0, 90000)}\n\n[… truncated for model context …]`
+      const cappedText = extractedText.length > 70000
+        ? `${extractedText.slice(0, 70000)}\n\n[… truncated for model context …]`
         : extractedText;
+      const cappedVision = visionText.length > 40000
+        ? `${visionText.slice(0, 40000)}\n\n[… vision extract truncated …]`
+        : visionText;
 
       const proposalMeta = {
         name: file.name,
@@ -2077,7 +2291,9 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
         fileType,
         storagePath,
         storageBucket: 'intelligence',
-        extractedText: capped,
+        extractedText: cappedText,
+        visionExtract: cappedVision || null,
+        imageCount,
         uploadedAt: new Date().toISOString(),
       };
       setUploadedFile(proposalMeta);
@@ -2087,20 +2303,26 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
         `File: ${file.name}`,
         `Type: ${fileType}`,
         `Stored at: intelligence/${storagePath}`,
+        imageCount ? `Images interpreted: ${imageCount}` : null,
         '',
-        'EXTRACTED DOCUMENT TEXT:',
-        capped,
-      ].join('\n');
+        cappedText ? 'EXTRACTED DOCUMENT TEXT:\n' + cappedText : 'EXTRACTED DOCUMENT TEXT: (little or no text layer — rely on image extract below)',
+        cappedVision ? `\n\nEXTRACTED FROM IMAGES (tables, charts, pasted Excel, screenshots):\n${cappedVision}` : '',
+      ].filter((line) => line != null).join('\n');
+
+      const bits = [
+        `${Math.round((cappedText.length + cappedVision.length) / 1000)}k chars`,
+        imageCount ? `${imageCount} image${imageCount === 1 ? '' : 's'} read` : null,
+      ].filter(Boolean).join(', ');
 
       setMessages((prev) => [...prev, {
         role: 'system',
-        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${Math.round(capped.length / 1000)}k chars extracted).\n\nStarting **Analyze Existing IC** with this document as context…`,
+        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${bits}).\n\nStarting **Analyze Existing IC** with this document as context…`,
       }]);
       setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
 
       await launchWorkflowDirect(
         'analyze_ic',
-        'Assess my IC using the uploaded proposal document provided in context. Extract the scheme from that document — do not ask the user to restate details already present in the text.',
+        'Assess my IC using the uploaded proposal document provided in context. Extract the scheme from that document text AND any image/table extracts — do not ask the user to restate details already present.',
         focusedContext,
       );
     } catch (err) {
@@ -3085,10 +3307,14 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
     if (pptxClarifyPending) return getPptxClarify().options;
+    // While an agent is waiting for answers, surface numbered clarifying questions as reply chips
+    if (currentWorkflow?.awaitingAgentReply) {
+      const last = [...messages].reverse().find((m) => m.role === 'assistant');
+      return last?.content ? extractChoiceOptions(last.content) : null;
+    }
     if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
     const last = [...messages].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
     if (!last?.content) return null;
-    // Prefer explicit numbered 1–3 options in the latest prompt
     return extractChoiceOptions(last.content);
   }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision]);
 
@@ -3752,14 +3978,27 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
 
                 {choiceButtons && choiceButtons.length > 0 && !isLoading && !pptxGenerating && (
                   <div className="mb-3">
-                    <div className="text-xs text-blue-300/70 mb-2">Choose an option (or type your own):</div>
+                    <div className="text-xs text-blue-300/70 mb-2">
+                      {currentWorkflow?.awaitingAgentReply
+                        ? 'Numbered questions from the agent — click to prefill your reply:'
+                        : 'Choose an option (or type your own):'}
+                    </div>
                     <div className="flex flex-wrap gap-2">
                       {choiceButtons.map((opt) => (
                         <button
                           key={opt.value}
                           type="button"
-                          onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); handleSubmit(e, opt.value); }}
-                          className="px-3 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/35 hover:border-cyan-400/55 rounded-lg text-xs text-cyan-100 font-semibold transition-all hover:scale-105 active:scale-95"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            setSuggestedPrompts([]);
+                            if (currentWorkflow?.awaitingAgentReply) {
+                              const template = choiceButtons.map((o) => `${o.value}: `).join('\n');
+                              setInput(template);
+                              return;
+                            }
+                            handleSubmit(e, opt.value);
+                          }}
+                          className="px-3 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/35 hover:border-cyan-400/55 rounded-lg text-xs text-cyan-100 font-semibold transition-all hover:scale-105 active:scale-95 text-left max-w-full"
                         >
                           {opt.label}
                         </button>
@@ -4047,7 +4286,7 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                     <div className="w-10 h-10 bg-white/15 rounded-lg flex items-center justify-center"><UserCog className="w-5 h-5" /></div>
                     <div>
                       <h2 className="text-xl font-bold">User Settings</h2>
-                      <p className="text-blue-100 text-xs sm:text-sm">Preferences and context the AI must respect across Consultation, agents, and Stella.</p>
+                      <p className="text-blue-100 text-xs sm:text-sm">Your preferences and IC context — applied across Consultation and specialist agents.</p>
                     </div>
                   </div>
                   <div className="text-right text-xs text-blue-100/80">
@@ -4248,40 +4487,6 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                   <input ref={pptxTemplateInputRef} type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={handlePptxTemplateUpload} className="hidden" />
                 </div>
 
-                <div className="mt-8 pt-6 border-t border-blue-400/15">
-                  <h3 className="text-sm font-bold text-white mb-1">PowerPoint context</h3>
-                  <p className="text-xs text-blue-300/60 mb-4">
-                    Guidance used when offering and generating PowerPoint exports. Saved in your settings JSON with everything else — not hardcoded in the app.
-                  </p>
-                  {[
-                    ['intentDetection', 'Offer detection (after chat)', 'When to offer an export after a conversation.'],
-                    ['messageClassify', 'Message classify (export vs assess)', 'Routes a typed user message: export / assessment / neither.'],
-                    ['summary', 'Session summary', 'System prompt for conversation-summary decks.'],
-                    ['produced', 'Produced document', 'System prompt for working documents / IC packs.'],
-                  ].map(([key, title, desc]) => (
-                    <div key={key} className="mb-4">
-                      <label className="block text-xs text-blue-300/70 font-semibold mb-1">{title}</label>
-                      <p className="text-[11px] text-blue-300/45 mb-2">{desc}</p>
-                      <textarea
-                        value={userSettings.pptxContext?.[key] ?? ''}
-                        onChange={(e) => setUserSettings(prev => ({
-                          ...prev,
-                          pptxContext: { ...mergePptxContext(prev.pptxContext), [key]: e.target.value },
-                        }))}
-                        rows={key === 'intentDetection' || key === 'messageClassify' ? 8 : 10}
-                        className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-xs font-mono outline-none focus:border-blue-400 resize-y"
-                      />
-                    </div>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={() => setUserSettings(prev => ({ ...prev, pptxContext: { ...DEFAULT_PPTX_CONTEXT } }))}
-                    className="text-xs text-blue-300/70 hover:text-blue-200 underline underline-offset-2"
-                  >
-                    Restore factory PowerPoint context
-                  </button>
-                </div>
-
                 <div className="flex flex-wrap items-center gap-3 mt-6">
                   <button
                     onClick={() => saveUserSettings(userSettings)}
@@ -4413,7 +4618,12 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                             setTopics(next);
                             await persistIntelligenceSettings({ topics: next });
                           }} className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${topic.status === 'active' ? 'bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-400 border border-yellow-400/30' : 'bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-400/30'}`}>{topic.status === 'active' ? 'Disable' : 'Enable'}</button>
-                          <button onClick={() => { setEditingTopic({...topic}); setExpandedSteps({}); }} className="flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 border border-cyan-400/30">Edit</button>
+                          <button onClick={() => {
+                            const hydrated = mergeTopics([topic])[0];
+                            setEditingTopic(hydrated);
+                            setEditingTopicTab('orchestrator');
+                            setExpandedSteps({});
+                          }} className="flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 border border-cyan-400/30">Edit</button>
                         </div>
                       </div>
                     ))}
@@ -4439,7 +4649,7 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                   <div>
                     <h3 className="text-lg font-bold text-white">PowerPoint context</h3>
                     <p className="text-xs text-blue-300/55 mt-1">
-                      Same fields as User Settings → PowerPoint context. Saved to this user’s settings JSON (local + Supabase).
+                      Export prompts and clarify copy for IC consultation. Template upload stays in User Settings. Saved to settings JSON.
                     </p>
                   </div>
                   {[['intentDetection', 'Offer Detection (after chat)', 'Decides when to offer a PowerPoint export.'], ['messageClassify', 'Message Classify (export vs assess)', 'Routes typed messages: export, assessment, or neither.'], ['summary', 'Session Summary', 'Used when generating a summary deck.'], ['produced', 'Produced Document', 'Used when generating a working document.']].map(([key, title, desc]) => (
@@ -4457,10 +4667,27 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                       />
                     </div>
                   ))}
+                  <div className="bg-slate-800/40 border border-blue-400/20 rounded-xl p-4">
+                    <div className="text-sm font-semibold text-white mb-1">PPT clarify prompt</div>
+                    <p className="text-xs text-blue-300/50 mb-3">Shown when the user wants an export but has not chosen summary / one-pager / full pack.</p>
+                    <textarea
+                      value={userSettings.pptxClarify?.prompt ?? ''}
+                      onChange={(e) => setUserSettings(prev => ({
+                        ...prev,
+                        pptxClarify: { ...(prev.pptxClarify || {}), prompt: e.target.value },
+                      }))}
+                      rows={8}
+                      className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-blue-400/20 focus:border-blue-400/50 focus:outline-none font-mono resize-y"
+                    />
+                  </div>
                   <div className="flex flex-wrap gap-3">
                     <button
                       type="button"
-                      onClick={() => saveUserSettings(userSettings)}
+                      onClick={() => saveUserSettings({
+                        ...userSettings,
+                        pptxContext: userSettings.pptxContext,
+                        pptxClarify: userSettings.pptxClarify,
+                      })}
                       disabled={userSettingsSaveStatus === 'saving'}
                       className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 text-white font-semibold rounded-lg transition-all flex items-center gap-2"
                     >
@@ -4468,7 +4695,11 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                     </button>
                     <button
                       type="button"
-                      onClick={() => setUserSettings(prev => ({ ...prev, pptxContext: { ...DEFAULT_PPTX_CONTEXT } }))}
+                      onClick={() => setUserSettings(prev => ({
+                        ...prev,
+                        pptxContext: { ...DEFAULT_PPTX_CONTEXT },
+                        pptxClarify: { ...DEFAULT_PPTX_CLARIFY, options: DEFAULT_PPTX_CLARIFY.options.map((o) => ({ ...o })) },
+                      }))}
                       className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg border border-slate-500/30"
                     >
                       Restore factory defaults
@@ -4521,25 +4752,18 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                 <div className="space-y-6">
                   <div>
                     <h3 className="text-lg font-bold text-white">Runtime prompts & copy</h3>
-                    <p className="text-xs text-blue-300/55 mt-1">Workflow wrappers, welcome messages, PPT clarify, and Stella prompts — all in settings JSON.</p>
+                    <p className="text-xs text-blue-300/55 mt-1">
+                      Incentive Comp shared glue — welcome, workflow match/offer, agent wrappers, proposal vision, PPT repair. Orchestrator prompts live on each workflow (Workflows → Edit).
+                    </p>
                   </div>
                   {[
                     ['welcomeMessages.consultation', 'Consultation welcome'],
-                    ['welcomeMessages.stella', 'Stella welcome'],
-                    ['pptxClarify.prompt', 'PPT clarify prompt'],
                     ['workflowRuntime.matchDetectorPrompt', 'Workflow match detector'],
                     ['workflowRuntime.offerTemplate', 'Workflow offer template'],
                     ['workflowRuntime.agentTaskWrapper', 'Agent task wrapper'],
                     ['workflowRuntime.handoffAddon', 'Handoff add-on'],
-                    ['workflowRuntime.orchestratorEvaluatePrompt', 'Orchestrator evaluate prompt'],
-                    ['workflowRuntime.orchestratorIntroFocused', 'Orchestrator intro (focused)'],
-                    ['workflowRuntime.orchestratorIntroFull', 'Orchestrator intro (full)'],
-                    ['workflowRuntime.orchestratorBriefingPrompt', 'Orchestrator briefing'],
-                    ['workflowRuntime.orchestratorWrapUpPrompt', 'Orchestrator wrap-up'],
+                    ['workflowRuntime.proposalImageInterpretPrompt', 'Proposal image / vision extract'],
                     ['workflowRuntime.pptxRepairPrompt', 'PPT JSON repair'],
-                    ['stellaPrompts.contentSummary', 'Stella content summary'],
-                    ['stellaPrompts.intake', 'Stella intake'],
-                    ['stellaPrompts.analyst', 'Stella analyst'],
                   ].map(([path, title]) => {
                     const [root, key] = path.split('.');
                     const value = userSettings?.[root]?.[key] ?? '';
@@ -4562,9 +4786,7 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                     type="button"
                     onClick={() => persistIntelligenceSettings({
                       welcomeMessages: userSettings.welcomeMessages,
-                      pptxClarify: userSettings.pptxClarify,
                       workflowRuntime: userSettings.workflowRuntime,
-                      stellaPrompts: userSettings.stellaPrompts,
                       suggestions: userSettings.suggestions,
                     })}
                     disabled={userSettingsSaveStatus === 'saving'}
@@ -4650,28 +4872,78 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
               )}
 
               {editingTopic && (
-                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-start justify-center z-50 p-4 overflow-y-auto">
-                  <div className="bg-slate-900 border border-blue-400/20 rounded-xl max-w-4xl w-full my-8">
-                    <div className="sticky top-0 bg-slate-900 border-b border-blue-400/20 p-6 flex items-center justify-between z-10 rounded-t-xl">
-                      <h2 className="text-xl font-bold">Edit Workflow: {editingTopic.name}</h2>
-                      <button onClick={() => setEditingTopic(null)} className="text-blue-300 hover:text-white transition-colors"><X className="w-6 h-6" /></button>
-                    </div>
-                    <div className="p-6 space-y-6">
-                      <div><label className="block text-sm font-semibold mb-2">Workflow Name</label><input type="text" value={editingTopic.name} onChange={(e) => setEditingTopic({...editingTopic, name: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
-                      <div><label className="block text-sm font-semibold mb-2">Description</label><textarea value={editingTopic.description} onChange={(e) => setEditingTopic({...editingTopic, description: e.target.value})} rows={3} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
-                      <div><label className="block text-sm font-semibold mb-2">Trigger Keywords (comma-separated)</label><input type="text" value={editingTopic.triggerKeywords?.join(', ') || ''} onChange={(e) => setEditingTopic({ ...editingTopic, triggerKeywords: e.target.value.split(',').map(k => k.trim()).filter(k => k) })} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm" /></div>
-                      <div className="border-t border-blue-400/20 pt-4 space-y-3">
-                        <h3 className="text-sm font-bold text-cyan-400">Orchestrator context</h3>
-                        <div><label className="text-xs text-blue-300/70 block mb-1">Role</label><textarea value={editingTopic.orchestrator?.role || ''} onChange={(e) => setEditingTopic({ ...editingTopic, orchestrator: { ...editingTopic.orchestrator, role: e.target.value } })} rows={2} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-3 py-2 text-white text-sm font-mono" /></div>
-                        <div><label className="text-xs text-blue-300/70 block mb-1">Goal</label><textarea value={editingTopic.orchestrator?.goal || ''} onChange={(e) => setEditingTopic({ ...editingTopic, orchestrator: { ...editingTopic.orchestrator, goal: e.target.value } })} rows={2} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-3 py-2 text-white text-sm font-mono" /></div>
-                        <div><label className="text-xs text-blue-300/70 block mb-1">Approach / rules</label><textarea value={editingTopic.orchestrator?.approach || ''} onChange={(e) => setEditingTopic({ ...editingTopic, orchestrator: { ...editingTopic.orchestrator, approach: e.target.value } })} rows={4} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-3 py-2 text-white text-sm font-mono" /></div>
+                <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-start justify-center z-[60] p-4 overflow-y-auto">
+                  <div className="bg-slate-900 border border-cyan-400/30 rounded-xl max-w-4xl w-full my-6 shadow-2xl shadow-cyan-500/10">
+                    <div className="sticky top-0 bg-slate-900 border-b border-blue-400/20 p-4 sm:p-5 z-10 rounded-t-xl space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <h2 className="text-xl font-bold">Edit Workflow: {editingTopic.name}</h2>
+                        <button type="button" onClick={() => { setEditingTopic(null); setEditingTopicTab('basics'); }} className="text-blue-300 hover:text-white transition-colors"><X className="w-6 h-6" /></button>
                       </div>
-                      <div className="border-t border-blue-400/20 pt-6">
-                        <div className="flex items-center justify-between mb-4">
-                          <h3 className="text-lg font-bold text-cyan-400">Workflow Steps</h3>
-                          <button onClick={() => { const newStep = { step: editingTopic.workflow.length + 1, name: 'New Step', agents: [], goal: '', successCriteria: '' }; setEditingTopic({ ...editingTopic, workflow: [...editingTopic.workflow, newStep] }); }} className="px-3 py-1.5 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-lg text-xs flex items-center gap-1 border border-green-400/30"><Plus className="w-3 h-3" />Add Step</button>
+                      <div className="flex gap-2 overflow-x-auto">
+                        {[['basics', 'Basics'], ['orchestrator', 'Orchestrator'], ['steps', 'Steps']].map(([id, label]) => (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => setEditingTopicTab(id)}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap transition-all ${editingTopicTab === id ? 'bg-gradient-to-r from-cyan-500 to-blue-500 text-white' : 'bg-slate-800 text-blue-300 hover:bg-slate-700'}`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="p-5 sm:p-6 space-y-5 max-h-[70vh] overflow-y-auto">
+                      {editingTopicTab === 'basics' && (
+                        <>
+                          <div><label className="block text-sm font-semibold mb-2">Workflow Name</label><input type="text" value={editingTopic.name} onChange={(e) => setEditingTopic({...editingTopic, name: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
+                          <div><label className="block text-sm font-semibold mb-2">Description</label><textarea value={editingTopic.description} onChange={(e) => setEditingTopic({...editingTopic, description: e.target.value})} rows={3} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
+                          <div><label className="block text-sm font-semibold mb-2">Trigger Keywords (comma-separated)</label><input type="text" value={editingTopic.triggerKeywords?.join(', ') || ''} onChange={(e) => setEditingTopic({ ...editingTopic, triggerKeywords: e.target.value.split(',').map(k => k.trim()).filter(k => k) })} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm" /></div>
+                          <label className="flex items-center gap-2 text-sm text-blue-100 cursor-pointer">
+                            <input type="checkbox" checked={!!editingTopic.autoAdvance} onChange={(e) => setEditingTopic({ ...editingTopic, autoAdvance: e.target.checked })} className="rounded border-blue-400/40" />
+                            Auto-advance between steps (no Continue click required)
+                          </label>
+                        </>
+                      )}
+
+                      {editingTopicTab === 'orchestrator' && (
+                        <div className="space-y-4">
+                          <p className="text-xs text-cyan-200/70 bg-cyan-500/10 border border-cyan-400/20 rounded-lg p-3">
+                            Orchestrator prompts for <strong>this workflow only</strong> (role, rules, intro, briefing, evaluate, wrap-up). These are not in Runtime.
+                          </p>
+                          {[
+                            ['role', 'Role', 2],
+                            ['goal', 'Goal', 2],
+                            ['approach', 'Approach / rules', 5],
+                            ['introFull', 'Intro (full workflow)', 3],
+                            ['introFocused', 'Intro (focused / pre-selected)', 2],
+                            ['briefingPrompt', 'Step briefing prompt', 3],
+                            ['evaluatePrompt', 'Step evaluate prompt (JSON decision)', 10],
+                            ['wrapUpPrompt', 'Wrap-up prompt', 3],
+                            ['evalFallbackMessage', 'Fallback message when evaluate fails', 2],
+                          ].map(([key, label, rows]) => (
+                            <div key={key}>
+                              <label className="text-xs text-blue-300/70 block mb-1 font-semibold">{label}</label>
+                              <textarea
+                                value={editingTopic.orchestrator?.[key] || ''}
+                                onChange={(e) => setEditingTopic({
+                                  ...editingTopic,
+                                  orchestrator: { ...(editingTopic.orchestrator || {}), [key]: e.target.value },
+                                })}
+                                rows={rows}
+                                className="w-full bg-slate-800 border border-cyan-400/25 rounded-lg px-3 py-2 text-white text-sm font-mono"
+                              />
+                            </div>
+                          ))}
                         </div>
+                      )}
+
+                      {editingTopicTab === 'steps' && (
                         <div className="space-y-3">
+                          <div className="flex items-center justify-between mb-2">
+                            <h3 className="text-sm font-bold text-cyan-400">Workflow Steps</h3>
+                            <button type="button" onClick={() => { const newStep = { step: (editingTopic.workflow?.length || 0) + 1, name: 'New Step', agents: [], goal: '', successCriteria: '' }; setEditingTopic({ ...editingTopic, workflow: [...(editingTopic.workflow || []), newStep] }); }} className="px-3 py-1.5 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-lg text-xs flex items-center gap-1 border border-green-400/30"><Plus className="w-3 h-3" />Add Step</button>
+                          </div>
                           {editingTopic.workflow?.map((step, index) => {
                             const stepKey = `${editingTopic.id}-${index}`;
                             const isExpanded = expandedSteps[stepKey] || false;
@@ -4679,10 +4951,10 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                               <div key={index} className="bg-slate-800 border border-blue-400/20 rounded-lg">
                                 <div className="p-4">
                                   <div className="flex items-center gap-3">
-                                    <button onClick={() => setExpandedSteps({...expandedSteps, [stepKey]: !isExpanded})} className="w-8 h-8 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center flex-shrink-0 hover:bg-blue-500/30 transition-colors">{isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}</button>
+                                    <button type="button" onClick={() => setExpandedSteps({...expandedSteps, [stepKey]: !isExpanded})} className="w-8 h-8 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center flex-shrink-0 hover:bg-blue-500/30 transition-colors">{isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}</button>
                                     <span className="w-8 h-8 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center font-bold text-sm flex-shrink-0">{step.step}</span>
                                     <div className="flex-1"><div className="text-white font-medium">{step.name}</div></div>
-                                    <button onClick={() => { const newWorkflow = editingTopic.workflow.filter((_, i) => i !== index); newWorkflow.forEach((s, i) => s.step = i + 1); setEditingTopic({ ...editingTopic, workflow: newWorkflow }); }} className="p-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded transition-colors"><Trash2 className="w-4 h-4" /></button>
+                                    <button type="button" onClick={() => { const newWorkflow = editingTopic.workflow.filter((_, i) => i !== index); newWorkflow.forEach((s, i) => s.step = i + 1); setEditingTopic({ ...editingTopic, workflow: newWorkflow }); }} className="p-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded transition-colors"><Trash2 className="w-4 h-4" /></button>
                                   </div>
                                 </div>
                                 {isExpanded && (
@@ -4697,16 +4969,18 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
                             );
                           })}
                         </div>
-                      </div>
+                      )}
                     </div>
-                    <div className="border-t border-blue-400/20 p-6 flex gap-3 bg-slate-900 rounded-b-xl">
-                      <button onClick={async () => {
+
+                    <div className="border-t border-blue-400/20 p-4 sm:p-5 flex gap-3 bg-slate-900 rounded-b-xl">
+                      <button type="button" onClick={async () => {
                         const next = topics.map(t => t.id === editingTopic.id ? editingTopic : t);
                         setTopics(next);
                         setEditingTopic(null);
+                        setEditingTopicTab('basics');
                         await persistIntelligenceSettings({ topics: next });
                       }} className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5" />Save Changes</button>
-                      <button onClick={() => setEditingTopic(null)} className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors">Cancel</button>
+                      <button type="button" onClick={() => { setEditingTopic(null); setEditingTopicTab('basics'); }} className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors">Cancel</button>
                     </div>
                   </div>
                 </div>
@@ -4723,13 +4997,60 @@ INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract 
               {adminModule === 'stella' && (
                 <div className="space-y-4">
                   <div className="flex gap-2 border-b border-blue-400/20 pb-3 overflow-x-auto">
-                    {[{ id: 'data', label: 'Data' }, { id: 'business', label: 'Business Context' }, { id: 'connections', label: 'Connections' }].map(tab => (
+                    {[{ id: 'data', label: 'Data' }, { id: 'business', label: 'Business Context' }, { id: 'connections', label: 'Connections' }, { id: 'prompts', label: 'Prompts' }].map(tab => (
                       <button key={tab.id} onClick={() => setStellaTab(tab.id)} className={`px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap transition-all ${stellaTab === tab.id ? 'bg-gradient-to-r from-blue-500 to-cyan-500 text-white' : 'bg-slate-700/30 text-blue-300 hover:bg-slate-700/50'}`}>{tab.label}</button>
                     ))}
                   </div>
                   {(stellaTab === 'data' || stellaTab === 'chat') && renderStellaDataPanel()}
                   {stellaTab === 'business' && renderStellaBusinessPanel()}
                   {stellaTab === 'connections' && renderStellaConnectionsPanel()}
+                  {stellaTab === 'prompts' && (
+                    <div className="space-y-6">
+                      <div>
+                        <h3 className="text-lg font-bold text-white">Stella prompts</h3>
+                        <p className="text-xs text-blue-300/55 mt-1">
+                          Welcome message and AI prompts for data intake / analysis. Stored in settings JSON — separate from Incentive Comp runtime.
+                        </p>
+                      </div>
+                      {[
+                        ['welcomeMessages.stella', 'Welcome message'],
+                        ['stellaPrompts.contentSummary', 'Content summary'],
+                        ['stellaPrompts.intake', 'Intake'],
+                        ['stellaPrompts.analyst', 'Analyst'],
+                      ].map(([path, title]) => {
+                        const [root, key] = path.split('.');
+                        const value = userSettings?.[root]?.[key] ?? '';
+                        return (
+                          <div key={path} className="bg-slate-800/40 border border-cyan-400/20 rounded-xl p-4">
+                            <div className="text-sm font-semibold text-white mb-2">{title}</div>
+                            <textarea
+                              value={value}
+                              onChange={(e) => setUserSettings(prev => ({
+                                ...prev,
+                                [root]: { ...(prev[root] || {}), [key]: e.target.value },
+                              }))}
+                              rows={8}
+                              className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-cyan-400/20 focus:border-cyan-400/50 focus:outline-none font-mono resize-y"
+                            />
+                          </div>
+                        );
+                      })}
+                      <button
+                        type="button"
+                        onClick={() => persistIntelligenceSettings({
+                          welcomeMessages: userSettings.welcomeMessages,
+                          stellaPrompts: userSettings.stellaPrompts,
+                        })}
+                        disabled={userSettingsSaveStatus === 'saving'}
+                        className="px-5 py-2.5 bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
+                      >
+                        <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save Stella prompts'}
+                      </button>
+                      {userSettingsSaveStatus === 'saved' && (
+                        <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved</span>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

@@ -45,36 +45,32 @@ Step {{stepNumber}}: {{stepName}}
 Goal: {{stepGoal}}
 Success criteria: {{successCriteria}}
 
-If you still need information from the user, ask clear questions and wait — do not claim the step is finished.
+If you still need information from the user, ask clarifying questions and wait — do not claim the step is finished.
+
+CLARIFYING QUESTIONS (mandatory formatting):
+- Put every question the user must answer in a clearly numbered list: 1. 2. 3. …
+- One question per number. Do not bury questions inside paragraphs.
+- Prefer a short intro sentence, then the numbered list, then stop and wait.
+- Ask only what is still missing; do not re-ask facts already provided in the conversation or uploaded documents.
+- Numbering must stay stable so the user can reply "1: … 2: …" or answer by number.
+
 Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`,
-  handoffAddon: 'You have been assigned a specific sub-task by the workflow orchestrator.',
-  orchestratorEvaluatePrompt: `Respond in JSON only:
-{
-  "agentStillWorking": true/false,
-  "stepComplete": true/false,
-  "reason": "brief internal reason",
-  "rerouteToStep": null,
-  "rerouteBriefing": "",
-  "handoffs": [],
-  "buttons": [{ "label": "...", "action": "...", "requiresInput": false, "inputPrompt": "" }],
-  "orchestratorMessage": "",
-  "workflowComplete": false
-}
+  handoffAddon: `You have been assigned a specific sub-task by the workflow orchestrator.
 
-CRITICAL — waiting on the user:
-- If the agent asked the user any clarifying/open questions, or is clearly waiting for answers, set agentStillWorking=true, stepComplete=false, orchestratorMessage="", buttons=[].
-- Do NOT say the stage is finished and do NOT offer Continue/Proceed while questions are unanswered.
-- Only set agentStillWorking=false when the agent has produced a substantive deliverable for this step's success criteria AND is not asking the user for more input.
+If you ask the user clarifying questions, number them clearly as 1. 2. 3. … (one question per number) so answers are easy to map.`,
+  proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, or pasted Excel tables shown as pictures).
 
-If agentStillWorking is true, set orchestratorMessage to "" and buttons to [].
-When agentStillWorking is false, write orchestratorMessage and 2-4 buttons.
-Button "action" values MUST be exactly one of: "proceed", "refine", "redesign", "override" (never "continue", "next", or free text).
-Include at least one proceed button and one refine button.`,
-  orchestratorIntroFocused: 'The user has already selected a specific territory. Keep your introduction to 1 sentence. Do NOT list workflow steps — they are appended separately.',
-  orchestratorIntroFull: 'Introduce yourself briefly (1-2 sentences) and state the overall goal. Do NOT list the workflow steps yourself — they are appended separately from the plan. Keep it short.',
-  orchestratorBriefingPrompt: 'Prepare a focused task briefing for the next specialist agent. Be specific and concise (3-5 sentences max).',
-  orchestratorWrapUpPrompt: 'The workflow is now complete. Write a brief, warm closing summary (3-5 sentences) covering what was accomplished.',
-  orchestratorEvalFallbackMessage: 'The agent has completed its work. How would you like to proceed?',
+Extract ALL readable scheme information into clear structured markdown:
+- Tables (reproduce as markdown tables with headers/rows)
+- Payout curves / thresholds / accelerators
+- Component names, weights, metrics, eligibility, caps, gates
+- Any labels, footnotes, or caveats visible in the image
+
+Rules:
+- Be faithful to what is visible — do not invent numbers.
+- If a cell is unreadable, write [unclear].
+- If multiple images, label each as Image 1, Image 2, …
+- Return ONLY the extracted content (no preamble about being an AI).`,
   pptxRepairPrompt: 'Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.',
 };
 
