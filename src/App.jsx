@@ -2749,8 +2749,20 @@ ${topic.autoAdvance
   : 'Only ask short numbered clarifying questions for gaps that are truly missing from the extracted text (user will reply 1 = … 2 = …).'}`;
         } else if (workflowContext.length > 0) {
           const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
+          const proposalBundle = String(focusedContext || '');
+          const textPart = proposalBundle.match(/EXTRACTED DOCUMENT \/ SLIDE TEXT:[\s\S]*?(?=\n\nEXTRACTED FROM |\s*$)/)?.[0]
+            || proposalBundle.slice(0, 12000);
+          const visionPart = proposalBundle.match(/EXTRACTED FROM SCHEME IMAGES[\s\S]*$/)?.[0]
+            || proposalBundle.match(/EXTRACTED FROM NATIVE CHARTS[\s\S]*$/)?.[0]
+            || '';
+          const structuredPart = proposalBundle.match(/EXTRACTED FROM NATIVE CHARTS \/ EMBEDDED SPREADSHEETS[\s\S]*?(?=\n\nEXTRACTED FROM SCHEME IMAGES|\s*$)/)?.[0] || '';
+          const proposalExcerpt = [
+            textPart.slice(0, 14000),
+            structuredPart.slice(0, 8000),
+            visionPart.slice(0, 14000),
+          ].filter(Boolean).join('\n\n');
           const briefingSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.briefingPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt}`);
-          const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nUploaded proposal excerpt (still available):\n${String(focusedContext).slice(0, 6000)}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing. Remind the agent to use the uploaded proposal facts — do not invent missing scheme details.`;
+          const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nUploaded proposal (slide text + scheme image/chart extracts — use BOTH):\n${proposalExcerpt}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing. Remind the agent to use BOTH slide text and image/chart extracts — do not invent missing scheme details.`;
           taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 400);
         }
       } else if (isTerritoryWorkflow && isStructureStep && territoryStructures.length > 0) {
