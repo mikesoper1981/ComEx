@@ -28,13 +28,13 @@ Each suggestion is sent verbatim as the user's next message — so it must read 
 
 Rules (mandatory):
 - Write in first person as the user (I / we / my / our), or as a clear user instruction/decision.
-- Ground every suggestion in the recent conversation — reference the actual scheme, products, open questions, or next step being discussed.
+- Ground every suggestion in the recent conversation — reference the actual scheme, products, or next step being discussed.
 - Do NOT write assistant-style clarifying questions (bad: "What is your IC budget?", "How many reps do you have?").
-- DO write actionable user replies that advance the work (good: "Set the IC budget at £2.5m", "Use 40/30/30 weightings for sales/access/KAM", "Approve this design and move to compliance", "Export a one-pager of this scheme").
-- If a value is unknown, use a clear placeholder the user can edit mentally, e.g. "Update the IC budget to [amount]" — still as a user statement, not a question to the AI.
+- CRITICAL — if the assistant just asked numbered clarifying questions (1. 2. 3. …), return an EMPTY JSON array []. Never invent answers, never write "1 = …", never guess missing facts.
+- Suggested prompts only help move the conversation forward when facts are already known (good: "Approve this design and move to compliance", "Export a one-pager of this scheme").
 - No hardcoded generic IC trivia. No duplicates. Max 12 words each when possible.
-- Respond ONLY with a JSON array of strings, length {{n}}.`,
-  userPromptTemplate: `Recent conversation:\n{{recent}}\n\nReturn {{n}} user-next-message suggestions as a JSON array.`,
+- Respond ONLY with a JSON array of strings, length {{n}} (or [] when clarifying questions are pending).`,
+  userPromptTemplate: `Recent conversation:\n{{recent}}\n\nIf the assistant asked numbered clarifying questions, return []. Otherwise return {{n}} user-next-message suggestions as a JSON array.`,
 };
 
 export const DEFAULT_WORKFLOW_RUNTIME = {
@@ -52,12 +52,13 @@ CLARIFYING QUESTIONS (mandatory formatting):
 - One question per number. Do not bury questions inside paragraphs.
 - Prefer a short intro sentence, then the numbered list, then stop and wait.
 - Ask only what is still missing; do not re-ask facts already provided in the conversation or uploaded documents.
-- Numbering must stay stable so the user can reply "1: … 2: …" or answer by number.
+- Tell the user they can reply as 1 = … 2 = … (do not invent their answers).
+- Numbering must stay stable so answers map clearly.
 
 Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your response.`,
   handoffAddon: `You have been assigned a specific sub-task by the workflow orchestrator.
 
-If you ask the user clarifying questions, number them clearly as 1. 2. 3. … (one question per number) so answers are easy to map.`,
+If you ask the user clarifying questions, number them clearly as 1. 2. 3. … (one question per number) so they can reply 1 = … 2 = …. Do not invent answers.`,
   proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, or pasted Excel tables shown as pictures).
 
 Extract ALL readable scheme information into clear structured markdown:

@@ -43,6 +43,6 @@ Always use rich formatting to make responses visually engaging:
 CLARIFYING QUESTIONS (mandatory when you need user input):
 - Number every question the user must answer as 1. 2. 3. … (one question per number)
 - Do not bury questions inside long paragraphs — use a short intro, then the numbered list, then wait
-- Prefer replies the user can answer as "1: … 2: …"
+- Tell the user they can reply as 1 = … 2 = … — never invent their answers
 
 Format responses conversationally and practically.`;

@@ -285,7 +285,7 @@ function ensureIcOnePagerSlide(slideData, { force = false } = {}) {
   return { ...slideData, slides };
 }
 
-/** Detect numbered 1–9 choices in an assistant prompt so we can show clickable buttons. */
+/** Detect numbered 1–9 closed choices (not open clarifying questions). */
 function extractChoiceOptions(text) {
   if (!text) return null;
   const opts = [];
@@ -295,13 +295,21 @@ function extractChoiceOptions(text) {
     if (!m) continue;
     let label = m[2].replace(/\*\*/g, '').replace(/\s*—\s*.*$/, '').trim();
     if (label.length > 72) label = `${label.slice(0, 69)}…`;
-    opts.push({ value: m[1], label: `${m[1]}. ${label}` });
+    opts.push({ value: m[1], label: `${m[1]}. ${label}`, asks: /\?/.test(label) });
   }
-  // Deduplicate by value, keep order
   const seen = new Set();
   const unique = opts.filter((o) => (seen.has(o.value) ? false : (seen.add(o.value), true)));
-  if (unique.length >= 1 && unique.length <= 9) return unique;
-  return null;
+  if (unique.length < 1 || unique.length > 9) return null;
+  // Open clarifying questions (1. What is…?) are NOT clickable choices — user types 1 = …
+  if (unique.filter((o) => o.asks).length >= Math.ceil(unique.length / 2)) return null;
+  return unique.map(({ value, label }) => ({ value, label }));
+}
+
+/** True when the assistant asked numbered clarifying questions the user must answer themselves. */
+function hasNumberedClarifyingQuestions(text) {
+  if (!text) return false;
+  const numberedQs = [...String(text).matchAll(/(?:^|\n)\s*(?:\*\*)?([1-9])(?:\*\*)?\s*[.:)\]]\s+.+\?/gm)];
+  return numberedQs.length >= 1;
 }
 
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
@@ -1510,6 +1518,16 @@ export default function CommercialExcellenceApp() {
 
   const generateSuggestions = async (conversationHistory) => {
     if (!suggestionsEnabled || conversationHistory.length === 0) { setSuggestedPrompts([]); return; }
+    // Never invent answers while an agent is waiting on clarifying questions
+    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser) {
+      setSuggestedPrompts([]);
+      return;
+    }
+    const lastAssistant = [...conversationHistory].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator' || m.role === 'agent');
+    if (hasNumberedClarifyingQuestions(lastAssistant?.content)) {
+      setSuggestedPrompts([]);
+      return;
+    }
     try {
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
       const n = Math.min(Math.max(1, maxSuggestions), 5);
@@ -1531,7 +1549,9 @@ export default function CommercialExcellenceApp() {
             .map((p) => String(p || '').trim())
             .filter(Boolean)
             // Drop assistant-style interrogatives that slipped through
-            .filter((p) => !/^(what|how many|which|who|when|where|do you|can you|could you|please (tell|confirm|provide|share))\b/i.test(p));
+            .filter((p) => !/^(what|how many|which|who|when|where|do you|can you|could you|please (tell|confirm|provide|share))\b/i.test(p))
+            // Drop invented answers to numbered clarifying questions
+            .filter((p) => !/^\s*[1-9]\s*[=:).\-]/i.test(p));
           setSuggestedPrompts(cleaned.slice(0, n));
         }
       }
@@ -1940,6 +1960,7 @@ ${introInstr}`);
 
       if (evaluation.agentStillWorking) {
         setOrchestratorDecision(null);
+        setSuggestedPrompts([]);
         setCurrentWorkflow(prev => prev ? {
           ...prev,
           currentStep: stepIndex,
@@ -2176,6 +2197,7 @@ Do NOT ask the user to re-provide information already in the document. Only ask 
 
       if (evaluation.agentStillWorking) {
         setOrchestratorDecision(null);
+        setSuggestedPrompts([]);
         logActivity('orchestrator', `Step ${stepIndex + 1} waiting for user answers`);
         setCurrentWorkflow(prev => prev ? {
           ...prev,
@@ -3307,15 +3329,21 @@ Do NOT ask the user to re-provide information already in the document. Only ask 
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
     if (pptxClarifyPending) return getPptxClarify().options;
-    // While an agent is waiting for answers, surface numbered clarifying questions as reply chips
-    if (currentWorkflow?.awaitingAgentReply) {
-      const last = [...messages].reverse().find((m) => m.role === 'assistant');
-      return last?.content ? extractChoiceOptions(last.content) : null;
-    }
+    // While waiting on clarifying answers, never show chips — user types 1 = … 2 = …
+    if (currentWorkflow?.awaitingAgentReply) return null;
     if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
     const last = [...messages].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
     if (!last?.content) return null;
+    if (hasNumberedClarifyingQuestions(last.content)) return null;
     return extractChoiceOptions(last.content);
+  }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision]);
+
+  const clarifyingReplyHint = useMemo(() => {
+    if (isLoading || pptxGenerating) return false;
+    if (currentWorkflow?.awaitingAgentReply) return true;
+    if (currentWorkflow || pendingWorkflow || orchestratorDecision || pptxClarifyPending) return false;
+    const last = [...messages].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+    return hasNumberedClarifyingQuestions(last?.content);
   }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision]);
 
   const offerFromClassification = (classified) => {
@@ -3976,28 +4004,21 @@ Do NOT ask the user to re-provide information already in the document. Only ask 
                   </div>
                 )}
 
+                {clarifyingReplyHint && !isLoading && !pptxGenerating && (
+                  <div className="mb-3 text-xs text-blue-300/70 bg-slate-800/40 border border-blue-400/20 rounded-lg px-3 py-2">
+                    Reply with your answers by number, e.g. <span className="text-cyan-300 font-mono">1 = …</span>  <span className="text-cyan-300 font-mono">2 = …</span>
+                  </div>
+                )}
+
                 {choiceButtons && choiceButtons.length > 0 && !isLoading && !pptxGenerating && (
                   <div className="mb-3">
-                    <div className="text-xs text-blue-300/70 mb-2">
-                      {currentWorkflow?.awaitingAgentReply
-                        ? 'Numbered questions from the agent — click to prefill your reply:'
-                        : 'Choose an option (or type your own):'}
-                    </div>
+                    <div className="text-xs text-blue-300/70 mb-2">Choose an option (or type your own):</div>
                     <div className="flex flex-wrap gap-2">
                       {choiceButtons.map((opt) => (
                         <button
                           key={opt.value}
                           type="button"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            setSuggestedPrompts([]);
-                            if (currentWorkflow?.awaitingAgentReply) {
-                              const template = choiceButtons.map((o) => `${o.value}: `).join('\n');
-                              setInput(template);
-                              return;
-                            }
-                            handleSubmit(e, opt.value);
-                          }}
+                          onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); handleSubmit(e, opt.value); }}
                           className="px-3 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/35 hover:border-cyan-400/55 rounded-lg text-xs text-cyan-100 font-semibold transition-all hover:scale-105 active:scale-95 text-left max-w-full"
                         >
                           {opt.label}
@@ -4007,7 +4028,7 @@ Do NOT ask the user to re-provide information already in the document. Only ask 
                   </div>
                 )}
 
-                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !isLoading && !choiceButtons?.length && (
+                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
                   <div className="mb-3">
                     <div className="text-xs text-blue-300/70 mb-2 flex items-center gap-2"><span>💡 Suggested next steps:</span></div>
                     <div className="flex flex-wrap gap-2">
