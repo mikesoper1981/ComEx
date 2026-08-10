@@ -701,6 +701,7 @@ function purposeLabel(purpose) {
     stock_photo: 'Stock photo',
     icon: 'Icon',
     other: 'Other',
+    vector: 'Convert failed',
   };
   return map[purpose] || purpose || 'Unknown';
 }
@@ -782,9 +783,95 @@ async function extractPptxStructuredExtras(zip) {
   return { text: parts.join('\n\n').trim(), notes };
 }
 
+function dataUrlToProposalImage(dataUrl, name, { sourceFormat = null } = {}) {
+  const m = String(dataUrl || '').match(/^data:(image\/[a-z0-9+.-]+);base64,(.+)$/i);
+  if (!m) return null;
+  const mediaType = m[1].toLowerCase();
+  const base64 = m[2];
+  const bytes = Math.round(base64.length * 0.75);
+  // Decode a few header bytes for dimensions when possible
+  let dimensions = null;
+  try {
+    const head = Uint8Array.from(atob(base64.slice(0, 64)), (c) => c.charCodeAt(0));
+    dimensions = readRasterDimensions(head, mediaType);
+  } catch { /* ignore */ }
+  return {
+    name,
+    mediaType,
+    base64,
+    bytes,
+    dimensions,
+    sourceFormat,
+    convertedFrom: sourceFormat,
+  };
+}
+
+/** Rasterise SVG → PNG via browser Image + canvas (vision cannot ingest SVG). */
+async function convertSvgToPngDataUrl(svgTextOrBuf, { maxSide = 1600 } = {}) {
+  let svgText = typeof svgTextOrBuf === 'string'
+    ? svgTextOrBuf
+    : new TextDecoder('utf-8').decode(svgTextOrBuf);
+  if (!/<svg[\s>]/i.test(svgText)) return null;
+  if (!svgText.includes('xmlns')) {
+    svgText = svgText.replace(/<svg\b/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+  }
+  const blob = new Blob([svgText], { type: 'image/svg+xml;charset=utf-8' });
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('SVG decode failed'));
+      el.src = objectUrl;
+    });
+    let w = img.naturalWidth || img.width || 800;
+    let h = img.naturalHeight || img.height || 600;
+    if (!w || !h) { w = 800; h = 600; }
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/png');
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+/** Convert EMF/WMF/SVG media bytes to a PNG proposal image for vision. */
+async function convertVectorMediaToPng(path, buf) {
+  const name = path.split('/').pop();
+  const ext = name.split('.').pop().toLowerCase();
+  const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+
+  if (ext === 'svg') {
+    const dataUrl = await convertSvgToPngDataUrl(buf);
+    if (!dataUrl) return null;
+    return dataUrlToProposalImage(dataUrl, name, { sourceFormat: 'svg' });
+  }
+
+  if (ext === 'emf' || ext === 'wmf') {
+    const mod = await import('emf-converter');
+    const convert = ext === 'wmf'
+      ? (mod.convertWmfToDataUrl || mod.default?.convertWmfToDataUrl)
+      : (mod.convertEmfToDataUrl || mod.default?.convertEmfToDataUrl);
+    if (!convert) return null;
+    const dataUrl = await convert(ab, { maxWidth: 1600, maxHeight: 1600, dpiScale: 2 });
+    if (!dataUrl) return null;
+    return dataUrlToProposalImage(dataUrl, name, { sourceFormat: ext });
+  }
+
+  return null;
+}
+
 /**
  * Extract embedded images from a .pptx (pasted Excel tables, charts, screenshots).
  * Prefers the largest rasters (payment scales are usually big screenshots, not tiny icons).
+ * EMF/WMF/SVG are rasterised to PNG so vision can read them.
  * Also inventories skipped media so the chat can show what was NOT sent to vision.
  */
 async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes = 1200 } = {}) {
@@ -796,16 +883,6 @@ async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes 
   const otherPaths = mediaPaths.filter((n) => !vectorPaths.includes(n) && !rasterPaths.includes(n));
 
   const skipped = [];
-  for (const path of vectorPaths) {
-    const entry = zip.file(path);
-    const bytes = entry ? (await entry.async('uint8array')).byteLength : 0;
-    skipped.push({
-      name: path.split('/').pop(),
-      bytes,
-      reason: 'Vector (EMF/WMF/SVG) — vision API cannot read this format',
-      kind: 'vector',
-    });
-  }
   for (const path of otherPaths) {
     skipped.push({
       name: path.split('/').pop(),
@@ -839,20 +916,58 @@ async function extractPptxEmbeddedImages(fileOrBlob, { maxImages = 24, minBytes 
       dimensions: readRasterDimensions(buf, mediaType),
     });
   }
+
+  let vectorConverted = 0;
+  let vectorFailed = 0;
+  for (const path of vectorPaths) {
+    const entry = zip.file(path);
+    if (!entry) continue;
+    const buf = await entry.async('uint8array');
+    if (!buf) continue;
+    const name = path.split('/').pop();
+    try {
+      const converted = await convertVectorMediaToPng(path, buf);
+      if (converted && converted.base64) {
+        candidates.push(converted);
+        vectorConverted += 1;
+      } else {
+        vectorFailed += 1;
+        skipped.push({
+          name,
+          bytes: buf.byteLength,
+          reason: 'Could not rasterise EMF/WMF/SVG for vision',
+          kind: 'vector',
+        });
+      }
+    } catch (err) {
+      console.warn('Vector convert failed:', name, err);
+      vectorFailed += 1;
+      skipped.push({
+        name,
+        bytes: buf.byteLength,
+        reason: `Vector convert failed: ${err.message || 'error'}`,
+        kind: 'vector',
+      });
+    }
+  }
+
   candidates.sort((a, b) => b.bytes - a.bytes);
 
   const structured = await extractPptxStructuredExtras(zip);
 
   const notes = [...(structured.notes || [])];
-  if (vectorPaths.length) {
-    notes.push(`${vectorPaths.length} vector graphic(s) (EMF/WMF/SVG) cannot be vision-read — re-save as PDF or paste the scale as a PNG screenshot.`);
+  if (vectorConverted) {
+    notes.push(`Rasterised ${vectorConverted} EMF/WMF/SVG graphic(s) to PNG for vision.`);
   }
-  if (candidates.length === 0 && rasterPaths.length === 0 && mediaPaths.length === 0) {
+  if (vectorFailed) {
+    notes.push(`${vectorFailed} vector graphic(s) could not be converted — try exporting the slide as PDF.`);
+  }
+  if (candidates.length === 0 && rasterPaths.length === 0 && vectorPaths.length === 0 && mediaPaths.length === 0) {
     notes.push('No embedded images found in the PowerPoint media folder.');
-  } else if (candidates.length === 0 && rasterPaths.length > 0) {
-    notes.push('Embedded rasters were too small (icons) to treat as scheme content.');
+  } else if (candidates.length === 0 && (rasterPaths.length > 0 || vectorPaths.length > 0)) {
+    notes.push('Embedded graphics were too small or failed conversion — none sent to vision.');
   } else if (candidates.length) {
-    notes.push(`Found ${candidates.length} raster image(s); classifying purpose before vision read.`);
+    notes.push(`Found ${candidates.length} image(s) after raster conversion; classifying purpose before vision read.`);
   }
 
   return { candidates, skipped, notes, structuredText: structured.text || '', usageMap };
@@ -2714,6 +2829,7 @@ ${topic.autoAdvance
             included: true,
             purpose: classByName[img.name]?.purpose || 'scheme_content',
             reason: classByName[img.name]?.reason,
+            sourceFormat: img.sourceFormat || img.convertedFrom || null,
             src: `data:${img.mediaType};base64,${img.base64}`,
           })),
           ...skipped.map((s) => ({
@@ -2818,7 +2934,7 @@ ${topic.autoAdvance
           : null,
         cappedVision
           ? `\n\nEXTRACTED FROM IMAGES — PAYOUT SCALES / TABLES / CHARTS / SCREENSHOTS (treat as primary evidence for curves and tables):\n${cappedVision}`
-          : '\n\nEXTRACTED FROM IMAGES: (none — if a payment scale was only EMF/WMF, re-upload as PDF or PNG screenshot)',
+          : '\n\nEXTRACTED FROM IMAGES: (none — if charts failed conversion, export the deck as PDF and re-upload)',
       ].filter((line) => line != null).join('\n');
 
       const bits = [
@@ -4398,13 +4514,14 @@ ${topic.autoAdvance
                                   />
                                 ) : (
                                   <div className="h-20 w-[120px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
-                                    {img.kind === 'vector' ? 'Vector — not vision-readable' : (img.reason || 'Skipped')}
+                                    {img.kind === 'vector' ? 'Convert failed' : (img.reason || 'Skipped')}
                                   </div>
                                 )}
                                 <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px]">
                                   <div className="truncate">{img.included ? '✓ ' : '✗ '}{img.name}</div>
                                   <div className={`truncate ${img.included ? 'text-emerald-300/90' : 'text-slate-400'}`}>
                                     {purposeLabel(img.purpose || img.kind)}
+                                    {img.sourceFormat ? ` · from ${String(img.sourceFormat).toUpperCase()}` : ''}
                                     {img.bytes ? ` · ${(img.bytes / 1024).toFixed(0)}KB` : ''}
                                   </div>
                                 </figcaption>
