@@ -8,6 +8,7 @@ import {
   userSettingsLocalKey,
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
+  userProposalRemotePath,
 } from './auth';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -21,6 +22,7 @@ import {
   buildKnowledgeBaseFromDocuments,
 } from './defaults';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import JSZip from 'jszip';
 
 // Recharts is loaded lazily so it can never affect initial page load.
 const StellaChart = lazy(() => import('./StellaChart'));
@@ -408,6 +410,49 @@ async function stellaExtractPdfText(fileOrBlob) {
     if (text.length > 250000) break;
   }
   return text.trim();
+}
+
+/** Extract readable text from a .pptx (slide XML <a:t> runs). */
+async function extractPptxPlainText(fileOrBlob) {
+  const zip = await JSZip.loadAsync(await fileOrBlob.arrayBuffer());
+  const slidePaths = Object.keys(zip.files)
+    .filter((n) => /^ppt\/slides\/slide\d+\.xml$/i.test(n))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/slide(\d+)/i)?.[1] || '0', 10);
+      const nb = parseInt(b.match(/slide(\d+)/i)?.[1] || '0', 10);
+      return na - nb;
+    });
+  const parts = [];
+  for (const path of slidePaths) {
+    const xml = await zip.file(path).async('text');
+    const runs = [...xml.matchAll(/<(?:\w+:)?t\b[^>]*>([^<]*)<\/(?:\w+:)?t>/g)].map((m) => m[1]);
+    const slideText = runs.join(' ').replace(/\s+/g, ' ').trim();
+    if (slideText) {
+      const num = path.match(/slide(\d+)/i)?.[1] || String(parts.length + 1);
+      parts.push(`--- Slide ${num} ---\n${slideText}`);
+    }
+  }
+  return parts.join('\n\n').trim();
+}
+
+async function extractProposalText(file) {
+  const name = String(file?.name || '').toLowerCase();
+  if (name.endsWith('.pdf') || file?.type?.includes('pdf')) {
+    return stellaExtractPdfText(file);
+  }
+  if (name.endsWith('.pptx') || file?.type?.includes('presentation')) {
+    return extractPptxPlainText(file);
+  }
+  if (name.endsWith('.ppt')) {
+    throw new Error('Legacy .ppt is not supported — please upload .pptx or PDF.');
+  }
+  // Plain text fallback
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || '').trim());
+    reader.onerror = () => reject(new Error('Could not read file'));
+    reader.readAsText(file);
+  });
 }
 
 function stellaExtractedTextPath(storagePath) {
@@ -1647,15 +1692,16 @@ ${getWorkflowRuntime().handoffAddon}`);
     return await callAnthropic(system, [{ role: 'user', content: task }], 2000);
   };
 
-  const executeOrchestrator = async (topic, userMessage, stepIndex = null) => {
+  const executeOrchestrator = async (topic, userMessage, stepIndex = null, focusedContextOverride = null) => {
     const currentStep = stepIndex !== null ? stepIndex : (currentWorkflow?.currentStep || 0);
     const workflowContext = currentWorkflow?.context || [];
+    const focusedContext = focusedContextOverride ?? currentWorkflow?.focusedContext ?? null;
     const isIntro = currentStep === 0 && workflowContext.length === 0;
 
     if (isIntro) {
       logActivity('orchestrator', `Starting workflow: ${topic.name}`);
       const firstAgent = agents.find(a => a.id === topic.workflow[0].agents[0]);
-      const isFocused = !!currentWorkflow?.focusedContext;
+      const isFocused = !!focusedContext;
       const stepCount = topic.workflow.length;
       const stepsBlock = topic.workflow
         .map((s) => `**Step ${s.step}: ${s.name}** — ${s.goal}`)
@@ -1678,12 +1724,12 @@ ${isFocused
       setIsLoading(false);
       setTimeout(async () => {
         setIsLoading(true);
-        await runWorkflowStep(topic, 0, userMessage, []);
+        await runWorkflowStep(topic, 0, userMessage, [], focusedContext);
         setIsLoading(false);
       }, 800);
       return;
     }
-    await runWorkflowStep(topic, currentStep, userMessage, workflowContext);
+    await runWorkflowStep(topic, currentStep, userMessage, workflowContext, focusedContext);
   };
 
   const launchWorkflowDirect = async (topicId, userMessage, focusedContext = null) => {
@@ -1694,7 +1740,7 @@ ${isFocused
     setCurrentWorkflow({ topicId: topic.id, currentStep: 0, context: [], waitingForUser: false, focusedContext });
     setPendingWorkflow(null);
     logActivity('workflow', `Direct launch: ${topic.name}`);
-    await executeOrchestrator(topic, userMessage, 0);
+    await executeOrchestrator(topic, userMessage, 0, focusedContext);
     setIsLoading(false);
   };
 
@@ -1877,7 +1923,7 @@ ${isFocused
     setIsLoading(false);
   };
 
-  const runWorkflowStep = async (topic, stepIndex, userMessage, workflowContext) => {
+  const runWorkflowStep = async (topic, stepIndex, userMessage, workflowContext, focusedContextOverride = null) => {
     const step = topic.workflow[stepIndex];
     const agentId = step.agents[0];
     const agent = agents.find(a => a.id === agentId);
@@ -1891,9 +1937,23 @@ ${isFocused
     try {
       let taskBriefing = userMessage;
       const isTerritoryWorkflow = topic.id === 'territory_assessment';
+      const isAnalyzeWorkflow = topic.id === 'analyze_ic';
       const isStructureStep = stepIndex === 0;
-      const focusedContext = currentWorkflow?.focusedContext || null;
-      if (isTerritoryWorkflow && isStructureStep && territoryStructures.length > 0) {
+      const focusedContext = focusedContextOverride ?? currentWorkflow?.focusedContext ?? null;
+      if (isAnalyzeWorkflow && focusedContext) {
+        if (isStructureStep) {
+          taskBriefing = `${focusedContext}
+
+User request: ${userMessage}
+
+INSTRUCTION: The uploaded IC proposal text above is the primary source. Extract components, weightings, metrics, eligibility, payout mechanics, and any other scheme details from that text. Assess against the 6 Fundamental Axes / best practices. Do NOT ask the user to re-provide information that is already in the document. Only ask short clarifying questions for gaps that are truly missing from the extracted text.`;
+        } else if (workflowContext.length > 0) {
+          const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
+          const briefingSystem = withUserSettings(`${topic.orchestrator.role}\n${getWorkflowRuntime().orchestratorBriefingPrompt}`);
+          const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nUploaded proposal excerpt (still available):\n${String(focusedContext).slice(0, 6000)}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing. Remind the agent to use the uploaded proposal facts — do not invent missing scheme details.`;
+          taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 400);
+        }
+      } else if (isTerritoryWorkflow && isStructureStep && territoryStructures.length > 0) {
         const activeStruct = territoryStructures.find(s => s.id === selectedTerritoryStructure) || territoryStructures[0];
         if (focusedContext) {
           taskBriefing = `${focusedContext}\n\nINSTRUCTION: The user wants to assess the FOCUS TERRITORY marked above. Begin by presenting a brief profile then ask what specific aspects the user wants to explore.`;
@@ -1968,21 +2028,89 @@ ${isFocused
   };
 
   const handleFileUpload = async (event) => {
-    const file = event.target.files[0];
+    const file = event.target.files?.[0];
+    event.target.value = '';
     if (!file) return;
-    setUploadedFile(file);
-    const fileType = file.type.includes('pdf') ? 'PDF' : file.type.includes('presentation') || file.type.includes('powerpoint') || /\.pptx?$/i.test(file.name) ? 'PowerPoint' : 'document';
+
+    const fileType = file.type.includes('pdf') || /\.pdf$/i.test(file.name)
+      ? 'PDF'
+      : file.type.includes('presentation') || file.type.includes('powerpoint') || /\.pptx?$/i.test(file.name)
+        ? 'PowerPoint'
+        : 'document';
+
     setShowLanding(false);
     setActiveTab('chat');
-    setMessages(prev => [...prev, {
+    setIsLoading(true);
+    setMessages((prev) => [...prev, {
       role: 'system',
-      content: `📎 File uploaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)\n\nStarting **Analyze Existing IC** for this ${fileType} proposal…`,
+      content: `📎 Processing **${file.name}** (${(file.size / 1024).toFixed(1)} KB) — extracting text and saving to cloud…`,
     }]);
-    setTimeout(() => {
-      // Explicit assessment prompt — must route to analyze_ic, never PPT export
-      handleSubmit(null, 'Assess my IC', true);
-    }, 800);
-    event.target.value = '';
+
+    try {
+      const extractedRaw = await extractProposalText(file);
+      const extractedText = String(extractedRaw || '').trim();
+      if (!extractedText || extractedText.length < 40) {
+        throw new Error('Could not extract usable text from this file. Try a text-based PDF or .pptx (not a scanned image-only deck).');
+      }
+
+      const storagePath = userProposalRemotePath(currentUser.id, file.name);
+      const { error: uploadError } = await supabase.storage
+        .from('intelligence')
+        .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
+      if (uploadError) throw new Error(uploadError.message || 'Cloud upload failed');
+
+      // Persist extracted text next to the original for reuse / debugging
+      try {
+        const textBlob = new Blob([extractedText], { type: 'text/plain' });
+        await supabase.storage
+          .from('intelligence')
+          .upload(`${storagePath}.extracted.txt`, textBlob, { upsert: true, contentType: 'text/plain' });
+      } catch { /* non-fatal */ }
+
+      const capped = extractedText.length > 90000
+        ? `${extractedText.slice(0, 90000)}\n\n[… truncated for model context …]`
+        : extractedText;
+
+      const proposalMeta = {
+        name: file.name,
+        size: file.size,
+        fileType,
+        storagePath,
+        storageBucket: 'intelligence',
+        extractedText: capped,
+        uploadedAt: new Date().toISOString(),
+      };
+      setUploadedFile(proposalMeta);
+
+      const focusedContext = [
+        'UPLOADED IC PROPOSAL (source of truth for this analysis)',
+        `File: ${file.name}`,
+        `Type: ${fileType}`,
+        `Stored at: intelligence/${storagePath}`,
+        '',
+        'EXTRACTED DOCUMENT TEXT:',
+        capped,
+      ].join('\n');
+
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${Math.round(capped.length / 1000)}k chars extracted).\n\nStarting **Analyze Existing IC** with this document as context…`,
+      }]);
+      setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
+
+      await launchWorkflowDirect(
+        'analyze_ic',
+        'Assess my IC using the uploaded proposal document provided in context. Extract the scheme from that document — do not ask the user to restate details already present in the text.',
+        focusedContext,
+      );
+    } catch (err) {
+      setUploadedFile(null);
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `❌ Could not process proposal: ${err.message || 'Unknown error'}`,
+      }]);
+      setIsLoading(false);
+    }
   };
 
   // ── SUPABASE: Upload intelligence files ──

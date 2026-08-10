@@ -61,3 +61,13 @@ export function userSettingsRemotePath(userId) {
 export function userPptxTemplateRemotePath(userId) {
   return `users/${userId}/pptx-template.pptx`;
 }
+
+/** Per-user IC proposal uploads (Assess Proposal). */
+export function userProposalRemotePath(userId, fileName) {
+  const safe = String(fileName || 'proposal')
+    .replace(/[^\w.\-() ]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120) || 'proposal';
+  return `users/${userId}/proposals/${Date.now()}_${safe}`;
+}
