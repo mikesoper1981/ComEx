@@ -191,6 +191,8 @@ export function mergeSuggestions(partial) {
   // Refresh stale factory copy that forbade questions and leaked knowledge-file names into chips
   if (systemPrompt.includes('Do NOT write assistant-style clarifying questions')
     || systemPrompt.includes('No hardcoded generic IC trivia')
+    || systemPrompt.includes('How would a 110% accelerator')
+    || !/concrete detail/i.test(systemPrompt)
     || !/NEVER name knowledge files/i.test(systemPrompt)) {
     systemPrompt = DEFAULT_SUGGESTIONS.systemPrompt;
     userPromptTemplate = DEFAULT_SUGGESTIONS.userPromptTemplate;

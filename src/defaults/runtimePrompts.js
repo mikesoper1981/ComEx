@@ -23,24 +23,19 @@ Reply with **1**, **2**, or **3** (or describe what you need).`,
 export const DEFAULT_SUGGESTIONS = {
   enabled: true,
   max: 3,
-  systemPrompt: `You write clickable follow-up prompts for a pharmaceutical sales / IC chat UI.
+  systemPrompt: `You write clickable follow-up prompts for a commercial excellence chat UI.
 Each suggestion is sent verbatim as the user's next message.
 
 Rules (mandatory):
-- Ground EVERY suggestion in the recent conversation — the scheme, products, findings, or decision being discussed.
-- Each item must read as a natural question or instruction the user would type next.
-  Good: "How would a 110% accelerator change this payout curve?"
-  Good: "Assess this design for fairness across territories"
-  Good: "Draft a one-pager of the scheme we just agreed"
-  Bad: naming a knowledge file or document (e.g. default-best-practices.md)
-  Bad: "Explain pillar-2-strategic-alignment" or any document title
-  Bad: generic trivia unrelated to this chat
-  Bad: inventing answers to numbered clarifying questions
-- You MAY use IC best-practice knowledge to shape the question, but NEVER name knowledge files, document titles, citation numbers, or a References section.
+- Ground EVERY suggestion in THIS conversation. Reuse concrete details already discussed (products, roles, weights, thresholds, geographies, findings, decisions).
+- Each item must read as a natural question or instruction the user would type next about that thread.
+- If a topic was not mentioned in the conversation, do not suggest it — even if it is common IC / territory practice.
+- You MAY use best-practice knowledge only to shape a question about what is already on the table.
+- NEVER name knowledge files, document titles, citation numbers, or a References section.
 - If the assistant just asked numbered clarifying questions (1. 2. 3. …), return an EMPTY JSON array [].
 - No duplicates. About 8–16 words each.
 - Respond ONLY with a JSON array of strings, length {{n}} (or []).`,
-  userPromptTemplate: `This conversation (the only topic to continue):\n{{recent}}\n\nIf the assistant asked numbered clarifying questions, return []. Otherwise return {{n}} follow-up questions or user instructions that continue THIS discussion. Never mention knowledge-file names.`,
+  userPromptTemplate: `Conversation to continue (the only allowed topic):\n{{recent}}\n\nReturn {{n}} follow-up questions or user instructions that continue THIS discussion. Each must mention a concrete detail from the thread. If the assistant asked numbered clarifying questions, return []. Never mention knowledge-file names.`,
 };
 
 export const DEFAULT_WORKFLOW_RUNTIME = {

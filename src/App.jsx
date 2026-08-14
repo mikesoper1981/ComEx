@@ -79,7 +79,38 @@ function isSensibleSuggestion(text, extraNames = []) {
   if (looksLikeIntelligenceRef(p, extraNames)) return false;
   if (/^\s*[1-9]\s*[=:).\-]/.test(p)) return false;
   if (/\?/.test(p)) return true;
-  return /^(i|we|let'?s|please|help|tell|give|make|build|explain|summarize|summarise|check|recommend|propose|create|generate|list|outline|walk|rewrite|tighten|model|simulate|flag|identify|approve|export|assess|review|design|compare|add|change|update|draft|show|run|continue|move|apply|calculate|estimate|how|what|why|could|would|should|can)\b/i.test(p);
+  if (/^(i|we|let'?s|please|help|tell|give|make|build|explain|summarize|summarise|check|recommend|propose|create|generate|list|outline|walk|rewrite|tighten|model|simulate|flag|identify|approve|export|assess|review|design|compare|add|change|update|draft|show|run|continue|move|apply|calculate|estimate|how|what|why|could|would|should|can)\b/i.test(p)) return true;
+  return p.split(/\s+/).length >= 4;
+}
+
+const SUGGESTION_STOPWORDS = new Set([
+  'about', 'after', 'also', 'based', 'been', 'being', 'could', 'does', 'from', 'have', 'into', 'just',
+  'like', 'make', 'more', 'need', 'please', 'should', 'some', 'than', 'that', 'them', 'then', 'they',
+  'this', 'using', 'want', 'were', 'what', 'when', 'which', 'will', 'with', 'would', 'your', 'their',
+  'here', 'there', 'these', 'those', 'next', 'help', 'tell', 'show', 'give', 'how', 'why',
+]);
+
+function significantTokens(text) {
+  const matches = String(text || '').toLowerCase().match(/[a-z][a-z0-9%-]{3,}|[0-9]+(?:\.[0-9]+)?%?/g) || [];
+  return new Set(matches.filter((w) => !SUGGESTION_STOPWORDS.has(w)));
+}
+
+function isConversationGrounded(suggestion, convoTokens) {
+  if (!convoTokens || convoTokens.size < 4) return true;
+  const sugTokens = significantTokens(suggestion);
+  let overlap = 0;
+  for (const t of sugTokens) {
+    if (convoTokens.has(t)) overlap += 1;
+  }
+  return overlap >= 1;
+}
+
+function excerptForSuggestions(text, max = 1200) {
+  const t = String(text || '').trim();
+  if (t.length <= max) return t;
+  const head = Math.floor(max * 0.55);
+  const tail = max - head - 20;
+  return `${t.slice(0, head)}\n…\n${t.slice(-tail)}`;
 }
 
 function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice, thinking, signal }) {
@@ -2604,19 +2635,24 @@ export default function CommercialExcellenceApp() {
     }
     try {
       const knowledgeNames = (documents || []).map((d) => d.name).filter(Boolean);
-      const recentMessages = conversationHistory.slice(-12).map((m) => {
-        const body = stripKnowledgeCitations(String(m.content || '')).substring(0, 900);
+      const thread = conversationHistory.filter((m) =>
+        m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator' || m.role === 'agent') && m.content,
+      );
+      const recentMessages = thread.slice(-10).map((m) => {
+        const body = excerptForSuggestions(stripKnowledgeCitations(String(m.content || ''), knowledgeNames), 1100);
         return `${m.role}: ${body}`;
-      }).join('\n');
-      const lastUser = [...conversationHistory].reverse().find((m) => m.role === 'user');
-      const lastUserText = stripKnowledgeCitations(String(lastUser?.content || '')).substring(0, 500);
-      const lastAsstText = stripKnowledgeCitations(String(lastAssistant?.content || '')).substring(0, 700);
+      }).join('\n\n');
+      const lastUser = [...thread].reverse().find((m) => m.role === 'user');
+      const lastUserText = excerptForSuggestions(stripKnowledgeCitations(String(lastUser?.content || ''), knowledgeNames), 800);
+      const lastAsstText = excerptForSuggestions(stripKnowledgeCitations(String(lastAssistant?.content || ''), knowledgeNames), 1100);
+      const convoTokens = significantTokens(`${lastUserText}\n${lastAsstText}\n${recentMessages}`);
       const n = Math.min(Math.max(1, maxSuggestions), 5);
       const sug = getIntel().suggestions;
       const response = await anthropicMessagesPost({
-        system: `${fillTemplate(sug.systemPrompt, { n })}${buildUserSettingsPromptBlock(userSettings)}
+        system: `${fillTemplate(sug.systemPrompt, { n })}
 
-Never mention knowledge-file names, .md/.yml titles, citation numbers, or a References section. Suggestions must be questions or instructions the user would type next about THIS conversation.`,
+Never mention knowledge-file names, .md/.yml titles, citation numbers, or a References section.
+Do not suggest generic incentive or territory topics that are not already in this thread.`,
         messages: [{
           role: 'user',
           content: `${fillTemplate(sug.userPromptTemplate, { recent: recentMessages, n })}
@@ -2627,7 +2663,7 @@ ${lastUserText || '(none)'}
 Assistant's latest reply:
 ${lastAsstText || '(none)'}
 
-Return ${n} clickable follow-ups that continue this thread. Each must read as a natural question or instruction (not a document title).`,
+Return ${n} clickable follow-ups that continue this thread. Each must mention a concrete detail from the messages above.`,
         }],
         max_tokens: 400,
       });
@@ -2637,8 +2673,8 @@ Return ${n} clickable follow-ups that continue this thread. Each must read as a 
         const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
         if (Array.isArray(parsed)) {
           const cleaned = parsed
-            .map((p) => stripKnowledgeCitations(String(p || '')).replace(/\s+/g, ' ').trim())
-            .filter((p) => isSensibleSuggestion(p, knowledgeNames));
+            .map((p) => stripKnowledgeCitations(String(p || ''), knowledgeNames).replace(/\s+/g, ' ').trim())
+            .filter((p) => isSensibleSuggestion(p, knowledgeNames) && isConversationGrounded(p, convoTokens));
           setSuggestedPrompts(cleaned.slice(0, n));
         }
       }
