@@ -105,6 +105,15 @@ function isConversationGrounded(suggestion, convoTokens) {
   return overlap >= 1;
 }
 
+function isQuestionAboutThisDocument(question, extract) {
+  const q = String(question || '');
+  const ext = String(extract || '');
+  if (q.replace(/\s+/g, ' ').trim().length < 8) return false;
+  const wander = /\b(payout|accelerator|quota|weighting|incentive|commission|spiff|compliance|fairness|product mix|territory (?:re)?design|strategic alignment|scheme design)\b/i;
+  if (wander.test(q) && !wander.test(ext)) return false;
+  return true;
+}
+
 function excerptForSuggestions(text, max = 1200) {
   const t = String(text || '').trim();
   if (t.length <= max) return t;
@@ -3671,9 +3680,9 @@ ${stepInstruction}`;
 
   const runContextIntakeTurn = async ({ extractBlob, moduleLabel: label, intakeMessages }) => {
     const rt = getWorkflowRuntime();
-    const system = withUserSettings(fillTemplate(rt.contextIntakePrompt, { moduleLabel: label }), { moduleContext: false });
+    const system = fillTemplate(rt.contextIntakePrompt, { moduleLabel: label });
     const convo = [
-      { role: 'user', content: `Onboarding file extract:\n${String(extractBlob || '').slice(0, 16000)}` },
+      { role: 'user', content: `THIS FILE ONLY (do not ask about anything else):\n${String(extractBlob || '').slice(0, 16000)}` },
       ...(intakeMessages || []).map((m) => ({ role: toAnthropicRole(m.role), content: m.content })),
     ];
     let parsed = {};
@@ -3682,28 +3691,38 @@ ${stepInstruction}`;
       raw = await callAnthropic(system, convo, 900);
       parsed = extractJsonObject(raw) || {};
     } catch { /* fall through */ }
+    const message = parsed.message
+      || (parsed.complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || 'Is there anything in this file I should not take at face value?'));
+    const offTopic = parsed.complete ? false : !isQuestionAboutThisDocument(message, extractBlob);
     return {
-      complete: !!parsed.complete,
-      message: parsed.message
-        || (parsed.complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || 'Could you tell me what this file represents and how I should use it?')),
-      context_qa: parsed.context_qa || null,
+      complete: !!parsed.complete || offTopic,
+      message: offTopic ? 'Thanks — this file is clear enough to store as context.' : message,
+      context_qa: parsed.complete ? (parsed.context_qa || null) : (offTopic ? { what_it_represents: '', time_period: '', key_metrics: [], interpretation_notes: 'File stored without extra questions — extract was sufficient.', qa_pairs: [] } : null),
     };
   };
 
   const summarizeContextFile = async ({ name, extractBlob, moduleId, columns = [] }) => {
     const rt = getWorkflowRuntime();
-    const system = withUserSettings(fillTemplate(rt.contextContentSummaryPrompt, {
+    const system = fillTemplate(rt.contextContentSummaryPrompt, {
       moduleLabel: moduleLabelFor(moduleId),
-    }), { moduleContext: false });
+    });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map((c) => `- ${c.name}`).join('\n')}` : '';
     const raw = await callAnthropic(system, [{
       role: 'user',
-      content: `FILE:\n- name: ${name}\n- module: ${moduleLabelFor(moduleId)}${colText}\n\nCONTENT SAMPLE:\n${String(extractBlob || '').slice(0, 18000)}`,
+      content: `FILE NAME: ${name}\n(The module "${moduleLabelFor(moduleId)}" is only where this file will be stored — do not ask module-wide questions.)${colText}\n\nFILE CONTENTS:\n${String(extractBlob || '').slice(0, 18000)}`,
     }], 1000);
     const parsed = extractJsonObject(raw);
-    return parsed && typeof parsed === 'object'
-      ? parsed
-      : { summary: 'Uploaded context file.', columns: [], suggestedQuestions: [] };
+    const fallback = { summary: 'Uploaded context file.', columns: [], suggestedQuestions: [] };
+    if (!parsed || typeof parsed !== 'object') return fallback;
+    const questions = (Array.isArray(parsed.suggestedQuestions) ? parsed.suggestedQuestions : [])
+      .map((q) => String(q || '').replace(/\s+/g, ' ').trim())
+      .filter((q) => isQuestionAboutThisDocument(q, extractBlob))
+      .slice(0, 3);
+    return {
+      summary: parsed.summary || fallback.summary,
+      columns: Array.isArray(parsed.columns) ? parsed.columns : [],
+      suggestedQuestions: questions,
+    };
   };
 
   const completeProposalIngest = async (job) => {

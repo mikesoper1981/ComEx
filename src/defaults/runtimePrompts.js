@@ -156,27 +156,30 @@ Rules:
 - Prefer relevant=true or "unsure" over dropping possible content.
 - relevant=false only when clearly logo / decoration / stock photo / icon.
 - Use the exact filename provided for each image.`,
-  contextContentSummaryPrompt: `You onboard an uploaded context file for a commercial excellence module ({{moduleLabel}}).
+  contextContentSummaryPrompt: `You onboard ONE uploaded file. Your only job is to understand THIS file.
 
 Return ONLY valid JSON. No markdown.
 Schema:
 {
-  "summary": "2-5 sentences describing what this file appears to contain and how it should inform this module",
+  "summary": "2-4 sentences describing what THIS file contains",
   "columns": [{ "name": "exact column name", "description": "what this column represents" }],
-  "suggestedQuestions": ["3-5 clarifying questions about meaning/intent that the file itself does not answer"]
+  "suggestedQuestions": ["questions about THIS file only"]
 }
 
-If column names are provided, describe each of them. If none, return an empty columns array.
-Do NOT ask about facts already visible in the extract (row counts, listed product names, obvious headings). Only ask about meaning, time period, how the user wants this used, definitions, and caveats.`,
-  contextIntakePrompt: `You capture interpretive context for an uploaded {{moduleLabel}} file so later chats always use it correctly.
+Rules:
+- suggestedQuestions may be an EMPTY array [] if the file is already clear (e.g. a simple team list with names and roles).
+- Ask at most 3 questions, and only about ambiguities in this file (unclear column, missing effective date, whether the list is complete, duplicate names).
+- Do NOT ask about incentive design, payouts, quotas, strategy, products, territories, or other topics unless those topics actually appear in the file.
+- Do NOT ask how the file should be used in the {{moduleLabel}} module if that is obvious from the file itself.
+- Never ask about facts already visible in the extract (names, headings, row counts, listed roles).
+- If column names are provided, describe them. If none, return an empty columns array.`,
+  contextIntakePrompt: `You capture missing meaning for ONE uploaded file. Ask only about THIS file.
 
-Ask ONE focused question per turn. Ask only what the extract does not already answer, covering as needed:
-- what the file represents and how it should be used in this module
-- the time period / version it covers
-- key fields, products, teams, or metrics and what they mean
-- caveats, filters, or "do not assume" notes
+Ask ONE question per turn, and only if the extract is ambiguous.
+If the extract is a clear list or structure (for example a team roster with names and roles) and nothing material is missing, set complete=true immediately — do not invent extra questions.
 
-CRITICAL — NEVER ask about facts already visible in the extract. If the file is already clear, set complete=true after at most one confirmation.
+Do NOT ask about incentive schemes, payouts, strategy, other files, or module-wide design unless those appear in this file.
+Never ask about facts already visible in the extract.
 
 When you have enough, set "complete": true and fill "context_qa" fully.
 

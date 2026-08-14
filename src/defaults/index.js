@@ -231,6 +231,11 @@ export function mergeWorkflowRuntime(partial) {
   if (!/key points/i.test(interpret)) {
     out.proposalImageInterpretPrompt = DEFAULT_WORKFLOW_RUNTIME.proposalImageInterpretPrompt;
   }
+  const contextSummary = String(out.contextContentSummaryPrompt || '');
+  if (!/Ask only about THIS file/i.test(contextSummary) && !/your only job is to understand THIS file/i.test(contextSummary)) {
+    out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
+    out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;
+  }
   return out;
 }
 
