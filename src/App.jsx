@@ -7464,7 +7464,7 @@ ${stepInstruction}`;
                       <div className="md:col-span-2">
                         <label className="block text-xs text-blue-300/70 font-semibold mb-2">Remembered from chats</label>
                         <p className="text-[11px] text-blue-300/45 mb-2">
-                          Short facts from clarifying answers — not the full transcript. Used in later chats. Stored in settings.json.
+                          Short facts from chat, in addition to the settings fields above and any uploaded context files. Not the full transcript.
                         </p>
                         {(userSettings.memory || []).length === 0 ? (
                           <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet.</div>
