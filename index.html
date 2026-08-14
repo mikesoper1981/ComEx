@@ -5,9 +5,19 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>comex</title>
+    <style>html,body,#root{margin:0;min-height:100%;background:#0f172a;color:#e2e8f0}</style>
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      window.addEventListener('error', function (e) {
+        if (window.__comexBooted) return;
+        var root = document.getElementById('root');
+        if (!root) return;
+        var msg = (e.error && (e.error.stack || e.error.message)) || e.message || 'Unknown error';
+        root.innerHTML = '<pre style="padding:24px;font-family:sans-serif;white-space:pre-wrap;color:#f87171">' + String(msg).replace(/</g, '&lt;') + '</pre>';
+      });
+    </script>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

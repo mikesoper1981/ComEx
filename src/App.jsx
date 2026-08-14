@@ -1,4 +1,4 @@
-import { Component, useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
+import { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers, UserCog, History, LogOut } from 'lucide-react';
 import { supabase } from './supabase';
 import {
@@ -2033,27 +2033,8 @@ const MOCK_PERFORMANCE = {
 };
 
 // Prevents a single bad message/chart render from blanking the whole app.
-class MessageErrorBoundary extends Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false };
-  }
-  static getDerivedStateFromError() {
-    return { hasError: true };
-  }
-  componentDidCatch(error) {
-    console.error('Stella message render error:', error);
-  }
-  render() {
-    if (this.state.hasError) {
-      return this.props.fallback || (
-        <div className="text-xs text-red-300/80 bg-red-500/10 border border-red-400/25 rounded-lg p-3">
-          ⚠️ This response couldn't be displayed (a chart or block failed to render). The rest of Stella is unaffected.
-        </div>
-      );
-    }
-    return this.props.children;
-  }
+function MessageErrorBoundary({ children }) {
+  return children;
 }
 
 function contextBlocksFromFile(f) {
