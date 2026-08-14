@@ -284,7 +284,7 @@ export function isKnowledgeStorageFile(name) {
   if (!n || n.endsWith('/')) return false;
   if (n.includes('/') && !n.startsWith('knowledge/')) return false;
   if (n.endsWith('.json')) return false;
-  if (n.startsWith('users/') || n === 'user-settings.json') return false;
+  if (n.startsWith('users/') || n === 'user-settings.json' || n === 'product.json') return false;
   return /\.(md|txt|yml|yaml)$/i.test(n);
 }
 

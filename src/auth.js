@@ -84,6 +84,15 @@ export function userSettingsRemotePath(userId) {
   return `users/${userId}/settings.json`;
 }
 
+/** Shared Admin / product intelligence (agents, workflows, prompts). Not per-user. */
+export function productIntelligenceLocalKey() {
+  return 'comex-product-intelligence';
+}
+
+export function productIntelligenceRemotePath() {
+  return 'product.json';
+}
+
 export function userPptxTemplateRemotePath(userId) {
   return `users/${userId}/pptx-template.pptx`;
 }

@@ -42,6 +42,10 @@ export function isEmptyContextValue(value) {
   if (!t) return true;
   const lower = t.toLowerCase().replace(/\s+/g, ' ');
   if (/^(n\/a|na|none|null|nil|undefined|-|—|unknown|not specified|not provided|tbd|none provided)$/i.test(lower)) return true;
+  if (/\bappears to be empty\b/i.test(lower) && t.length < 800) return true;
+  if (/\bcontains? only a filename\b/i.test(lower) && t.length < 800) return true;
+  if (/\bno actual data( content)?\b/i.test(lower) && t.length < 800) return true;
+  if (/\bfilename reference\b/i.test(lower) && t.length < 800) return true;
   // Only treat short filler as empty — a long extract may mention missing text on one slide.
   if (t.length > 240) return false;
   if (/\bno (readable |extractable |usable )?(text|content|data|extract|information|context)\b/i.test(lower)) return true;
@@ -182,6 +186,42 @@ export function mergeModuleContext(raw) {
     out[id] = { files };
   }
   return out;
+}
+
+/** Disk shape: curated context only — no intake chat, extracts, or processing flags. */
+export function serializeContextFileForPersist(fileRec) {
+  const rec = normalizeContextFile(fileRec);
+  if (!rec) return null;
+  const out = { id: rec.id, name: rec.name };
+  if (rec.fileType) out.fileType = rec.fileType;
+  if (rec.sizeLabel) out.sizeLabel = rec.sizeLabel;
+  if (rec.uploadedAt) out.uploadedAt = rec.uploadedAt;
+  if (rec.summary) out.summary = rec.summary;
+  if (rec.imageCount) out.imageCount = rec.imageCount;
+  if (rec.capturedContext) out.capturedContext = rec.capturedContext;
+  if (rec.notes?.length) out.notes = rec.notes;
+  if (rec.intakeComplete) out.intakeComplete = true;
+  return out;
+}
+
+export function serializeModuleContextForPersist(raw) {
+  const merged = mergeModuleContext(raw);
+  const out = {};
+  for (const id of MODULE_CONTEXT_IDS) {
+    out[id] = {
+      files: (merged[id]?.files || []).map(serializeContextFileForPersist).filter(Boolean),
+    };
+  }
+  return out;
+}
+
+export function isThinContextExtract(extractBlob, fileName) {
+  if (isEmptyContextValue(extractBlob)) return true;
+  const t = String(extractBlob || '').trim();
+  if (t.length < 24) return true;
+  const stem = String(fileName || '').replace(/\.[^.]+$/, '').trim().toLowerCase();
+  if (stem && t.length < 80 && t.toLowerCase().includes(stem)) return true;
+  return false;
 }
 
 export function serializeContextFile(fileRec) {

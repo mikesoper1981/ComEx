@@ -5,12 +5,15 @@ import {
   getCurrentUser,
   setCurrentUser,
   getHardcodedUser,
+  HARDCODED_USERS,
   isAdminUser,
   clearCurrentUser,
   userSettingsLocalKey,
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
   userProposalRemotePath,
+  productIntelligenceLocalKey,
+  productIntelligenceRemotePath,
 } from './auth';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -18,7 +21,6 @@ import {
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_PPTX_CLARIFY,
   DEFAULT_ORCHESTRATOR_PROMPTS,
-  DEFAULT_INTELLIGENCE_CONTEXT,
   mergeIntelligenceContext,
   mergeTopics,
   fillTemplate,
@@ -32,11 +34,13 @@ import {
   detectContextFileKind,
   extractSpreadsheetText,
   mergeModuleContext,
+  serializeModuleContextForPersist,
   upsertModuleContextFile,
   patchModuleContextFile,
   removeModuleContextFile,
   formatModuleContextPromptBlock,
   listModuleContextBlocks,
+  isThinContextExtract,
   knowledgeStemPattern,
   isEmptyContextValue,
   compactCapturedContext,
@@ -231,21 +235,40 @@ const DEFAULT_USER_SETTINGS = {
   moduleContext: mergeModuleContext({}),
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
-  // PowerPoint generation guidance — edited in Admin → PPT; persisted in settings JSON
-  pptxContext: { ...DEFAULT_PPTX_CONTEXT },
-  // Agents, workflows, system prompt, knowledge, Stella/runtime prompts — Admin only
-  ...DEFAULT_INTELLIGENCE_CONTEXT,
 };
 
-function mergeUserSettingsFields(raw = {}) {
-  const { knowledge: _legacyKnowledge, ...rest } = raw || {};
-  const intel = mergeIntelligenceContext(rest);
+function mergeProductIntelligence(raw = {}) {
   return {
-    ...DEFAULT_USER_SETTINGS,
-    ...rest,
-    pptxContext: mergePptxContext(rest.pptxContext),
-    ...intel,
-    moduleContext: mergeModuleContext(rest.moduleContext),
+    ...mergeIntelligenceContext(raw),
+    pptxContext: mergePptxContext(raw.pptxContext),
+  };
+}
+
+function extractProductIntelligence(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const src = raw.intelligence && typeof raw.intelligence === 'object'
+    ? raw.intelligence
+    : (raw.settings && typeof raw.settings === 'object' ? raw.settings : raw);
+  if (!(src.agents || src.topics || src.systemPrompt || src.workflowRuntime || src.stellaPrompts || src.pptxContext)) {
+    return null;
+  }
+  return mergeProductIntelligence(src);
+}
+
+function mergeUserSettingsFields(raw = {}) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  return {
+    companyName: String(src.companyName || ''),
+    industry: String(src.industry || ''),
+    role: String(src.role || ''),
+    currency: String(src.currency || DEFAULT_USER_SETTINGS.currency),
+    metrics: String(src.metrics || ''),
+    abbreviations: String(src.abbreviations || ''),
+    preferences: String(src.preferences || ''),
+    constraints: String(src.constraints || ''),
+    customContext: String(src.customContext || ''),
+    moduleContext: mergeModuleContext(src.moduleContext),
+    pptxTemplate: src.pptxTemplate || null,
   };
 }
 
@@ -267,10 +290,34 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
   return {
     userId,
     updatedAt: new Date().toISOString(),
-    settings: merged,
+    settings: {
+      ...merged,
+      moduleContext: serializeModuleContextForPersist(merged.moduleContext),
+    },
     chats: normalizeStoredChats(chats),
     activeChatId: activeChatId || null,
   };
+}
+
+function buildProductIntelligenceDocument(intel) {
+  return {
+    updatedAt: new Date().toISOString(),
+    intelligence: mergeProductIntelligence(intel),
+  };
+}
+
+function readLocalProductIntelligence() {
+  try {
+    const parsed = safeJsonParse(localStorage.getItem(productIntelligenceLocalKey()));
+    const fromProduct = extractProductIntelligence(parsed);
+    if (fromProduct) return fromProduct;
+  } catch { /* ignore */ }
+  try {
+    const userLocal = safeJsonParse(localStorage.getItem(userSettingsLocalKey(getCurrentUser().id)));
+    const fromUser = extractProductIntelligence(userLocal);
+    if (fromUser) return fromUser;
+  } catch { /* ignore */ }
+  return mergeProductIntelligence({});
 }
 
 const MAX_STORED_CHATS = 25;
@@ -430,10 +477,10 @@ function readLocalChatState(userId) {
   return { chats: [], activeChatId: null };
 }
 
-function consultationWelcome(userId) {
+function consultationWelcome() {
   return {
     role: 'assistant',
-    content: mergeIntelligenceContext(readLocalUserSettings(userId)).welcomeMessages.consultation,
+    content: readLocalProductIntelligence().welcomeMessages.consultation,
   };
 }
 
@@ -2074,7 +2121,7 @@ export default function CommercialExcellenceApp() {
   const [stellaTab, setStellaTab] = useState('chat'); // chat | data | business | connections
   const [stellaMessages, setStellaMessages] = useState(() => [{
     role: 'assistant',
-    content: mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).welcomeMessages.stella,
+    content: readLocalProductIntelligence().welcomeMessages.stella,
   }]);
   const [stellaInput, setStellaInput] = useState('');
   const [stellaIsLoading, setStellaIsLoading] = useState(false);
@@ -2090,6 +2137,7 @@ export default function CommercialExcellenceApp() {
   });
   const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
   const [userSettings, setUserSettings] = useState(() => readLocalUserSettings(getCurrentUser().id));
+  const [productIntel, setProductIntel] = useState(() => readLocalProductIntelligence());
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
   const [userSettingsPane, setUserSettingsPane] = useState('general'); // general | incentives | stella
   const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
@@ -2128,9 +2176,9 @@ export default function CommercialExcellenceApp() {
       return next;
     });
   };
-  const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
+  const [agents, setAgents] = useState(() => readLocalProductIntelligence().agents);
 
-  const [topics, setTopics] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).topics);
+  const [topics, setTopics] = useState(() => readLocalProductIntelligence().topics);
 
   const [orchestratorDecision, setOrchestratorDecision] = useState(null);
   const [pendingButtonAction, setPendingButtonAction] = useState(null);
@@ -2181,13 +2229,13 @@ export default function CommercialExcellenceApp() {
   const [expandedSteps, setExpandedSteps] = useState({});
   const [editingAgent, setEditingAgent] = useState(null);
   const [suggestedPrompts, setSuggestedPrompts] = useState([]);
-  const [suggestionsEnabled, setSuggestionsEnabled] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).suggestions.enabled);
+  const [suggestionsEnabled, setSuggestionsEnabled] = useState(() => readLocalProductIntelligence().suggestions.enabled);
+  const [maxSuggestions, setMaxSuggestions] = useState(() => readLocalProductIntelligence().suggestions.max);
+  const [customSystemPrompt, setCustomSystemPrompt] = useState(() => readLocalProductIntelligence().systemPrompt);
   const [pptxOffers, setPptxOffers] = useState(null);
   const [pptxGenerating, setPptxGenerating] = useState(false);
   const [pptxClarifyPending, setPptxClarifyPending] = useState(false);
-  const [maxSuggestions, setMaxSuggestions] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).suggestions.max);
   const [hoveredCitation, setHoveredCitation] = useState(null);
-  const [customSystemPrompt, setCustomSystemPrompt] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).systemPrompt);
 
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -2311,6 +2359,57 @@ export default function CommercialExcellenceApp() {
         } catch { /* try next candidate */ }
       }
 
+      // Shared product intelligence (admin-owned). Fall back to admin user JSON once, then factory defaults.
+      try {
+        let intelParsed = null;
+        {
+          const { data, error } = await supabase.storage.from('intelligence').download(productIntelligenceRemotePath());
+          if (!error && data) intelParsed = safeJsonParse(await data.text());
+        }
+        let intel = extractProductIntelligence(intelParsed);
+        let migratedFromUser = false;
+        if (!intel) {
+          const adminId = HARDCODED_USERS.find((u) => u.role === 'admin')?.id || getHardcodedUser().id;
+          const adminCandidates = [
+            userSettingsRemotePath(adminId),
+            ...(currentUser.id === adminId ? [LEGACY_USER_SETTINGS_FILE] : []),
+          ];
+          for (const candidate of adminCandidates) {
+            try {
+              const { data, error } = await supabase.storage.from('intelligence').download(candidate);
+              if (error || !data) continue;
+              intel = extractProductIntelligence(safeJsonParse(await data.text()));
+              if (intel) {
+                migratedFromUser = true;
+                break;
+              }
+            } catch { /* try next */ }
+          }
+        }
+        if (intel) {
+          const mergedIntel = mergeProductIntelligence(intel);
+          setProductIntel(mergedIntel);
+          setAgents(mergedIntel.agents);
+          setTopics(mergedIntel.topics);
+          setCustomSystemPrompt(mergedIntel.systemPrompt);
+          setSuggestionsEnabled(!!mergedIntel.suggestions.enabled);
+          setMaxSuggestions(mergedIntel.suggestions.max);
+          try {
+            localStorage.setItem(productIntelligenceLocalKey(), JSON.stringify(buildProductIntelligenceDocument(mergedIntel)));
+          } catch { /* ignore */ }
+          if (!intelParsed && migratedFromUser) {
+            try {
+              const blob = new Blob([JSON.stringify(buildProductIntelligenceDocument(mergedIntel), null, 2)], { type: 'application/json' });
+              await supabase.storage.from('intelligence').upload(
+                productIntelligenceRemotePath(),
+                blob,
+                { upsert: true, contentType: 'application/json' },
+              );
+            } catch { /* first-time seed is best-effort */ }
+          }
+        }
+      } catch { /* product intel falls back to factory defaults */ }
+
       // User settings scoped by current userId (users/<id>/settings.json).
       try {
         const path = userSettingsRemotePath(currentUser.id);
@@ -2328,11 +2427,6 @@ export default function CommercialExcellenceApp() {
           const merged = normalizeLoadedUserSettings(parsed);
           const { chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(parsed);
           setUserSettings(merged);
-          setAgents(merged.agents);
-          setTopics(merged.topics);
-          setCustomSystemPrompt(merged.systemPrompt);
-          setSuggestionsEnabled(merged.suggestions.enabled);
-          setMaxSuggestions(merged.suggestions.max);
           if (remoteChats.length) {
             skipChatPersistRef.current = true;
             setChatSessions(remoteChats);
@@ -2347,12 +2441,16 @@ export default function CommercialExcellenceApp() {
             setTimeout(() => { skipChatPersistRef.current = false; }, 0);
           }
           try {
-            localStorage.setItem(
-              userSettingsLocalKey(currentUser.id),
-              JSON.stringify(buildUserSettingsDocument(currentUser.id, merged, {
-                chats: remoteChats.length ? remoteChats : chatSessionsRef.current,
-                activeChatId: remoteActive || activeChatIdRef.current,
-              }))
+            const cleaned = buildUserSettingsDocument(currentUser.id, merged, {
+              chats: remoteChats.length ? remoteChats : chatSessionsRef.current,
+              activeChatId: remoteActive || activeChatIdRef.current,
+            });
+            localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(cleaned));
+            const blob = new Blob([JSON.stringify(cleaned, null, 2)], { type: 'application/json' });
+            await supabase.storage.from('intelligence').upload(
+              userSettingsRemotePath(currentUser.id),
+              blob,
+              { upsert: true, contentType: 'application/json' },
             );
           } catch { /* ignore */ }
         }
@@ -2406,13 +2504,7 @@ export default function CommercialExcellenceApp() {
       const next = upsertChatInPlace(chatSessionsRef.current, snap);
       chatSessionsRef.current = next;
       setChatSessions(next);
-      let settingsDoc = userSettings;
-      try {
-        const existing = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
-        if (existing?.settings) settingsDoc = mergeUserSettingsFields(existing.settings);
-      } catch { /* ignore */ }
-      const mergedSettings = mergeUserSettingsFields(settingsDoc);
-      delete mergedSettings.knowledge;
+      const mergedSettings = mergeUserSettingsFields(userSettings);
       const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, { chats: next, activeChatId: id });
       try {
         localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
@@ -2759,7 +2851,7 @@ Return ${n} clickable follow-ups that continue this thread. Each must mention a 
     if (conversationHistory.length < 2) return;
     try {
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
-      const pptxCtx = getPptxContext(userSettings);
+      const pptxCtx = getPptxContext(productIntel);
       const response = await anthropicMessagesPost({
         system: `${pptxCtx.intentDetection}${buildUserSettingsPromptBlock(userSettings)}`,
         messages: [{ role: 'user', content: `Conversation:\n${recentMessages}` }],
@@ -2834,24 +2926,59 @@ Do not cite sources. Never name knowledge files, intelligence documents, or file
 END-USER MODE: Never cite or name knowledge files, intelligence documents, or source filenames. Do not use [1]/[2] markers or a References section. Apply best-practice knowledge in your reasoning without mentioning where it came from.`;
   };
 
-  const getIntel = () => mergeIntelligenceContext(userSettings);
+  const getIntel = () => mergeProductIntelligence({
+    ...productIntel,
+    systemPrompt: customSystemPrompt,
+    agents,
+    topics,
+    suggestions: {
+      ...(productIntel.suggestions || {}),
+      enabled: suggestionsEnabled,
+      max: maxSuggestions,
+    },
+  });
   const getWorkflowRuntime = () => getIntel().workflowRuntime;
   const getPptxClarify = () => getIntel().pptxClarify;
   const getStellaPrompts = () => getIntel().stellaPrompts;
 
-  /** Persist current Admin intelligence editors into settings JSON. */
+  /** Persist Admin intelligence into the shared product JSON (not per-user). */
   const persistIntelligenceSettings = async (overrides = {}) => {
-    return saveUserSettings({
+    const intel = mergeProductIntelligence({
+      ...productIntel,
       systemPrompt: customSystemPrompt,
       agents,
       topics,
       suggestions: {
-        ...(userSettings.suggestions || {}),
+        ...(productIntel.suggestions || {}),
         enabled: suggestionsEnabled,
         max: maxSuggestions,
       },
       ...overrides,
     });
+    setProductIntel(intel);
+    setAgents(intel.agents);
+    setTopics(intel.topics);
+    setCustomSystemPrompt(intel.systemPrompt);
+    setSuggestionsEnabled(!!intel.suggestions.enabled);
+    setMaxSuggestions(intel.suggestions.max);
+    const doc = buildProductIntelligenceDocument(intel);
+    setUserSettingsSaveStatus('saving');
+    try {
+      localStorage.setItem(productIntelligenceLocalKey(), JSON.stringify(doc));
+    } catch { /* ignore */ }
+    try {
+      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
+      const { error } = await supabase.storage
+        .from('intelligence')
+        .upload(productIntelligenceRemotePath(), blob, { upsert: true, contentType: 'application/json' });
+      if (error) throw error;
+      setUserSettingsSaveStatus('saved');
+      setTimeout(() => setUserSettingsSaveStatus('idle'), 3000);
+    } catch {
+      setUserSettingsSaveStatus('saved-local');
+      setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
+    }
+    return intel;
   };
 
   const saveUserSettings = async (next) => {
@@ -2859,22 +2986,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
     const settings = mergeUserSettingsFields({
       ...userSettings,
       ...incoming,
-      systemPrompt: incoming.systemPrompt ?? customSystemPrompt,
-      agents: incoming.agents ?? agents,
-      topics: incoming.topics ?? topics,
-      suggestions: {
-        ...(userSettings.suggestions || {}),
-        ...(incoming.suggestions || {}),
-        enabled: incoming.suggestions?.enabled ?? suggestionsEnabled,
-        max: incoming.suggestions?.max ?? maxSuggestions,
-      },
-      workflowRuntime: incoming.workflowRuntime ?? userSettings.workflowRuntime,
-      stellaPrompts: incoming.stellaPrompts ?? userSettings.stellaPrompts,
-      welcomeMessages: incoming.welcomeMessages ?? userSettings.welcomeMessages,
-      pptxClarify: incoming.pptxClarify ?? userSettings.pptxClarify,
     });
-    // Knowledge is file-based — never persist markdown blobs into settings JSON
-    delete settings.knowledge;
     const liveSnap = serializeChatSnapshot({
       id: activeChatIdRef.current || newChatId(),
       messages: messagesRef.current,
@@ -2891,13 +3003,6 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       activeChatId: activeChatIdRef.current || liveSnap.id,
     });
     setUserSettings(settings);
-    if (settings.agents) setAgents(settings.agents);
-    if (settings.topics) setTopics(settings.topics);
-    if (settings.systemPrompt != null) setCustomSystemPrompt(settings.systemPrompt);
-    if (settings.suggestions) {
-      setSuggestionsEnabled(!!settings.suggestions.enabled);
-      setMaxSuggestions(settings.suggestions.max);
-    }
     setUserSettingsSaveStatus('saving');
     try {
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
@@ -2917,13 +3022,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
   };
 
   const persistChatList = async (list, activeId) => {
-    let settingsDoc = userSettings;
-    try {
-      const existing = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
-      if (existing?.settings) settingsDoc = mergeUserSettingsFields(existing.settings);
-    } catch { /* ignore */ }
-    const mergedSettings = mergeUserSettingsFields(settingsDoc);
-    delete mergedSettings.knowledge;
+    const mergedSettings = mergeUserSettingsFields(userSettings);
     const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, {
       chats: list,
       activeChatId: activeId,
@@ -3767,7 +3866,7 @@ ${stepInstruction}`;
 
   const summarizeContextFile = async ({ name, extractBlob, moduleId, columns = [] }) => {
     const fallback = { summary: '', columns: [], suggestedQuestions: [] };
-    if (isEmptyContextValue(extractBlob)) return fallback;
+    if (isThinContextExtract(extractBlob, name)) return fallback;
     const rt = getWorkflowRuntime();
     const system = fillTemplate(rt.contextContentSummaryPrompt, {
       moduleLabel: moduleLabelFor(moduleId),
@@ -4097,9 +4196,11 @@ ${stepInstruction}`;
 
     const extractBlob = [extractedText, structuredText, visionText].filter((t) => !isEmptyContextValue(t)).join('\n\n');
     let onboarding = { summary: '', suggestedQuestions: [] };
-    try {
-      onboarding = await summarizeContextFile({ name: file.name, extractBlob, moduleId });
-    } catch { /* keep fallback */ }
+    if (!isThinContextExtract(extractBlob, file.name)) {
+      try {
+        onboarding = await summarizeContextFile({ name: file.name, extractBlob, moduleId });
+      } catch { /* keep fallback */ }
+    }
     const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
     const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
     const assistantMsg = questions.length
@@ -5699,7 +5800,7 @@ ${stepInstruction}`;
     const text = String(messageContent || '').trim();
     if (!text) return { kind: 'none' };
     try {
-      const pptxCtx = getPptxContext(userSettings);
+      const pptxCtx = getPptxContext(productIntel);
       const raw = await callAnthropic(
         `${pptxCtx.messageClassify}${buildUserSettingsPromptBlock(userSettings)}`,
         [{ role: 'user', content: `User message:\n${text}` }],
@@ -5756,7 +5857,7 @@ ${stepInstruction}`;
     const isSummary = mode === 'summary';
     const deckType = offer?.deckType || (isSummary ? 'session_summary' : 'general');
     const conversationContext = buildPptxConversationContext(messages);
-    const pptxCtx = getPptxContext(userSettings);
+    const pptxCtx = getPptxContext(productIntel);
     const systemPrompt = withUserSettings(isSummary ? pptxCtx.summary : pptxCtx.produced);
     const userContent = [
       `Export mode: ${isSummary ? 'SESSION SUMMARY (chat facts only)' : 'PRODUCED WORKING DOCUMENT'}`,
@@ -7335,7 +7436,7 @@ ${stepInstruction}`;
               {adminSection === 'system-prompt' && (
                 <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
                   <h2 className="text-xl font-bold mb-2 flex items-center gap-2"><FileText className="w-6 h-6 text-blue-400" />System Prompt Configuration</h2>
-                  <p className="text-xs text-blue-300/55 mb-3">Saved to user settings JSON with agents, workflows, and other context.</p>
+                  <p className="text-xs text-blue-300/55 mb-3">Saved to the shared product JSON — used by all users, not stored in their settings.</p>
                   <textarea value={customSystemPrompt} onChange={(e) => setCustomSystemPrompt(e.target.value)} rows={24} className="w-full bg-slate-950 border border-blue-400/30 rounded-lg px-4 py-3 text-xs text-slate-200 font-mono leading-relaxed focus:outline-none focus:border-cyan-400/60 resize-y" spellCheck={false} />
                   <div className="flex flex-wrap gap-3 mt-4">
                     <button onClick={() => persistIntelligenceSettings({ systemPrompt: customSystemPrompt })} disabled={userSettingsSaveStatus === 'saving'} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 text-white rounded-lg text-sm font-semibold flex items-center gap-2 disabled:opacity-50"><Save className="w-4 h-4" />{userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save'}</button>
@@ -7350,7 +7451,7 @@ ${stepInstruction}`;
                   <div>
                     <h3 className="text-lg font-bold text-white">PowerPoint context</h3>
                     <p className="text-xs text-blue-300/55 mt-1">
-                      Export prompts and clarify copy for IC consultation. Template upload stays in User Settings. Saved to settings JSON.
+                      Export prompts and clarify copy for IC consultation. Template upload stays in User Settings. Saved to the shared product JSON.
                     </p>
                   </div>
                   {[['intentDetection', 'Offer Detection (after chat)', 'Decides when to offer a PowerPoint export.'], ['messageClassify', 'Message Classify (export vs assess)', 'Routes typed messages: export, assessment, or neither.'], ['summary', 'Session Summary', 'Used when generating a summary deck.'], ['produced', 'Produced Document', 'Used when generating a working document.']].map(([key, title, desc]) => (
@@ -7358,8 +7459,8 @@ ${stepInstruction}`;
                       <div className="text-sm font-semibold text-white mb-1">{title}</div>
                       <p className="text-xs text-blue-300/50 mb-3">{desc}</p>
                       <textarea
-                        value={userSettings.pptxContext?.[key] ?? ''}
-                        onChange={e => setUserSettings(prev => ({
+                        value={productIntel.pptxContext?.[key] ?? ''}
+                        onChange={e => setProductIntel(prev => ({
                           ...prev,
                           pptxContext: { ...mergePptxContext(prev.pptxContext), [key]: e.target.value },
                         }))}
@@ -7372,8 +7473,8 @@ ${stepInstruction}`;
                     <div className="text-sm font-semibold text-white mb-1">PPT clarify prompt</div>
                     <p className="text-xs text-blue-300/50 mb-3">Shown when the user wants an export but has not chosen summary / one-pager / full pack.</p>
                     <textarea
-                      value={userSettings.pptxClarify?.prompt ?? ''}
-                      onChange={(e) => setUserSettings(prev => ({
+                      value={productIntel.pptxClarify?.prompt ?? ''}
+                      onChange={(e) => setProductIntel(prev => ({
                         ...prev,
                         pptxClarify: { ...(prev.pptxClarify || {}), prompt: e.target.value },
                       }))}
@@ -7384,10 +7485,9 @@ ${stepInstruction}`;
                   <div className="flex flex-wrap gap-3">
                     <button
                       type="button"
-                      onClick={() => saveUserSettings({
-                        ...userSettings,
-                        pptxContext: userSettings.pptxContext,
-                        pptxClarify: userSettings.pptxClarify,
+                      onClick={() => persistIntelligenceSettings({
+                        pptxContext: productIntel.pptxContext,
+                        pptxClarify: productIntel.pptxClarify,
                       })}
                       disabled={userSettingsSaveStatus === 'saving'}
                       className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 text-white font-semibold rounded-lg transition-all flex items-center gap-2"
@@ -7396,7 +7496,7 @@ ${stepInstruction}`;
                     </button>
                     <button
                       type="button"
-                      onClick={() => setUserSettings(prev => ({
+                      onClick={() => setProductIntel(prev => ({
                         ...prev,
                         pptxContext: { ...DEFAULT_PPTX_CONTEXT },
                         pptxClarify: { ...DEFAULT_PPTX_CLARIFY, options: DEFAULT_PPTX_CLARIFY.options.map((o) => ({ ...o })) },
@@ -7431,8 +7531,8 @@ ${stepInstruction}`;
                     <div className="mb-3">
                       <label className="text-xs text-blue-300/70 font-semibold mb-1 block">Suggestions system prompt</label>
                       <textarea
-                        value={userSettings.suggestions?.systemPrompt ?? ''}
-                        onChange={(e) => setUserSettings(prev => ({ ...prev, suggestions: { ...prev.suggestions, systemPrompt: e.target.value } }))}
+                        value={productIntel.suggestions?.systemPrompt ?? ''}
+                        onChange={(e) => setProductIntel(prev => ({ ...prev, suggestions: { ...prev.suggestions, systemPrompt: e.target.value } }))}
                         rows={8}
                         className="w-full bg-slate-950 border border-blue-400/30 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono resize-y"
                       />
@@ -7470,13 +7570,13 @@ ${stepInstruction}`;
                     ['workflowRuntime.pptxRepairPrompt', 'PPT JSON repair'],
                   ].map(([path, title]) => {
                     const [root, key] = path.split('.');
-                    const value = userSettings?.[root]?.[key] ?? '';
+                    const value = productIntel?.[root]?.[key] ?? '';
                     return (
                       <div key={path} className="bg-slate-800/40 border border-blue-400/20 rounded-xl p-4">
                         <div className="text-sm font-semibold text-white mb-2">{title}</div>
                         <textarea
                           value={value}
-                          onChange={(e) => setUserSettings(prev => ({
+                          onChange={(e) => setProductIntel(prev => ({
                             ...prev,
                             [root]: { ...(prev[root] || {}), [key]: e.target.value },
                           }))}
@@ -7489,9 +7589,9 @@ ${stepInstruction}`;
                   <button
                     type="button"
                     onClick={() => persistIntelligenceSettings({
-                      welcomeMessages: userSettings.welcomeMessages,
-                      workflowRuntime: userSettings.workflowRuntime,
-                      suggestions: userSettings.suggestions,
+                      welcomeMessages: productIntel.welcomeMessages,
+                      workflowRuntime: productIntel.workflowRuntime,
+                      suggestions: productIntel.suggestions,
                     })}
                     disabled={userSettingsSaveStatus === 'saving'}
                     className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
@@ -7720,7 +7820,7 @@ ${stepInstruction}`;
                       <div>
                         <h3 className="text-lg font-bold text-white">Stella prompts</h3>
                         <p className="text-xs text-blue-300/55 mt-1">
-                          Welcome message and AI prompts for data intake / analysis. Stored in settings JSON — separate from Incentive Comp runtime.
+                          Welcome message and AI prompts for data intake / analysis. Stored in the shared product JSON — separate from Incentive Comp runtime.
                         </p>
                       </div>
                       {[
@@ -7730,13 +7830,13 @@ ${stepInstruction}`;
                         ['stellaPrompts.analyst', 'Analyst'],
                       ].map(([path, title]) => {
                         const [root, key] = path.split('.');
-                        const value = userSettings?.[root]?.[key] ?? '';
+                        const value = productIntel?.[root]?.[key] ?? '';
                         return (
                           <div key={path} className="bg-slate-800/40 border border-cyan-400/20 rounded-xl p-4">
                             <div className="text-sm font-semibold text-white mb-2">{title}</div>
                             <textarea
                               value={value}
-                              onChange={(e) => setUserSettings(prev => ({
+                              onChange={(e) => setProductIntel(prev => ({
                                 ...prev,
                                 [root]: { ...(prev[root] || {}), [key]: e.target.value },
                               }))}
@@ -7749,8 +7849,8 @@ ${stepInstruction}`;
                       <button
                         type="button"
                         onClick={() => persistIntelligenceSettings({
-                          welcomeMessages: userSettings.welcomeMessages,
-                          stellaPrompts: userSettings.stellaPrompts,
+                          welcomeMessages: productIntel.welcomeMessages,
+                          stellaPrompts: productIntel.stellaPrompts,
                         })}
                         disabled={userSettingsSaveStatus === 'saving'}
                         className="px-5 py-2.5 bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
