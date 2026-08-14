@@ -11,7 +11,6 @@ import {
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
   userProposalRemotePath,
-  userModuleContextRemotePath,
 } from './auth';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -4023,25 +4022,6 @@ ${stepInstruction}`;
     } catch (err) {
       job.onStatus?.(`Image reading skipped: ${err.message || 'vision failed'}`);
     }
-    const storagePath = userModuleContextRemotePath(currentUser.id, moduleId, file.name);
-    const { error: uploadError } = await supabase.storage
-      .from('intelligence')
-      .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
-    if (uploadError) throw new Error(uploadError.message || 'Cloud upload failed');
-    const combinedPersist = [
-      `File: ${file.name}`,
-      `Module: ${moduleId}`,
-      extractedText ? `=== TEXT ===\n${extractedText}` : '',
-      structuredText ? `=== TABLES / CHARTS ===\n${structuredText}` : '',
-      visionText ? `=== IMAGES ===\n${visionText}` : '',
-    ].filter(Boolean).join('\n\n');
-    try {
-      await supabase.storage.from('intelligence').upload(
-        `${storagePath}.extracted.txt`,
-        new Blob([combinedPersist], { type: 'text/plain' }),
-        { upsert: true, contentType: 'text/plain' },
-      );
-    } catch { /* sidecar is best-effort */ }
 
     const extractBlob = [extractedText, structuredText, visionText].filter(Boolean).join('\n\n');
     let onboarding = { summary: 'Uploaded context file.', suggestedQuestions: [] };
@@ -4057,8 +4037,8 @@ ${stepInstruction}`;
       name: file.name,
       fileType: job.fileType,
       sizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
-      storagePath,
-      storageBucket: 'intelligence',
+      storagePath: null,
+      storageBucket: null,
       uploadedAt: new Date().toISOString(),
       summary: onboarding.summary || '',
       extractedText,
@@ -4304,9 +4284,9 @@ ${stepInstruction}`;
           Upload a file, answer any questions about it, then save. You can come back later and add more context for that file. It is always included when you work in {moduleLabelFor(moduleId)}.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
-          Saved for this user only: notes and extract in settings JSON (
+          Saved for this user only in their settings JSON (
           <code className="text-cyan-300/70">{userSettingsRemotePath(currentUser.id)}</code>
-          ), original file under <code className="text-cyan-300/70">users/{currentUser.id}/context/{moduleId}/</code>.
+          ) — extract, intake answers, and notes. The original PowerPoint/Excel/PDF is not kept.
         </p>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <button
