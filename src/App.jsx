@@ -285,9 +285,9 @@ function normalizeLoadedUserSettings(parsed) {
 }
 
 /** Document shape saved to localStorage / Supabase — always includes userId. */
-function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId = null } = {}) {
+function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId = null, userName = '' } = {}) {
   const merged = mergeUserSettingsFields(settings || {});
-  return {
+  const doc = {
     userId,
     updatedAt: new Date().toISOString(),
     settings: {
@@ -297,6 +297,43 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
     chats: normalizeStoredChats(chats),
     activeChatId: activeChatId || null,
   };
+  if (userName) doc.userName = userName;
+  return doc;
+}
+
+async function uploadUserSettingsJson(userId, doc) {
+  const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
+  const { error } = await supabase.storage
+    .from('intelligence')
+    .upload(userSettingsRemotePath(userId), blob, { upsert: true, contentType: 'application/json' });
+  if (error) throw error;
+}
+
+const userSettingsUploadSlots = new Map();
+
+/** Last-write-wins cloud save so a slower chat autosave cannot wipe a newer context upload. */
+function queueUserSettingsUpload(userId, doc) {
+  let slot = userSettingsUploadSlots.get(userId);
+  if (!slot) {
+    slot = { pending: null, chain: Promise.resolve() };
+    userSettingsUploadSlots.set(userId, slot);
+  }
+  slot.pending = doc;
+  slot.chain = slot.chain.then(async () => {
+    let ok = true;
+    while (slot.pending) {
+      const toWrite = slot.pending;
+      slot.pending = null;
+      try {
+        await uploadUserSettingsJson(userId, toWrite);
+      } catch (err) {
+        ok = false;
+        console.warn(`Could not save ${userSettingsRemotePath(userId)}:`, err?.message || err);
+      }
+    }
+    return ok;
+  });
+  return slot.chain;
 }
 
 function buildProductIntelligenceDocument(intel) {
@@ -2447,15 +2484,27 @@ export default function CommercialExcellenceApp() {
             const cleaned = buildUserSettingsDocument(currentUser.id, merged, {
               chats: remoteChats.length ? remoteChats : chatSessionsRef.current,
               activeChatId: remoteActive || activeChatIdRef.current,
+              userName: currentUser.name,
             });
             localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(cleaned));
-            const blob = new Blob([JSON.stringify(cleaned, null, 2)], { type: 'application/json' });
-            await supabase.storage.from('intelligence').upload(
-              userSettingsRemotePath(currentUser.id),
-              blob,
-              { upsert: true, contentType: 'application/json' },
-            );
+            await queueUserSettingsUpload(currentUser.id, cleaned);
           } catch { /* ignore */ }
+        } else {
+          // First visit for this user — create users/<id>/settings.json so context is not browser-only.
+          const localMerged = mergeUserSettingsFields(userSettingsRef.current);
+          const localDoc = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
+          const { chats: localChats, activeChatId: localActive } = extractChatsFromDocument(localDoc);
+          const seeded = buildUserSettingsDocument(currentUser.id, localMerged, {
+            chats: localChats.length ? localChats : (chatSessionsRef.current || []),
+            activeChatId: localActive || activeChatIdRef.current,
+            userName: currentUser.name,
+          });
+          try {
+            localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(seeded));
+          } catch { /* ignore */ }
+          const ok = await queueUserSettingsUpload(currentUser.id, seeded);
+          setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
+          setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
         }
       } catch { /* per-user settings may not exist yet */ }
     };
@@ -2509,17 +2558,16 @@ export default function CommercialExcellenceApp() {
       chatSessionsRef.current = next;
       setChatSessions(next);
       const mergedSettings = mergeUserSettingsFields(userSettingsRef.current);
-      const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, { chats: next, activeChatId: id });
+      const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, {
+        chats: next,
+        activeChatId: id,
+        userName: currentUser.name,
+      });
       try {
         localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
       } catch { /* ignore */ }
       try {
-        const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
-        await supabase.storage.from('intelligence').upload(
-          userSettingsRemotePath(currentUser.id),
-          blob,
-          { upsert: true, contentType: 'application/json' },
-        );
+        await queueUserSettingsUpload(currentUser.id, doc);
       } catch { /* local is enough */ }
     }, 1200);
     return () => clearTimeout(persistChatsTimerRef.current);
@@ -3005,6 +3053,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
     const doc = buildUserSettingsDocument(currentUser.id, settings, {
       chats: liveChats,
       activeChatId: activeChatIdRef.current || liveSnap.id,
+      userName: currentUser.name,
     });
     setUserSettings(settings);
     userSettingsRef.current = settings;
@@ -3013,16 +3062,13 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* private mode / quota — continue to cloud */ }
     try {
-      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
-      const { error } = await supabase.storage
-        .from('intelligence')
-        .upload(userSettingsRemotePath(currentUser.id), blob, { upsert: true, contentType: 'application/json' });
-      if (error) throw error;
-      setUserSettingsSaveStatus('saved');
-      setTimeout(() => setUserSettingsSaveStatus('idle'), 3000);
-    } catch {
+      const ok = await queueUserSettingsUpload(currentUser.id, doc);
+      setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
+      setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
+    } catch (err) {
+      console.warn('User settings cloud save failed:', err?.message || err);
       setUserSettingsSaveStatus('saved-local');
-      setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
+      setTimeout(() => setUserSettingsSaveStatus('idle'), 6000);
     }
   };
 
@@ -3031,17 +3077,13 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
     const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, {
       chats: list,
       activeChatId: activeId,
+      userName: currentUser.name,
     });
     try {
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* ignore */ }
     try {
-      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
-      await supabase.storage.from('intelligence').upload(
-        userSettingsRemotePath(currentUser.id),
-        blob,
-        { upsert: true, contentType: 'application/json' },
-      );
+      await queueUserSettingsUpload(currentUser.id, doc);
     } catch { /* local is enough */ }
   };
 
@@ -4493,9 +4535,11 @@ ${stepInstruction}`;
           Upload a file and use the chat to add more context. Detected content from the file appears below so you can confirm, edit, or remove it. Only those saved fields are sent to the AI as guidance in {moduleLabelFor(moduleId)}.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
-          Saved for this user only in their settings JSON (
-          <code className="text-cyan-300/70">{userSettingsRemotePath(currentUser.id)}</code>
-          ) — extract, intake answers, and notes. The original PowerPoint/Excel/PDF is not kept.
+          Saved for this user in Supabase Storage <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser.id)}</code>
+          {' '}(user id <code className="text-cyan-300/70">{currentUser.id}</code>). Extract and notes only — the original file is not kept.
+          {userSettingsSaveStatus === 'saved-local' && (
+            <span className="block mt-1 text-amber-300/90">Cloud sync unavailable — this copy is in the browser only until Supabase accepts the upload.</span>
+          )}
         </p>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <button
@@ -7169,9 +7213,11 @@ ${stepInstruction}`;
                 {userSettingsPane === 'general' && (
                   <>
                     <p className="text-xs text-blue-300/70 mb-5">
-                      These apply across the hub. Saved per user as JSON in this browser and Supabase (
-                      <code className="text-cyan-300/80">{userSettingsRemotePath(currentUser.id)}</code>
-                      ).
+                      These apply across the hub. Saved per user in this browser and in Supabase Storage bucket
+                      {' '}<code className="text-cyan-300/80">intelligence</code>
+                      {' '}→ folder <code className="text-cyan-300/80">users/{currentUser.id}</code>
+                      {' '}→ <code className="text-cyan-300/80">settings.json</code>
+                      {' '}({currentUser.name}’s id is <code className="text-cyan-300/80">{currentUser.id}</code>, not the display name).
                     </p>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
