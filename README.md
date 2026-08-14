@@ -14,7 +14,7 @@ Set these in your local `.env` and in your Vercel project settings:
 | `VITE_APP_USER_ID` | Browser | Admin user id (default `default`) |
 | `VITE_APP_USER_NAME` | Browser | Admin display name (default `Admin`) |
 | `VITE_APP_USER2_ID` | Browser | Second (non-admin) user id (default `consultant`) |
-| `VITE_APP_USER2_NAME` | Browser | Second user display name (default `Consultant`) |
+| `VITE_APP_USER2_NAME` | Browser | Second user display name (default `Standard User`) |
 | `VITE_APP_USER2_PASSWORD` | Browser | Password for the second user (falls back to `VITE_APP_PASSWORD`) |
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.cjs`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |

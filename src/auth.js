@@ -22,7 +22,7 @@ export const HARDCODED_USERS = [
   },
   {
     id: envStr('VITE_APP_USER2_ID', 'consultant'),
-    name: envStr('VITE_APP_USER2_NAME', 'Consultant'),
+    name: envStr('VITE_APP_USER2_NAME', 'Standard User'),
     role: 'user',
     password: envStr('VITE_APP_USER2_PASSWORD', envStr('VITE_APP_PASSWORD', '')),
   },
