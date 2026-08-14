@@ -105,15 +105,6 @@ function isConversationGrounded(suggestion, convoTokens) {
   return overlap >= 1;
 }
 
-function isQuestionAboutThisDocument(question, extract) {
-  const q = String(question || '');
-  const ext = String(extract || '');
-  if (q.replace(/\s+/g, ' ').trim().length < 8) return false;
-  const wander = /\b(payout|accelerator|quota|weighting|incentive|commission|spiff|compliance|fairness|product mix|territory (?:re)?design|strategic alignment|scheme design)\b/i;
-  if (wander.test(q) && !wander.test(ext)) return false;
-  return true;
-}
-
 function excerptForSuggestions(text, max = 1200) {
   const t = String(text || '').trim();
   if (t.length <= max) return t;
@@ -3692,12 +3683,11 @@ ${stepInstruction}`;
       parsed = extractJsonObject(raw) || {};
     } catch { /* fall through */ }
     const message = parsed.message
-      || (parsed.complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || 'Is there anything in this file I should not take at face value?'));
-    const offTopic = parsed.complete ? false : !isQuestionAboutThisDocument(message, extractBlob);
+      || (parsed.complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || 'Is anything in this file still unclear?'));
     return {
-      complete: !!parsed.complete || offTopic,
-      message: offTopic ? 'Thanks — this file is clear enough to store as context.' : message,
-      context_qa: parsed.complete ? (parsed.context_qa || null) : (offTopic ? { what_it_represents: '', time_period: '', key_metrics: [], interpretation_notes: 'File stored without extra questions — extract was sufficient.', qa_pairs: [] } : null),
+      complete: !!parsed.complete,
+      message,
+      context_qa: parsed.context_qa || null,
     };
   };
 
@@ -3709,15 +3699,15 @@ ${stepInstruction}`;
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map((c) => `- ${c.name}`).join('\n')}` : '';
     const raw = await callAnthropic(system, [{
       role: 'user',
-      content: `FILE NAME: ${name}\n(The module "${moduleLabelFor(moduleId)}" is only where this file will be stored — do not ask module-wide questions.)${colText}\n\nFILE CONTENTS:\n${String(extractBlob || '').slice(0, 18000)}`,
+      content: `FILE NAME: ${name}\nStored under: ${moduleLabelFor(moduleId)} (storage location only — not a topic to ask about).${colText}\n\nFILE CONTENTS:\n${String(extractBlob || '').slice(0, 18000)}`,
     }], 1000);
     const parsed = extractJsonObject(raw);
     const fallback = { summary: 'Uploaded context file.', columns: [], suggestedQuestions: [] };
     if (!parsed || typeof parsed !== 'object') return fallback;
     const questions = (Array.isArray(parsed.suggestedQuestions) ? parsed.suggestedQuestions : [])
       .map((q) => String(q || '').replace(/\s+/g, ' ').trim())
-      .filter((q) => isQuestionAboutThisDocument(q, extractBlob))
-      .slice(0, 3);
+      .filter((q) => q.length >= 8)
+      .slice(0, 5);
     return {
       summary: parsed.summary || fallback.summary,
       columns: Array.isArray(parsed.columns) ? parsed.columns : [],
@@ -4841,7 +4831,7 @@ ${stepInstruction}`;
     const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
     const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1000);
     const parsed = extractJsonObject(raw);
-    return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', columns: [], suggestedQuestions: ['What does this data represent?', 'What time period does it cover?', 'Which metrics matter most?', 'Any definitions or filters to apply?'] };
+    return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', columns: [], suggestedQuestions: [] };
   };
 
   // Runs one intake turn for the given (up-to-date) file object.

@@ -156,32 +156,32 @@ Rules:
 - Prefer relevant=true or "unsure" over dropping possible content.
 - relevant=false only when clearly logo / decoration / stock photo / icon.
 - Use the exact filename provided for each image.`,
-  contextContentSummaryPrompt: `You onboard ONE uploaded file. Your only job is to understand THIS file.
+  contextContentSummaryPrompt: `You read ONE uploaded file, then we save it as context.
 
 Return ONLY valid JSON. No markdown.
 Schema:
 {
-  "summary": "2-4 sentences describing what THIS file contains",
+  "summary": "2-4 sentences describing what THIS file contains, based only on its contents",
   "columns": [{ "name": "exact column name", "description": "what this column represents" }],
-  "suggestedQuestions": ["questions about THIS file only"]
+  "suggestedQuestions": []
 }
 
-Rules:
-- suggestedQuestions may be an EMPTY array [] if the file is already clear (e.g. a simple team list with names and roles).
-- Ask at most 3 questions, and only about ambiguities in this file (unclear column, missing effective date, whether the list is complete, duplicate names).
-- Do NOT ask about incentive design, payouts, quotas, strategy, products, territories, or other topics unless those topics actually appear in the file.
-- Do NOT ask how the file should be used in the {{moduleLabel}} module if that is obvious from the file itself.
-- Never ask about facts already visible in the extract (names, headings, row counts, listed roles).
-- If column names are provided, describe them. If none, return an empty columns array.`,
-  contextIntakePrompt: `You capture missing meaning for ONE uploaded file. Ask only about THIS file.
+Process:
+1. Read the file contents provided.
+2. If something needed to interpret THIS file is missing or ambiguous, add a clarifying question about that gap. Questions must be about this file only.
+3. If the file is already understandable from its contents, return suggestedQuestions as [].
+4. Never use a fixed checklist of questions. Never ask about topics that are not in the file.
+5. Never ask about facts already visible in the extract.
+6. If column names are provided, describe them. If none, return an empty columns array.
 
-Ask ONE question per turn, and only if the extract is ambiguous.
-If the extract is a clear list or structure (for example a team roster with names and roles) and nothing material is missing, set complete=true immediately — do not invent extra questions.
+{{moduleLabel}} is only the place this file will be stored — it is not a topic to ask about.`,
+  contextIntakePrompt: `You help onboard ONE uploaded file so it can be saved.
 
-Do NOT ask about incentive schemes, payouts, strategy, other files, or module-wide design unless those appear in this file.
-Never ask about facts already visible in the extract.
+Process: read the extract; ask one question only if something in THIS file is still unclear; otherwise set complete=true so the file is saved.
 
-When you have enough, set "complete": true and fill "context_qa" fully.
+Never use a fixed checklist. Never ask about other files or about the module in general. Never ask about facts already visible in the extract.
+
+When the file is understandable, set complete=true and fill context_qa.
 
 Return ONLY valid JSON — no markdown fences.
 Schema:

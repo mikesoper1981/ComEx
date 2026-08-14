@@ -232,7 +232,9 @@ export function mergeWorkflowRuntime(partial) {
     out.proposalImageInterpretPrompt = DEFAULT_WORKFLOW_RUNTIME.proposalImageInterpretPrompt;
   }
   const contextSummary = String(out.contextContentSummaryPrompt || '');
-  if (!/Ask only about THIS file/i.test(contextSummary) && !/your only job is to understand THIS file/i.test(contextSummary)) {
+  if (contextSummary.includes('simple team list')
+    || contextSummary.includes('incentive design, payouts')
+    || !/Never use a fixed checklist/i.test(contextSummary)) {
     out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
     out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;
   }
