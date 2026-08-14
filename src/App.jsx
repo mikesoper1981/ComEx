@@ -813,12 +813,11 @@ function formatMemoryPromptBlock(settings) {
   return `\n\nREMEMBERED FROM PRIOR CHATS (facts the user already confirmed — clarifying answers, plan rules, definitions. Use them. Do not re-ask unless the user contradicts them):\n${body}`;
 }
 
-function shouldHarvestChatMemory(assistantText, userText) {
+function shouldHarvestChatMemory(_assistantText, userText) {
   const user = String(userText || '').trim();
   if (user.length < 8) return false;
   if (/^(y|yes|yeah|yep|sure|ok|okay|start|go|continue|proceed|no|cancel|thanks|thank you)[\s.!]*$/i.test(user)) return false;
-  if (user.length >= 40) return true;
-  return hasNumberedClarifyingQuestions(assistantText);
+  return true;
 }
 
 // Short, URL/identifier-safe random id (used for stella_data_<id> tables).
@@ -3050,12 +3049,13 @@ Return ${n} clickable follow-ups that continue this thread. Each must mention a 
     try {
       const raw = await callAnthropic(
         `You extract durable memory for a commercial-excellence copilot.
-From the exchange, list facts the USER confirmed that should be remembered in later chats: answers to clarifying questions, plan rules, metrics, dates, roles, constraints, preferences.
+From the exchange, list facts the USER stated that should be remembered in later chats.
+Include volunteered facts (e.g. "our products are X"), answers to clarifying questions, plan rules, metrics, dates, roles, constraints, and preferences.
 Skip greetings, "yes start the workflow", process chatter, the assistant's own advice, and unanswered questions.
 Return JSON only: {"facts":["..."]}. Max 5 facts. Each fact one short sentence. If nothing durable, {"facts":[]}.`,
         [{
           role: 'user',
-          content: `Assistant asked:\n${String(assistantText || '').slice(0, 2500)}\n\nUser replied:\n${String(userText || '').slice(0, 2500)}`,
+          content: `Recent assistant message (may be empty):\n${String(assistantText || '').slice(0, 2500)}\n\nUser said:\n${String(userText || '').slice(0, 2500)}`,
         }],
         400,
       );
