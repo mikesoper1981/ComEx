@@ -1578,6 +1578,7 @@ export default function CommercialExcellenceApp() {
   const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
   const [userSettings, setUserSettings] = useState(() => readLocalUserSettings(getCurrentUser().id));
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
+  const [userSettingsPane, setUserSettingsPane] = useState('general'); // general | incentives | stella
   const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
   const [pptxTemplateError, setPptxTemplateError] = useState('');
   const [knowledgeBase, setKnowledgeBase] = useState('');
@@ -4472,15 +4473,33 @@ ${stepInstruction}`;
                 {showLanding && <p className="text-xs text-blue-300/70 hidden sm:block">Field & Commercial Excellence Platform</p>}
               </div>
             </div>
-            {!showLanding && (
-              <div className="flex gap-1 sm:gap-2 bg-slate-800/50 rounded-lg p-1">
-                {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance'], ['territory', Map, 'Territory'], ['stella', Layers, 'Stella Insights'], ['user-settings', UserCog, 'User Settings'], ['admin', Settings, 'Admin']].map(([tab, Icon, label]) => (
-                  <button key={tab} onClick={() => setActiveTab(tab)} className={`flex items-center gap-1 sm:gap-2 px-2 sm:px-4 py-1.5 sm:py-2 rounded-md transition-all text-xs sm:text-sm ${activeTab === tab ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}>
-                    <Icon className="w-3 h-3 sm:w-4 sm:h-4" /><span className="hidden sm:inline">{label}</span>
-                  </button>
-                ))}
-              </div>
-            )}
+            <div className="flex items-center gap-2">
+              {!showLanding && (activeTab === 'chat' || activeTab === 'performance') && (
+                <div className="flex gap-1 sm:gap-2 bg-slate-800/50 rounded-lg p-1">
+                  {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance']].map(([tab, Icon, label]) => (
+                    <button key={tab} onClick={() => setActiveTab(tab)} className={`flex items-center gap-1 sm:gap-2 px-2 sm:px-4 py-1.5 sm:py-2 rounded-md transition-all text-xs sm:text-sm ${activeTab === tab ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}>
+                      <Icon className="w-3 h-3 sm:w-4 sm:h-4" /><span className="hidden sm:inline">{label}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <button
+                type="button"
+                title="User settings"
+                onClick={() => { setShowLanding(false); setActiveTab('user-settings'); }}
+                className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'user-settings' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+              >
+                <UserCog className="w-4 h-4 sm:w-5 sm:h-5" />
+              </button>
+              <button
+                type="button"
+                title="Admin"
+                onClick={() => { setShowLanding(false); setActiveTab('admin'); }}
+                className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'admin' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+              >
+                <Settings className="w-4 h-4 sm:w-5 sm:h-5" />
+              </button>
+            </div>
           </div>
         </div>
       </header>
@@ -5093,7 +5112,7 @@ ${stepInstruction}`;
                     <div className="w-10 h-10 bg-white/15 rounded-lg flex items-center justify-center"><UserCog className="w-5 h-5" /></div>
                     <div>
                       <h2 className="text-xl font-bold">User Settings</h2>
-                      <p className="text-blue-100 text-xs sm:text-sm">Your preferences and IC context — applied across Consultation and specialist agents.</p>
+                      <p className="text-blue-100 text-xs sm:text-sm">General preferences for your account. Product-specific settings will sit in their own tabs.</p>
                     </div>
                   </div>
                   <div className="text-right text-xs text-blue-100/80">
@@ -5103,196 +5122,219 @@ ${stepInstruction}`;
                 </div>
               </div>
 
+              <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit">
+                {[['general', 'General'], ['incentives', 'Incentives'], ['stella', 'Stella Insights']].map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setUserSettingsPane(id)}
+                    className={`px-3 sm:px-4 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${userSettingsPane === id ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
               <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 sm:p-6">
-                <p className="text-xs text-blue-300/70 mb-5">
-                  Saved per user as JSON in this browser and Supabase storage (
-                  <code className="text-cyan-300/80">{userSettingsRemotePath(currentUser.id)}</code>
-                  ). The document includes <code className="text-cyan-300/80">userId</code> so multiple users can coexist; swap the hardcoded login for real auth later without changing this shape.
-                </p>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
-                    <input
-                      value={userSettings.companyName}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, companyName: e.target.value }))}
-                      placeholder="e.g. Acme Pharma UK"
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry / therapeutic area</label>
-                    <input
-                      value={userSettings.industry}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, industry: e.target.value }))}
-                      placeholder="e.g. Specialty pharma — oncology"
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Your role</label>
-                    <input
-                      value={userSettings.role}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, role: e.target.value }))}
-                      placeholder="e.g. Incentive Compensation Manager"
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Preferred currency / units</label>
-                    <input
-                      value={userSettings.currency}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, currency: e.target.value }))}
-                      placeholder="e.g. GBP, % of target"
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company metrics &amp; definitions</label>
-                    <textarea
-                      value={userSettings.metrics}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, metrics: e.target.value }))}
-                      rows={3}
-                      placeholder={"e.g. Attainment = actual / quota\nPrimary KPI = Net Sales\nQuota year = calendar year"}
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Abbreviations &amp; terminology</label>
-                    <textarea
-                      value={userSettings.abbreviations}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, abbreviations: e.target.value }))}
-                      rows={4}
-                      placeholder={"e.g. AE = Account Executive\nKAM = Key Account Manager\nSPIFF = Short-term incentive / contest"}
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Preferences</label>
-                    <textarea
-                      value={userSettings.preferences}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, preferences: e.target.value }))}
-                      rows={3}
-                      placeholder={"e.g. Prefer 3–5 plan components\nKeep responses concise with tables\nAlways show weightings as %"}
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Hard constraints</label>
-                    <textarea
-                      value={userSettings.constraints}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, constraints: e.target.value }))}
-                      rows={3}
-                      placeholder={"e.g. Must comply with ABPI\nNo individual SPIFs\nTeam component < 20%"}
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className="block text-xs text-blue-300/70 font-semibold mb-2">Additional context</label>
-                    <textarea
-                      value={userSettings.customContext}
-                      onChange={(e) => setUserSettings(prev => ({ ...prev, customContext: e.target.value }))}
-                      rows={4}
-                      placeholder="Anything else the AI should always know — org structure notes, product portfolio, historical scheme quirks, etc."
-                      className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
-                    />
-                  </div>
-                </div>
-
-                <div className="mt-8 pt-6 border-t border-blue-400/15">
-                  <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
-                  <p className="text-xs text-blue-300/60 mb-4">
-                    Upload a branded .pptx. Exports use its background, colours, fonts and shading — then choose a layout per slide based on the content (cards, table, process, two-column, etc.), not a clone of every template slide. Without a template, ComEx uses its built-in default style. Stored at{' '}
-                    <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>.
-                  </p>
-
-                  {userSettings.pptxTemplate ? (
-                    <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 space-y-3">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-semibold text-white">{userSettings.pptxTemplate.fileName}</div>
-                          <div className="text-xs text-blue-300/50 mt-0.5">
-                            Theme: {userSettings.pptxTemplate.theme?.schemeName || 'Custom'}
-                            {userSettings.pptxTemplate.theme?.fonts?.heading ? ` · ${userSettings.pptxTemplate.theme.fonts.heading}` : ''}
-                            {userSettings.pptxTemplate.theme?.typography?.titleFontSize ? ` · title ${userSettings.pptxTemplate.theme.typography.titleFontSize}pt` : ''}
-                            {userSettings.pptxTemplate.theme?.logoCount ? ` · ${userSettings.pptxTemplate.theme.logoCount} logo(s)` : ''}
-                            {userSettings.pptxTemplate.uploadedAt ? ` · ${new Date(userSettings.pptxTemplate.uploadedAt).toLocaleDateString('en-GB')}` : ''}
-                          </div>
-                        </div>
-                        <div className="flex gap-2">
-                          <button
-                            type="button"
-                            onClick={() => pptxTemplateInputRef.current?.click()}
-                            disabled={pptxTemplateStatus === 'extracting' || pptxTemplateStatus === 'uploading'}
-                            className="px-3 py-1.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 text-xs font-semibold rounded-lg border border-slate-500/30 disabled:opacity-50"
-                          >
-                            Replace
-                          </button>
-                          <button
-                            type="button"
-                            onClick={handleRemovePptxTemplate}
-                            className="px-3 py-1.5 bg-red-500/15 hover:bg-red-500/25 text-red-300 text-xs font-semibold rounded-lg border border-red-400/25"
-                          >
-                            Remove
-                          </button>
-                        </div>
+                {userSettingsPane === 'general' && (
+                  <>
+                    <p className="text-xs text-blue-300/70 mb-5">
+                      These apply across the hub. Saved per user as JSON in this browser and Supabase (
+                      <code className="text-cyan-300/80">{userSettingsRemotePath(currentUser.id)}</code>
+                      ).
+                    </p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
+                        <input
+                          value={userSettings.companyName}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, companyName: e.target.value }))}
+                          placeholder="e.g. Acme Pharma UK"
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                        />
                       </div>
-                      {(() => {
-                        const gen = getPptxGeneratorThemeFromUserSettings(userSettings);
-                        const meta = userSettings.pptxTemplate?.theme?.blueprintMeta;
-                        const swatches = [
-                          ['Brand', gen.bgDark],
-                          ['Accent', gen.accent],
-                          ['Subtitle', gen.subtitleColor],
-                          ['Title', gen.textOnDark],
-                          ['Body', gen.textOnLight],
-                        ].filter(([, hex]) => hex);
-                        return (
-                          <div className="flex flex-wrap gap-3 items-center">
-                            {swatches.map(([label, hex]) => (
-                              <div key={label} className="flex items-center gap-2 text-xs text-blue-200/70">
-                                <span className="w-6 h-6 rounded border border-white/20 shadow-inner" style={{ backgroundColor: `#${hex}` }} title={`#${hex}`} />
-                                <span>{label} <span className="text-blue-300/40 font-mono">#{hex}</span></span>
-                              </div>
-                            ))}
-                            {userSettings.pptxTemplate?.theme?.hasBackgroundImage && (
-                              <span className="text-[10px] text-cyan-300/80 font-semibold">Background from template ✓</span>
-                            )}
-                            {meta && (
-                              <span className="text-[10px] text-cyan-300/80 font-semibold">
-                                {meta.cardColumnCount || 0} columns · {meta.chromeShapeCount || 0} shapes
-                              </span>
-                            )}
-                            {gen.slideWidth && gen.slideHeight && (
-                              <span className="text-[10px] text-emerald-400/80 font-semibold">
-                                {gen.slideWidth}&quot;×{gen.slideHeight}&quot;
-                                {gen.headingFont ? ` · ${gen.headingFont}` : ''}
-                                {gen.titleFontSize ? ` ${gen.titleFontSize}pt` : ''}
-                              </span>
-                            )}
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry / therapeutic area</label>
+                        <input
+                          value={userSettings.industry}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, industry: e.target.value }))}
+                          placeholder="e.g. Specialty pharma — oncology"
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Your role</label>
+                        <input
+                          value={userSettings.role}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, role: e.target.value }))}
+                          placeholder="e.g. Incentive Compensation Manager"
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Preferred currency / units</label>
+                        <input
+                          value={userSettings.currency}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, currency: e.target.value }))}
+                          placeholder="e.g. GBP, % of target"
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+                        />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company metrics &amp; definitions</label>
+                        <textarea
+                          value={userSettings.metrics}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, metrics: e.target.value }))}
+                          rows={3}
+                          placeholder={"e.g. Attainment = actual / quota\nPrimary KPI = Net Sales\nQuota year = calendar year"}
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                        />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Abbreviations &amp; terminology</label>
+                        <textarea
+                          value={userSettings.abbreviations}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, abbreviations: e.target.value }))}
+                          rows={4}
+                          placeholder={"e.g. AE = Account Executive\nKAM = Key Account Manager\nSPIFF = Short-term incentive / contest"}
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                        />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Preferences</label>
+                        <textarea
+                          value={userSettings.preferences}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, preferences: e.target.value }))}
+                          rows={3}
+                          placeholder={"e.g. Prefer concise answers with tables"}
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                        />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Hard constraints</label>
+                        <textarea
+                          value={userSettings.constraints}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, constraints: e.target.value }))}
+                          rows={3}
+                          placeholder={"e.g. Must comply with ABPI"}
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                        />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Additional context</label>
+                        <textarea
+                          value={userSettings.customContext}
+                          onChange={(e) => setUserSettings(prev => ({ ...prev, customContext: e.target.value }))}
+                          rows={4}
+                          placeholder="Anything else the AI should always know across tools."
+                          className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {userSettingsPane === 'incentives' && (
+                  <>
+                    <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
+                    <p className="text-xs text-blue-300/60 mb-4">
+                      Used when exporting Incentive Compensation decks. Upload a branded .pptx — exports take its colours, fonts and background. Without a template, ComEx uses the default style. Stored at{' '}
+                      <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>.
+                    </p>
+                    {userSettings.pptxTemplate ? (
+                      <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 space-y-3">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold text-white">{userSettings.pptxTemplate.fileName}</div>
+                            <div className="text-xs text-blue-300/50 mt-0.5">
+                              Theme: {userSettings.pptxTemplate.theme?.schemeName || 'Custom'}
+                              {userSettings.pptxTemplate.theme?.fonts?.heading ? ` · ${userSettings.pptxTemplate.theme.fonts.heading}` : ''}
+                              {userSettings.pptxTemplate.theme?.typography?.titleFontSize ? ` · title ${userSettings.pptxTemplate.theme.typography.titleFontSize}pt` : ''}
+                              {userSettings.pptxTemplate.theme?.logoCount ? ` · ${userSettings.pptxTemplate.theme.logoCount} logo(s)` : ''}
+                              {userSettings.pptxTemplate.uploadedAt ? ` · ${new Date(userSettings.pptxTemplate.uploadedAt).toLocaleDateString('en-GB')}` : ''}
+                            </div>
                           </div>
-                        );
-                      })()}
-                    </div>
-                  ) : (
-                    <div className="bg-slate-900/30 border border-dashed border-blue-400/25 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                      <div className="text-xs text-blue-300/60">No template uploaded — exports use the default navy / cyan ComEx style.</div>
-                      <button
-                        type="button"
-                        onClick={() => pptxTemplateInputRef.current?.click()}
-                        disabled={pptxTemplateStatus === 'extracting' || pptxTemplateStatus === 'uploading'}
-                        className="px-4 py-2 bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold disabled:opacity-50 flex items-center gap-2"
-                      >
-                        <Upload className="w-3.5 h-3.5" />
-                        {pptxTemplateStatus === 'extracting' ? 'Reading theme…' : pptxTemplateStatus === 'uploading' ? 'Uploading…' : 'Upload .pptx template'}
-                      </button>
-                    </div>
-                  )}
-                  {pptxTemplateStatus === 'error' && pptxTemplateError && (
-                    <div className="mt-2 text-xs text-red-300 flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5" /> {pptxTemplateError}</div>
-                  )}
-                  <input ref={pptxTemplateInputRef} type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={handlePptxTemplateUpload} className="hidden" />
-                </div>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => pptxTemplateInputRef.current?.click()}
+                              disabled={pptxTemplateStatus === 'extracting' || pptxTemplateStatus === 'uploading'}
+                              className="px-3 py-1.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 text-xs font-semibold rounded-lg border border-slate-500/30 disabled:opacity-50"
+                            >
+                              Replace
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleRemovePptxTemplate}
+                              className="px-3 py-1.5 bg-red-500/15 hover:bg-red-500/25 text-red-300 text-xs font-semibold rounded-lg border border-red-400/25"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        </div>
+                        {(() => {
+                          const gen = getPptxGeneratorThemeFromUserSettings(userSettings);
+                          const meta = userSettings.pptxTemplate?.theme?.blueprintMeta;
+                          const swatches = [
+                            ['Brand', gen.bgDark],
+                            ['Accent', gen.accent],
+                            ['Subtitle', gen.subtitleColor],
+                            ['Title', gen.textOnDark],
+                            ['Body', gen.textOnLight],
+                          ].filter(([, hex]) => hex);
+                          return (
+                            <div className="flex flex-wrap gap-3 items-center">
+                              {swatches.map(([label, hex]) => (
+                                <div key={label} className="flex items-center gap-2 text-xs text-blue-200/70">
+                                  <span className="w-6 h-6 rounded border border-white/20 shadow-inner" style={{ backgroundColor: `#${hex}` }} title={`#${hex}`} />
+                                  <span>{label} <span className="text-blue-300/40 font-mono">#{hex}</span></span>
+                                </div>
+                              ))}
+                              {userSettings.pptxTemplate?.theme?.hasBackgroundImage && (
+                                <span className="text-[10px] text-cyan-300/80 font-semibold">Background from template ✓</span>
+                              )}
+                              {meta && (
+                                <span className="text-[10px] text-cyan-300/80 font-semibold">
+                                  {meta.cardColumnCount || 0} columns · {meta.chromeShapeCount || 0} shapes
+                                </span>
+                              )}
+                              {gen.slideWidth && gen.slideHeight && (
+                                <span className="text-[10px] text-emerald-400/80 font-semibold">
+                                  {gen.slideWidth}&quot;×{gen.slideHeight}&quot;
+                                  {gen.headingFont ? ` · ${gen.headingFont}` : ''}
+                                  {gen.titleFontSize ? ` ${gen.titleFontSize}pt` : ''}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    ) : (
+                      <div className="bg-slate-900/30 border border-dashed border-blue-400/25 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="text-xs text-blue-300/60">No template uploaded — exports use the default navy / cyan ComEx style.</div>
+                        <button
+                          type="button"
+                          onClick={() => pptxTemplateInputRef.current?.click()}
+                          disabled={pptxTemplateStatus === 'extracting' || pptxTemplateStatus === 'uploading'}
+                          className="px-4 py-2 bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold disabled:opacity-50 flex items-center gap-2"
+                        >
+                          <Upload className="w-3.5 h-3.5" />
+                          {pptxTemplateStatus === 'extracting' ? 'Reading theme…' : pptxTemplateStatus === 'uploading' ? 'Uploading…' : 'Upload .pptx template'}
+                        </button>
+                      </div>
+                    )}
+                    {pptxTemplateStatus === 'error' && pptxTemplateError && (
+                      <div className="mt-2 text-xs text-red-300 flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5" /> {pptxTemplateError}</div>
+                    )}
+                    <input ref={pptxTemplateInputRef} type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={handlePptxTemplateUpload} className="hidden" />
+                  </>
+                )}
+
+                {userSettingsPane === 'stella' && (
+                  <div className="text-sm text-blue-300/70 bg-slate-900/30 border border-dashed border-blue-400/20 rounded-xl p-6">
+                    Stella Insights settings will live here (data defaults, chart preferences, and analysis context). Nothing to configure yet.
+                  </div>
+                )}
 
                 <div className="flex flex-wrap items-center gap-3 mt-6">
                   <button
