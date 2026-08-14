@@ -4394,6 +4394,9 @@ ${stepInstruction}`;
     const ctx = { ...(rec.capturedContext || {}) };
     const patch = {};
     if (blockId === 'summary') patch.summary = empty ? '' : nextValue;
+    else if (blockId === 'extractedText') patch.extractedText = empty ? '' : nextValue;
+    else if (blockId === 'structuredExtract') patch.structuredExtract = empty ? '' : nextValue;
+    else if (blockId === 'visionExtract') patch.visionExtract = empty ? '' : nextValue;
     else if (blockId === 'represents') patch.capturedContext = { ...ctx, what_it_represents: empty ? '' : nextValue };
     else if (blockId === 'period') patch.capturedContext = { ...ctx, time_period: empty ? '' : nextValue };
     else if (blockId === 'interpretation') patch.capturedContext = { ...ctx, interpretation_notes: empty ? '' : nextValue };
@@ -4450,7 +4453,7 @@ ${stepInstruction}`;
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
         <p className="text-xs text-blue-300/60 mb-2">
-          Upload a file and use the chat to answer questions or add more context. Saved fields below can be edited or removed. Only those fields are sent to the AI as guidance in {moduleLabelFor(moduleId)}.
+          Upload a file and use the chat to add more context. Detected content from the file appears below so you can confirm, edit, or remove it. Only those saved fields are sent to the AI as guidance in {moduleLabelFor(moduleId)}.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
           Saved for this user only in their settings JSON (
@@ -4559,7 +4562,7 @@ ${stepInstruction}`;
                   {contextBlocks.length > 0 && (
                     <div className="space-y-2 pt-2 border-t border-blue-400/15">
                       <div className="flex items-center justify-between gap-2">
-                        <div className="text-[11px] font-semibold text-blue-200">Saved context</div>
+                        <div className="text-[11px] font-semibold text-blue-200">Detected & saved context</div>
                         {contextEditSaveStatus === 'saving' && <span className="text-[11px] text-blue-300/70">Saving…</span>}
                         {contextEditSaveStatus === 'saved' && <span className="text-[11px] text-green-400 font-semibold">Saved</span>}
                         {contextEditSaveStatus === 'error' && <span className="text-[11px] text-red-400 font-semibold">Save failed</span>}

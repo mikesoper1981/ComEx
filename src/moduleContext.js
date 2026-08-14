@@ -42,10 +42,15 @@ export function isEmptyContextValue(value) {
   if (!t) return true;
   const lower = t.toLowerCase().replace(/\s+/g, ' ');
   if (/^(n\/a|na|none|null|nil|undefined|-|—|unknown|not specified|not provided|tbd|none provided)$/i.test(lower)) return true;
-  if (/\bappears to be empty\b/i.test(lower) && t.length < 800) return true;
-  if (/\bcontains? only a filename\b/i.test(lower) && t.length < 800) return true;
-  if (/\bno actual data( content)?\b/i.test(lower) && t.length < 800) return true;
-  if (/\bfilename reference\b/i.test(lower) && t.length < 800) return true;
+  if (/\bto use this correctly i need a little context\b/i.test(lower)) return true;
+  if (/\byou can answer them together or one at a time\b/i.test(lower)) return true;
+  if (t.length < 900) {
+    if (/\bappears to be empty\b/i.test(lower)) return true;
+    if (/\bcontains? only a filename\b/i.test(lower)) return true;
+    if (/\bno actual data( content)?\b/i.test(lower)) return true;
+    if (/\bfilename reference\b/i.test(lower)) return true;
+    if (/\bwhat data should this .+\sfile contain\b/i.test(lower)) return true;
+  }
   // Only treat short filler as empty — a long extract may mention missing text on one slide.
   if (t.length > 240) return false;
   if (/\bno (readable |extractable |usable )?(text|content|data|extract|information|context)\b/i.test(lower)) return true;
@@ -188,7 +193,7 @@ export function mergeModuleContext(raw) {
   return out;
 }
 
-/** Disk shape: curated context only — no intake chat, extracts, or processing flags. */
+/** Disk shape: detected file content + curated blocks. Never intake chat. */
 export function serializeContextFileForPersist(fileRec) {
   const rec = normalizeContextFile(fileRec);
   if (!rec) return null;
@@ -197,6 +202,9 @@ export function serializeContextFileForPersist(fileRec) {
   if (rec.sizeLabel) out.sizeLabel = rec.sizeLabel;
   if (rec.uploadedAt) out.uploadedAt = rec.uploadedAt;
   if (rec.summary) out.summary = rec.summary;
+  if (rec.extractedText) out.extractedText = rec.extractedText;
+  if (rec.structuredExtract) out.structuredExtract = rec.structuredExtract;
+  if (rec.visionExtract) out.visionExtract = rec.visionExtract;
   if (rec.imageCount) out.imageCount = rec.imageCount;
   if (rec.capturedContext) out.capturedContext = rec.capturedContext;
   if (rec.notes?.length) out.notes = rec.notes;
@@ -258,6 +266,15 @@ export function listModuleContextBlocks(f) {
   if (!f) return [];
   const ctx = f.capturedContext || {};
   const blocks = [];
+  if (!isEmptyContextValue(f.extractedText)) {
+    blocks.push({ id: 'extractedText', label: 'Detected from file', value: f.extractedText });
+  }
+  if (!isEmptyContextValue(f.structuredExtract)) {
+    blocks.push({ id: 'structuredExtract', label: 'Tables / charts', value: f.structuredExtract });
+  }
+  if (!isEmptyContextValue(f.visionExtract)) {
+    blocks.push({ id: 'visionExtract', label: 'From images', value: f.visionExtract });
+  }
   if (!isEmptyContextValue(f.summary)) blocks.push({ id: 'summary', label: 'Summary', value: f.summary });
   if (!isEmptyContextValue(ctx.what_it_represents)) blocks.push({ id: 'represents', label: 'What it represents', value: ctx.what_it_represents, line: true });
   if (!isEmptyContextValue(ctx.time_period)) blocks.push({ id: 'period', label: 'Time period', value: ctx.time_period, line: true });
