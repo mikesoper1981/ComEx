@@ -10,7 +10,12 @@ Set these in your local `.env` and in your Vercel project settings:
 | --- | --- | --- |
 | `VITE_SUPABASE_URL` | Browser | Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | Browser | Supabase anon key (used by `src/supabase.js`) |
-| `VITE_APP_PASSWORD` | Browser | Password gate for the app |
+| `VITE_APP_PASSWORD` | Browser | Password for the admin user |
+| `VITE_APP_USER_ID` | Browser | Admin user id (default `default`) |
+| `VITE_APP_USER_NAME` | Browser | Admin display name (default `Admin`) |
+| `VITE_APP_USER2_ID` | Browser | Second (non-admin) user id (default `consultant`) |
+| `VITE_APP_USER2_NAME` | Browser | Second user display name (default `Consultant`) |
+| `VITE_APP_USER2_PASSWORD` | Browser | Password for the second user (falls back to `VITE_APP_PASSWORD`) |
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.cjs`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |
 | `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.cjs`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used solely to run validated read-only `SELECT` queries for Stella Insights. |

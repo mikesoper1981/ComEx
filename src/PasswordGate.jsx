@@ -1,18 +1,16 @@
 import { useState } from 'react';
-import { Lock } from 'lucide-react';
+import { Lock, Shield, User } from 'lucide-react';
 import {
   SESSION_UNLOCKED_KEY,
-  getHardcodedUser,
+  HARDCODED_USERS,
   setCurrentUser,
 } from './auth';
 
 export default function PasswordGate({ children }) {
-  const expected = import.meta.env.VITE_APP_PASSWORD;
-  const hardcodedUser = getHardcodedUser();
-
   const [unlocked, setUnlocked] = useState(
     () => sessionStorage.getItem(SESSION_UNLOCKED_KEY) === '1'
   );
+  const [selectedId, setSelectedId] = useState(HARDCODED_USERS[0]?.id || '');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
@@ -20,13 +18,14 @@ export default function PasswordGate({ children }) {
     return children;
   }
 
+  const selected = HARDCODED_USERS.find((u) => u.id === selectedId) || HARDCODED_USERS[0];
+
   const handleSubmit = (e) => {
     e.preventDefault();
     const a = password.trim();
-    const b = String(expected ?? '').trim();
-    if (a === b) {
-      // Bind session to the hardcoded user so settings/data can be scoped by userId.
-      setCurrentUser(hardcodedUser);
+    const b = String(selected?.password ?? '').trim();
+    if (a && b && a === b) {
+      setCurrentUser(selected);
       setUnlocked(true);
       setError('');
       setPassword('');
@@ -47,14 +46,32 @@ export default function PasswordGate({ children }) {
         <h1 className="text-xl font-semibold text-center text-white tracking-tight mb-1">
           Sign in
         </h1>
-        <p className="text-sm text-blue-200/70 text-center mb-2">
-          Enter the app password to continue.
-        </p>
-        <p className="text-xs text-blue-300/50 text-center mb-6">
-          Signing in as <span className="text-blue-200/80 font-medium">{hardcodedUser.name}</span>
-          <span className="text-blue-300/40"> ({hardcodedUser.id})</span>
+        <p className="text-sm text-blue-200/70 text-center mb-6">
+          Choose who you are, then enter that account password.
         </p>
         <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="grid grid-cols-2 gap-2">
+            {HARDCODED_USERS.map((u) => {
+              const active = u.id === selected?.id;
+              const Icon = u.role === 'admin' ? Shield : User;
+              return (
+                <button
+                  key={u.id}
+                  type="button"
+                  onClick={() => { setSelectedId(u.id); setError(''); }}
+                  className={`rounded-xl border px-3 py-3 text-left transition-all ${
+                    active
+                      ? 'bg-blue-500/20 border-blue-400/70 ring-1 ring-blue-400/40'
+                      : 'bg-slate-800/50 border-blue-400/20 hover:border-blue-400/40'
+                  }`}
+                >
+                  <Icon className={`w-4 h-4 mb-1.5 ${active ? 'text-cyan-300' : 'text-blue-300/70'}`} />
+                  <div className="text-sm font-semibold text-white truncate">{u.name}</div>
+                  <div className="text-[11px] text-blue-300/60">{u.role === 'admin' ? 'Admin' : 'User'}</div>
+                </button>
+              );
+            })}
+          </div>
           <div>
             <label htmlFor="app-password" className="sr-only">
               Password
@@ -68,7 +85,7 @@ export default function PasswordGate({ children }) {
                 setPassword(e.target.value);
                 if (error) setError('');
               }}
-              placeholder="Password"
+              placeholder={`Password for ${selected?.name || 'user'}`}
               className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-4 py-3 text-sm outline-none focus:border-blue-400 transition-colors"
             />
           </div>

@@ -1,10 +1,12 @@
 import React, { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers, UserCog } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers, UserCog, History, LogOut } from 'lucide-react';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
   setCurrentUser,
   getHardcodedUser,
+  isAdminUser,
+  clearCurrentUser,
   userSettingsLocalKey,
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
@@ -182,13 +184,148 @@ function normalizeLoadedUserSettings(parsed) {
 }
 
 /** Document shape saved to localStorage / Supabase — always includes userId. */
-function buildUserSettingsDocument(userId, settings) {
+function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId = null } = {}) {
   const merged = mergeUserSettingsFields(settings || {});
   return {
     userId,
     updatedAt: new Date().toISOString(),
     settings: merged,
+    chats: normalizeStoredChats(chats),
+    activeChatId: activeChatId || null,
   };
+}
+
+const MAX_STORED_CHATS = 25;
+const MAX_STORED_MESSAGES = 80;
+
+function newChatId() {
+  return `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function deriveChatTitle(messages) {
+  const userMsg = (messages || []).find((m) => m.role === 'user' && String(m.content || '').trim());
+  if (!userMsg) return 'New chat';
+  const t = String(userMsg.content).replace(/\s+/g, ' ').trim();
+  return t.length > 52 ? `${t.slice(0, 50)}…` : t;
+}
+
+function chatHasUserContent(messages) {
+  return (messages || []).some((m) => m.role === 'user' && String(m.content || '').trim());
+}
+
+function sanitizeMessageForStorage(m) {
+  if (!m || typeof m !== 'object') return null;
+  const out = {
+    role: m.role,
+    content: String(m.content || '').slice(0, 20000),
+  };
+  if (Array.isArray(m.imagePreviews) && m.imagePreviews.length) {
+    out.imagePreviews = m.imagePreviews.slice(0, 24).map((img) => ({
+      name: img.name,
+      included: !!img.included,
+      pending: false,
+      purpose: img.purpose || img.kind,
+      reason: img.reason,
+      sourceFormat: img.sourceFormat || null,
+      bytes: img.bytes || 0,
+    }));
+  }
+  return out;
+}
+
+function serializeChatSnapshot({ id, title, updatedAt, messages, currentWorkflow, pendingWorkflow, uploadedFile }) {
+  const safeMessages = (messages || []).slice(-MAX_STORED_MESSAGES).map(sanitizeMessageForStorage).filter(Boolean);
+  return {
+    id: id || newChatId(),
+    title: title && title !== 'New chat' ? title : deriveChatTitle(safeMessages),
+    updatedAt: updatedAt || new Date().toISOString(),
+    messages: safeMessages,
+    currentWorkflow: currentWorkflow
+      ? {
+          topicId: currentWorkflow.topicId,
+          currentStep: currentWorkflow.currentStep || 0,
+          waitingForUser: !!currentWorkflow.waitingForUser,
+          awaitingAgentReply: !!currentWorkflow.awaitingAgentReply,
+          focusedContext: String(currentWorkflow.focusedContext || '').slice(0, 80000),
+          context: (currentWorkflow.context || []).slice(-8).map((c) => ({
+            step: c.step,
+            agent: c.agent,
+            output: String(c.output || '').slice(0, 18000),
+            handoffs: (c.handoffs || []).slice(0, 6).map((h) => ({
+              agent: h.agent,
+              output: String(h.output || '').slice(0, 1500),
+            })),
+          })),
+          stepMessages: (currentWorkflow.stepMessages || []).slice(-12).map((m) => ({
+            role: m.role,
+            content: String(m.content || '').slice(0, 8000),
+          })),
+        }
+      : null,
+    pendingWorkflow: pendingWorkflow || null,
+    uploadedFile: uploadedFile
+      ? {
+          name: uploadedFile.name,
+          fileType: uploadedFile.fileType,
+          storagePath: uploadedFile.storagePath,
+          storageBucket: uploadedFile.storageBucket,
+          extractedText: String(uploadedFile.extractedText || '').slice(0, 40000),
+          visionExtract: String(uploadedFile.visionExtract || '').slice(0, 20000),
+          structuredExtract: String(uploadedFile.structuredExtract || '').slice(0, 15000),
+          imageCount: uploadedFile.imageCount || 0,
+        }
+      : null,
+  };
+}
+
+function normalizeStoredChats(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((c) => c && c.id && Array.isArray(c.messages))
+    .slice(0, MAX_STORED_CHATS)
+    .map((c) => ({
+      ...c,
+      title: c.title || deriveChatTitle(c.messages),
+      updatedAt: c.updatedAt || new Date().toISOString(),
+    }));
+}
+
+function extractChatsFromDocument(parsed) {
+  if (!parsed || typeof parsed !== 'object') return { chats: [], activeChatId: null };
+  const chats = normalizeStoredChats(parsed.chats || parsed.settings?.chats);
+  const activeChatId = parsed.activeChatId || parsed.settings?.activeChatId || null;
+  return { chats, activeChatId };
+}
+
+function readLocalChatState(userId) {
+  try {
+    const scoped = localStorage.getItem(userSettingsLocalKey(userId));
+    if (scoped) {
+      const parsed = safeJsonParse(scoped);
+      if (parsed) return extractChatsFromDocument(parsed);
+    }
+  } catch { /* ignore */ }
+  return { chats: [], activeChatId: null };
+}
+
+function consultationWelcome(userId) {
+  return {
+    role: 'assistant',
+    content: mergeIntelligenceContext(readLocalUserSettings(userId)).welcomeMessages.consultation,
+  };
+}
+
+function formatChatTime(iso) {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    if (sameDay) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  } catch {
+    return '';
+  }
 }
 
 function readLocalUserSettings(userId) {
@@ -1709,14 +1846,38 @@ export default function CommercialExcellenceApp() {
     }
     return setCurrentUser(getHardcodedUser());
   });
+  const isAdmin = isAdminUser(currentUser);
   const [activeTab, setActiveTab] = useState('chat');
   const [showLanding, setShowLanding] = useState(true);
-  const [messages, setMessages] = useState(() => [{
-    role: 'assistant',
-    content: mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).welcomeMessages.consultation,
-  }]);
+  const [chatSessions, setChatSessions] = useState(() => readLocalChatState(getCurrentUser().id).chats);
+  const [activeChatId, setActiveChatId] = useState(() => {
+    const { chats, activeChatId: saved } = readLocalChatState(getCurrentUser().id);
+    return saved || chats[0]?.id || null;
+  });
+  const [messages, setMessages] = useState(() => {
+    const uid = getCurrentUser().id;
+    const { chats, activeChatId: saved } = readLocalChatState(uid);
+    const active = chats.find((c) => c.id === (saved || chats[0]?.id));
+    if (active?.messages?.length) return active.messages;
+    return [consultationWelcome(uid)];
+  });
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [currentWorkflow, setCurrentWorkflow] = useState(() => {
+    const { chats, activeChatId: saved } = readLocalChatState(getCurrentUser().id);
+    const active = chats.find((c) => c.id === (saved || chats[0]?.id));
+    return active?.currentWorkflow || null;
+  });
+  const [pendingWorkflow, setPendingWorkflow] = useState(() => {
+    const { chats, activeChatId: saved } = readLocalChatState(getCurrentUser().id);
+    const active = chats.find((c) => c.id === (saved || chats[0]?.id));
+    return active?.pendingWorkflow || null;
+  });
+  const [uploadedFile, setUploadedFile] = useState(() => {
+    const { chats, activeChatId: saved } = readLocalChatState(getCurrentUser().id);
+    const active = chats.find((c) => c.id === (saved || chats[0]?.id));
+    return active?.uploadedFile || null;
+  });
   const [stellaTab, setStellaTab] = useState('chat'); // chat | data | business | connections
   const [stellaMessages, setStellaMessages] = useState(() => [{
     role: 'assistant',
@@ -1744,17 +1905,22 @@ export default function CommercialExcellenceApp() {
   const [structuredKnowledge, setStructuredKnowledge] = useState(null);
   const [documents, setDocuments] = useState([]);
   const [knowledgeLoadStatus, setKnowledgeLoadStatus] = useState('idle'); // idle | loading | ready | error
-  const [uploadedFile, setUploadedFile] = useState(null);
   const [imageLightbox, setImageLightbox] = useState(null); // { src, name, purpose, reason, included }
   const [pendingImageReview, setPendingImageReview] = useState(null); // pause ingest until user confirms unsure images
   const pendingImageReviewRef = useRef(null);
   const proposalIngestRunningRef = useRef(false);
+  const chatSessionsRef = useRef(chatSessions);
+  const activeChatIdRef = useRef(activeChatId);
+  const messagesRef = useRef(messages);
+  const currentWorkflowRef = useRef(currentWorkflow);
+  const pendingWorkflowRef = useRef(pendingWorkflow);
+  const uploadedFileRef = useRef(uploadedFile);
+  const persistChatsTimerRef = useRef(null);
+  const skipChatPersistRef = useRef(false);
   const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
 
   const [topics, setTopics] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).topics);
 
-  const [currentWorkflow, setCurrentWorkflow] = useState(null);
-  const [pendingWorkflow, setPendingWorkflow] = useState(null);
   const [orchestratorDecision, setOrchestratorDecision] = useState(null);
   const [pendingButtonAction, setPendingButtonAction] = useState(null);
   const [selectedTerritoryStructure, setSelectedTerritoryStructure] = useState(null);
@@ -1948,16 +2114,33 @@ export default function CommercialExcellenceApp() {
         }
         if (parsed && typeof parsed === 'object') {
           const merged = normalizeLoadedUserSettings(parsed);
+          const { chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(parsed);
           setUserSettings(merged);
           setAgents(merged.agents);
           setTopics(merged.topics);
           setCustomSystemPrompt(merged.systemPrompt);
           setSuggestionsEnabled(merged.suggestions.enabled);
           setMaxSuggestions(merged.suggestions.max);
+          if (remoteChats.length) {
+            skipChatPersistRef.current = true;
+            setChatSessions(remoteChats);
+            chatSessionsRef.current = remoteChats;
+            const pick = remoteChats.find((c) => c.id === remoteActive) || remoteChats[0];
+            setActiveChatId(pick.id);
+            activeChatIdRef.current = pick.id;
+            if (pick.messages?.length) setMessages(pick.messages);
+            setCurrentWorkflow(pick.currentWorkflow || null);
+            setPendingWorkflow(pick.pendingWorkflow || null);
+            setUploadedFile(pick.uploadedFile || null);
+            setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+          }
           try {
             localStorage.setItem(
               userSettingsLocalKey(currentUser.id),
-              JSON.stringify(buildUserSettingsDocument(currentUser.id, merged))
+              JSON.stringify(buildUserSettingsDocument(currentUser.id, merged, {
+                chats: remoteChats.length ? remoteChats : chatSessionsRef.current,
+                activeChatId: remoteActive || activeChatIdRef.current,
+              }))
             );
           } catch { /* ignore */ }
         }
@@ -1969,6 +2152,65 @@ export default function CommercialExcellenceApp() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+    currentWorkflowRef.current = currentWorkflow;
+    pendingWorkflowRef.current = pendingWorkflow;
+    uploadedFileRef.current = uploadedFile;
+    activeChatIdRef.current = activeChatId;
+    chatSessionsRef.current = chatSessions;
+  });
+
+  useEffect(() => {
+    if (!isAdmin && activeTab === 'admin') {
+      setActiveTab('chat');
+      setShowLanding(true);
+    }
+  }, [isAdmin, activeTab]);
+
+  useEffect(() => {
+    if (skipChatPersistRef.current) return;
+    if (!chatHasUserContent(messages) && !currentWorkflow) return;
+    if (persistChatsTimerRef.current) clearTimeout(persistChatsTimerRef.current);
+    persistChatsTimerRef.current = setTimeout(async () => {
+      const id = activeChatIdRef.current || newChatId();
+      if (!activeChatIdRef.current) {
+        activeChatIdRef.current = id;
+        setActiveChatId(id);
+      }
+      const snap = serializeChatSnapshot({
+        id,
+        messages: messagesRef.current,
+        currentWorkflow: currentWorkflowRef.current,
+        pendingWorkflow: pendingWorkflowRef.current,
+        uploadedFile: uploadedFileRef.current,
+      });
+      const next = [snap, ...(chatSessionsRef.current || []).filter((c) => c.id !== snap.id)].slice(0, MAX_STORED_CHATS);
+      chatSessionsRef.current = next;
+      setChatSessions(next);
+      let settingsDoc = userSettings;
+      try {
+        const existing = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
+        if (existing?.settings) settingsDoc = mergeUserSettingsFields(existing.settings);
+      } catch { /* ignore */ }
+      const mergedSettings = mergeUserSettingsFields(settingsDoc);
+      delete mergedSettings.knowledge;
+      const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, { chats: next, activeChatId: id });
+      try {
+        localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
+      } catch { /* ignore */ }
+      try {
+        const blob = new Blob([JSON.stringify(doc)], { type: 'application/json' });
+        await supabase.storage.from('intelligence').upload(
+          userSettingsRemotePath(currentUser.id),
+          blob,
+          { upsert: true, contentType: 'application/json' },
+        );
+      } catch { /* local is enough */ }
+    }, 1200);
+    return () => clearTimeout(persistChatsTimerRef.current);
+  }, [messages, currentWorkflow, pendingWorkflow, uploadedFile]);
 
   const handleCancelWorkflow = (e) => {
     if (e) { e.preventDefault(); e.stopPropagation(); }
@@ -2368,7 +2610,20 @@ export default function CommercialExcellenceApp() {
     });
     // Knowledge is file-based — never persist markdown blobs into settings JSON
     delete settings.knowledge;
-    const doc = buildUserSettingsDocument(currentUser.id, settings);
+    const liveSnap = serializeChatSnapshot({
+      id: activeChatIdRef.current || newChatId(),
+      messages: messagesRef.current,
+      currentWorkflow: currentWorkflowRef.current,
+      pendingWorkflow: pendingWorkflowRef.current,
+      uploadedFile: uploadedFileRef.current,
+    });
+    const liveChats = chatHasUserContent(liveSnap.messages)
+      ? [liveSnap, ...(chatSessionsRef.current || []).filter((c) => c.id !== liveSnap.id)].slice(0, MAX_STORED_CHATS)
+      : (chatSessionsRef.current || []);
+    const doc = buildUserSettingsDocument(currentUser.id, settings, {
+      chats: liveChats,
+      activeChatId: activeChatIdRef.current || liveSnap.id,
+    });
     setUserSettings(settings);
     if (settings.agents) setAgents(settings.agents);
     if (settings.topics) setTopics(settings.topics);
@@ -2393,6 +2648,115 @@ export default function CommercialExcellenceApp() {
       setUserSettingsSaveStatus('saved-local');
       setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
     }
+  };
+
+  const persistChatList = async (list, activeId) => {
+    let settingsDoc = userSettings;
+    try {
+      const existing = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
+      if (existing?.settings) settingsDoc = mergeUserSettingsFields(existing.settings);
+    } catch { /* ignore */ }
+    const mergedSettings = mergeUserSettingsFields(settingsDoc);
+    delete mergedSettings.knowledge;
+    const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, {
+      chats: list,
+      activeChatId: activeId,
+    });
+    try {
+      localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
+    } catch { /* ignore */ }
+    try {
+      const blob = new Blob([JSON.stringify(doc)], { type: 'application/json' });
+      await supabase.storage.from('intelligence').upload(
+        userSettingsRemotePath(currentUser.id),
+        blob,
+        { upsert: true, contentType: 'application/json' },
+      );
+    } catch { /* local is enough */ }
+  };
+
+  const flushActiveChat = () => {
+    const id = activeChatIdRef.current || newChatId();
+    if (!activeChatIdRef.current) {
+      activeChatIdRef.current = id;
+      setActiveChatId(id);
+    }
+    const snap = serializeChatSnapshot({
+      id,
+      messages: messagesRef.current,
+      currentWorkflow: currentWorkflowRef.current,
+      pendingWorkflow: pendingWorkflowRef.current,
+      uploadedFile: uploadedFileRef.current,
+    });
+    const next = chatHasUserContent(snap.messages)
+      ? [snap, ...(chatSessionsRef.current || []).filter((c) => c.id !== snap.id)].slice(0, MAX_STORED_CHATS)
+      : (chatSessionsRef.current || []).filter((c) => c.id !== snap.id);
+    chatSessionsRef.current = next;
+    setChatSessions(next);
+    return { list: next, activeId: id, snap };
+  };
+
+  const resetLiveChat = (id, snapshot = null) => {
+    skipChatPersistRef.current = true;
+    setActiveChatId(id);
+    activeChatIdRef.current = id;
+    setMessages(snapshot?.messages?.length ? snapshot.messages : [consultationWelcome(currentUser.id)]);
+    setCurrentWorkflow(snapshot?.currentWorkflow || null);
+    setPendingWorkflow(snapshot?.pendingWorkflow || null);
+    setUploadedFile(snapshot?.uploadedFile || null);
+    setOrchestratorDecision(null);
+    setPendingButtonAction(null);
+    setPendingImageReview(null);
+    pendingImageReviewRef.current = null;
+    setInput('');
+    setSuggestedPrompts([]);
+    setPptxOffers(null);
+    setPptxClarifyPending(false);
+    setIsLoading(false);
+    setShowLanding(false);
+    setActiveTab('chat');
+    setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+  };
+
+  const startNewChat = () => {
+    const { list } = flushActiveChat();
+    const id = newChatId();
+    resetLiveChat(id);
+    persistChatList(list, id);
+  };
+
+  const continueChat = (chatId) => {
+    if (chatId === activeChatIdRef.current) {
+      setShowLanding(false);
+      setActiveTab('chat');
+      return;
+    }
+    const { list } = flushActiveChat();
+    const found = list.find((c) => c.id === chatId) || (chatSessionsRef.current || []).find((c) => c.id === chatId);
+    if (!found) return;
+    resetLiveChat(found.id, found);
+    persistChatList(list, found.id);
+  };
+
+  const deleteChat = (chatId, event) => {
+    if (event) { event.preventDefault(); event.stopPropagation(); }
+    const next = (chatSessionsRef.current || []).filter((c) => c.id !== chatId);
+    chatSessionsRef.current = next;
+    setChatSessions(next);
+    if (activeChatIdRef.current === chatId) {
+      const id = newChatId();
+      resetLiveChat(id);
+      persistChatList(next, id);
+      return;
+    }
+    persistChatList(next, activeChatIdRef.current);
+  };
+
+  const handleSignOut = () => {
+    flushActiveChat();
+    persistChatList(chatSessionsRef.current, activeChatIdRef.current);
+    clearCurrentUser();
+    window.location.reload();
   };
 
   const handlePptxTemplateUpload = async (event) => {
@@ -4833,7 +5197,7 @@ ${stepInstruction}`;
           'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
           kb
             ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
-            : 'KNOWLEDGE BASE:\nNo knowledge files are loaded yet. Ask the user to upload intelligence files in Admin → Knowledge, or answer from conversation context only.'
+            : 'KNOWLEDGE BASE:\nNo knowledge files are loaded yet. Answer from conversation context and user settings only.'
         )
         + fileContext);
 
@@ -4895,13 +5259,27 @@ ${stepInstruction}`;
               >
                 <UserCog className="w-4 h-4 sm:w-5 sm:h-5" />
               </button>
+              {isAdmin && (
+                <button
+                  type="button"
+                  title="Admin"
+                  onClick={() => { setShowLanding(false); setActiveTab('admin'); }}
+                  className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'admin' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+                >
+                  <Settings className="w-4 h-4 sm:w-5 sm:h-5" />
+                </button>
+              )}
+              <div className="hidden sm:flex flex-col items-end leading-tight mr-0.5">
+                <span className="text-xs font-semibold text-white max-w-[140px] truncate">{currentUser.name}</span>
+                <span className="text-[10px] text-blue-300/60">{isAdmin ? 'Admin' : 'User'}</span>
+              </div>
               <button
                 type="button"
-                title="Admin"
-                onClick={() => { setShowLanding(false); setActiveTab('admin'); }}
-                className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'admin' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+                title="Sign out"
+                onClick={handleSignOut}
+                className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40 transition-all"
               >
-                <Settings className="w-4 h-4 sm:w-5 sm:h-5" />
+                <LogOut className="w-4 h-4 sm:w-5 sm:h-5" />
               </button>
             </div>
           </div>
@@ -4943,6 +5321,52 @@ ${stepInstruction}`;
               </div>
             ))}
           </div>
+
+          {chatSessions.filter((c) => chatHasUserContent(c.messages)).length > 0 && (
+            <div className="mt-10">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <History className="w-5 h-5 text-cyan-300" />
+                  <h3 className="text-lg font-semibold text-white">Your chats</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={startNewChat}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-400/40 rounded-lg text-xs text-blue-100 font-semibold"
+                >
+                  <Plus className="w-3.5 h-3.5" /> New chat
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {chatSessions.filter((c) => chatHasUserContent(c.messages)).slice(0, 9).map((chat) => (
+                  <div
+                    key={chat.id}
+                    className="text-left bg-slate-800/50 hover:bg-slate-700/55 border border-blue-400/20 hover:border-blue-400/45 rounded-xl p-4 transition-all group"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <button type="button" onClick={() => continueChat(chat.id)} className="min-w-0 text-left flex-1">
+                        <div className="text-sm font-semibold text-white truncate">{chat.title || 'Chat'}</div>
+                        <div className="text-[11px] text-blue-300/60 mt-1">
+                          {formatChatTime(chat.updatedAt)}
+                          {chat.currentWorkflow ? ' · Workflow in progress' : ''}
+                          {chat.id === activeChatId ? ' · Current' : ''}
+                        </div>
+                        <div className="mt-3 text-xs text-cyan-300/80 font-semibold">Continue →</div>
+                      </button>
+                      <button
+                        type="button"
+                        title="Delete chat"
+                        onClick={(e) => deleteChat(chat.id, e)}
+                        className="p-1 rounded text-slate-500 hover:text-red-300 hover:bg-red-500/15 opacity-0 group-hover:opacity-100 transition-all"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       ) : (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 sm:py-6 h-[calc(100vh-80px)] sm:h-[calc(100vh-100px)] overflow-hidden">
@@ -4956,9 +5380,56 @@ ${stepInstruction}`;
             </div>
           }>
           {activeTab === 'chat' ? (
-            <div className="flex flex-col h-full">
+            <div className="flex gap-3 h-full min-h-0">
+              <aside className="hidden md:flex w-56 lg:w-64 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
+                <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
+                    <History className="w-3.5 h-3.5" /> Chats
+                  </div>
+                  <button
+                    type="button"
+                    onClick={startNewChat}
+                    className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-[11px] text-blue-100 font-semibold"
+                  >
+                    <Plus className="w-3 h-3" /> New
+                  </button>
+                </div>
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1">
+                  {chatSessions.filter((c) => chatHasUserContent(c.messages)).length === 0 && (
+                    <div className="text-[11px] text-blue-300/50 px-2 py-3">No saved chats yet. Start a conversation and it will appear here.</div>
+                  )}
+                  {chatSessions.filter((c) => chatHasUserContent(c.messages)).map((chat) => (
+                    <div
+                      key={chat.id}
+                      className={`group flex items-start gap-1 rounded-lg border ${chat.id === activeChatId ? 'bg-blue-500/20 border-blue-400/40' : 'border-transparent hover:bg-slate-700/40 hover:border-blue-400/20'}`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => continueChat(chat.id)}
+                        className="flex-1 min-w-0 text-left px-2.5 py-2"
+                      >
+                        <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
+                        <div className="text-[10px] text-blue-300/55 mt-0.5">
+                          {formatChatTime(chat.updatedAt)}
+                          {chat.currentWorkflow ? ' · in progress' : ''}
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        title="Delete"
+                        onClick={(e) => deleteChat(chat.id, e)}
+                        className="mt-1.5 mr-1 p-1 rounded text-slate-500 hover:text-red-300 opacity-0 group-hover:opacity-100"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </aside>
+              <div className="flex flex-col h-full min-w-0 flex-1">
               {/* Quick Actions */}
               <div className="flex flex-wrap gap-2 mb-3 flex-shrink-0">
+                <button type="button" onClick={startNewChat} className="md:hidden flex items-center gap-1.5 px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-400/40 rounded-lg text-xs text-blue-100 font-semibold"><Plus className="w-3.5 h-3.5" /> New chat</button>
                 <button onClick={() => setInput('I need to design an incentive scheme for a team of 10 AEs.')} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-300 hover:text-blue-200 transition-all"><Target className="w-3.5 h-3.5" /> Design New Scheme</button>
                 <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-300 hover:text-cyan-200 transition-all"><Upload className="w-3.5 h-3.5" /> Assess Proposal</button>
                 <button onClick={() => setInput('What are the key principles for designing effective sales incentive schemes?')} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-300 hover:text-purple-200 transition-all"><Award className="w-3.5 h-3.5" /> Best Practices</button>
@@ -5300,6 +5771,7 @@ ${stepInstruction}`;
               </div>
               <input ref={fileInputRef} type="file" accept=".pdf,.ppt,.pptx" onChange={handleFileUpload} className="hidden" />
             </div>
+            </div>
 
           ) : activeTab === 'performance' ? (
             <div className="space-y-6 overflow-y-auto h-full custom-scrollbar pr-2">
@@ -5487,7 +5959,9 @@ ${stepInstruction}`;
                       <p className="text-cyan-100 text-xs">Chat with your data — analyse trends and chart insights</p>
                     </div>
                   </div>
+                  {isAdmin && (
                   <button onClick={() => { setActiveTab('admin'); setAdminModule('stella'); setStellaTab('data'); }} className="flex items-center gap-2 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold transition-all"><Settings className="w-4 h-4" /> Manage data & context</button>
+                  )}
                 </div>
               </div>
 
@@ -5554,7 +6028,7 @@ ${stepInstruction}`;
                     <div className="w-10 h-10 bg-white/15 rounded-lg flex items-center justify-center"><UserCog className="w-5 h-5" /></div>
                     <div>
                       <h2 className="text-xl font-bold">User Settings</h2>
-                      <p className="text-blue-100 text-xs sm:text-sm">General preferences for your account. Product-specific settings will sit in their own tabs.</p>
+                      <p className="text-blue-100 text-xs sm:text-sm">Saved only for {currentUser.name} in their settings JSON — not shared with other users.</p>
                     </div>
                   </div>
                   <div className="text-right text-xs text-blue-100/80">
@@ -5813,7 +6287,7 @@ ${stepInstruction}`;
               </div>
             </div>
 
-          ) : (
+          ) : isAdmin ? (
             // ADMIN
             <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full custom-scrollbar pr-1 sm:pr-2">
               <div className="flex gap-2 pb-1 overflow-x-auto">
@@ -6355,7 +6829,7 @@ ${stepInstruction}`;
                 </div>
               )}
             </div>
-          )}
+          ) : null}
           </MessageErrorBoundary>
         </div>
       )}
