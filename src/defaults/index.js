@@ -147,30 +147,33 @@ export function mergeTopics(partial) {
     return cloneTopics(DEFAULT_TOPICS);
   }
   const defaultById = Object.fromEntries(DEFAULT_TOPICS.map((t) => [t.id, t]));
-  return cloneTopics(
-    partial.map((t) => {
-      const d = defaultById[t.id];
-      if (!d) return t;
-      return {
-        ...t,
-        autoAdvance: t.autoAdvance !== undefined ? t.autoAdvance : d.autoAdvance,
-        orchestrator: cloneOrchestrator({
-          ...d.orchestrator,
-          ...(t.orchestrator || {}),
-          role: t.orchestrator?.role || d.orchestrator?.role,
-          goal: t.orchestrator?.goal || d.orchestrator?.goal,
-          approach: t.orchestrator?.approach || d.orchestrator?.approach,
-          evaluatePrompt: t.orchestrator?.evaluatePrompt || d.orchestrator?.evaluatePrompt,
-          introFull: t.orchestrator?.introFull || d.orchestrator?.introFull,
-          introFocused: t.orchestrator?.introFocused || d.orchestrator?.introFocused,
-          briefingPrompt: t.orchestrator?.briefingPrompt || d.orchestrator?.briefingPrompt,
-          wrapUpPrompt: t.orchestrator?.wrapUpPrompt || d.orchestrator?.wrapUpPrompt,
-          evalFallbackMessage: t.orchestrator?.evalFallbackMessage || d.orchestrator?.evalFallbackMessage,
-        }),
-        workflow: mergeWorkflowSteps(t.workflow, d.workflow),
-      };
-    }),
-  );
+  const mergedSaved = partial.map((t) => {
+    const d = defaultById[t.id];
+    if (!d) return t;
+    return {
+      ...t,
+      autoAdvance: t.autoAdvance !== undefined ? t.autoAdvance : d.autoAdvance,
+      orchestrator: cloneOrchestrator({
+        ...d.orchestrator,
+        ...(t.orchestrator || {}),
+        role: t.orchestrator?.role || d.orchestrator?.role,
+        goal: t.orchestrator?.goal || d.orchestrator?.goal,
+        approach: t.orchestrator?.approach || d.orchestrator?.approach,
+        evaluatePrompt: t.orchestrator?.evaluatePrompt || d.orchestrator?.evaluatePrompt,
+        introFull: t.orchestrator?.introFull || d.orchestrator?.introFull,
+        introFocused: t.orchestrator?.introFocused || d.orchestrator?.introFocused,
+        briefingPrompt: t.orchestrator?.briefingPrompt || d.orchestrator?.briefingPrompt,
+        wrapUpPrompt: t.orchestrator?.wrapUpPrompt || d.orchestrator?.wrapUpPrompt,
+        evalFallbackMessage: t.orchestrator?.evalFallbackMessage || d.orchestrator?.evalFallbackMessage,
+      }),
+      workflow: mergeWorkflowSteps(t.workflow, d.workflow),
+    };
+  });
+  const savedIds = new Set(partial.map((t) => t.id));
+  for (const d of DEFAULT_TOPICS) {
+    if (!savedIds.has(d.id)) mergedSaved.push(d);
+  }
+  return cloneTopics(mergedSaved);
 }
 
 export function mergeWelcomeMessages(partial) {

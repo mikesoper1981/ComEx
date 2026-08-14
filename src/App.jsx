@@ -37,12 +37,23 @@ const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
 const CHAT_API_PATH = '/api/chat';
 
-function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice, thinking }) {
+function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice, thinking, signal }) {
   return fetch(CHAT_API_PATH, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ system, messages, max_tokens, tools, tool_choice, thinking }),
+    signal,
   });
+}
+
+async function withAbortTimeout(ms, work) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await work(ctrl.signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function anthropicAssistantText(data) {
@@ -483,6 +494,46 @@ function rasterMediaType(path) {
   return 'image/png';
 }
 
+const VISION_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+/** Downscale to JPEG so vision requests stay under Vercel body limits and do not hang. */
+async function shrinkProposalImageForVision(img, { maxSide = 1280, quality = 0.72 } = {}) {
+  if (!img?.base64) return null;
+  const rawType = String(img.mediaType || 'image/png').toLowerCase();
+  const inType = VISION_MEDIA_TYPES.has(rawType) ? rawType : 'image/png';
+  try {
+    const binary = atob(img.base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: inType });
+    const bitmap = await createImageBitmap(blob);
+    const scale = Math.min(1, maxSide / Math.max(bitmap.width || maxSide, bitmap.height || maxSide));
+    const w = Math.max(1, Math.round((bitmap.width || maxSide) * scale));
+    const h = Math.max(1, Math.round((bitmap.height || maxSide) * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      bitmap.close?.();
+      return VISION_MEDIA_TYPES.has(rawType) ? { ...img, mediaType: inType } : null;
+    }
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    bitmap.close?.();
+    const dataUrl = canvas.toDataURL('image/jpeg', quality);
+    const b64 = dataUrl.split(',')[1];
+    if (!b64) return VISION_MEDIA_TYPES.has(rawType) ? { ...img, mediaType: inType } : null;
+    return {
+      ...img,
+      mediaType: 'image/jpeg',
+      base64: b64,
+      bytes: Math.round(b64.length * 0.75),
+    };
+  } catch {
+    return VISION_MEDIA_TYPES.has(rawType) ? { ...img, mediaType: inType } : null;
+  }
+}
+
 function readRasterDimensions(buf, mediaType) {
   if (!buf || buf.length < 24) return null;
   if (mediaType === 'image/png' || (buf[0] === 0x89 && buf[1] === 0x50)) {
@@ -654,17 +705,32 @@ async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = 
     }
   }
 
-  const batchSize = 3;
-  for (let i = 0; i < needsVision.length; i += batchSize) {
-    const batch = needsVision.slice(i, i + batchSize);
+  const preparedVision = [];
+  for (const img of needsVision) {
+    const shrunk = await shrinkProposalImageForVision(img);
+    if (shrunk) preparedVision.push({ orig: img, send: shrunk });
+    else {
+      decided.push({
+        img,
+        purpose: 'other_ic',
+        relevant: false,
+        unsure: true,
+        reason: 'Could not prepare image for classification',
+      });
+    }
+  }
+
+  const batchSize = 2;
+  for (let i = 0; i < preparedVision.length; i += batchSize) {
+    const batch = preparedVision.slice(i, i + batchSize);
     const content = [
-      ...batch.map((img) => ({
+      ...batch.map((item) => ({
         type: 'image',
-        source: { type: 'base64', media_type: img.mediaType, data: img.base64 },
+        source: { type: 'base64', media_type: item.send.mediaType, data: item.send.base64 },
       })),
       {
         type: 'text',
-        text: `Classify these ${batch.length} proposal image(s). Filenames in order: ${batch.map((img) => img.name).join(', ')}.
+        text: `Classify these ${batch.length} proposal image(s). Filenames in order: ${batch.map((item) => item.orig.name).join(', ')}.
 
 relevant=true for any IC/scheme content (payout scales, tables, charts, diagrams, eligibility, process, comms, governance — not only numbers).
 relevant=false only for logos, decoration, stock photos, icons.
@@ -672,11 +738,12 @@ relevant="unsure" if it might contain scheme context but you cannot tell.`,
       },
     ];
     try {
-      const res = await anthropicMessagesPost({
+      const res = await withAbortTimeout(25000, (signal) => anthropicMessagesPost({
         system: classifyPrompt,
         messages: [{ role: 'user', content }],
         max_tokens: 1200,
-      });
+        signal,
+      }));
       if (!res.ok) throw new Error(`Classify ${res.status}`);
       const data = await res.json();
       const parsed = parseJsonArrayFromModel(anthropicAssistantText(data));
@@ -684,7 +751,7 @@ relevant="unsure" if it might contain scheme context but you cannot tell.`,
         (Array.isArray(parsed) ? parsed : []).map((row) => [String(row.name || '').toLowerCase(), row]),
       );
       for (let bi = 0; bi < batch.length; bi++) {
-        const img = batch[bi];
+        const img = batch[bi].orig;
         const row = byName[img.name.toLowerCase()]
           || byName[img.name.split('.')[0].toLowerCase()]
           || (Array.isArray(parsed) ? parsed[bi] : null);
@@ -720,7 +787,8 @@ relevant="unsure" if it might contain scheme context but you cannot tell.`,
       }
     } catch (err) {
       console.warn('Image purpose classification failed:', err);
-      for (const img of batch) {
+      for (const item of batch) {
+        const img = item.orig;
         const tiny = (img.bytes || 0) < 8000;
         decided.push({
           img,
@@ -1175,39 +1243,50 @@ async function extractProposalImages(file, { textLength = 0 } = {}) {
 
 /**
  * Send proposal images to the vision model (prompt from workflowRuntime.proposalImageInterpretPrompt).
- * Batches to stay within request size limits.
+ * Shrinks, sends one at a time, and times out so large decks cannot stall Assess IC.
  */
-async function interpretProposalImages(images, systemPrompt) {
+async function interpretProposalImages(images, systemPrompt, { onProgress, maxImages = 8 } = {}) {
   if (!images?.length) return '';
-  const batches = [];
-  const size = 2;
-  for (let i = 0; i < images.length; i += size) batches.push(images.slice(i, i + size));
+  const prepared = [];
+  for (const img of images.slice(0, maxImages)) {
+    const shrunk = await shrinkProposalImageForVision(img);
+    if (shrunk) prepared.push({ name: img.name || shrunk.name, ...shrunk });
+  }
   const parts = [];
-  for (let b = 0; b < batches.length; b++) {
-    const batch = batches[b];
-    const content = [
-      ...batch.map((img) => ({
-        type: 'image',
-        source: { type: 'base64', media_type: img.mediaType, data: img.base64 },
-      })),
-      {
-        type: 'text',
-        text: `Extract ALL readable IC content from these ${batch.length} image(s): ${batch.map((i) => i.name).join(', ')}. Capture payout scales, tables, charts, diagrams, process/eligibility/comms graphics, plus each image's key points / message.`,
-      },
-    ];
-    const res = await anthropicMessagesPost({
-      system: systemPrompt,
-      messages: [{ role: 'user', content }],
-      max_tokens: 4000,
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Vision API ${res.status}: ${errText.substring(0, 180)}`);
+  for (let i = 0; i < prepared.length; i++) {
+    const img = prepared[i];
+    onProgress?.(i + 1, prepared.length, img.name);
+    try {
+      const res = await withAbortTimeout(25000, (signal) => anthropicMessagesPost({
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.base64 } },
+            {
+              type: 'text',
+              text: `Extract ALL readable IC content from image "${img.name}". Capture payout scales, tables, charts, diagrams, process/eligibility/comms graphics, plus key points / message.`,
+            },
+          ],
+        }],
+        max_tokens: 2500,
+        signal,
+      }));
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Vision API ${res.status}: ${errText.substring(0, 180)}`);
+      }
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message || 'Vision extraction failed');
+      const text = anthropicAssistantText(data)?.trim();
+      if (text) parts.push(`### ${img.name}\n${text}`);
+    } catch (err) {
+      const why = err?.name === 'AbortError' ? 'timed out' : (err.message || 'failed');
+      parts.push(`### ${img.name}\n(Could not read this image: ${why})`);
     }
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message || 'Vision extraction failed');
-    const text = anthropicAssistantText(data)?.trim();
-    if (text) parts.push(batches.length > 1 ? `### Image batch ${b + 1}\n${text}` : text);
+  }
+  if (images.length > maxImages) {
+    parts.push(`(${images.length - maxImages} further image(s) skipped to keep extract moving)`);
   }
   return parts.join('\n\n').trim();
 }
@@ -1668,6 +1747,8 @@ export default function CommercialExcellenceApp() {
   const [uploadedFile, setUploadedFile] = useState(null);
   const [imageLightbox, setImageLightbox] = useState(null); // { src, name, purpose, reason, included }
   const [pendingImageReview, setPendingImageReview] = useState(null); // pause ingest until user confirms unsure images
+  const pendingImageReviewRef = useRef(null);
+  const proposalIngestRunningRef = useRef(false);
   const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
 
   const [topics, setTopics] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).topics);
@@ -2576,8 +2657,16 @@ ${introInstr}`);
       setIsLoading(false);
       setTimeout(async () => {
         setIsLoading(true);
-        await runWorkflowStep(topic, 0, userMessage, [], focusedContext);
-        setIsLoading(false);
+        try {
+          await runWorkflowStep(topic, 0, userMessage, [], focusedContext);
+        } catch (err) {
+          setMessages((prev) => [...prev, {
+            role: 'system',
+            content: `⚠️ Workflow step failed: ${err.message || 'Unknown error'}`,
+          }]);
+        } finally {
+          setIsLoading(false);
+        }
       }, 800);
       return;
     }
@@ -2586,14 +2675,29 @@ ${introInstr}`);
 
   const launchWorkflowDirect = async (topicId, userMessage, focusedContext = null) => {
     const topic = topics.find(t => t.id === topicId);
-    if (!topic) return;
+    if (!topic) {
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `⚠️ Cannot start workflow \`${topicId}\` — it is missing from settings.`,
+      }]);
+      setIsLoading(false);
+      return;
+    }
     setIsLoading(true);
     setPptxOffers(null);
     setCurrentWorkflow({ topicId: topic.id, currentStep: 0, context: [], waitingForUser: false, focusedContext });
     setPendingWorkflow(null);
     logActivity('workflow', `Direct launch: ${topic.name}`);
-    await executeOrchestrator(topic, userMessage, 0, focusedContext);
-    setIsLoading(false);
+    try {
+      await executeOrchestrator(topic, userMessage, 0, focusedContext);
+    } catch (err) {
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `⚠️ Could not start workflow: ${err.message || 'Unknown error'}`,
+      }]);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const continueAgentWithUserReply = async (topic, stepIndex, userReply, workflowContext) => {
@@ -2615,7 +2719,7 @@ ${introInstr}`);
       logActivity('orchestrator', `Evaluating Step ${stepIndex + 1} after user reply`);
       const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext, stepIndex);
 
-      if (evaluation.agentStillWorking) {
+      if (evaluation.agentStillWorking && !topic.autoAdvance) {
         setOrchestratorDecision(null);
         setSuggestedPrompts([]);
         setCurrentWorkflow(prev => prev ? {
@@ -2920,7 +3024,7 @@ ${stepInstruction}`;
       logActivity('orchestrator', `Evaluating Step ${stepIndex + 1}`);
       const evaluation = await orchestratorEvaluate(topic, step, agentResponse, workflowContext, stepIndex);
 
-      if (evaluation.agentStillWorking) {
+      if (evaluation.agentStillWorking && !topic.autoAdvance) {
         setOrchestratorDecision(null);
         setSuggestedPrompts([]);
         logActivity('orchestrator', `Step ${stepIndex + 1} waiting for user answers`);
@@ -2962,54 +3066,74 @@ ${stepInstruction}`;
   };
 
   const completeProposalIngest = async (job) => {
-    const {
-      file,
-      fileType,
-      extractedText,
-      structuredText,
-      imageNotes,
-      images,
-      skipped,
-    } = job;
     setIsLoading(true);
+    pendingImageReviewRef.current = null;
+    setPendingImageReview(null);
     let visionText = '';
     let visionError = '';
-    const imageCount = images.length;
-    const ignoredPurposeCount = (skipped || []).filter((s) =>
-      ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
-    ).length;
-    const imagePreviews = buildProposalImagePreviews(images, [], skipped);
-    const imageInventoryLines = imagePreviews.map((img) => {
-      const flag = img.included ? 'INCLUDED' : 'SKIPPED';
-      const purpose = purposeLabel(img.purpose || img.kind);
-      const from = img.sourceFormat ? ` from ${String(img.sourceFormat).toUpperCase()}` : '';
-      const why = img.reason ? ` — ${img.reason}` : '';
-      return `- [${flag}] ${img.name} (${purpose}${from}${img.bytes ? `, ${Math.round(img.bytes / 1024)}KB` : ''})${why}`;
-    });
-
     try {
+      const file = job?.file;
+      const fileType = job?.fileType;
+      const extractedText = job?.extractedText || '';
+      const structuredText = job?.structuredText || '';
+      const imageNotes = job?.imageNotes || [];
+      const images = Array.isArray(job?.images) ? job.images : (job?.included || []);
+      const skipped = job?.skipped || [];
+      if (!file) throw new Error('Proposal file was lost before processing finished. Please upload again.');
+      const imageCount = images.length;
+      const ignoredPurposeCount = (skipped || []).filter((s) =>
+        ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
+      ).length;
+      const imagePreviews = buildProposalImagePreviews(images, [], skipped);
+      const imageInventoryLines = imagePreviews.map((img) => {
+        const flag = img.included ? 'INCLUDED' : 'SKIPPED';
+        const purpose = purposeLabel(img.purpose || img.kind);
+        const from = img.sourceFormat ? ` from ${String(img.sourceFormat).toUpperCase()}` : '';
+        const why = img.reason ? ` — ${img.reason}` : '';
+        return `- [${flag}] ${img.name} (${purpose}${from}${img.bytes ? `, ${Math.round(img.bytes / 1024)}KB` : ''})${why}`;
+      });
+
       if (images.length) {
+        try {
+          setMessages((prev) => [...prev, {
+            role: 'system',
+            content: `🖼️ Extracting content and key points from **${Math.min(images.length, 8)}** scheme image(s)…`,
+          }]);
+          visionText = await interpretProposalImages(
+            images,
+            withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
+            {
+              onProgress: (n, total, name) => {
+                setMessages((prev) => {
+                  const copy = [...prev];
+                  const last = copy[copy.length - 1];
+                  if (last?.role === 'system' && String(last.content || '').includes('Extracting content')) {
+                    copy[copy.length - 1] = {
+                      ...last,
+                      content: `🖼️ Reading image **${n}/${total}** (${name})…`,
+                    };
+                    return copy;
+                  }
+                  return [...prev, { role: 'system', content: `🖼️ Reading image **${n}/${total}** (${name})…` }];
+                });
+              },
+            },
+          );
+        } catch (visionErr) {
+          visionError = visionErr.message || 'vision failed';
+          console.warn('Proposal image interpretation failed:', visionErr);
+          setMessages((prev) => [...prev, {
+            role: 'system',
+            content: `⚠️ Image reading skipped: ${visionError}. Continuing with text extract.`,
+          }]);
+        }
+      }
+
+      if ((!extractedText || extractedText.length < 40) && !visionText && !structuredText) {
         setMessages((prev) => [...prev, {
           role: 'system',
-          content: `🖼️ Extracting content and key points from **${images.length}** scheme image(s)…`,
+          content: '⚠️ Little text or image content was readable. Starting **Assess IC** with whatever was extracted.',
         }]);
-        visionText = await interpretProposalImages(
-          images,
-          withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
-        );
-      }
-    } catch (visionErr) {
-      visionError = visionErr.message || 'vision failed';
-      console.warn('Proposal image interpretation failed:', visionErr);
-      setMessages((prev) => [...prev, {
-        role: 'system',
-        content: `⚠️ Image reading skipped: ${visionError}. Continuing with text extract.`,
-      }]);
-    }
-
-    try {
-      if ((!extractedText || extractedText.length < 40) && !visionText && !structuredText) {
-        throw new Error('Could not extract usable text or image content. Try a text-based PDF/.pptx, or ensure tables/charts are visible in the file.');
       }
 
       const storagePath = userProposalRemotePath(currentUser.id, file.name);
@@ -3127,7 +3251,7 @@ ${stepInstruction}`;
   };
 
   const applyUnsureImageDecision = async (nameOrAll, include) => {
-    const prev = pendingImageReview;
+    const prev = pendingImageReviewRef.current || pendingImageReview;
     if (!prev) return;
     let included = [...(prev.included || [])];
     let unsure = [...(prev.unsure || [])];
@@ -3159,30 +3283,59 @@ ${stepInstruction}`;
     }
 
     const next = { ...prev, included, unsure, skipped };
-    const previews = buildProposalImagePreviews(included, unsure, skipped);
+    if (unsure.length) {
+      pendingImageReviewRef.current = next;
+      setPendingImageReview(next);
+      const previews = buildProposalImagePreviews(included, unsure, skipped);
+      setMessages((msgs) => {
+        const copy = [...msgs];
+        for (let i = copy.length - 1; i >= 0; i--) {
+          if (copy[i].imageReviewPending) {
+            copy[i] = {
+              ...copy[i],
+              content: `🖼️ **${included.length}** scheme image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry IC context.`,
+              imagePreviews: previews,
+            };
+            break;
+          }
+        }
+        return copy;
+      });
+      return;
+    }
+    if (proposalIngestRunningRef.current) return;
+    proposalIngestRunningRef.current = true;
+    pendingImageReviewRef.current = null;
+    setPendingImageReview(null);
+    setIsLoading(true);
     setMessages((msgs) => {
       const copy = [...msgs];
       for (let i = copy.length - 1; i >= 0; i--) {
         if (copy[i].imageReviewPending) {
           copy[i] = {
             ...copy[i],
-            content: unsure.length
-              ? `🖼️ **${included.length}** scheme image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry IC context.`
-              : `🖼️ **${included.length}** scheme image(s) selected for extract.`,
-            imagePreviews: previews,
+            content: `🖼️ **${included.length}** scheme image(s) selected for extract.`,
+            imageReviewPending: false,
           };
           break;
         }
       }
-      return copy;
+      return [...copy, {
+        role: 'system',
+        content: `▶️ Confirmed **${included.length}** image(s). Continuing Assess IC…`,
+      }];
     });
-
-    if (unsure.length) {
-      setPendingImageReview(next);
-      return;
+    try {
+      await completeProposalIngest({ ...next, images: included });
+    } catch (err) {
+      setIsLoading(false);
+      setMessages((prevMsgs) => [...prevMsgs, {
+        role: 'system',
+        content: `❌ Could not continue after image review: ${err.message || 'Unknown error'}`,
+      }]);
+    } finally {
+      proposalIngestRunningRef.current = false;
     }
-    setPendingImageReview(null);
-    await completeProposalIngest(next);
   };
 
   const handleFileUpload = async (event) => {
@@ -3251,7 +3404,7 @@ ${stepInstruction}`;
         }
 
         if (unsure.length) {
-          setPendingImageReview({
+          const job = {
             file,
             fileType,
             extractedText,
@@ -3260,7 +3413,9 @@ ${stepInstruction}`;
             included,
             unsure,
             skipped,
-          });
+          };
+          pendingImageReviewRef.current = job;
+          setPendingImageReview(job);
           setIsLoading(false);
           return;
         }
@@ -4508,7 +4663,9 @@ ${stepInstruction}`;
       setInput('');
       const lower = messageContent.toLowerCase().trim();
       setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
-      if (/\b(include all|all of them|yes all|keep all)\b/.test(lower) || lower === 'all' || lower === 'yes') {
+      const wantsProceed = /\b(include all|all of them|yes all|keep all|assess|analyze|analyse|continue|proceed|start workflow|go ahead)\b/.test(lower)
+        || lower === 'all' || lower === 'yes' || lower === 'y';
+      if (wantsProceed) {
         await applyUnsureImageDecision('*', true);
         return;
       }
@@ -4563,7 +4720,7 @@ ${stepInstruction}`;
 
     // Uploaded IC proposal → always Analyze Existing IC workflow (never PPT export).
     if (isFileAnalysis && !currentWorkflow) {
-      const analyzeTopic = topics.find((t) => t.id === 'analyze_ic' && t.status === 'active');
+      const analyzeTopic = topics.find((t) => t.id === 'analyze_ic');
       if (analyzeTopic) {
         const fileName = uploadedFile?.name;
         const workflowMessage = fileName
@@ -4613,7 +4770,7 @@ ${stepInstruction}`;
         return;
       }
       if (routed.kind === 'assessment' && !currentWorkflow) {
-        const analyzeTopic = topics.find((t) => t.id === 'analyze_ic' && t.status === 'active');
+        const analyzeTopic = topics.find((t) => t.id === 'analyze_ic');
         if (analyzeTopic) {
           setPendingWorkflow(null);
           await launchWorkflowDirect('analyze_ic', messageContent);
