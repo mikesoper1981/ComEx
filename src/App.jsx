@@ -409,7 +409,7 @@ function deriveChatTitle(messages) {
 }
 
 function chatHasUserContent(messages) {
-  return (messages || []).some((m) => m.role === 'user' && String(m.content || '').trim());
+  return (Array.isArray(messages) ? messages : []).some((m) => m.role === 'user' && String(m.content || '').trim());
 }
 
 function sanitizeMessageForStorage(m) {
@@ -518,10 +518,12 @@ function readLocalChatState(userId) {
 }
 
 function consultationWelcome() {
-  return {
-    role: 'assistant',
-    content: readLocalProductIntelligence().welcomeMessages.consultation,
-  };
+  try {
+    const text = readLocalProductIntelligence()?.welcomeMessages?.consultation;
+    return { role: 'assistant', content: text || 'How can I help?' };
+  } catch {
+    return { role: 'assistant', content: 'How can I help?' };
+  }
 }
 
 function formatChatTime(iso) {
@@ -1969,12 +1971,12 @@ function TerritoryMap({ structure, selectedTerritory, onSelectTerritory }) {
     return () => window.removeEventListener('message', handler);
   }, [structure, selectedTerritory, onSelectTerritory]);
 
-  if (!structure) return null;
-
   const html = useMemo(
-    () => buildMapHTML(structure, selectedTerritory?.id || null),
+    () => (structure ? buildMapHTML(structure, selectedTerritory?.id || null) : ''),
     [structure, selectedTerritory?.id]
   );
+
+  if (!structure) return null;
 
   return (
     <div className="rounded-xl overflow-hidden border border-blue-400/20" style={{ height: 520 }}>
@@ -2163,7 +2165,7 @@ export default function CommercialExcellenceApp() {
   const [stellaTab, setStellaTab] = useState('chat'); // chat | data | business | connections
   const [stellaMessages, setStellaMessages] = useState(() => [{
     role: 'assistant',
-    content: readLocalProductIntelligence().welcomeMessages.stella,
+    content: readLocalProductIntelligence()?.welcomeMessages?.stella || 'Ask a question about your uploaded datasets.',
   }]);
   const [stellaInput, setStellaInput] = useState('');
   const [stellaIsLoading, setStellaIsLoading] = useState(false);
@@ -5918,10 +5920,10 @@ ${stepInstruction}`;
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
     if (pptxClarifyPending) return getPptxClarify().options;
-    // While waiting on clarifying answers, never show chips — user types 1 = … 2 = …
     if (currentWorkflow?.awaitingAgentReply) return null;
     if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
-    const last = [...messages].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
+    const list = Array.isArray(messages) ? messages : [];
+    const last = [...list].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
     if (!last?.content) return null;
     if (hasNumberedClarifyingQuestions(last.content)) return null;
     return extractChoiceOptions(last.content);
@@ -5931,7 +5933,8 @@ ${stepInstruction}`;
     if (isLoading || pptxGenerating) return false;
     if (currentWorkflow?.awaitingAgentReply) return true;
     if (currentWorkflow || pendingWorkflow || orchestratorDecision || pptxClarifyPending) return false;
-    const last = [...messages].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+    const list = Array.isArray(messages) ? messages : [];
+    const last = [...list].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
     return hasNumberedClarifyingQuestions(last?.content);
   }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision]);
 

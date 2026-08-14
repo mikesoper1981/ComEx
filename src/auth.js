@@ -29,7 +29,12 @@ export const HARDCODED_USERS = [
 ];
 
 export function getHardcodedUser() {
-  return sanitizeUser(HARDCODED_USERS[0]);
+  const u = HARDCODED_USERS[0] || {};
+  return {
+    id: String(u.id || 'default'),
+    name: String(u.name || 'Admin'),
+    role: u.role === 'admin' ? 'admin' : 'user',
+  };
 }
 
 export function findHardcodedUser(id) {
@@ -44,8 +49,9 @@ export function isAdminUser(user) {
 
 function sanitizeUser(user) {
   const listed = findHardcodedUser(user?.id);
+  const fallback = HARDCODED_USERS[0] || {};
   return {
-    id: String(user?.id || listed?.id || getHardcodedUser().id),
+    id: String(user?.id || listed?.id || fallback.id || 'default'),
     name: String(listed?.name || user?.name || user?.id || 'User'),
     role: listed?.role || (user?.role === 'admin' ? 'admin' : 'user'),
   };
@@ -82,15 +88,19 @@ export function userSettingsLocalKey(userId) {
 
 /** Storage folder is the account display name (e.g. "Standard User"), not the internal id. */
 export function userStorageFolder(userOrName) {
-  const raw = userOrName && typeof userOrName === 'object'
-    ? (userOrName.name || userOrName.id)
-    : userOrName;
-  const folder = String(raw || '')
-    .replace(/[\\/:*?"<>|]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 80);
-  return folder || 'user';
+  try {
+    const raw = userOrName && typeof userOrName === 'object'
+      ? (userOrName.name || userOrName.id)
+      : userOrName;
+    const folder = String(raw || '')
+      .replace(/[\\/:*?"<>|]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+    return folder || 'user';
+  } catch {
+    return 'user';
+  }
 }
 
 export function userSettingsRemotePath(userOrName) {
