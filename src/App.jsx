@@ -37,6 +37,8 @@ import {
   removeModuleContextFile,
   formatModuleContextPromptBlock,
   knowledgeStemPattern,
+  isEmptyContextValue,
+  compactCapturedContext,
 } from './moduleContext';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -374,17 +376,24 @@ function serializeChatSnapshot({ id, title, updatedAt, messages, currentWorkflow
       : null,
     pendingWorkflow: pendingWorkflow || null,
     uploadedFile: uploadedFile
-      ? {
-          name: uploadedFile.name,
-          fileType: uploadedFile.fileType,
-          storagePath: uploadedFile.storagePath,
-          storageBucket: uploadedFile.storageBucket,
-          extractedText: String(uploadedFile.extractedText || '').slice(0, 40000),
-          visionExtract: String(uploadedFile.visionExtract || '').slice(0, 20000),
-          structuredExtract: String(uploadedFile.structuredExtract || '').slice(0, 15000),
-          imageCount: uploadedFile.imageCount || 0,
-          capturedContext: uploadedFile.capturedContext || null,
-        }
+      ? (() => {
+          const extractedText = String(uploadedFile.extractedText || '').slice(0, 40000);
+          const visionExtract = String(uploadedFile.visionExtract || '').slice(0, 20000);
+          const structuredExtract = String(uploadedFile.structuredExtract || '').slice(0, 15000);
+          const captured = compactCapturedContext(uploadedFile.capturedContext);
+          const rec = {
+            name: uploadedFile.name,
+            fileType: uploadedFile.fileType,
+          };
+          if (uploadedFile.storagePath) rec.storagePath = uploadedFile.storagePath;
+          if (uploadedFile.storageBucket && uploadedFile.storagePath) rec.storageBucket = uploadedFile.storageBucket;
+          if (!isEmptyContextValue(extractedText)) rec.extractedText = extractedText;
+          if (!isEmptyContextValue(visionExtract)) rec.visionExtract = visionExtract;
+          if (!isEmptyContextValue(structuredExtract)) rec.structuredExtract = structuredExtract;
+          if (uploadedFile.imageCount) rec.imageCount = uploadedFile.imageCount;
+          if (captured) rec.capturedContext = captured;
+          return rec;
+        })()
       : null,
   };
 }
@@ -1955,6 +1964,88 @@ class MessageErrorBoundary extends React.Component {
   }
 }
 
+function contextBlocksFromFile(f) {
+  if (!f) return [];
+  const ctx = f.capturedContext || {};
+  const blocks = [];
+  if (!isEmptyContextValue(f.summary)) blocks.push({ id: 'summary', label: 'Summary', value: f.summary });
+  if (!isEmptyContextValue(ctx.what_it_represents)) blocks.push({ id: 'represents', label: 'What it represents', value: ctx.what_it_represents, line: true });
+  if (!isEmptyContextValue(ctx.time_period)) blocks.push({ id: 'period', label: 'Time period', value: ctx.time_period, line: true });
+  if (Array.isArray(ctx.key_metrics) && ctx.key_metrics.some((m) => !isEmptyContextValue(m))) {
+    blocks.push({ id: 'metrics', label: 'Key fields', value: ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('\n') });
+  }
+  if (!isEmptyContextValue(ctx.interpretation_notes)) blocks.push({ id: 'interpretation', label: 'How to use', value: ctx.interpretation_notes });
+  (ctx.qa_pairs || []).forEach((p, i) => {
+    if (isEmptyContextValue(p?.question) && isEmptyContextValue(p?.answer)) return;
+    blocks.push({ id: `qa:${i}`, label: 'Clarification', qa: true, question: p.question || '', answer: p.answer || '' });
+  });
+  (f.notes || []).forEach((n) => {
+    if (!n || isEmptyContextValue(n.text)) return;
+    blocks.push({ id: `note:${n.id}`, label: 'Added context', value: n.text });
+  });
+  return blocks;
+}
+
+function EditableContextBlock({ label, value, question, answer, qa, line, onSave, onDelete }) {
+  const [text, setText] = useState(value || '');
+  const [q, setQ] = useState(question || '');
+  const [a, setA] = useState(answer || '');
+  useEffect(() => { setText(value || ''); }, [value]);
+  useEffect(() => { setQ(question || ''); setA(answer || ''); }, [question, answer]);
+  const fieldClass = 'w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400';
+  return (
+    <div className="bg-slate-800/40 border border-blue-400/20 rounded-lg p-2.5">
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <div className="text-[11px] font-semibold text-blue-200">{label}</div>
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onDelete}
+          className="p-1 hover:bg-red-500/20 rounded text-red-400"
+          title="Remove this context"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+      {qa ? (
+        <div className="space-y-1.5">
+          <textarea
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onBlur={() => { if (q !== (question || '') || a !== (answer || '')) onSave({ question: q, answer: a }); }}
+            rows={2}
+            placeholder="Question"
+            className={`${fieldClass} resize-y`}
+          />
+          <textarea
+            value={a}
+            onChange={(e) => setA(e.target.value)}
+            onBlur={() => { if (q !== (question || '') || a !== (answer || '')) onSave({ question: q, answer: a }); }}
+            rows={2}
+            placeholder="Answer"
+            className={`${fieldClass} resize-y`}
+          />
+        </div>
+      ) : line ? (
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onBlur={() => { if (text !== (value || '')) onSave(text); }}
+          className={fieldClass}
+        />
+      ) : (
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onBlur={() => { if (text !== (value || '')) onSave(text); }}
+          rows={3}
+          className={`${fieldClass} resize-y`}
+        />
+      )}
+    </div>
+  );
+}
+
 export default function CommercialExcellenceApp() {
   // Ensure older sessions (unlocked before userId existed) still have an identity.
   const [currentUser] = useState(() => {
@@ -2035,7 +2126,6 @@ export default function CommercialExcellenceApp() {
   const [activeContextFileId, setActiveContextFileId] = useState(null);
   const [contextIntakeInput, setContextIntakeInput] = useState('');
   const [contextIntakeBusy, setContextIntakeBusy] = useState(false);
-  const [contextEditDraft, setContextEditDraft] = useState(null); // { fileId, userNotes, summary, represents, period, interpretation }
   const [contextEditSaveStatus, setContextEditSaveStatus] = useState('idle');
   const chatSessionsRef = useRef(chatSessions);
   const activeChatIdRef = useRef(activeChatId);
@@ -3693,6 +3783,8 @@ ${stepInstruction}`;
   };
 
   const summarizeContextFile = async ({ name, extractBlob, moduleId, columns = [] }) => {
+    const fallback = { summary: '', columns: [], suggestedQuestions: [] };
+    if (isEmptyContextValue(extractBlob)) return fallback;
     const rt = getWorkflowRuntime();
     const system = fillTemplate(rt.contextContentSummaryPrompt, {
       moduleLabel: moduleLabelFor(moduleId),
@@ -3703,17 +3795,15 @@ ${stepInstruction}`;
       content: `FILE NAME: ${name}\nStored under: ${moduleLabelFor(moduleId)} (storage location only — not a topic to ask about).${colText}\n\nFILE CONTENTS:\n${String(extractBlob || '').slice(0, 18000)}`,
     }], 1000);
     const parsed = extractJsonObject(raw);
-    const fallback = { summary: 'Uploaded context file.', columns: [], suggestedQuestions: [] };
     if (!parsed || typeof parsed !== 'object') return fallback;
     const questions = (Array.isArray(parsed.suggestedQuestions) ? parsed.suggestedQuestions : [])
       .map((q) => String(q || '').replace(/\s+/g, ' ').trim())
-      .filter((q) => q.length >= 8)
+      .filter((q) => q.length >= 8 && !isEmptyContextValue(q))
       .slice(0, 5);
-    return {
-      summary: parsed.summary || fallback.summary,
-      columns: Array.isArray(parsed.columns) ? parsed.columns : [],
-      suggestedQuestions: questions,
-    };
+    const columnsOut = (Array.isArray(parsed.columns) ? parsed.columns : [])
+      .filter((c) => c && !isEmptyContextValue(c.name));
+    const summary = isEmptyContextValue(parsed.summary) ? '' : String(parsed.summary).trim();
+    return { summary, columns: columnsOut, suggestedQuestions: questions };
   };
 
   const completeProposalIngest = async (job) => {
@@ -3850,13 +3940,13 @@ ${stepInstruction}`;
         '',
         cappedText
           ? `EXTRACTED DOCUMENT / SLIDE TEXT:\n${cappedText}`
-          : 'EXTRACTED DOCUMENT / SLIDE TEXT: (little or no text layer — rely on image/chart extracts below)',
+          : null,
         cappedStructured
           ? `\n\nEXTRACTED FROM NATIVE CHARTS / EMBEDDED SPREADSHEETS (payment-scale series often live here):\n${cappedStructured}`
           : null,
         cappedVision
           ? `\n\nEXTRACTED FROM SCHEME IMAGES — CONTENT / KEY POINTS / MESSAGE (payout scales, tables, diagrams, comms, process):\n${cappedVision}`
-          : '\n\nEXTRACTED FROM SCHEME IMAGES: (none after purpose filter / conversion)',
+          : null,
       ].filter((line) => line != null).join('\n');
 
       setUploadedFile({
@@ -3865,12 +3955,11 @@ ${stepInstruction}`;
         fileType,
         storagePath,
         storageBucket: 'intelligence',
-        extractedText: cappedText,
-        visionExtract: cappedVision || null,
-        structuredExtract: cappedStructured || null,
-        imageCount,
+        ...(!isEmptyContextValue(cappedText) ? { extractedText: cappedText } : {}),
+        ...(!isEmptyContextValue(cappedVision) ? { visionExtract: cappedVision } : {}),
+        ...(!isEmptyContextValue(cappedStructured) ? { structuredExtract: cappedStructured } : {}),
+        ...(imageCount ? { imageCount } : {}),
         uploadedAt: new Date().toISOString(),
-        capturedContext: null,
       });
 
       const bits = [
@@ -3909,18 +3998,18 @@ ${stepInstruction}`;
   const finishProposalIntakeAndLaunch = async (intake, capturedContext) => {
     pendingProposalIntakeRef.current = null;
     setPendingProposalIntake(null);
-    const ctx = capturedContext && typeof capturedContext === 'object' ? capturedContext : {};
+    const ctx = compactCapturedContext(capturedContext) || {};
     const qa = Array.isArray(ctx.qa_pairs)
       ? ctx.qa_pairs.filter((p) => p?.question || p?.answer).map((p) => `Q: ${p.question}\nA: ${p.answer}`).join('\n')
       : '';
     const clarifications = [
-      ctx.what_it_represents ? `Represents: ${ctx.what_it_represents}` : '',
-      ctx.time_period ? `Time period: ${ctx.time_period}` : '',
-      ctx.key_metrics?.length ? `Key fields: ${ctx.key_metrics.join('; ')}` : '',
-      ctx.interpretation_notes ? `Notes: ${ctx.interpretation_notes}` : '',
+      !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
+      !isEmptyContextValue(ctx.time_period) ? `Time period: ${ctx.time_period}` : '',
+      ctx.key_metrics?.length ? `Key fields: ${ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('; ')}` : '',
+      !isEmptyContextValue(ctx.interpretation_notes) ? `Notes: ${ctx.interpretation_notes}` : '',
       qa ? `User clarifications:\n${qa}` : '',
     ].filter(Boolean).join('\n');
-    setUploadedFile((prev) => (prev ? { ...prev, capturedContext: ctx } : prev));
+    setUploadedFile((prev) => (prev ? { ...prev, capturedContext: Object.keys(ctx).length ? ctx : undefined } : prev));
     const focusedContext = clarifications
       ? `${intake.focusedContext}\n\nUSER CLARIFICATIONS ON THIS PROPOSAL:\n${clarifications}`
       : intake.focusedContext;
@@ -4023,37 +4112,33 @@ ${stepInstruction}`;
       job.onStatus?.(`Image reading skipped: ${err.message || 'vision failed'}`);
     }
 
-    const extractBlob = [extractedText, structuredText, visionText].filter(Boolean).join('\n\n');
-    let onboarding = { summary: 'Uploaded context file.', suggestedQuestions: [] };
+    const extractBlob = [extractedText, structuredText, visionText].filter((t) => !isEmptyContextValue(t)).join('\n\n');
+    let onboarding = { summary: '', suggestedQuestions: [] };
     try {
       onboarding = await summarizeContextFile({ name: file.name, extractBlob, moduleId });
     } catch { /* keep fallback */ }
     const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+    const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
     const assistantMsg = questions.length
-      ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.\n\n${onboarding.summary || ''}\n\nTo use this correctly I need a little context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
-      : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.\n\n${onboarding.summary || 'Stored as module context.'}`;
+      ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}\n\nTo use this correctly I need a little context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
+      : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}`;
     const rec = {
       id: fileId,
       name: file.name,
       fileType: job.fileType,
       sizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
-      storagePath: null,
-      storageBucket: null,
       uploadedAt: new Date().toISOString(),
-      summary: onboarding.summary || '',
+      summary: onboarding.summary,
       extractedText,
       visionExtract: visionText,
       structuredExtract: structuredText,
       imageCount: images.length,
       intakeMessages: [{ role: 'assistant', content: assistantMsg }],
       intakeComplete: questions.length === 0,
-      processing: false,
-      capturedContext: {},
     };
     const nextCtx = upsertModuleContextFile(userSettings.moduleContext, moduleId, rec);
     await persistContextFiles(nextCtx);
     setActiveContextFileId(fileId);
-    setContextEditDraft(draftFromContextFile(rec));
     contextIngestJobRef.current = null;
     setContextIngestJob(null);
     if (questions.length === 0) {
@@ -4080,7 +4165,7 @@ ${stepInstruction}`;
     setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
     try {
       const result = await runContextIntakeTurn({
-        extractBlob: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter(Boolean).join('\n\n'),
+        extractBlob: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter((t) => !isEmptyContextValue(t)).join('\n\n'),
         moduleLabel: moduleLabelFor(moduleId),
         intakeMessages: nextMessages,
       });
@@ -4091,10 +4176,6 @@ ${stepInstruction}`;
         capturedContext: result.complete ? (result.context_qa || rec.capturedContext) : rec.capturedContext,
       });
       await persistContextFiles(patched);
-      if (result.complete) {
-        const saved = patched[moduleId]?.files?.find((f) => f.id === fileId);
-        setContextEditDraft(draftFromContextFile(saved));
-      }
     } catch (err) {
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: [...nextMessages, { role: 'system', content: `⚠️ ${err.message || 'Intake failed'}` }],
@@ -4154,8 +4235,6 @@ ${stepInstruction}`;
       processing: true,
       intakeComplete: false,
       intakeMessages: [{ role: 'assistant', content: `⏳ Processing **${file.name}**…` }],
-      summary: '',
-      extractedText: '',
     };
     const optimistic = upsertModuleContextFile(userSettings.moduleContext, moduleId, placeholder);
     setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
@@ -4220,34 +4299,41 @@ ${stepInstruction}`;
     if (activeContextFileId === fileId) setActiveContextFileId(null);
   };
 
-  const draftFromContextFile = (f) => (f ? {
-    fileId: f.id,
-    userNotes: f.userNotes || '',
-    summary: f.summary || '',
-    represents: f.capturedContext?.what_it_represents || '',
-    period: f.capturedContext?.time_period || '',
-    interpretation: f.capturedContext?.interpretation_notes || '',
-  } : null);
-
-  const saveContextFileEdits = async (moduleId, fileId) => {
+  const persistContextBlock = async (moduleId, fileId, blockId, nextValue, remove = false) => {
     const rec = (userSettings.moduleContext?.[moduleId]?.files || []).find((f) => f.id === fileId);
-    const draft = contextEditDraft?.fileId === fileId ? contextEditDraft : draftFromContextFile(rec);
-    if (!rec || !draft) return;
+    if (!rec) return;
+    const empty = remove || (
+      nextValue && typeof nextValue === 'object'
+        ? isEmptyContextValue(nextValue.question) && isEmptyContextValue(nextValue.answer)
+        : isEmptyContextValue(nextValue)
+    );
+    const ctx = { ...(rec.capturedContext || {}) };
+    const patch = {};
+    if (blockId === 'summary') patch.summary = empty ? '' : nextValue;
+    else if (blockId === 'represents') patch.capturedContext = { ...ctx, what_it_represents: empty ? '' : nextValue };
+    else if (blockId === 'period') patch.capturedContext = { ...ctx, time_period: empty ? '' : nextValue };
+    else if (blockId === 'interpretation') patch.capturedContext = { ...ctx, interpretation_notes: empty ? '' : nextValue };
+    else if (blockId === 'metrics') {
+      const metrics = empty ? [] : String(nextValue || '').split(/[\n;]+/).map((s) => s.trim()).filter(Boolean);
+      patch.capturedContext = { ...ctx, key_metrics: metrics };
+    } else if (blockId.startsWith('qa:')) {
+      const idx = Number(blockId.slice(3));
+      const qa = [...(ctx.qa_pairs || [])];
+      if (empty || idx < 0 || idx >= qa.length) qa.splice(idx, 1);
+      else qa[idx] = { question: nextValue.question || '', answer: nextValue.answer || '' };
+      patch.capturedContext = { ...ctx, qa_pairs: qa };
+    } else if (blockId.startsWith('note:')) {
+      const nid = blockId.slice(5);
+      const notes = [...(rec.notes || [])];
+      patch.notes = empty
+        ? notes.filter((n) => n.id !== nid)
+        : notes.map((n) => (n.id === nid ? { ...n, text: nextValue } : n));
+    } else {
+      return;
+    }
     setContextEditSaveStatus('saving');
-    const patched = patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, {
-      summary: draft.summary,
-      userNotes: draft.userNotes,
-      capturedContext: {
-        ...(rec.capturedContext || {}),
-        what_it_represents: draft.represents,
-        time_period: draft.period,
-        interpretation_notes: draft.interpretation,
-      },
-    });
     try {
-      await persistContextFiles(patched);
-      const saved = patched[moduleId]?.files?.find((f) => f.id === fileId);
-      setContextEditDraft(draftFromContextFile(saved));
+      await persistContextFiles(patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, patch));
       setContextEditSaveStatus('saved');
       setTimeout(() => setContextEditSaveStatus('idle'), 2500);
     } catch {
@@ -4258,19 +4344,18 @@ ${stepInstruction}`;
   const appendContextFileNote = async (moduleId, fileId, note) => {
     const rec = (userSettings.moduleContext?.[moduleId]?.files || []).find((f) => f.id === fileId);
     if (!rec || !note) return;
-    const nextNotes = [rec.userNotes, note].filter(Boolean).join('\n\n');
     const patched = patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, {
-      userNotes: nextNotes,
+      notes: [...(rec.notes || []), { id: `note_${Date.now()}`, text: note }],
       intakeMessages: [...(rec.intakeMessages || []), { role: 'user', content: note }],
     });
     await persistContextFiles(patched);
-    setContextEditDraft(draftFromContextFile(patched[moduleId]?.files?.find((f) => f.id === fileId)));
     setContextIntakeInput('');
   };
 
   const renderModuleContextPanel = (moduleId) => {
     const files = userSettings.moduleContext?.[moduleId]?.files || [];
     const active = files.find((f) => f.id === activeContextFileId) || files[files.length - 1] || null;
+    const contextBlocks = active && !active.processing ? contextBlocksFromFile(active) : [];
     const job = (contextIngestJob?.moduleId === moduleId) ? contextIngestJob : null;
     const unsurePreviews = job?.unsure?.length
       ? buildProposalImagePreviews(job.included || [], job.unsure || [], job.skipped || [])
@@ -4281,7 +4366,7 @@ ${stepInstruction}`;
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
         <p className="text-xs text-blue-300/60 mb-2">
-          Upload a file, answer any questions about it, then save. You can come back later and add more context for that file. It is always included when you work in {moduleLabelFor(moduleId)}.
+          Upload a file and use the chat to answer questions or add more context. Saved fields below can be edited or removed. This context is always included when you work in {moduleLabelFor(moduleId)}.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
           Saved for this user only in their settings JSON (
@@ -4334,7 +4419,7 @@ ${stepInstruction}`;
               {files.map((f) => (
                 <div key={f.id} className={`w-full bg-slate-900/40 border rounded-xl p-3 ${active?.id === f.id ? 'border-cyan-400/50' : 'border-blue-400/20'}`}>
                   <div className="flex items-start justify-between gap-2">
-                    <button type="button" onClick={() => { setActiveContextFileId(f.id); setContextEditDraft(draftFromContextFile(f)); }} className="min-w-0 text-left flex-1">
+                    <button type="button" onClick={() => setActiveContextFileId(f.id)} className="min-w-0 text-left flex-1">
                       <div className="text-sm font-semibold text-white truncate">{f.name}</div>
                       <div className="text-[11px] text-blue-300/55 mt-0.5">{f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}{f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : ''}</div>
                       {f.summary && <div className="text-[11px] text-blue-200/75 mt-1 line-clamp-2">{f.summary}</div>}
@@ -4358,8 +4443,8 @@ ${stepInstruction}`;
                 <div className="text-xs text-blue-300/50">Select a file to review or add context.</div>
               ) : (
                 <div className="space-y-3">
-                  <div className="text-xs font-bold text-white">{active.intakeComplete ? 'Context' : 'Intake'}</div>
-                  <div className="max-h-[200px] overflow-y-auto custom-scrollbar space-y-2">
+                  <div className="text-xs font-bold text-white">{active.intakeComplete ? 'Add context' : 'Intake'}</div>
+                  <div className="max-h-[240px] overflow-y-auto custom-scrollbar space-y-2">
                     {(active.intakeMessages || []).map((m, i) => (
                       <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         <div className={`max-w-[95%] px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
@@ -4387,54 +4472,27 @@ ${stepInstruction}`;
                       </button>
                     </div>
                   )}
-                  {!active.processing && (
+                  {contextBlocks.length > 0 && (
                     <div className="space-y-2 pt-2 border-t border-blue-400/15">
-                      <div className="text-[11px] font-semibold text-blue-200">Edit context for this file</div>
-                      <textarea
-                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.summary : active.summary) || ''}
-                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), summary: e.target.value }))}
-                        rows={2}
-                        placeholder="Short summary of this file"
-                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-y"
-                      />
-                      <input
-                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.represents : active.capturedContext?.what_it_represents) || ''}
-                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), represents: e.target.value }))}
-                        placeholder="What this file represents"
-                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400"
-                      />
-                      <input
-                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.period : active.capturedContext?.time_period) || ''}
-                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), period: e.target.value }))}
-                        placeholder="Time period / version (if any)"
-                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400"
-                      />
-                      <textarea
-                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.interpretation : active.capturedContext?.interpretation_notes) || ''}
-                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), interpretation: e.target.value }))}
-                        rows={2}
-                        placeholder="How to use this file"
-                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-y"
-                      />
-                      <textarea
-                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.userNotes : active.userNotes) || ''}
-                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), userNotes: e.target.value }))}
-                        rows={4}
-                        placeholder="Further context you add later — always used with this file"
-                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-y"
-                      />
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => saveContextFileEdits(moduleId, active.id)}
-                          disabled={contextEditSaveStatus === 'saving'}
-                          className="px-3 py-1.5 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/30 rounded-lg text-xs text-cyan-100 font-semibold disabled:opacity-50 flex items-center gap-1.5"
-                        >
-                          <Save className="w-3.5 h-3.5" /> {contextEditSaveStatus === 'saving' ? 'Saving…' : 'Save file context'}
-                        </button>
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-[11px] font-semibold text-blue-200">Saved context</div>
+                        {contextEditSaveStatus === 'saving' && <span className="text-[11px] text-blue-300/70">Saving…</span>}
                         {contextEditSaveStatus === 'saved' && <span className="text-[11px] text-green-400 font-semibold">Saved</span>}
                         {contextEditSaveStatus === 'error' && <span className="text-[11px] text-red-400 font-semibold">Save failed</span>}
                       </div>
+                      {contextBlocks.map((b) => (
+                        <EditableContextBlock
+                          key={b.id}
+                          label={b.label}
+                          value={b.value}
+                          question={b.question}
+                          answer={b.answer}
+                          qa={!!b.qa}
+                          line={!!b.line}
+                          onSave={(val) => persistContextBlock(moduleId, active.id, b.id, val)}
+                          onDelete={() => persistContextBlock(moduleId, active.id, b.id, '', true)}
+                        />
+                      ))}
                     </div>
                   )}
                 </div>

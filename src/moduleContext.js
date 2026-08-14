@@ -24,9 +24,39 @@ export function detectContextFileKind(file) {
 }
 
 function capText(value, max) {
-  const t = String(value || '');
+  const t = String(value || '').trim();
+  if (!t) return '';
   if (t.length <= max) return t;
   return `${t.slice(0, max)}\n\n[… truncated for stored context …]`;
+}
+
+/** True when a stored field would add noise instead of usable context. */
+export function isEmptyContextValue(value) {
+  if (value == null) return true;
+  if (Array.isArray(value)) return !value.length || value.every(isEmptyContextValue);
+  if (typeof value === 'object') {
+    const vals = Object.values(value);
+    return !vals.length || vals.every(isEmptyContextValue);
+  }
+  const t = String(value).trim();
+  if (!t) return true;
+  const lower = t.toLowerCase().replace(/\s+/g, ' ');
+  if (/^(n\/a|na|none|null|nil|undefined|-|—|unknown|not specified|not provided|tbd|none provided)$/i.test(lower)) return true;
+  // Only treat short filler as empty — a long extract may mention missing text on one slide.
+  if (t.length > 240) return false;
+  if (/\bno (readable |extractable |usable )?(text|content|data|extract|information|context)\b/i.test(lower)) return true;
+  if (/\bcontained no\b/i.test(lower)) return true;
+  if (/\bcontains? no (readable |extractable |usable )?(text|content)\b/i.test(lower)) return true;
+  if (/\blittle or no text\b/i.test(lower)) return true;
+  if (/\b(could not|unable to) (be )?(extract|read|parse)/i.test(lower)) return true;
+  if (/\bnothing to (extract|read|use)\b/i.test(lower)) return true;
+  if (/\b(empty|blank) (file|document|extract|sheet)\b/i.test(lower)) return true;
+  return false;
+}
+
+function usefulString(value, max) {
+  const t = max != null ? capText(value, max) : String(value || '').trim();
+  return isEmptyContextValue(t) ? '' : t;
 }
 
 export async function extractSpreadsheetText(file) {
@@ -54,22 +84,34 @@ export async function extractSpreadsheetText(file) {
   return parts.join('\n\n').trim();
 }
 
-function normalizeCapturedContext(ctx) {
+export function compactCapturedContext(ctx) {
   const base = ctx && typeof ctx === 'object' ? ctx : {};
   const qa = Array.isArray(base.qa_pairs)
     ? base.qa_pairs
-      .filter((p) => p && (p.question || p.answer))
-      .map((p) => ({ question: String(p.question || ''), answer: String(p.answer || '') }))
+      .map((p) => {
+        if (!p || typeof p !== 'object') return null;
+        const row = {};
+        const q = usefulString(p.question);
+        const a = usefulString(p.answer);
+        if (q) row.question = q;
+        if (a) row.answer = a;
+        return Object.keys(row).length ? row : null;
+      })
+      .filter(Boolean)
     : [];
-  return {
-    what_it_represents: String(base.what_it_represents || ''),
-    time_period: String(base.time_period || ''),
-    key_metrics: Array.isArray(base.key_metrics)
-      ? base.key_metrics.map((m) => String(m || '')).filter(Boolean)
-      : (base.key_metrics ? [String(base.key_metrics)] : []),
-    interpretation_notes: String(base.interpretation_notes || ''),
-    qa_pairs: qa,
-  };
+  const metrics = Array.isArray(base.key_metrics)
+    ? base.key_metrics.map((m) => usefulString(m)).filter(Boolean)
+    : (usefulString(base.key_metrics) ? [usefulString(base.key_metrics)] : []);
+  const out = {};
+  const represents = usefulString(base.what_it_represents);
+  const period = usefulString(base.time_period);
+  const notes = usefulString(base.interpretation_notes);
+  if (represents) out.what_it_represents = represents;
+  if (period) out.time_period = period;
+  if (metrics.length) out.key_metrics = metrics;
+  if (notes) out.interpretation_notes = notes;
+  if (qa.length) out.qa_pairs = qa;
+  return Object.keys(out).length ? out : undefined;
 }
 
 function normalizeContextFile(raw) {
@@ -77,27 +119,56 @@ function normalizeContextFile(raw) {
   const id = String(raw.id || '').trim();
   const name = String(raw.name || '').trim();
   if (!id || !name) return null;
-  return {
-    id,
-    name,
-    fileType: String(raw.fileType || raw.kind || 'document'),
-    sizeLabel: String(raw.sizeLabel || ''),
-    storagePath: raw.storagePath || null,
-    storageBucket: raw.storageBucket || 'intelligence',
-    uploadedAt: raw.uploadedAt || new Date().toISOString(),
-    summary: capText(raw.summary, EXTRACT_CAPS.summary),
-    extractedText: capText(raw.extractedText, EXTRACT_CAPS.text),
-    visionExtract: capText(raw.visionExtract, EXTRACT_CAPS.vision),
-    structuredExtract: capText(raw.structuredExtract, EXTRACT_CAPS.structured),
-    imageCount: Number(raw.imageCount) || 0,
-    intakeMessages: Array.isArray(raw.intakeMessages)
-      ? raw.intakeMessages.slice(-24).map((m) => ({ role: m.role, content: String(m.content || '').slice(0, 4000) }))
-      : [],
-    intakeComplete: !!raw.intakeComplete,
-    processing: !!raw.processing,
-    capturedContext: normalizeCapturedContext(raw.capturedContext),
-    userNotes: capText(raw.userNotes, 8000),
+  const rec = { id, name };
+  const fileType = usefulString(raw.fileType || raw.kind);
+  if (fileType) rec.fileType = fileType;
+  const sizeLabel = usefulString(raw.sizeLabel);
+  if (sizeLabel) rec.sizeLabel = sizeLabel;
+  if (raw.storagePath) rec.storagePath = raw.storagePath;
+  if (raw.storageBucket && raw.storagePath) rec.storageBucket = raw.storageBucket;
+  if (raw.uploadedAt) rec.uploadedAt = raw.uploadedAt;
+  const summary = usefulString(raw.summary, EXTRACT_CAPS.summary);
+  if (summary) rec.summary = summary;
+  const extractedText = usefulString(raw.extractedText, EXTRACT_CAPS.text);
+  if (extractedText) rec.extractedText = extractedText;
+  const visionExtract = usefulString(raw.visionExtract, EXTRACT_CAPS.vision);
+  if (visionExtract) rec.visionExtract = visionExtract;
+  const structuredExtract = usefulString(raw.structuredExtract, EXTRACT_CAPS.structured);
+  if (structuredExtract) rec.structuredExtract = structuredExtract;
+  const imageCount = Number(raw.imageCount) || 0;
+  if (imageCount > 0) rec.imageCount = imageCount;
+  const intakeMessages = Array.isArray(raw.intakeMessages)
+    ? raw.intakeMessages
+      .slice(-24)
+      .map((m) => ({ role: m.role, content: usefulString(m.content, 4000) }))
+      .filter((m) => m.role && m.content)
+    : [];
+  if (intakeMessages.length) rec.intakeMessages = intakeMessages;
+  if (raw.intakeComplete) rec.intakeComplete = true;
+  if (raw.processing) rec.processing = true;
+  const captured = compactCapturedContext(raw.capturedContext);
+  if (captured) rec.capturedContext = captured;
+  const notes = [];
+  const seenNoteIds = new Set();
+  const pushNote = (id, text) => {
+    const t = usefulString(text, 8000);
+    if (!t) return;
+    let nid = String(id || '').trim() || `note_${notes.length + 1}`;
+    while (seenNoteIds.has(nid)) nid = `${nid}_${notes.length + 1}`;
+    seenNoteIds.add(nid);
+    notes.push({ id: nid, text: t });
   };
+  if (Array.isArray(raw.notes)) {
+    raw.notes.forEach((n, i) => {
+      if (typeof n === 'string') pushNote(`note_${i + 1}`, n);
+      else if (n && typeof n === 'object') pushNote(n.id || `note_${i + 1}`, n.text);
+    });
+  }
+  if (!notes.length && usefulString(raw.userNotes)) {
+    String(raw.userNotes).split(/\n\n+/).forEach((part, i) => pushNote(`note_${i + 1}`, part));
+  }
+  if (notes.length) rec.notes = notes;
+  return rec;
 }
 
 export function mergeModuleContext(raw) {
@@ -145,28 +216,40 @@ export function removeModuleContextFile(moduleContext, moduleId, fileId) {
 
 export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 40000 } = {}) {
   const files = settings?.moduleContext?.[moduleId]?.files || [];
-  const ready = files.filter((f) => f.summary || f.extractedText || f.intakeComplete || f.userNotes);
+  const ready = files.filter((f) => (
+    !isEmptyContextValue(f.summary)
+    || !isEmptyContextValue(f.extractedText)
+    || !isEmptyContextValue(f.visionExtract)
+    || !isEmptyContextValue(f.structuredExtract)
+    || !isEmptyContextValue(f.notes)
+    || !isEmptyContextValue(f.userNotes)
+    || !isEmptyContextValue(f.capturedContext)
+  ));
   if (!ready.length) return '';
   const blobs = ready.map((f) => {
     const ctx = f.capturedContext || {};
     const qa = (ctx.qa_pairs || [])
-      .filter((p) => p.question || p.answer)
-      .map((p) => `Q: ${p.question}\nA: ${p.answer}`)
+      .filter((p) => !isEmptyContextValue(p.question) || !isEmptyContextValue(p.answer))
+      .map((p) => [!isEmptyContextValue(p.question) ? `Q: ${p.question}` : '', !isEmptyContextValue(p.answer) ? `A: ${p.answer}` : ''].filter(Boolean).join('\n'))
+      .filter(Boolean)
       .join('\n');
     return [
-      `### ${f.name} (${f.fileType || 'file'})`,
-      f.summary ? `Summary: ${f.summary}` : '',
-      ctx.what_it_represents ? `Represents: ${ctx.what_it_represents}` : '',
-      ctx.time_period ? `Time period: ${ctx.time_period}` : '',
-      ctx.key_metrics?.length ? `Key fields: ${ctx.key_metrics.join('; ')}` : '',
-      ctx.interpretation_notes ? `How to use: ${ctx.interpretation_notes}` : '',
+      `### ${f.name}${f.fileType ? ` (${f.fileType})` : ''}`,
+      !isEmptyContextValue(f.summary) ? `Summary: ${f.summary}` : '',
+      !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
+      !isEmptyContextValue(ctx.time_period) ? `Time period: ${ctx.time_period}` : '',
+      ctx.key_metrics?.length ? `Key fields: ${ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('; ')}` : '',
+      !isEmptyContextValue(ctx.interpretation_notes) ? `How to use: ${ctx.interpretation_notes}` : '',
       qa ? `User clarifications:\n${qa}` : '',
-      f.userNotes ? `User notes (added later):\n${f.userNotes}` : '',
-      f.extractedText ? `Extracted text:\n${f.extractedText}` : '',
-      f.structuredExtract ? `Tables / charts:\n${f.structuredExtract}` : '',
-      f.visionExtract ? `From images:\n${f.visionExtract}` : '',
+      (f.notes || []).length
+        ? `User notes:\n${f.notes.map((n) => n.text).filter((t) => !isEmptyContextValue(t)).join('\n\n')}`
+        : (!isEmptyContextValue(f.userNotes) ? `User notes:\n${f.userNotes}` : ''),
+      !isEmptyContextValue(f.extractedText) ? `Extracted text:\n${f.extractedText}` : '',
+      !isEmptyContextValue(f.structuredExtract) ? `Tables / charts:\n${f.structuredExtract}` : '',
+      !isEmptyContextValue(f.visionExtract) ? `From images:\n${f.visionExtract}` : '',
     ].filter(Boolean).join('\n');
-  });
+  }).filter((blob) => blob.split('\n').length > 1);
+  if (!blobs.length) return '';
   let body = blobs.join('\n\n');
   if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… module context truncated …]`;
   return `\n\nMODULE CONTEXT (${moduleId}) — mandatory background the user uploaded for this module. Treat it as source of truth alongside USER SETTINGS. Do not contradict it. Do not name storage paths or internal filenames to end users:\n${body}\n`;

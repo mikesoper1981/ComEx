@@ -173,6 +173,7 @@ Process:
 4. Never use a fixed checklist of questions. Never ask about topics that are not in the file.
 5. Never ask about facts already visible in the extract.
 6. If column names are provided, describe them. If none, return an empty columns array.
+7. If there is nothing usable to describe, return "summary": "" and "suggestedQuestions": []. Empty fields must be empty strings, not explanations of emptiness. Never write filler such as "the file contained no text", "could not extract", "empty file", "n/a", or "unknown".
 
 {{moduleLabel}} is only the place this file will be stored — it is not a topic to ask about.`,
   contextIntakePrompt: `You help onboard ONE uploaded file so it can be saved.
@@ -196,7 +197,7 @@ Schema:
     "qa_pairs": [{"question": "", "answer": ""}]
   }
 }
-When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked and the user's answer.`,
+When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked and the user's answer. Omit or leave empty any field with no real answer — do not write n/a, unknown, "the file contained no text", or similar filler.`,
 };
 
 export const DEFAULT_STELLA_PROMPTS = {
