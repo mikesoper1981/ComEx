@@ -96,6 +96,7 @@ function normalizeContextFile(raw) {
     intakeComplete: !!raw.intakeComplete,
     processing: !!raw.processing,
     capturedContext: normalizeCapturedContext(raw.capturedContext),
+    userNotes: capText(raw.userNotes, 8000),
   };
 }
 
@@ -144,7 +145,7 @@ export function removeModuleContextFile(moduleContext, moduleId, fileId) {
 
 export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 40000 } = {}) {
   const files = settings?.moduleContext?.[moduleId]?.files || [];
-  const ready = files.filter((f) => f.summary || f.extractedText || f.intakeComplete);
+  const ready = files.filter((f) => f.summary || f.extractedText || f.intakeComplete || f.userNotes);
   if (!ready.length) return '';
   const blobs = ready.map((f) => {
     const ctx = f.capturedContext || {};
@@ -160,6 +161,7 @@ export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 
       ctx.key_metrics?.length ? `Key fields: ${ctx.key_metrics.join('; ')}` : '',
       ctx.interpretation_notes ? `How to use: ${ctx.interpretation_notes}` : '',
       qa ? `User clarifications:\n${qa}` : '',
+      f.userNotes ? `User notes (added later):\n${f.userNotes}` : '',
       f.extractedText ? `Extracted text:\n${f.extractedText}` : '',
       f.structuredExtract ? `Tables / charts:\n${f.structuredExtract}` : '',
       f.visionExtract ? `From images:\n${f.visionExtract}` : '',

@@ -2036,6 +2036,8 @@ export default function CommercialExcellenceApp() {
   const [activeContextFileId, setActiveContextFileId] = useState(null);
   const [contextIntakeInput, setContextIntakeInput] = useState('');
   const [contextIntakeBusy, setContextIntakeBusy] = useState(false);
+  const [contextEditDraft, setContextEditDraft] = useState(null); // { fileId, userNotes, summary, represents, period, interpretation }
+  const [contextEditSaveStatus, setContextEditSaveStatus] = useState('idle');
   const chatSessionsRef = useRef(chatSessions);
   const activeChatIdRef = useRef(activeChatId);
   const messagesRef = useRef(messages);
@@ -4071,6 +4073,7 @@ ${stepInstruction}`;
     const nextCtx = upsertModuleContextFile(userSettings.moduleContext, moduleId, rec);
     await persistContextFiles(nextCtx);
     setActiveContextFileId(fileId);
+    setContextEditDraft(draftFromContextFile(rec));
     contextIngestJobRef.current = null;
     setContextIngestJob(null);
     if (questions.length === 0) {
@@ -4081,7 +4084,16 @@ ${stepInstruction}`;
   const continueModuleContextIntake = async (moduleId, fileId, userText) => {
     const files = userSettings.moduleContext?.[moduleId]?.files || [];
     const rec = files.find((f) => f.id === fileId);
-    if (!rec || rec.intakeComplete) return;
+    if (!rec) return;
+    if (rec.intakeComplete) {
+      setContextIntakeBusy(true);
+      try {
+        await appendContextFileNote(moduleId, fileId, userText);
+      } finally {
+        setContextIntakeBusy(false);
+      }
+      return;
+    }
     const nextMessages = [...(rec.intakeMessages || []), { role: 'user', content: userText }];
     setContextIntakeBusy(true);
     const optimistic = patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, { intakeMessages: nextMessages });
@@ -4099,6 +4111,10 @@ ${stepInstruction}`;
         capturedContext: result.complete ? (result.context_qa || rec.capturedContext) : rec.capturedContext,
       });
       await persistContextFiles(patched);
+      if (result.complete) {
+        const saved = patched[moduleId]?.files?.find((f) => f.id === fileId);
+        setContextEditDraft(draftFromContextFile(saved));
+      }
     } catch (err) {
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: [...nextMessages, { role: 'system', content: `⚠️ ${err.message || 'Intake failed'}` }],
@@ -4224,6 +4240,54 @@ ${stepInstruction}`;
     if (activeContextFileId === fileId) setActiveContextFileId(null);
   };
 
+  const draftFromContextFile = (f) => (f ? {
+    fileId: f.id,
+    userNotes: f.userNotes || '',
+    summary: f.summary || '',
+    represents: f.capturedContext?.what_it_represents || '',
+    period: f.capturedContext?.time_period || '',
+    interpretation: f.capturedContext?.interpretation_notes || '',
+  } : null);
+
+  const saveContextFileEdits = async (moduleId, fileId) => {
+    const rec = (userSettings.moduleContext?.[moduleId]?.files || []).find((f) => f.id === fileId);
+    const draft = contextEditDraft?.fileId === fileId ? contextEditDraft : draftFromContextFile(rec);
+    if (!rec || !draft) return;
+    setContextEditSaveStatus('saving');
+    const patched = patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, {
+      summary: draft.summary,
+      userNotes: draft.userNotes,
+      capturedContext: {
+        ...(rec.capturedContext || {}),
+        what_it_represents: draft.represents,
+        time_period: draft.period,
+        interpretation_notes: draft.interpretation,
+      },
+    });
+    try {
+      await persistContextFiles(patched);
+      const saved = patched[moduleId]?.files?.find((f) => f.id === fileId);
+      setContextEditDraft(draftFromContextFile(saved));
+      setContextEditSaveStatus('saved');
+      setTimeout(() => setContextEditSaveStatus('idle'), 2500);
+    } catch {
+      setContextEditSaveStatus('error');
+    }
+  };
+
+  const appendContextFileNote = async (moduleId, fileId, note) => {
+    const rec = (userSettings.moduleContext?.[moduleId]?.files || []).find((f) => f.id === fileId);
+    if (!rec || !note) return;
+    const nextNotes = [rec.userNotes, note].filter(Boolean).join('\n\n');
+    const patched = patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, {
+      userNotes: nextNotes,
+      intakeMessages: [...(rec.intakeMessages || []), { role: 'user', content: note }],
+    });
+    await persistContextFiles(patched);
+    setContextEditDraft(draftFromContextFile(patched[moduleId]?.files?.find((f) => f.id === fileId)));
+    setContextIntakeInput('');
+  };
+
   const renderModuleContextPanel = (moduleId) => {
     const files = userSettings.moduleContext?.[moduleId]?.files || [];
     const active = files.find((f) => f.id === activeContextFileId) || files[files.length - 1] || null;
@@ -4236,8 +4300,13 @@ ${stepInstruction}`;
         <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
-        <p className="text-xs text-blue-300/60 mb-4">
-          Upload strategy decks, product lists, territory or team Excel, goals, or other background. Files are extracted (including images), you confirm anything unclear, then a short intake captures how to use them. They are always included when you work in {moduleLabelFor(moduleId)}.
+        <p className="text-xs text-blue-300/60 mb-2">
+          Upload a file, answer any questions about it, then save. You can come back later and add more context for that file. It is always included when you work in {moduleLabelFor(moduleId)}.
+        </p>
+        <p className="text-[11px] text-blue-300/45 mb-4">
+          Saved for this user only: notes and extract in settings JSON (
+          <code className="text-cyan-300/70">{userSettingsRemotePath(currentUser.id)}</code>
+          ), original file under <code className="text-cyan-300/70">users/{currentUser.id}/context/{moduleId}/</code>.
         </p>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <button
@@ -4285,7 +4354,7 @@ ${stepInstruction}`;
               {files.map((f) => (
                 <div key={f.id} className={`w-full bg-slate-900/40 border rounded-xl p-3 ${active?.id === f.id ? 'border-cyan-400/50' : 'border-blue-400/20'}`}>
                   <div className="flex items-start justify-between gap-2">
-                    <button type="button" onClick={() => setActiveContextFileId(f.id)} className="min-w-0 text-left flex-1">
+                    <button type="button" onClick={() => { setActiveContextFileId(f.id); setContextEditDraft(draftFromContextFile(f)); }} className="min-w-0 text-left flex-1">
                       <div className="text-sm font-semibold text-white truncate">{f.name}</div>
                       <div className="text-[11px] text-blue-300/55 mt-0.5">{f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}{f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : ''}</div>
                       {f.summary && <div className="text-[11px] text-blue-200/75 mt-1 line-clamp-2">{f.summary}</div>}
@@ -4306,11 +4375,11 @@ ${stepInstruction}`;
             </div>
             <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4">
               {!active ? (
-                <div className="text-xs text-blue-300/50">Select a file to continue intake.</div>
+                <div className="text-xs text-blue-300/50">Select a file to review or add context.</div>
               ) : (
                 <div className="space-y-3">
-                  <div className="text-xs font-bold text-white">Intake</div>
-                  <div className="max-h-[280px] overflow-y-auto custom-scrollbar space-y-2">
+                  <div className="text-xs font-bold text-white">{active.intakeComplete ? 'Context' : 'Intake'}</div>
+                  <div className="max-h-[200px] overflow-y-auto custom-scrollbar space-y-2">
                     {(active.intakeMessages || []).map((m, i) => (
                       <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         <div className={`max-w-[95%] px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
@@ -4319,12 +4388,12 @@ ${stepInstruction}`;
                       </div>
                     ))}
                   </div>
-                  {!active.intakeComplete && !active.processing && (
+                  {!active.processing && (
                     <div className="flex gap-2">
                       <textarea
                         value={contextIntakeInput}
                         onChange={(e) => setContextIntakeInput(e.target.value)}
-                        placeholder="Answer the intake questions…"
+                        placeholder={active.intakeComplete ? 'Add further context for this file…' : 'Answer the intake questions…'}
                         rows={2}
                         className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
                       />
@@ -4334,14 +4403,58 @@ ${stepInstruction}`;
                         onClick={() => continueModuleContextIntake(moduleId, active.id, contextIntakeInput.trim())}
                         className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
                       >
-                        <Send className="w-3.5 h-3.5" /> Send
+                        <Send className="w-3.5 h-3.5" /> {active.intakeComplete ? 'Add' : 'Send'}
                       </button>
                     </div>
                   )}
-                  {active.intakeComplete && active.capturedContext?.what_it_represents && (
-                    <div className="text-[11px] text-emerald-200/90 bg-emerald-500/10 border border-emerald-400/20 rounded-lg p-3 whitespace-pre-wrap">
-                      {active.capturedContext.what_it_represents}
-                      {active.capturedContext.time_period ? `\nPeriod: ${active.capturedContext.time_period}` : ''}
+                  {!active.processing && (
+                    <div className="space-y-2 pt-2 border-t border-blue-400/15">
+                      <div className="text-[11px] font-semibold text-blue-200">Edit context for this file</div>
+                      <textarea
+                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.summary : active.summary) || ''}
+                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), summary: e.target.value }))}
+                        rows={2}
+                        placeholder="Short summary of this file"
+                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-y"
+                      />
+                      <input
+                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.represents : active.capturedContext?.what_it_represents) || ''}
+                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), represents: e.target.value }))}
+                        placeholder="What this file represents"
+                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400"
+                      />
+                      <input
+                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.period : active.capturedContext?.time_period) || ''}
+                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), period: e.target.value }))}
+                        placeholder="Time period / version (if any)"
+                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400"
+                      />
+                      <textarea
+                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.interpretation : active.capturedContext?.interpretation_notes) || ''}
+                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), interpretation: e.target.value }))}
+                        rows={2}
+                        placeholder="How to use this file"
+                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-y"
+                      />
+                      <textarea
+                        value={(contextEditDraft?.fileId === active.id ? contextEditDraft.userNotes : active.userNotes) || ''}
+                        onChange={(e) => setContextEditDraft((prev) => ({ ...(prev?.fileId === active.id ? prev : draftFromContextFile(active)), userNotes: e.target.value }))}
+                        rows={4}
+                        placeholder="Further context you add later — always used with this file"
+                        className="w-full bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-y"
+                      />
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => saveContextFileEdits(moduleId, active.id)}
+                          disabled={contextEditSaveStatus === 'saving'}
+                          className="px-3 py-1.5 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/30 rounded-lg text-xs text-cyan-100 font-semibold disabled:opacity-50 flex items-center gap-1.5"
+                        >
+                          <Save className="w-3.5 h-3.5" /> {contextEditSaveStatus === 'saving' ? 'Saving…' : 'Save file context'}
+                        </button>
+                        {contextEditSaveStatus === 'saved' && <span className="text-[11px] text-green-400 font-semibold">Saved</span>}
+                        {contextEditSaveStatus === 'error' && <span className="text-[11px] text-red-400 font-semibold">Save failed</span>}
+                      </div>
                     </div>
                   )}
                 </div>
