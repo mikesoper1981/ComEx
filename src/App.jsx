@@ -343,6 +343,7 @@ async function uploadUserSettingsJson(user, doc) {
 }
 
 async function downloadUserSettingsDocument(user) {
+  const path = userSettingsRemotePath(user);
   const q = new URLSearchParams({
     userId: String(user?.id || ''),
     userName: String(user?.name || ''),
@@ -350,28 +351,27 @@ async function downloadUserSettingsDocument(user) {
   try {
     const res = await fetch(`/api/user-settings?${q}`);
     if (res.ok) {
-      const parsed = await res.json();
-      if (parsed && typeof parsed === 'object' && !parsed.error) return parsed;
-    } else if (res.status !== 404) {
+      const payload = await res.json();
+      const doc = payload?.document && typeof payload.document === 'object'
+        ? payload.document
+        : (payload && typeof payload === 'object' && !payload.error ? payload : null);
+      if (doc) return doc;
+    } else if (res.status === 404) {
+      return null;
+    } else {
       const data = await res.json().catch(() => ({}));
       throw new Error(data?.error?.message || `Could not load settings.json (${res.status})`);
     }
   } catch (err) {
     if (err?.message && /Could not load settings\.json/i.test(err.message)) throw err;
   }
-  const pathCandidates = [
-    ...userSettingsRemotePathCandidates(user),
-    ...(user?.id === getHardcodedUser().id ? [LEGACY_USER_SETTINGS_FILE] : []),
-  ];
-  for (const candidate of pathCandidates) {
-    try {
-      const { data, error } = await supabase.storage.from('intelligence').download(candidate);
-      if (!error && data) {
-        const parsed = safeJsonParse(await data.text());
-        if (parsed) return parsed;
-      }
-    } catch { /* try next path */ }
-  }
+  try {
+    const { data, error } = await supabase.storage.from('intelligence').download(path);
+    if (!error && data) {
+      const parsed = safeJsonParse(await data.text());
+      if (parsed) return parsed;
+    }
+  } catch { /* missing file */ }
   return null;
 }
 
@@ -2225,6 +2225,7 @@ export default function CommercialExcellenceApp() {
   const userSettingsRef = useRef(userSettings);
   const persistChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
+  const userSettingsReadyRef = useRef(false);
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
     try { return localStorage.getItem('comex-chat-history-collapsed') === '1'; } catch { return false; }
   });
@@ -2469,28 +2470,30 @@ export default function CommercialExcellenceApp() {
         }
       } catch { /* product intel falls back to factory defaults */ }
 
-      // User settings: one JSON file per account. Login is read-only.
+      // User settings: only intelligence/users/<display name>/settings.json — never users/<id>/.
       try {
         try {
           localStorage.removeItem(userSettingsLocalKey(currentUser.id));
           localStorage.removeItem(LEGACY_USER_SETTINGS_STORAGE_KEY);
+          Object.keys(localStorage)
+            .filter((k) => k.startsWith('comex-user-settings'))
+            .forEach((k) => localStorage.removeItem(k));
         } catch { /* ignore */ }
         const parsed = await downloadUserSettingsDocument(currentUser);
         if (parsed && typeof parsed === 'object') {
           const remoteSettings = normalizeLoadedUserSettings(parsed);
-          const localSettings = mergeUserSettingsFields(userSettingsRef.current);
+          const liveSettings = mergeUserSettingsFields(userSettingsRef.current);
           const merged = {
-            ...localSettings,
             ...remoteSettings,
-            moduleContext: mergeModuleContextPreferRich(localSettings.moduleContext, remoteSettings.moduleContext),
+            moduleContext: mergeModuleContextPreferRich(liveSettings.moduleContext, remoteSettings.moduleContext),
           };
           const { chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(parsed);
           setUserSettings(merged);
           userSettingsRef.current = merged;
+          skipChatPersistRef.current = true;
+          setChatSessions(remoteChats);
+          chatSessionsRef.current = remoteChats;
           if (remoteChats.length) {
-            skipChatPersistRef.current = true;
-            setChatSessions(remoteChats);
-            chatSessionsRef.current = remoteChats;
             const pick = remoteChats.find((c) => c.id === remoteActive) || remoteChats[0];
             setActiveChatId(pick.id);
             activeChatIdRef.current = pick.id;
@@ -2498,12 +2501,31 @@ export default function CommercialExcellenceApp() {
             setCurrentWorkflow(pick.currentWorkflow || null);
             setPendingWorkflow(pick.pendingWorkflow || null);
             setUploadedFile(pick.uploadedFile || null);
-            setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+          } else {
+            setActiveChatId(null);
+            activeChatIdRef.current = null;
+            setMessages([consultationWelcome()]);
+            setCurrentWorkflow(null);
+            setPendingWorkflow(null);
+            setUploadedFile(null);
           }
+          setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+        } else {
+          skipChatPersistRef.current = true;
+          setChatSessions([]);
+          chatSessionsRef.current = [];
+          setActiveChatId(null);
+          activeChatIdRef.current = null;
+          setMessages([consultationWelcome()]);
+          setCurrentWorkflow(null);
+          setPendingWorkflow(null);
+          setUploadedFile(null);
+          setTimeout(() => { skipChatPersistRef.current = false; }, 0);
         }
       } catch (err) {
         setUserSettingsCloudError(err?.message || 'Could not load settings.json');
       }
+      userSettingsReadyRef.current = true;
     };
     loadStella();
   }, [currentUser.id]);
@@ -2530,6 +2552,7 @@ export default function CommercialExcellenceApp() {
   }, [isAdmin, activeTab]);
 
   useEffect(() => {
+    if (!userSettingsReadyRef.current) return;
     if (skipChatPersistRef.current) return;
     if (!chatHasUserContent(messages) && !currentWorkflow) return;
     if (persistChatsTimerRef.current) clearTimeout(persistChatsTimerRef.current);
@@ -3078,6 +3101,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
   };
 
   const persistChatList = async (list, activeId) => {
+    if (!userSettingsReadyRef.current) return;
     try {
       await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
         currentUser.id,
@@ -6470,10 +6494,13 @@ ${stepInstruction}`;
 
           {recentChats(chatSessions).length > 0 && (
             <div className="mt-10">
-              <div className="flex items-center gap-2 mb-4">
+              <div className="flex items-center gap-2 mb-1">
                 <History className="w-5 h-5 text-cyan-300" />
                 <h3 className="text-lg font-semibold text-white">Recent chats</h3>
               </div>
+              <p className="text-[11px] text-blue-300/45 mb-4">
+                From <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code> only.
+              </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
                 {recentChats(chatSessions).map((chat) => {
                   const mod = chatModuleMeta(chat);
