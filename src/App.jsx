@@ -37,7 +37,6 @@ import {
   extractSpreadsheetText,
   mergeModuleContext,
   mergeModuleContextPreferRich,
-  moduleContextContentScore,
   serializeModuleContextForPersist,
   upsertModuleContextFile,
   patchModuleContextFile,
@@ -305,6 +304,7 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
   return doc;
 }
 
+/** Create users/<name>/settings.json if missing; otherwise overwrite that same file. */
 async function uploadUserSettingsJson(user, doc) {
   const path = userSettingsRemotePath(user);
   const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
@@ -2482,6 +2482,8 @@ export default function CommercialExcellenceApp() {
         if (parsed && typeof parsed === 'object') {
           const remoteSettings = normalizeLoadedUserSettings(parsed);
           const localSettings = mergeUserSettingsFields(userSettingsRef.current);
+          // Login is read-only. Keep a richer in-memory extract if this tab just saved
+          // and the download is a stale empty copy — never write the cloud file here.
           const merged = {
             ...localSettings,
             ...remoteSettings,
@@ -2510,42 +2512,7 @@ export default function CommercialExcellenceApp() {
               userName: currentUser.name,
             });
             localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(cleaned));
-            // Push local extracts if this browser already has context the cloud file lacks.
-            if (moduleContextContentScore(localSettings.moduleContext) > moduleContextContentScore(remoteSettings.moduleContext)) {
-              const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
-                currentUser.id,
-                mergeUserSettingsFields(userSettingsRef.current),
-                {
-                  chats: chatSessionsRef.current,
-                  activeChatId: activeChatIdRef.current,
-                  userName: currentUser.name,
-                },
-              ));
-              setUserSettingsCloudError(ok ? '' : lastUserSettingsUploadError(currentUser));
-              setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
-              setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
-            }
           } catch { /* ignore */ }
-        } else {
-          // First visit — keep browser settings. Do not seed an empty cloud file
-          // (that empty object later wins upserts and wipes extracts).
-          const localMerged = mergeUserSettingsFields(userSettingsRef.current);
-          if (moduleContextContentScore(localMerged.moduleContext) > 0) {
-            const localDoc = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
-            const { chats: localChats, activeChatId: localActive } = extractChatsFromDocument(localDoc);
-            const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
-              currentUser.id,
-              mergeUserSettingsFields(userSettingsRef.current),
-              {
-                chats: localChats.length ? localChats : (chatSessionsRef.current || []),
-                activeChatId: localActive || activeChatIdRef.current,
-                userName: currentUser.name,
-              },
-            ));
-            setUserSettingsCloudError(ok ? '' : lastUserSettingsUploadError(currentUser));
-            setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
-            setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
-          }
         }
       } catch { /* per-user settings may not exist yet */ }
     };
@@ -4602,8 +4569,8 @@ ${stepInstruction}`;
           Upload a file and use the chat to add more context. Detected content from the file appears below so you can confirm, edit, or remove it. Only those saved fields are sent to the AI as guidance in {moduleLabelFor(moduleId)}.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
-          Saved for this user in Supabase Storage <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.
-          {' '}Extract and notes only — the original file is not kept.
+          One file per user: <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.
+          {' '}Created if missing, overwritten on each save. Extract and notes only — the original file is not kept.
           {userSettingsSaveStatus === 'saved' && (
             <span className="block mt-1 text-emerald-300/80">Cloud copy updated.</span>
           )}
