@@ -214,45 +214,51 @@ export function removeModuleContextFile(moduleContext, moduleId, fileId) {
   return next;
 }
 
-export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 40000 } = {}) {
-  const files = settings?.moduleContext?.[moduleId]?.files || [];
-  const ready = files.filter((f) => (
-    !isEmptyContextValue(f.summary)
-    || !isEmptyContextValue(f.extractedText)
-    || !isEmptyContextValue(f.visionExtract)
-    || !isEmptyContextValue(f.structuredExtract)
-    || !isEmptyContextValue(f.notes)
-    || !isEmptyContextValue(f.userNotes)
-    || !isEmptyContextValue(f.capturedContext)
-  ));
-  if (!ready.length) return '';
-  const blobs = ready.map((f) => {
-    const ctx = f.capturedContext || {};
-    const qa = (ctx.qa_pairs || [])
-      .filter((p) => !isEmptyContextValue(p.question) || !isEmptyContextValue(p.answer))
-      .map((p) => [!isEmptyContextValue(p.question) ? `Q: ${p.question}` : '', !isEmptyContextValue(p.answer) ? `A: ${p.answer}` : ''].filter(Boolean).join('\n'))
-      .filter(Boolean)
-      .join('\n');
+export function listModuleContextBlocks(f) {
+  if (!f) return [];
+  const ctx = f.capturedContext || {};
+  const blocks = [];
+  if (!isEmptyContextValue(f.summary)) blocks.push({ id: 'summary', label: 'Summary', value: f.summary });
+  if (!isEmptyContextValue(ctx.what_it_represents)) blocks.push({ id: 'represents', label: 'What it represents', value: ctx.what_it_represents, line: true });
+  if (!isEmptyContextValue(ctx.time_period)) blocks.push({ id: 'period', label: 'Time period', value: ctx.time_period, line: true });
+  if (Array.isArray(ctx.key_metrics) && ctx.key_metrics.some((m) => !isEmptyContextValue(m))) {
+    blocks.push({ id: 'metrics', label: 'Key fields', value: ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('\n') });
+  }
+  if (!isEmptyContextValue(ctx.interpretation_notes)) blocks.push({ id: 'interpretation', label: 'How to use', value: ctx.interpretation_notes });
+  (ctx.qa_pairs || []).forEach((p, i) => {
+    if (isEmptyContextValue(p?.question) && isEmptyContextValue(p?.answer)) return;
+    blocks.push({ id: `qa:${i}`, label: 'Clarification', qa: true, question: p.question || '', answer: p.answer || '' });
+  });
+  (f.notes || []).forEach((n) => {
+    if (!n || isEmptyContextValue(n.text)) return;
+    blocks.push({ id: `note:${n.id}`, label: 'Added context', value: n.text });
+  });
+  return blocks;
+}
+
+function formatBlockForPrompt(b) {
+  if (b.qa) {
     return [
-      `### ${f.name}${f.fileType ? ` (${f.fileType})` : ''}`,
-      !isEmptyContextValue(f.summary) ? `Summary: ${f.summary}` : '',
-      !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
-      !isEmptyContextValue(ctx.time_period) ? `Time period: ${ctx.time_period}` : '',
-      ctx.key_metrics?.length ? `Key fields: ${ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('; ')}` : '',
-      !isEmptyContextValue(ctx.interpretation_notes) ? `How to use: ${ctx.interpretation_notes}` : '',
-      qa ? `User clarifications:\n${qa}` : '',
-      (f.notes || []).length
-        ? `User notes:\n${f.notes.map((n) => n.text).filter((t) => !isEmptyContextValue(t)).join('\n\n')}`
-        : (!isEmptyContextValue(f.userNotes) ? `User notes:\n${f.userNotes}` : ''),
-      !isEmptyContextValue(f.extractedText) ? `Extracted text:\n${f.extractedText}` : '',
-      !isEmptyContextValue(f.structuredExtract) ? `Tables / charts:\n${f.structuredExtract}` : '',
-      !isEmptyContextValue(f.visionExtract) ? `From images:\n${f.visionExtract}` : '',
+      !isEmptyContextValue(b.question) ? `${b.label} — Q: ${b.question}` : b.label,
+      !isEmptyContextValue(b.answer) ? `A: ${b.answer}` : '',
     ].filter(Boolean).join('\n');
-  }).filter((blob) => blob.split('\n').length > 1);
+  }
+  const value = String(b.value || '').trim();
+  if (!value) return '';
+  return `${b.label}: ${value}`;
+}
+
+export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 12000 } = {}) {
+  const files = (settings?.moduleContext?.[moduleId]?.files || []).filter((f) => f && !f.processing);
+  const blobs = files.map((f) => {
+    const blocks = listModuleContextBlocks(f).map(formatBlockForPrompt).filter(Boolean);
+    if (!blocks.length) return '';
+    return [`### ${f.name}${f.fileType ? ` (${f.fileType})` : ''}`, ...blocks].join('\n');
+  }).filter(Boolean);
   if (!blobs.length) return '';
   let body = blobs.join('\n\n');
   if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… module context truncated …]`;
-  return `\n\nMODULE CONTEXT (${moduleId}) — mandatory background the user uploaded for this module. Treat it as source of truth alongside USER SETTINGS. Do not contradict it. Do not name storage paths or internal filenames to end users:\n${body}\n`;
+  return `\n\nMODULE CONTEXT (${moduleId}) — user-provided guidance for this module. Treat it as mandatory background. Do not contradict it. Do not name internal filenames to end users:\n${body}\n`;
 }
 
 export function knowledgeStemPattern(names = []) {

@@ -36,6 +36,7 @@ import {
   patchModuleContextFile,
   removeModuleContextFile,
   formatModuleContextPromptBlock,
+  listModuleContextBlocks,
   knowledgeStemPattern,
   isEmptyContextValue,
   compactCapturedContext,
@@ -586,8 +587,8 @@ function buildUserSettingsPromptBlock(settings) {
   if (!settings || typeof settings !== 'object') return '';
   const lines = [];
   const push = (label, value) => {
-    const v = String(value || '').trim();
-    if (v) lines.push(`- ${label}: ${v}`);
+    if (isEmptyContextValue(value)) return;
+    lines.push(`- ${label}: ${String(value).trim()}`);
   };
   push('Company', settings.companyName);
   push('Industry / therapeutic area', settings.industry);
@@ -597,7 +598,7 @@ function buildUserSettingsPromptBlock(settings) {
   push('Abbreviations & terminology', settings.abbreviations);
   push('Preferences', settings.preferences);
   push('Hard constraints', settings.constraints);
-  const extra = String(settings.customContext || '').trim();
+  const extra = isEmptyContextValue(settings.customContext) ? '' : String(settings.customContext).trim();
   if (!lines.length && !extra) return '';
   return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, and constraints in every response; do not contradict them):\n${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}\n`;
 }
@@ -1965,25 +1966,7 @@ class MessageErrorBoundary extends React.Component {
 }
 
 function contextBlocksFromFile(f) {
-  if (!f) return [];
-  const ctx = f.capturedContext || {};
-  const blocks = [];
-  if (!isEmptyContextValue(f.summary)) blocks.push({ id: 'summary', label: 'Summary', value: f.summary });
-  if (!isEmptyContextValue(ctx.what_it_represents)) blocks.push({ id: 'represents', label: 'What it represents', value: ctx.what_it_represents, line: true });
-  if (!isEmptyContextValue(ctx.time_period)) blocks.push({ id: 'period', label: 'Time period', value: ctx.time_period, line: true });
-  if (Array.isArray(ctx.key_metrics) && ctx.key_metrics.some((m) => !isEmptyContextValue(m))) {
-    blocks.push({ id: 'metrics', label: 'Key fields', value: ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('\n') });
-  }
-  if (!isEmptyContextValue(ctx.interpretation_notes)) blocks.push({ id: 'interpretation', label: 'How to use', value: ctx.interpretation_notes });
-  (ctx.qa_pairs || []).forEach((p, i) => {
-    if (isEmptyContextValue(p?.question) && isEmptyContextValue(p?.answer)) return;
-    blocks.push({ id: `qa:${i}`, label: 'Clarification', qa: true, question: p.question || '', answer: p.answer || '' });
-  });
-  (f.notes || []).forEach((n) => {
-    if (!n || isEmptyContextValue(n.text)) return;
-    blocks.push({ id: `note:${n.id}`, label: 'Added context', value: n.text });
-  });
-  return blocks;
+  return listModuleContextBlocks(f);
 }
 
 function EditableContextBlock({ label, value, question, answer, qa, line, onSave, onDelete }) {
@@ -4366,7 +4349,7 @@ ${stepInstruction}`;
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
         <p className="text-xs text-blue-300/60 mb-2">
-          Upload a file and use the chat to answer questions or add more context. Saved fields below can be edited or removed. This context is always included when you work in {moduleLabelFor(moduleId)}.
+          Upload a file and use the chat to answer questions or add more context. Saved fields below can be edited or removed. Only those fields are sent to the AI as guidance in {moduleLabelFor(moduleId)}.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
           Saved for this user only in their settings JSON (
@@ -6142,7 +6125,7 @@ ${stepInstruction}`;
                 {showLanding && <p className="text-xs text-blue-300/70 hidden sm:block">Field & Commercial Excellence Platform</p>}
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 sm:gap-3">
               {!showLanding && (activeTab === 'chat' || activeTab === 'performance') && (
                 <div className="flex gap-1 sm:gap-2 bg-slate-800/50 rounded-lg p-1">
                   {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance']].map(([tab, Icon, label]) => (
@@ -6156,21 +6139,22 @@ ${stepInstruction}`;
                 type="button"
                 title="User settings"
                 onClick={() => { setShowLanding(false); setActiveTab('user-settings'); }}
-                className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'user-settings' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+                className={`h-11 sm:h-12 px-3 sm:px-3.5 rounded-lg flex items-center justify-center gap-2 border transition-all ${!showLanding && activeTab === 'user-settings' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
               >
-                <UserCog className="w-4 h-4 sm:w-5 sm:h-5" />
+                <UserCog className="w-5 h-5 sm:w-6 sm:h-6" />
+                <span className="hidden sm:inline text-sm font-semibold">Settings</span>
               </button>
               {isAdmin && (
                 <button
                   type="button"
                   title="Admin"
                   onClick={() => { setShowLanding(false); setActiveTab('admin'); }}
-                  className={`w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'admin' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+                  className={`h-11 sm:h-12 w-11 sm:w-12 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'admin' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
                 >
-                  <Settings className="w-4 h-4 sm:w-5 sm:h-5" />
+                  <Settings className="w-5 h-5 sm:w-6 sm:h-6" />
                 </button>
               )}
-              <div className="hidden sm:flex flex-col items-end leading-tight mr-0.5">
+              <div className="hidden sm:flex flex-col items-end leading-tight ml-3 sm:ml-6 pl-3 sm:pl-6 border-l border-blue-400/25">
                 <span className="text-xs font-semibold text-white max-w-[140px] truncate">{currentUser.name}</span>
                 <span className="text-[10px] text-blue-300/60">{isAdmin ? 'Admin' : 'User'}</span>
               </div>
@@ -6178,9 +6162,9 @@ ${stepInstruction}`;
                 type="button"
                 title="Sign out"
                 onClick={handleSignOut}
-                className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg flex items-center justify-center border bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40 transition-all"
+                className="h-11 sm:h-12 w-11 sm:w-12 rounded-lg flex items-center justify-center border bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40 transition-all"
               >
-                <LogOut className="w-4 h-4 sm:w-5 sm:h-5" />
+                <LogOut className="w-5 h-5 sm:w-6 sm:h-6" />
               </button>
             </div>
           </div>
@@ -6952,7 +6936,6 @@ ${stepInstruction}`;
                     <div className="w-10 h-10 bg-white/15 rounded-lg flex items-center justify-center"><UserCog className="w-5 h-5" /></div>
                     <div>
                       <h2 className="text-xl font-bold">User Settings</h2>
-                      <p className="text-blue-100 text-xs sm:text-sm">Saved only for {currentUser.name} in their settings JSON — not shared with other users.</p>
                     </div>
                   </div>
                   <div className="text-right text-xs text-blue-100/80">
