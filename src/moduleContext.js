@@ -177,6 +177,13 @@ function normalizeContextFile(raw) {
     String(raw.userNotes).split(/\n\n+/).forEach((part, i) => pushNote(`note_${i + 1}`, part));
   }
   if (notes.length) rec.notes = notes;
+  if (!rec.intakeComplete && !rec.processing) {
+    const hasStoredContent = !!(
+      rec.summary || rec.extractedText || rec.visionExtract || rec.structuredExtract
+      || rec.capturedContext || rec.notes?.length
+    );
+    if (hasStoredContent) rec.intakeComplete = true;
+  }
   return rec;
 }
 
