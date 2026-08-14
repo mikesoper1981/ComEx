@@ -11,6 +11,7 @@ import {
   userSettingsRemotePath,
   userPptxTemplateRemotePath,
   userProposalRemotePath,
+  userModuleContextRemotePath,
 } from './auth';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -28,6 +29,16 @@ import {
 } from './defaults';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import JSZip from 'jszip';
+import {
+  detectContextFileKind,
+  extractSpreadsheetText,
+  mergeModuleContext,
+  upsertModuleContextFile,
+  patchModuleContextFile,
+  removeModuleContextFile,
+  formatModuleContextPromptBlock,
+  knowledgeStemPattern,
+} from './moduleContext';
 
 // Recharts is loaded lazily so it can never affect initial page load.
 const StellaChart = lazy(() => import('./StellaChart'));
@@ -38,6 +49,38 @@ const STELLA_QUERY_API_PATH = '/api/stella-query';
 const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
 const CHAT_API_PATH = '/api/chat';
+
+function stripKnowledgeCitations(text, extraNames = []) {
+  let t = String(text || '');
+  t = t.replace(/[-]{2,}\s*\nReferences:\s*\n[\s\S]*$/i, '');
+  t = t.replace(/\n+#{0,3}\s*References:\s*\n(?:\s*\d+\.\s+.+\n?)*/gi, '\n');
+  t = t.replace(/\s*\[\d+\]/g, '');
+  t = t.replace(/\b[\w./-]+\.(?:md|ya?ml|txt)\b/gi, '');
+  const stemRe = knowledgeStemPattern([...(KNOWLEDGE_SEED_FILES || []), ...extraNames]);
+  if (stemRe) t = t.replace(stemRe, '');
+  t = t.replace(/\bBest-practice guidance \d+\b/gi, '');
+  return t.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function looksLikeIntelligenceRef(text, extraNames = []) {
+  const p = String(text || '');
+  if (/\.(md|ya?ml|txt)\b/i.test(p)) return true;
+  if (/\b(knowledge[- ]base file|intelligence file|document name|source filename|knowledge file)\b/i.test(p)) return true;
+  if (/\bbest-practice guidance \d+\b/i.test(p)) return true;
+  if (/\breferences?\s*:/i.test(p)) return true;
+  if (/\[\d+\]/.test(p)) return true;
+  const stemRe = knowledgeStemPattern([...(KNOWLEDGE_SEED_FILES || []), ...extraNames]);
+  return !!(stemRe && stemRe.test(p));
+}
+
+function isSensibleSuggestion(text, extraNames = []) {
+  const p = String(text || '').replace(/\s+/g, ' ').trim();
+  if (p.length < 8 || p.length > 160) return false;
+  if (looksLikeIntelligenceRef(p, extraNames)) return false;
+  if (/^\s*[1-9]\s*[=:).\-]/.test(p)) return false;
+  if (/\?/.test(p)) return true;
+  return /^(i|we|let'?s|please|help|tell|give|make|build|explain|summarize|summarise|check|recommend|propose|create|generate|list|outline|walk|rewrite|tighten|model|simulate|flag|identify|approve|export|assess|review|design|compare|add|change|update|draft|show|run|continue|move|apply|calculate|estimate|how|what|why|could|would|should|can)\b/i.test(p);
+}
 
 function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice, thinking, signal }) {
   return fetch(CHAT_API_PATH, {
@@ -152,6 +195,7 @@ const DEFAULT_USER_SETTINGS = {
   preferences: '',
   constraints: '',
   customContext: '',
+  moduleContext: mergeModuleContext({}),
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
   // PowerPoint generation guidance — edited in Admin → PPT; persisted in settings JSON
@@ -168,6 +212,7 @@ function mergeUserSettingsFields(raw = {}) {
     ...rest,
     pptxContext: mergePptxContext(rest.pptxContext),
     ...intel,
+    moduleContext: mergeModuleContext(rest.moduleContext),
   };
 }
 
@@ -308,6 +353,7 @@ function serializeChatSnapshot({ id, title, updatedAt, messages, currentWorkflow
           visionExtract: String(uploadedFile.visionExtract || '').slice(0, 20000),
           structuredExtract: String(uploadedFile.structuredExtract || '').slice(0, 15000),
           imageCount: uploadedFile.imageCount || 0,
+          capturedContext: uploadedFile.capturedContext || null,
         }
       : null,
   };
@@ -639,7 +685,10 @@ async function extractProposalText(file) {
     return extractPptxPlainText(file);
   }
   if (name.endsWith('.ppt')) {
-    throw new Error('Legacy .ppt is not supported — please upload .pptx or PDF.');
+    throw new Error('Legacy .ppt is not supported — please upload .pptx, PDF, or Excel.');
+  }
+  if (name.endsWith('.xlsx') || name.endsWith('.xls') || name.endsWith('.csv') || file?.type?.includes('spreadsheet') || file?.type?.includes('excel') || file?.type?.includes('csv')) {
+    return extractSpreadsheetText(file);
   }
   // Plain text fallback
   return new Promise((resolve, reject) => {
@@ -1018,6 +1067,10 @@ function purposeLabel(purpose) {
     governance: 'Governance',
     timeline: 'Timeline',
     org_chart: 'Org / roles',
+    strategy: 'Strategy',
+    products: 'Products',
+    map: 'Map / territory',
+    diagram: 'Diagram',
     other_ic: 'Possible scheme content',
     logo: 'Logo',
     decorative: 'Decorative',
@@ -1945,6 +1998,13 @@ export default function CommercialExcellenceApp() {
   const [pendingImageReview, setPendingImageReview] = useState(null); // pause ingest until user confirms unsure images
   const pendingImageReviewRef = useRef(null);
   const proposalIngestRunningRef = useRef(false);
+  const [pendingProposalIntake, setPendingProposalIntake] = useState(null);
+  const pendingProposalIntakeRef = useRef(null);
+  const [contextIngestJob, setContextIngestJob] = useState(null);
+  const contextIngestJobRef = useRef(null);
+  const [activeContextFileId, setActiveContextFileId] = useState(null);
+  const [contextIntakeInput, setContextIntakeInput] = useState('');
+  const [contextIntakeBusy, setContextIntakeBusy] = useState(false);
   const chatSessionsRef = useRef(chatSessions);
   const activeChatIdRef = useRef(activeChatId);
   const messagesRef = useRef(messages);
@@ -2030,6 +2090,7 @@ export default function CommercialExcellenceApp() {
   const territoryFileInputRef = useRef(null);
   const stellaDataFileInputRef = useRef(null);
   const pptxTemplateInputRef = useRef(null);
+  const moduleContextFileInputRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -2399,8 +2460,10 @@ export default function CommercialExcellenceApp() {
   };
 
   const formatMarkdown = (content) => {
-    const references = parseReferences(content);
-    const cleanContent = content.replace(/[-]{2,}\s*\nReferences:\s*\n[\s\S]+?(\n[-]{2,}|\s*$)/i, '').trimEnd();
+    const hideCitations = !isAdmin;
+    const source = hideCitations ? stripKnowledgeCitations(content) : content;
+    const references = hideCitations ? {} : parseReferences(source);
+    const cleanContent = source.replace(/[-]{2,}\s*\nReferences:\s*\n[\s\S]+?(\n[-]{2,}|\s*$)/i, '').trimEnd();
     const chartMatch = cleanContent.match(/```chart-payout\n([\s\S]+?)\n```/);
     if (chartMatch) {
       try {
@@ -2492,12 +2555,12 @@ export default function CommercialExcellenceApp() {
                     return (
                       <div key={i} className="flex gap-2 leading-relaxed" style={{ paddingLeft: `${indent * 4}px` }}>
                         <span className="text-cyan-400 flex-shrink-0 mt-0.5">•</span>
-                        <span className="text-sm">{renderTextWithCitations(text, references)}</span>
+                        <span className="text-sm">{hideCitations ? text : renderTextWithCitations(text, references)}</span>
                       </div>
                     );
                   }
                   if (line.trim() === '' || line.trim() === '---') return <div key={i} className="h-2"/>;
-                  return <div key={i} className="text-sm leading-relaxed">{renderTextWithCitations(line, references)}</div>;
+                  return <div key={i} className="text-sm leading-relaxed">{hideCitations ? line : renderTextWithCitations(line, references)}</div>;
                 })}
               </div>
             );
@@ -2510,7 +2573,7 @@ export default function CommercialExcellenceApp() {
             <div className="text-sm text-slate-200">{hoveredCitation.text}</div>
           </div>
         )}
-        {Object.keys(references).length > 0 && (
+        {Object.keys(references).length > 0 && isAdmin && (
           <div className="mt-4 pt-4 border-t border-slate-700">
             <div className="text-sm font-semibold text-cyan-400 mb-2">📚 References</div>
             <div className="space-y-1 text-xs text-slate-400">
@@ -2530,7 +2593,7 @@ export default function CommercialExcellenceApp() {
   const generateSuggestions = async (conversationHistory) => {
     if (!suggestionsEnabled || conversationHistory.length === 0) { setSuggestedPrompts([]); return; }
     // Never invent answers while an agent is waiting on clarifying questions
-    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser) {
+    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser || pendingProposalIntake) {
       setSuggestedPrompts([]);
       return;
     }
@@ -2540,16 +2603,33 @@ export default function CommercialExcellenceApp() {
       return;
     }
     try {
-      const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
+      const knowledgeNames = (documents || []).map((d) => d.name).filter(Boolean);
+      const recentMessages = conversationHistory.slice(-12).map((m) => {
+        const body = stripKnowledgeCitations(String(m.content || '')).substring(0, 900);
+        return `${m.role}: ${body}`;
+      }).join('\n');
+      const lastUser = [...conversationHistory].reverse().find((m) => m.role === 'user');
+      const lastUserText = stripKnowledgeCitations(String(lastUser?.content || '')).substring(0, 500);
+      const lastAsstText = stripKnowledgeCitations(String(lastAssistant?.content || '')).substring(0, 700);
       const n = Math.min(Math.max(1, maxSuggestions), 5);
       const sug = getIntel().suggestions;
       const response = await anthropicMessagesPost({
-        system: `${fillTemplate(sug.systemPrompt, { n })}${buildUserSettingsPromptBlock(userSettings)}`,
+        system: `${fillTemplate(sug.systemPrompt, { n })}${buildUserSettingsPromptBlock(userSettings)}
+
+Never mention knowledge-file names, .md/.yml titles, citation numbers, or a References section. Suggestions must be questions or instructions the user would type next about THIS conversation.`,
         messages: [{
           role: 'user',
-          content: fillTemplate(sug.userPromptTemplate, { recent: recentMessages, n }),
+          content: `${fillTemplate(sug.userPromptTemplate, { recent: recentMessages, n })}
+
+User's latest message:
+${lastUserText || '(none)'}
+
+Assistant's latest reply:
+${lastAsstText || '(none)'}
+
+Return ${n} clickable follow-ups that continue this thread. Each must read as a natural question or instruction (not a document title).`,
         }],
-        max_tokens: 300,
+        max_tokens: 400,
       });
       const data = await response.json();
       const text = anthropicAssistantText(data)?.trim();
@@ -2557,12 +2637,8 @@ export default function CommercialExcellenceApp() {
         const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
         if (Array.isArray(parsed)) {
           const cleaned = parsed
-            .map((p) => String(p || '').trim())
-            .filter(Boolean)
-            // Drop assistant-style interrogatives that slipped through
-            .filter((p) => !/^(what|how many|which|who|when|where|do you|can you|could you|please (tell|confirm|provide|share))\b/i.test(p))
-            // Drop invented answers to numbered clarifying questions
-            .filter((p) => !/^\s*[1-9]\s*[=:).\-]/i.test(p));
+            .map((p) => stripKnowledgeCitations(String(p || '')).replace(/\s+/g, ' ').trim())
+            .filter((p) => isSensibleSuggestion(p, knowledgeNames));
           setSuggestedPrompts(cleaned.slice(0, n));
         }
       }
@@ -2618,7 +2694,35 @@ export default function CommercialExcellenceApp() {
   };
 
   /** Append mandatory user preferences/context to any system prompt. */
-  const withUserSettings = (system) => `${system || ''}${buildUserSettingsPromptBlock(userSettings)}`;
+  const resolvePromptModule = () => {
+    if (activeTab === 'stella') return 'stella';
+    if (activeTab === 'territory') return 'territory';
+    const topic = String(currentWorkflow?.topicId || '');
+    if (topic.includes('territory')) return 'territory';
+    if (topic.includes('stella')) return 'stella';
+    return 'incentives';
+  };
+
+  const withUserSettings = (system, { moduleContext = true } = {}) => {
+    let prompt = String(system || '');
+    if (!isAdmin) {
+      prompt = prompt.replace(
+        /CITATION SYSTEM[\s\S]*?(?=\nCRITICAL - POWERPOINT|\nRESPONSE FORMATTING)/i,
+        `CITATION SYSTEM:
+Do not cite sources. Never name knowledge files, intelligence documents, or filenames. Do not use [1]/[2] markers or a References section. Apply best-practice knowledge silently.\n\n`
+      );
+      prompt = prompt.replace(/ALWAYS include the source of the data points in your response text/gi, 'Do not name the source of data points');
+      prompt = prompt.replace(/loaded from intelligence files/gi, 'best-practice guidance');
+    }
+    const moduleBlock = moduleContext
+      ? formatModuleContextPromptBlock(userSettings, resolvePromptModule())
+      : '';
+    const base = `${prompt}${buildUserSettingsPromptBlock(userSettings)}${moduleBlock}`;
+    if (isAdmin) return base;
+    return `${base}
+
+END-USER MODE: Never cite or name knowledge files, intelligence documents, or source filenames. Do not use [1]/[2] markers or a References section. Apply best-practice knowledge in your reasoning without mentioning where it came from.`;
+  };
 
   const getIntel = () => mergeIntelligenceContext(userSettings);
   const getWorkflowRuntime = () => getIntel().workflowRuntime;
@@ -2871,7 +2975,7 @@ export default function CommercialExcellenceApp() {
     const selected = keys.includes('*')
       ? active
       : active.filter((d) => keys.some((k) => d.name === k || d.name.endsWith(`/${k}`) || d.id === k));
-    return selected.map((d) => `## ${d.name}\n${d.content}`).join('\n\n');
+    return selected.map((d, i) => `${isAdmin ? `## ${d.name}` : `## Best-practice guidance ${i + 1}`}\n${d.content}`).join('\n\n');
   };
 
   const runAgent = async (agent, step, messages, { autoAdvance = false } = {}) => {
@@ -3487,6 +3591,85 @@ ${stepInstruction}`;
     }
   };
 
+  const moduleLabelFor = (id) => CHAT_MODULE_META[id]?.label || id;
+
+  const extractDocumentForIngest = async (file, { classifyPrompt, onStatus } = {}) => {
+    const { kind, label } = detectContextFileKind(file);
+    if (kind === 'ppt') throw new Error('Legacy .ppt is not supported — please upload .pptx, PDF, or Excel.');
+    onStatus?.(`Extracting text from **${file.name}**…`);
+    let extractedText = '';
+    if (kind === 'excel' || kind === 'csv') extractedText = String(await extractSpreadsheetText(file) || '').trim();
+    else extractedText = String(await extractProposalText(file) || '').trim();
+
+    let included = [];
+    let unsure = [];
+    let skipped = [];
+    let imageNotes = [];
+    let structuredText = '';
+    if (kind === 'pdf' || kind === 'pptx') {
+      onStatus?.('Scanning embedded images — keeping useful content, skipping logos/decoration…');
+      try {
+        const extracted = await extractProposalImages(file, { textLength: extractedText.length });
+        const finalized = await finalizeProposalImages(
+          extracted,
+          classifyPrompt || withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt, { moduleContext: false }),
+        );
+        const images = finalized.images || [];
+        unsure = finalized.unsure || [];
+        skipped = finalized.skipped || [];
+        const classifications = finalized.classifications || [];
+        imageNotes = finalized.notes || [];
+        structuredText = finalized.structuredText || '';
+        const classByName = Object.fromEntries(classifications.map((c) => [c.name, c]));
+        included = images.map((img) => ({
+          ...img,
+          purpose: classByName[img.name]?.purpose || img.purpose || 'scheme_content',
+          reason: classByName[img.name]?.reason || img.reason,
+        }));
+      } catch (err) {
+        imageNotes = [err.message || 'Image scan skipped'];
+      }
+    }
+    return { kind, fileType: label, extractedText, structuredText, included, unsure, skipped, imageNotes };
+  };
+
+  const runContextIntakeTurn = async ({ extractBlob, moduleLabel: label, intakeMessages }) => {
+    const rt = getWorkflowRuntime();
+    const system = withUserSettings(fillTemplate(rt.contextIntakePrompt, { moduleLabel: label }), { moduleContext: false });
+    const convo = [
+      { role: 'user', content: `Onboarding file extract:\n${String(extractBlob || '').slice(0, 16000)}` },
+      ...(intakeMessages || []).map((m) => ({ role: toAnthropicRole(m.role), content: m.content })),
+    ];
+    let parsed = {};
+    let raw = '';
+    try {
+      raw = await callAnthropic(system, convo, 900);
+      parsed = extractJsonObject(raw) || {};
+    } catch { /* fall through */ }
+    return {
+      complete: !!parsed.complete,
+      message: parsed.message
+        || (parsed.complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || 'Could you tell me what this file represents and how I should use it?')),
+      context_qa: parsed.context_qa || null,
+    };
+  };
+
+  const summarizeContextFile = async ({ name, extractBlob, moduleId, columns = [] }) => {
+    const rt = getWorkflowRuntime();
+    const system = withUserSettings(fillTemplate(rt.contextContentSummaryPrompt, {
+      moduleLabel: moduleLabelFor(moduleId),
+    }), { moduleContext: false });
+    const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map((c) => `- ${c.name}`).join('\n')}` : '';
+    const raw = await callAnthropic(system, [{
+      role: 'user',
+      content: `FILE:\n- name: ${name}\n- module: ${moduleLabelFor(moduleId)}${colText}\n\nCONTENT SAMPLE:\n${String(extractBlob || '').slice(0, 18000)}`,
+    }], 1000);
+    const parsed = extractJsonObject(raw);
+    return parsed && typeof parsed === 'object'
+      ? parsed
+      : { summary: 'Uploaded context file.', columns: [], suggestedQuestions: [] };
+  };
+
   const completeProposalIngest = async (job) => {
     setIsLoading(true);
     pendingImageReviewRef.current = null;
@@ -3523,7 +3706,7 @@ ${stepInstruction}`;
           }]);
           visionText = await interpretProposalImages(
             images,
-            withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
+            withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt, { moduleContext: false }),
             {
               onProgress: (n, total, name) => {
                 setMessages((prev) => {
@@ -3608,24 +3791,10 @@ ${stepInstruction}`;
         ? `${structuredText.slice(0, 30000)}\n\n[… structured extract truncated …]`
         : structuredText;
 
-      setUploadedFile({
-        name: file.name,
-        size: file.size,
-        fileType,
-        storagePath,
-        storageBucket: 'intelligence',
-        extractedText: cappedText,
-        visionExtract: cappedVision || null,
-        structuredExtract: cappedStructured || null,
-        imageCount,
-        uploadedAt: new Date().toISOString(),
-      });
-
       const focusedContext = [
         'UPLOADED IC PROPOSAL (source of truth for this analysis)',
         `File: ${file.name}`,
         `Type: ${fileType}`,
-        `Stored at: intelligence/${storagePath}`,
         `Slide/document text chars: ${cappedText.length}`,
         imageCount ? `Scheme-relevant images interpreted: ${imageCount}` : 'Scheme-relevant images interpreted: 0',
         ignoredPurposeCount ? `Non-scheme images ignored: ${ignoredPurposeCount} (logos, decoration, icons)` : null,
@@ -3644,6 +3813,20 @@ ${stepInstruction}`;
           : '\n\nEXTRACTED FROM SCHEME IMAGES: (none after purpose filter / conversion)',
       ].filter((line) => line != null).join('\n');
 
+      setUploadedFile({
+        name: file.name,
+        size: file.size,
+        fileType,
+        storagePath,
+        storageBucket: 'intelligence',
+        extractedText: cappedText,
+        visionExtract: cappedVision || null,
+        structuredExtract: cappedStructured || null,
+        imageCount,
+        uploadedAt: new Date().toISOString(),
+        capturedContext: null,
+      });
+
       const bits = [
         cappedText ? `${Math.round(cappedText.length / 1000)}k text` : null,
         cappedVision ? `${Math.round(cappedVision.length / 1000)}k image extract` : null,
@@ -3653,15 +3836,20 @@ ${stepInstruction}`;
 
       setMessages((prev) => [...prev, {
         role: 'system',
-        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${bits || 'minimal extract'}).\n\nPassing **slide text + scheme image extracts** into **Analyze Existing IC**…`,
+        content: `✅ Proposal saved (${bits || 'minimal extract'}). Checking whether anything still needs clarifying…`,
       }]);
-      setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
 
-      await launchWorkflowDirect(
-        'analyze_ic',
-        'Assess my IC using the uploaded proposal. Use BOTH the extracted slide/document text AND any scheme image extracts (content, key points, and message — not only payout scales) — do not ask the user to restate details already present in either source.',
+      const launchArgs = {
+        topicId: 'analyze_ic',
+        userMessage: 'Assess my IC using the uploaded proposal. Use BOTH the extracted slide/document text AND any scheme image extracts — do not ask the user to restate details already present in either source.',
         focusedContext,
-      );
+      };
+      await beginProposalIntake({
+        fileName: file.name,
+        focusedContext,
+        extractBlob: [cappedText, cappedStructured, cappedVision].filter(Boolean).join('\n\n'),
+        launchArgs,
+      });
     } catch (err) {
       setUploadedFile(null);
       setMessages((prev) => [...prev, {
@@ -3670,6 +3858,454 @@ ${stepInstruction}`;
       }]);
       setIsLoading(false);
     }
+  };
+
+  const finishProposalIntakeAndLaunch = async (intake, capturedContext) => {
+    pendingProposalIntakeRef.current = null;
+    setPendingProposalIntake(null);
+    const ctx = capturedContext && typeof capturedContext === 'object' ? capturedContext : {};
+    const qa = Array.isArray(ctx.qa_pairs)
+      ? ctx.qa_pairs.filter((p) => p?.question || p?.answer).map((p) => `Q: ${p.question}\nA: ${p.answer}`).join('\n')
+      : '';
+    const clarifications = [
+      ctx.what_it_represents ? `Represents: ${ctx.what_it_represents}` : '',
+      ctx.time_period ? `Time period: ${ctx.time_period}` : '',
+      ctx.key_metrics?.length ? `Key fields: ${ctx.key_metrics.join('; ')}` : '',
+      ctx.interpretation_notes ? `Notes: ${ctx.interpretation_notes}` : '',
+      qa ? `User clarifications:\n${qa}` : '',
+    ].filter(Boolean).join('\n');
+    setUploadedFile((prev) => (prev ? { ...prev, capturedContext: ctx } : prev));
+    const focusedContext = clarifications
+      ? `${intake.focusedContext}\n\nUSER CLARIFICATIONS ON THIS PROPOSAL:\n${clarifications}`
+      : intake.focusedContext;
+    setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
+    await launchWorkflowDirect(intake.launchArgs.topicId, intake.launchArgs.userMessage, focusedContext);
+  };
+
+  const beginProposalIntake = async ({ fileName, focusedContext, extractBlob, launchArgs }) => {
+    let onboarding = { summary: '', suggestedQuestions: [] };
+    try {
+      onboarding = await summarizeContextFile({
+        name: fileName,
+        extractBlob,
+        moduleId: 'incentives',
+      });
+    } catch { /* continue without questions */ }
+    const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+    if (!questions.length) {
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: 'Extract is clear enough — starting **Analyze Existing IC**.',
+      }]);
+      setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
+      await launchWorkflowDirect(launchArgs.topicId, launchArgs.userMessage, focusedContext);
+      return;
+    }
+    const assistantMsg = `I've saved **${fileName}** and read the text/images.\n\n${onboarding.summary || ''}\n\nA few clarifications before I assess it:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`;
+    const intake = {
+      fileName,
+      focusedContext,
+      extractBlob,
+      launchArgs,
+      summary: onboarding.summary || '',
+      intakeMessages: [{ role: 'assistant', content: assistantMsg }],
+    };
+    pendingProposalIntakeRef.current = intake;
+    setPendingProposalIntake(intake);
+    setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg }]);
+    setIsLoading(false);
+  };
+
+  const continueProposalIntake = async (userText) => {
+    const intake = pendingProposalIntakeRef.current || pendingProposalIntake;
+    if (!intake) return;
+    const nextMessages = [...(intake.intakeMessages || []), { role: 'user', content: userText }];
+    setIsLoading(true);
+    let launched = false;
+    try {
+      const result = await runContextIntakeTurn({
+        extractBlob: intake.extractBlob,
+        moduleLabel: 'Incentive Compensation proposal',
+        intakeMessages: nextMessages,
+      });
+      const withAssistant = [...nextMessages, { role: 'assistant', content: result.message }];
+      setMessages((prev) => [...prev, { role: 'assistant', content: result.message }]);
+      if (result.complete) {
+        launched = true;
+        await finishProposalIntakeAndLaunch({ ...intake, intakeMessages: withAssistant }, result.context_qa);
+        return;
+      }
+      const next = { ...intake, intakeMessages: withAssistant };
+      pendingProposalIntakeRef.current = next;
+      setPendingProposalIntake(next);
+    } catch (err) {
+      launched = true;
+      setMessages((prev) => [...prev, { role: 'system', content: `⚠️ Could not continue intake: ${err.message || 'error'}. Starting the assessment with the extract.` }]);
+      await finishProposalIntakeAndLaunch(intake, null);
+    } finally {
+      if (!launched) setIsLoading(false);
+    }
+  };
+
+  const persistContextFiles = async (nextModuleContext) => {
+    await saveUserSettings({ moduleContext: mergeModuleContext(nextModuleContext) });
+  };
+
+  const interpretContextImages = async (images, onStatus) => {
+    if (!images?.length) return '';
+    onStatus?.(`Reading ${Math.min(images.length, 8)} image(s)…`);
+    return interpretProposalImages(
+      images,
+      withUserSettings(getWorkflowRuntime().contextImageInterpretPrompt, { moduleContext: false }),
+      {
+        onProgress: (n, total, name) => onStatus?.(`Reading image ${n}/${total} (${name})…`),
+      },
+    );
+  };
+
+  const completeModuleContextIngest = async (job) => {
+    const moduleId = job.moduleId || 'incentives';
+    const file = job.file;
+    const extractedText = job.extractedText || '';
+    const structuredText = job.structuredText || '';
+    const images = Array.isArray(job.images) ? job.images : (job.included || []);
+    const fileId = job.fileId || `ctx_${Date.now()}_${stellaNanoId()}`;
+    let visionText = '';
+    try {
+      if (images.length) visionText = await interpretContextImages(images, job.onStatus);
+    } catch (err) {
+      job.onStatus?.(`Image reading skipped: ${err.message || 'vision failed'}`);
+    }
+    const storagePath = userModuleContextRemotePath(currentUser.id, moduleId, file.name);
+    const { error: uploadError } = await supabase.storage
+      .from('intelligence')
+      .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
+    if (uploadError) throw new Error(uploadError.message || 'Cloud upload failed');
+    const combinedPersist = [
+      `File: ${file.name}`,
+      `Module: ${moduleId}`,
+      extractedText ? `=== TEXT ===\n${extractedText}` : '',
+      structuredText ? `=== TABLES / CHARTS ===\n${structuredText}` : '',
+      visionText ? `=== IMAGES ===\n${visionText}` : '',
+    ].filter(Boolean).join('\n\n');
+    try {
+      await supabase.storage.from('intelligence').upload(
+        `${storagePath}.extracted.txt`,
+        new Blob([combinedPersist], { type: 'text/plain' }),
+        { upsert: true, contentType: 'text/plain' },
+      );
+    } catch { /* sidecar is best-effort */ }
+
+    const extractBlob = [extractedText, structuredText, visionText].filter(Boolean).join('\n\n');
+    let onboarding = { summary: 'Uploaded context file.', suggestedQuestions: [] };
+    try {
+      onboarding = await summarizeContextFile({ name: file.name, extractBlob, moduleId });
+    } catch { /* keep fallback */ }
+    const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+    const assistantMsg = questions.length
+      ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.\n\n${onboarding.summary || ''}\n\nTo use this correctly I need a little context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
+      : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.\n\n${onboarding.summary || 'Stored as module context.'}`;
+    const rec = {
+      id: fileId,
+      name: file.name,
+      fileType: job.fileType,
+      sizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
+      storagePath,
+      storageBucket: 'intelligence',
+      uploadedAt: new Date().toISOString(),
+      summary: onboarding.summary || '',
+      extractedText,
+      visionExtract: visionText,
+      structuredExtract: structuredText,
+      imageCount: images.length,
+      intakeMessages: [{ role: 'assistant', content: assistantMsg }],
+      intakeComplete: questions.length === 0,
+      processing: false,
+      capturedContext: {},
+    };
+    const nextCtx = upsertModuleContextFile(userSettings.moduleContext, moduleId, rec);
+    await persistContextFiles(nextCtx);
+    setActiveContextFileId(fileId);
+    contextIngestJobRef.current = null;
+    setContextIngestJob(null);
+    if (questions.length === 0) {
+      job.onStatus?.('Stored — no extra questions needed.');
+    }
+  };
+
+  const continueModuleContextIntake = async (moduleId, fileId, userText) => {
+    const files = userSettings.moduleContext?.[moduleId]?.files || [];
+    const rec = files.find((f) => f.id === fileId);
+    if (!rec || rec.intakeComplete) return;
+    const nextMessages = [...(rec.intakeMessages || []), { role: 'user', content: userText }];
+    setContextIntakeBusy(true);
+    const optimistic = patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, { intakeMessages: nextMessages });
+    setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
+    try {
+      const result = await runContextIntakeTurn({
+        extractBlob: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter(Boolean).join('\n\n'),
+        moduleLabel: moduleLabelFor(moduleId),
+        intakeMessages: nextMessages,
+      });
+      const withAssistant = [...nextMessages, { role: 'assistant', content: result.message }];
+      const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
+        intakeMessages: withAssistant,
+        intakeComplete: !!result.complete,
+        capturedContext: result.complete ? (result.context_qa || rec.capturedContext) : rec.capturedContext,
+      });
+      await persistContextFiles(patched);
+    } catch (err) {
+      const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
+        intakeMessages: [...nextMessages, { role: 'system', content: `⚠️ ${err.message || 'Intake failed'}` }],
+      });
+      await persistContextFiles(patched);
+    } finally {
+      setContextIntakeBusy(false);
+      setContextIntakeInput('');
+    }
+  };
+
+  const applyContextUnsureImageDecision = async (nameOrAll, include) => {
+    const prev = contextIngestJobRef.current || contextIngestJob;
+    if (!prev) return;
+    let included = [...(prev.included || [])];
+    let unsure = [...(prev.unsure || [])];
+    let skipped = [...(prev.skipped || [])];
+    const decide = (img, keep) => {
+      if (keep) included.push(img);
+      else skipped.push({ ...img, kind: 'skipped_by_user', reason: 'User skipped' });
+    };
+    if (nameOrAll === '*') {
+      unsure.forEach((img) => decide(img, include));
+      unsure = [];
+    } else {
+      const img = unsure.find((i) => i.name === nameOrAll);
+      if (!img) return;
+      decide(img, include);
+      unsure = unsure.filter((i) => i.name !== nameOrAll);
+    }
+    const next = { ...prev, included, unsure, skipped };
+    if (unsure.length) {
+      contextIngestJobRef.current = next;
+      setContextIngestJob(next);
+      return;
+    }
+    contextIngestJobRef.current = next;
+    setContextIngestJob({ ...next, processing: true });
+    try {
+      await completeModuleContextIngest({ ...next, images: included });
+    } catch (err) {
+      contextIngestJobRef.current = null;
+      setContextIngestJob({ ...next, processing: false, error: err.message || 'Upload failed' });
+    }
+  };
+
+  const handleModuleContextUpload = async (event, moduleId) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const fileId = `ctx_${Date.now()}_${stellaNanoId()}`;
+    const placeholder = {
+      id: fileId,
+      name: file.name,
+      fileType: detectContextFileKind(file).label,
+      sizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
+      processing: true,
+      intakeComplete: false,
+      intakeMessages: [{ role: 'assistant', content: `⏳ Processing **${file.name}**…` }],
+      summary: '',
+      extractedText: '',
+    };
+    const optimistic = upsertModuleContextFile(userSettings.moduleContext, moduleId, placeholder);
+    setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
+    setActiveContextFileId(fileId);
+    setUserSettingsPane(moduleId === 'stella' ? 'stella' : moduleId === 'territory' ? 'territory' : 'incentives');
+    try {
+      const extracts = await extractDocumentForIngest(file, {
+        classifyPrompt: withUserSettings(getWorkflowRuntime().contextImageClassifyPrompt, { moduleContext: false }),
+        onStatus: (msg) => {
+          setUserSettings((prev) => ({
+            ...prev,
+            moduleContext: patchModuleContextFile(prev.moduleContext, moduleId, fileId, {
+              intakeMessages: [{ role: 'assistant', content: `⏳ ${msg}` }],
+            }),
+          }));
+        },
+      });
+      const job = {
+        moduleId,
+        fileId,
+        file,
+        fileType: extracts.fileType,
+        extractedText: extracts.extractedText,
+        structuredText: extracts.structuredText,
+        imageNotes: extracts.imageNotes,
+        included: extracts.included,
+        unsure: extracts.unsure,
+        skipped: extracts.skipped,
+        onStatus: (msg) => {
+          setUserSettings((prev) => ({
+            ...prev,
+            moduleContext: patchModuleContextFile(prev.moduleContext, moduleId, fileId, {
+              intakeMessages: [{ role: 'assistant', content: `⏳ ${msg}` }],
+            }),
+          }));
+        },
+      };
+      if (extracts.unsure.length) {
+        contextIngestJobRef.current = job;
+        setContextIngestJob(job);
+        return;
+      }
+      await completeModuleContextIngest({ ...job, images: extracts.included });
+    } catch (err) {
+      const failed = patchModuleContextFile(userSettings.moduleContext, moduleId, fileId, {
+        processing: false,
+        intakeMessages: [{ role: 'system', content: `❌ Could not process ${file.name}: ${err.message || 'error'}` }],
+      });
+      await persistContextFiles(failed);
+    }
+  };
+
+  const handleRemoveModuleContextFile = async (moduleId, fileId) => {
+    const rec = (userSettings.moduleContext?.[moduleId]?.files || []).find((f) => f.id === fileId);
+    if (rec?.storagePath) {
+      try {
+        await supabase.storage.from('intelligence').remove([rec.storagePath, `${rec.storagePath}.extracted.txt`]);
+      } catch { /* ignore */ }
+    }
+    const next = removeModuleContextFile(userSettings.moduleContext, moduleId, fileId);
+    await persistContextFiles(next);
+    if (activeContextFileId === fileId) setActiveContextFileId(null);
+  };
+
+  const renderModuleContextPanel = (moduleId) => {
+    const files = userSettings.moduleContext?.[moduleId]?.files || [];
+    const active = files.find((f) => f.id === activeContextFileId) || files[files.length - 1] || null;
+    const job = (contextIngestJob?.moduleId === moduleId) ? contextIngestJob : null;
+    const unsurePreviews = job?.unsure?.length
+      ? buildProposalImagePreviews(job.included || [], job.unsure || [], job.skipped || [])
+      : [];
+    return (
+      <div className="mt-8 pt-6 border-t border-blue-400/15">
+        <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">
+          <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
+        </h3>
+        <p className="text-xs text-blue-300/60 mb-4">
+          Upload strategy decks, product lists, territory or team Excel, goals, or other background. Files are extracted (including images), you confirm anything unclear, then a short intake captures how to use them. They are always included when you work in {moduleLabelFor(moduleId)}.
+        </p>
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <button
+            type="button"
+            onClick={() => {
+              moduleContextFileInputRef.current?.setAttribute('data-module', moduleId);
+              moduleContextFileInputRef.current?.click();
+            }}
+            disabled={!!job?.processing || files.some((f) => f.processing)}
+            className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/30 rounded-lg text-xs text-cyan-100 font-semibold disabled:opacity-50 flex items-center gap-2"
+          >
+            <Upload className="w-3.5 h-3.5" /> Upload context file
+          </button>
+          <span className="text-[11px] text-blue-300/50">PowerPoint, PDF, Excel, CSV, or text</span>
+        </div>
+        {job?.error && (
+          <div className="mb-3 text-xs text-red-300 flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5" /> {job.error}</div>
+        )}
+        {unsurePreviews.length > 0 && (
+          <div className="mb-4 bg-slate-900/40 border border-amber-400/25 rounded-xl p-4">
+            <div className="text-xs font-semibold text-amber-200 mb-2">Some images might contain useful context — include any that matter.</div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {unsurePreviews.filter((img) => img.pending).map((img) => (
+                <figure key={img.name} className="bg-slate-800/50 rounded-lg p-2">
+                  <img src={img.src} alt={img.name} className="w-full h-20 object-contain rounded bg-slate-900" />
+                  <figcaption className="mt-1 text-[10px] text-blue-200/80 truncate">{img.name}</figcaption>
+                  <div className="flex gap-1 mt-1">
+                    <button type="button" className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 text-emerald-100 text-[10px] font-semibold" onClick={() => applyContextUnsureImageDecision(img.name, true)}>Include</button>
+                    <button type="button" className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 text-slate-100 text-[10px] font-semibold" onClick={() => applyContextUnsureImageDecision(img.name, false)}>Skip</button>
+                  </div>
+                </figure>
+              ))}
+            </div>
+            <div className="flex gap-2 mt-3">
+              <button type="button" onClick={() => applyContextUnsureImageDecision('*', true)} className="px-3 py-1.5 bg-emerald-500/25 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold">Include all</button>
+              <button type="button" onClick={() => applyContextUnsureImageDecision('*', false)} className="px-3 py-1.5 bg-slate-600/50 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold">Skip all</button>
+            </div>
+          </div>
+        )}
+        {files.length === 0 ? (
+          <div className="text-xs text-blue-300/50 bg-slate-900/30 border border-dashed border-blue-400/20 rounded-xl p-4">No context files yet for this module.</div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              {files.map((f) => (
+                <div key={f.id} className={`w-full bg-slate-900/40 border rounded-xl p-3 ${active?.id === f.id ? 'border-cyan-400/50' : 'border-blue-400/20'}`}>
+                  <div className="flex items-start justify-between gap-2">
+                    <button type="button" onClick={() => setActiveContextFileId(f.id)} className="min-w-0 text-left flex-1">
+                      <div className="text-sm font-semibold text-white truncate">{f.name}</div>
+                      <div className="text-[11px] text-blue-300/55 mt-0.5">{f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}{f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : ''}</div>
+                      {f.summary && <div className="text-[11px] text-blue-200/75 mt-1 line-clamp-2">{f.summary}</div>}
+                    </button>
+                    <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                      {f.processing ? (
+                        <span className="px-2 py-0.5 bg-amber-500/15 text-amber-200 text-[10px] rounded border border-amber-400/25">Processing</span>
+                      ) : f.intakeComplete ? (
+                        <span className="px-2 py-0.5 bg-green-500/20 text-green-300 text-[10px] rounded border border-green-400/30">Ready</span>
+                      ) : (
+                        <span className="px-2 py-0.5 bg-yellow-500/15 text-yellow-200 text-[10px] rounded border border-yellow-400/25">Intake</span>
+                      )}
+                      <button type="button" onClick={() => handleRemoveModuleContextFile(moduleId, f.id)} className="p-1 hover:bg-red-500/20 rounded text-red-400" title="Remove"><Trash2 className="w-3.5 h-3.5" /></button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4">
+              {!active ? (
+                <div className="text-xs text-blue-300/50">Select a file to continue intake.</div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="text-xs font-bold text-white">Intake</div>
+                  <div className="max-h-[280px] overflow-y-auto custom-scrollbar space-y-2">
+                    {(active.intakeMessages || []).map((m, i) => (
+                      <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`max-w-[95%] px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                          <span className="whitespace-pre-wrap">{m.content}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {!active.intakeComplete && !active.processing && (
+                    <div className="flex gap-2">
+                      <textarea
+                        value={contextIntakeInput}
+                        onChange={(e) => setContextIntakeInput(e.target.value)}
+                        placeholder="Answer the intake questions…"
+                        rows={2}
+                        className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
+                      />
+                      <button
+                        type="button"
+                        disabled={!contextIntakeInput.trim() || contextIntakeBusy}
+                        onClick={() => continueModuleContextIntake(moduleId, active.id, contextIntakeInput.trim())}
+                        className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
+                      >
+                        <Send className="w-3.5 h-3.5" /> Send
+                      </button>
+                    </div>
+                  )}
+                  {active.intakeComplete && active.capturedContext?.what_it_represents && (
+                    <div className="text-[11px] text-emerald-200/90 bg-emerald-500/10 border border-emerald-400/20 rounded-lg p-3 whitespace-pre-wrap">
+                      {active.capturedContext.what_it_represents}
+                      {active.capturedContext.time_period ? `\nPeriod: ${active.capturedContext.time_period}` : ''}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
   };
 
   const applyUnsureImageDecision = async (nameOrAll, include) => {
@@ -3765,11 +4401,7 @@ ${stepInstruction}`;
     event.target.value = '';
     if (!file) return;
 
-    const fileType = file.type.includes('pdf') || /\.pdf$/i.test(file.name)
-      ? 'PDF'
-      : file.type.includes('presentation') || file.type.includes('powerpoint') || /\.pptx?$/i.test(file.name)
-        ? 'PowerPoint'
-        : 'document';
+    const fileType = detectContextFileKind(file).label;
 
     setShowLanding(false);
     setActiveTab('chat');
@@ -3792,7 +4424,7 @@ ${stepInstruction}`;
         const extracted = await extractProposalImages(file, { textLength: extractedText.length });
         const finalized = await finalizeProposalImages(
           extracted,
-          withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt),
+          withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt, { moduleContext: false }),
         );
         const images = finalized.images || [];
         const unsure = finalized.unsure || [];
@@ -5108,6 +5740,13 @@ ${stepInstruction}`;
       return;
     }
 
+    if ((pendingProposalIntakeRef.current || pendingProposalIntake) && !currentWorkflow) {
+      setInput('');
+      setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+      await continueProposalIntake(messageContent);
+      return;
+    }
+
     setInput('');
     // Capture before clearing — needed to route Continue / typed replies correctly
     const pendingDecision = orchestratorDecision;
@@ -5249,12 +5888,20 @@ ${stepInstruction}`;
 
     try {
       const fileContext = isFileAnalysis && uploadedFile ? `\n\nCONTEXT: The user has just uploaded a file named "${uploadedFile.name}" for assessment.` : '';
-      const kb = knowledgeBase || buildKnowledgeBaseFromDocuments(documents);
+      const kbRaw = knowledgeBase || buildKnowledgeBaseFromDocuments(documents);
+      const kb = isAdmin
+        ? kbRaw
+        : (documents || [])
+          .filter((d) => d.status === 'active' && d.content)
+          .map((d, i) => `## Best-practice guidance ${i + 1}\n${d.content}`)
+          .join('\n\n');
       const systemPrompt = withUserSettings(customSystemPrompt
         .replace(
           'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
           kb
-            ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
+            ? (isAdmin
+              ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
+              : `KNOWLEDGE BASE (best-practice guidance — never name source files):\n${kb}`)
             : 'KNOWLEDGE BASE:\nNo knowledge files are loaded yet. Answer from conversation context and user settings only.'
         )
         + fileContext);
@@ -5827,7 +6474,7 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !pendingImageReview && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
+                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !pendingImageReview && !pendingProposalIntake && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
                   <div className="mb-3">
                     <div className="text-xs text-blue-300/70 mb-2 flex items-center gap-2"><span>💡 Suggested next steps:</span></div>
                     <div className="flex flex-wrap gap-2">
@@ -5850,7 +6497,7 @@ ${stepInstruction}`;
                   </div>
                 </form>
               </div>
-              <input ref={fileInputRef} type="file" accept=".pdf,.ppt,.pptx" onChange={handleFileUpload} className="hidden" />
+              <input ref={fileInputRef} type="file" accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md" onChange={handleFileUpload} className="hidden" />
             </div>
             </div>
 
@@ -6120,7 +6767,7 @@ ${stepInstruction}`;
               </div>
 
               <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit">
-                {[['general', 'General'], ['incentives', 'Incentives'], ['stella', 'Stella Insights']].map(([id, label]) => (
+                {[['general', 'General'], ['incentives', 'Incentives'], ['territory', 'Territory'], ['stella', 'Stella Insights']].map(([id, label]) => (
                   <button
                     key={id}
                     type="button"
@@ -6324,14 +6971,37 @@ ${stepInstruction}`;
                       <div className="mt-2 text-xs text-red-300 flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5" /> {pptxTemplateError}</div>
                     )}
                     <input ref={pptxTemplateInputRef} type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={handlePptxTemplateUpload} className="hidden" />
+                    {renderModuleContextPanel('incentives')}
+                  </>
+                )}
+
+                {userSettingsPane === 'territory' && (
+                  <>
+                    <p className="text-xs text-blue-300/70 mb-2">Background for Territory work — alignments, team lists, maps, and similar files.</p>
+                    {renderModuleContextPanel('territory')}
                   </>
                 )}
 
                 {userSettingsPane === 'stella' && (
-                  <div className="text-sm text-blue-300/70 bg-slate-900/30 border border-dashed border-blue-400/20 rounded-xl p-6">
-                    Stella Insights settings will live here (data defaults, chart preferences, and analysis context). Nothing to configure yet.
-                  </div>
+                  <>
+                    <p className="text-xs text-blue-300/70 mb-2">
+                      Optional background for Stella Insights (strategy notes, definitions). Tabular datasets still upload in the Stella <span className="text-cyan-300">Data</span> tab.
+                    </p>
+                    {renderModuleContextPanel('stella')}
+                  </>
                 )}
+
+                <input
+                  ref={moduleContextFileInputRef}
+                  type="file"
+                  accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md,.json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const raw = e.target.getAttribute('data-module') || userSettingsPane;
+                    const id = ['incentives', 'territory', 'stella'].includes(raw) ? raw : 'incentives';
+                    handleModuleContextUpload(e, id);
+                  }}
+                />
 
                 <div className="flex flex-wrap items-center gap-3 mt-6">
                   <button
@@ -6346,6 +7016,12 @@ ${stepInstruction}`;
                       const path = userSettings.pptxTemplate?.storagePath || userPptxTemplateRemotePath(currentUser.id);
                       if (userSettings.pptxTemplate) {
                         try { await supabase.storage.from('intelligence').remove([path]); } catch { /* ignore */ }
+                      }
+                      const contextPaths = Object.values(userSettings.moduleContext || {})
+                        .flatMap((bucket) => bucket?.files || [])
+                        .flatMap((f) => (f.storagePath ? [f.storagePath, `${f.storagePath}.extracted.txt`] : []));
+                      if (contextPaths.length) {
+                        try { await supabase.storage.from('intelligence').remove(contextPaths); } catch { /* ignore */ }
                       }
                       setPptxTemplateError('');
                       setPptxTemplateStatus('idle');

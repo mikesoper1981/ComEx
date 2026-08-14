@@ -23,18 +23,24 @@ Reply with **1**, **2**, or **3** (or describe what you need).`,
 export const DEFAULT_SUGGESTIONS = {
   enabled: true,
   max: 3,
-  systemPrompt: `You write clickable NEXT USER MESSAGES for a pharmaceutical sales / IC chat UI.
-Each suggestion is sent verbatim as the user's next message — so it must read as something the USER would say, not something the assistant would ask.
+  systemPrompt: `You write clickable follow-up prompts for a pharmaceutical sales / IC chat UI.
+Each suggestion is sent verbatim as the user's next message.
 
 Rules (mandatory):
-- Write in first person as the user (I / we / my / our), or as a clear user instruction/decision.
-- Ground every suggestion in the recent conversation — reference the actual scheme, products, or next step being discussed.
-- Do NOT write assistant-style clarifying questions (bad: "What is your IC budget?", "How many reps do you have?").
-- CRITICAL — if the assistant just asked numbered clarifying questions (1. 2. 3. …), return an EMPTY JSON array []. Never invent answers, never write "1 = …", never guess missing facts.
-- Suggested prompts only help move the conversation forward when facts are already known (good: "Approve this design and move to compliance", "Export a one-pager of this scheme").
-- No hardcoded generic IC trivia. No duplicates. Max 12 words each when possible.
-- Respond ONLY with a JSON array of strings, length {{n}} (or [] when clarifying questions are pending).`,
-  userPromptTemplate: `Recent conversation:\n{{recent}}\n\nIf the assistant asked numbered clarifying questions, return []. Otherwise return {{n}} user-next-message suggestions as a JSON array.`,
+- Ground EVERY suggestion in the recent conversation — the scheme, products, findings, or decision being discussed.
+- Each item must read as a natural question or instruction the user would type next.
+  Good: "How would a 110% accelerator change this payout curve?"
+  Good: "Assess this design for fairness across territories"
+  Good: "Draft a one-pager of the scheme we just agreed"
+  Bad: naming a knowledge file or document (e.g. default-best-practices.md)
+  Bad: "Explain pillar-2-strategic-alignment" or any document title
+  Bad: generic trivia unrelated to this chat
+  Bad: inventing answers to numbered clarifying questions
+- You MAY use IC best-practice knowledge to shape the question, but NEVER name knowledge files, document titles, citation numbers, or a References section.
+- If the assistant just asked numbered clarifying questions (1. 2. 3. …), return an EMPTY JSON array [].
+- No duplicates. About 8–16 words each.
+- Respond ONLY with a JSON array of strings, length {{n}} (or []).`,
+  userPromptTemplate: `This conversation (the only topic to continue):\n{{recent}}\n\nIf the assistant asked numbered clarifying questions, return []. Otherwise return {{n}} follow-up questions or user instructions that continue THIS discussion. Never mention knowledge-file names.`,
 };
 
 export const DEFAULT_WORKFLOW_RUNTIME = {
@@ -114,6 +120,85 @@ Rules:
 - relevant=false only when clearly logo / decoration / stock photo / icon.
 - Use the exact filename provided for each image.`,
   pptxRepairPrompt: 'Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.',
+  contextImageInterpretPrompt: `You read images from an uploaded business-context file (strategy, goals, products, territories, teams, or incentive materials).
+
+For EACH image, extract content later specialists would lose if they only had the text layer. Use this structure:
+
+### Image: <filename>
+**Type:** table | chart | diagram | map | org | process | strategy | products | other
+**Key points / message:** 2–6 bullets of what this image is communicating.
+**Extracted content:**
+- Reproduce tables as markdown tables (every readable cell)
+- Capture labels, legends, footnotes, product names, territory names, goals, metrics
+- If it is a diagram/process/map, describe the structure and any text on the graphic
+
+Rules:
+- Be faithful to what is visible — do not invent numbers or names.
+- If a cell or label is unreadable, write [unclear].
+- Return ONLY the extracted markdown (no preamble).`,
+  contextImageClassifyPrompt: `You classify images from an uploaded business-context file (PowerPoint/PDF: strategy, goals, products, territories, teams, or incentive materials).
+
+Decide whether each image carries content the AI would lose if ignored.
+
+RELEVANT (relevant=true) — any business meaning, including:
+- Strategy, goals, priorities, product lists, brand portfolios
+- Org charts, teams, roles, territories, maps with labels
+- Tables, charts, process diagrams, timelines
+- Incentive / scheme content (payout, eligibility, comms)
+
+NOT RELEVANT (relevant=false) — no business meaning:
+- Logos, brand marks, partner badges
+- Decorative backgrounds, gradients, abstract shapes
+- Stock photos with no labels or data
+- Icons, bullets, separators, clip-art used as chrome
+
+UNSURE (relevant="unsure") — might contain useful context but you cannot tell. The user will confirm.
+
+Return ONLY a JSON array (no markdown fences):
+[{"name":"<exact filename>","purpose":"table|chart|diagram|map|org_chart|process|strategy|products|timeline|comms|logo|decorative|stock_photo|icon|other","relevant":true|false|"unsure","reason":"≤12 words"}]
+
+Rules:
+- Prefer relevant=true or "unsure" over dropping possible content.
+- relevant=false only when clearly logo / decoration / stock photo / icon.
+- Use the exact filename provided for each image.`,
+  contextContentSummaryPrompt: `You onboard an uploaded context file for a commercial excellence module ({{moduleLabel}}).
+
+Return ONLY valid JSON. No markdown.
+Schema:
+{
+  "summary": "2-5 sentences describing what this file appears to contain and how it should inform this module",
+  "columns": [{ "name": "exact column name", "description": "what this column represents" }],
+  "suggestedQuestions": ["3-5 clarifying questions about meaning/intent that the file itself does not answer"]
+}
+
+If column names are provided, describe each of them. If none, return an empty columns array.
+Do NOT ask about facts already visible in the extract (row counts, listed product names, obvious headings). Only ask about meaning, time period, how the user wants this used, definitions, and caveats.`,
+  contextIntakePrompt: `You capture interpretive context for an uploaded {{moduleLabel}} file so later chats always use it correctly.
+
+Ask ONE focused question per turn. Ask only what the extract does not already answer, covering as needed:
+- what the file represents and how it should be used in this module
+- the time period / version it covers
+- key fields, products, teams, or metrics and what they mean
+- caveats, filters, or "do not assume" notes
+
+CRITICAL — NEVER ask about facts already visible in the extract. If the file is already clear, set complete=true after at most one confirmation.
+
+When you have enough, set "complete": true and fill "context_qa" fully.
+
+Return ONLY valid JSON — no markdown fences.
+Schema:
+{
+  "complete": true | false,
+  "message": "the single next question (complete=false) OR a one-line confirmation (complete=true)",
+  "context_qa": {
+    "what_it_represents": "",
+    "time_period": "",
+    "key_metrics": ["", ""],
+    "interpretation_notes": "",
+    "qa_pairs": [{"question": "", "answer": ""}]
+  }
+}
+When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked and the user's answer.`,
 };
 
 export const DEFAULT_STELLA_PROMPTS = {

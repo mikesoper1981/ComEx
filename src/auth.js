@@ -97,3 +97,14 @@ export function userProposalRemotePath(userId, fileName) {
     .slice(0, 120) || 'proposal';
   return `users/${userId}/proposals/${Date.now()}_${safe}`;
 }
+
+/** Per-user module context originals (strategy decks, territory Excel, etc.). */
+export function userModuleContextRemotePath(userId, moduleId, fileName) {
+  const mod = String(moduleId || 'context').replace(/[^\w-]+/g, '') || 'context';
+  const safe = String(fileName || 'file')
+    .replace(/[^\w.\-() ]+/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120) || 'file';
+  return `users/${userId}/context/${mod}/${Date.now()}_${safe}`;
+}

@@ -186,11 +186,20 @@ export function mergeWelcomeMessages(partial) {
 
 export function mergeSuggestions(partial) {
   const s = partial && typeof partial === 'object' ? partial : {};
+  let systemPrompt = s.systemPrompt != null ? String(s.systemPrompt) : DEFAULT_SUGGESTIONS.systemPrompt;
+  let userPromptTemplate = s.userPromptTemplate != null ? String(s.userPromptTemplate) : DEFAULT_SUGGESTIONS.userPromptTemplate;
+  // Refresh stale factory copy that forbade questions and leaked knowledge-file names into chips
+  if (systemPrompt.includes('Do NOT write assistant-style clarifying questions')
+    || systemPrompt.includes('No hardcoded generic IC trivia')
+    || !/NEVER name knowledge files/i.test(systemPrompt)) {
+    systemPrompt = DEFAULT_SUGGESTIONS.systemPrompt;
+    userPromptTemplate = DEFAULT_SUGGESTIONS.userPromptTemplate;
+  }
   return {
     enabled: s.enabled !== undefined ? !!s.enabled : DEFAULT_SUGGESTIONS.enabled,
     max: Number.isFinite(Number(s.max)) ? Math.min(5, Math.max(1, Number(s.max))) : DEFAULT_SUGGESTIONS.max,
-    systemPrompt: s.systemPrompt != null ? String(s.systemPrompt) : DEFAULT_SUGGESTIONS.systemPrompt,
-    userPromptTemplate: s.userPromptTemplate != null ? String(s.userPromptTemplate) : DEFAULT_SUGGESTIONS.userPromptTemplate,
+    systemPrompt,
+    userPromptTemplate,
   };
 }
 
