@@ -235,6 +235,7 @@ const DEFAULT_USER_SETTINGS = {
   preferences: '',
   constraints: '',
   customContext: '',
+  memory: [],
   moduleContext: mergeModuleContext({}),
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
@@ -270,6 +271,7 @@ function mergeUserSettingsFields(raw = {}) {
     preferences: String(src.preferences || ''),
     constraints: String(src.constraints || ''),
     customContext: String(src.customContext || ''),
+    memory: normalizeMemoryItems(src.memory),
     moduleContext: mergeModuleContext(src.moduleContext),
     pptxTemplate: src.pptxTemplate || null,
   };
@@ -741,8 +743,82 @@ function buildUserSettingsPromptBlock(settings) {
   push('Preferences', settings.preferences);
   push('Hard constraints', settings.constraints);
   const extra = isEmptyContextValue(settings.customContext) ? '' : String(settings.customContext).trim();
-  if (!lines.length && !extra) return '';
-  return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, and constraints in every response; do not contradict them):\n${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}\n`;
+  const memoryBlock = formatMemoryPromptBlock(settings);
+  if (!lines.length && !extra && !memoryBlock) return '';
+  return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, and constraints in every response; do not contradict them):\n${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}\n`;
+}
+
+const MEMORY_CAP = 30;
+const MEMORY_TEXT_MAX = 280;
+
+function normalizeMemoryItems(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const text = String(item?.text || (typeof item === 'string' ? item : ''))
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, MEMORY_TEXT_MAX);
+    if (!text || text.length < 12 || isEmptyContextValue(text)) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      id: String(item?.id || `mem_${out.length + 1}`),
+      text,
+      module: ['incentives', 'territory', 'stella'].includes(item?.module) ? item.module : '',
+      updatedAt: item?.updatedAt || new Date().toISOString(),
+    });
+    if (out.length >= MEMORY_CAP) break;
+  }
+  return out;
+}
+
+function mergeMemoryFacts(existing, incoming, { module = '' } = {}) {
+  const base = normalizeMemoryItems(existing);
+  const now = new Date().toISOString();
+  for (const raw of incoming || []) {
+    const text = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, MEMORY_TEXT_MAX);
+    if (text.length < 12 || isEmptyContextValue(text)) continue;
+    const key = text.toLowerCase();
+    const dup = base.findIndex((m) => {
+      const t = m.text.toLowerCase();
+      return t === key || t.includes(key) || key.includes(t);
+    });
+    if (dup >= 0) {
+      base[dup] = {
+        ...base[dup],
+        text: text.length >= base[dup].text.length ? text : base[dup].text,
+        module: module || base[dup].module,
+        updatedAt: now,
+      };
+      continue;
+    }
+    base.unshift({
+      id: `mem_${Date.now()}_${stellaNanoId(4)}`,
+      text,
+      module,
+      updatedAt: now,
+    });
+  }
+  return normalizeMemoryItems(base).slice(0, MEMORY_CAP);
+}
+
+function formatMemoryPromptBlock(settings) {
+  const items = normalizeMemoryItems(settings?.memory);
+  if (!items.length) return '';
+  let body = items.map((m) => `- ${m.text}`).join('\n');
+  if (body.length > 3500) body = `${body.slice(0, 3500)}\n- [… older remembered facts omitted …]`;
+  return `\n\nREMEMBERED FROM PRIOR CHATS (facts the user already confirmed — clarifying answers, plan rules, definitions. Use them. Do not re-ask unless the user contradicts them):\n${body}`;
+}
+
+function shouldHarvestChatMemory(assistantText, userText) {
+  const user = String(userText || '').trim();
+  if (user.length < 8) return false;
+  if (/^(y|yes|yeah|yep|sure|ok|okay|start|go|continue|proceed|no|cancel|thanks|thank you)[\s.!]*$/i.test(user)) return false;
+  if (user.length >= 40) return true;
+  return hasNumberedClarifyingQuestions(assistantText);
 }
 
 // Short, URL/identifier-safe random id (used for stella_data_<id> tables).
@@ -2226,6 +2302,7 @@ export default function CommercialExcellenceApp() {
   const persistChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
   const userSettingsReadyRef = useRef(false);
+  const harvestMemoryBusyRef = useRef(false);
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
     try { return localStorage.getItem('comex-chat-history-collapsed') === '1'; } catch { return false; }
   });
@@ -2966,6 +3043,42 @@ Return ${n} clickable follow-ups that continue this thread. Each must mention a 
     return anthropicAssistantText(data);
   };
 
+  const harvestChatMemory = async (assistantText, userText) => {
+    if (harvestMemoryBusyRef.current || !userSettingsReadyRef.current) return;
+    if (!shouldHarvestChatMemory(assistantText, userText)) return;
+    harvestMemoryBusyRef.current = true;
+    try {
+      const raw = await callAnthropic(
+        `You extract durable memory for a commercial-excellence copilot.
+From the exchange, list facts the USER confirmed that should be remembered in later chats: answers to clarifying questions, plan rules, metrics, dates, roles, constraints, preferences.
+Skip greetings, "yes start the workflow", process chatter, the assistant's own advice, and unanswered questions.
+Return JSON only: {"facts":["..."]}. Max 5 facts. Each fact one short sentence. If nothing durable, {"facts":[]}.`,
+        [{
+          role: 'user',
+          content: `Assistant asked:\n${String(assistantText || '').slice(0, 2500)}\n\nUser replied:\n${String(userText || '').slice(0, 2500)}`,
+        }],
+        400,
+      );
+      const parsed = safeJsonParse(String(raw || '').replace(/```(?:json)?/gi, '').replace(/```/g, '').trim());
+      const facts = Array.isArray(parsed?.facts) ? parsed.facts : [];
+      if (!facts.length) return;
+      const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts, { module: resolvePromptModule() });
+      const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
+      setUserSettings(settings);
+      userSettingsRef.current = settings;
+      await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+        currentUser.id,
+        mergeUserSettingsFields(userSettingsRef.current),
+        {
+          chats: chatSessionsRef.current,
+          activeChatId: activeChatIdRef.current,
+          userName: currentUser.name,
+        },
+      ));
+    } catch { /* memory is best-effort */ }
+    harvestMemoryBusyRef.current = false;
+  };
+
   /** Append mandatory user preferences/context to any system prompt. */
   const resolvePromptModule = () => {
     if (activeTab === 'stella') return 'stella';
@@ -3520,6 +3633,10 @@ ${introInstr}`);
       return;
     }
     logActivity('agent', `${agent.name} continuing conversation`);
+    const priorAsk = [...(currentWorkflow?.stepMessages || []), ...(messagesRef.current || [])]
+      .reverse()
+      .find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+    void harvestChatMemory(priorAsk?.content, userReply);
     try {
       const priorMessages = currentWorkflow?.stepMessages || [];
       const fullMessages = [...priorMessages, { role: 'user', content: userReply }];
@@ -6380,6 +6497,8 @@ ${stepInstruction}`;
       });
       const data = await response.json();
       const assistantMessage = anthropicAssistantText(data);
+      const priorAsk = [...messages].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+      if (!isFileAnalysis) void harvestChatMemory(priorAsk?.content, messageContent);
       setMessages(prev => {
         const updated = [...prev, { role: 'assistant', content: assistantMessage }];
         setTimeout(() => generateSuggestions(updated), 500);
@@ -7341,6 +7460,33 @@ ${stepInstruction}`;
                           placeholder="Anything else the AI should always know across tools."
                           className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
                         />
+                      </div>
+                      <div className="md:col-span-2">
+                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Remembered from chats</label>
+                        <p className="text-[11px] text-blue-300/45 mb-2">
+                          Short facts from clarifying answers — not the full transcript. Used in later chats. Stored in settings.json.
+                        </p>
+                        {(userSettings.memory || []).length === 0 ? (
+                          <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet.</div>
+                        ) : (
+                          <ul className="space-y-2">
+                            {(userSettings.memory || []).map((item) => (
+                              <li key={item.id} className="flex items-start gap-2 bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
+                                <span className="flex-1 text-xs text-slate-200 leading-relaxed">{item.text}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => saveUserSettings({
+                                    memory: (userSettings.memory || []).filter((m) => m.id !== item.id),
+                                  })}
+                                  className="text-blue-300/50 hover:text-red-300 p-0.5"
+                                  aria-label="Forget this fact"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
                       </div>
                     </div>
                   </>
