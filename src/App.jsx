@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers, UserCog, History, LogOut } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut } from 'lucide-react';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
@@ -6427,7 +6427,7 @@ ${stepInstruction}`;
               <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
             </button>
             <button onClick={() => { setShowLanding(false); setActiveTab('territory'); }} className="text-left bg-slate-800/60 hover:bg-slate-700/60 border border-emerald-400/30 hover:border-emerald-400/60 rounded-2xl p-6 transition-all group hover:shadow-xl hover:shadow-emerald-500/10 hover:-translate-y-0.5">
-              <div className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><Map className="w-6 h-6 text-white" /></div>
+              <div className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><MapIcon className="w-6 h-6 text-white" /></div>
               <h3 className="font-bold text-white text-base mb-1">Territory Design</h3>
               <p className="text-xs text-blue-300/60 leading-relaxed">Assess and optimise territory structures.</p>
               <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
@@ -6967,7 +6967,7 @@ ${stepInstruction}`;
             <div className="flex flex-col h-full overflow-hidden">
               <div className="bg-gradient-to-r from-emerald-600 to-teal-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-4">
                 <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3"><Map className="w-6 h-6" /><div><h2 className="text-xl font-bold">Territory Design</h2><p className="text-emerald-100 text-xs">Assess, design and optimise your sales territory structure</p></div></div>
+                  <div className="flex items-center gap-3"><MapIcon className="w-6 h-6" /><div><h2 className="text-xl font-bold">Territory Design</h2><p className="text-emerald-100 text-xs">Assess, design and optimise your sales territory structure</p></div></div>
                   <button onClick={() => territoryFileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-semibold transition-all"><Upload className="w-4 h-4" /> Upload Structure</button>
                   <input ref={territoryFileInputRef} type="file" accept=".json" onChange={handleTerritoryStructureUpload} className="hidden" />
                 </div>
