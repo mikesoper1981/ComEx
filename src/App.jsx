@@ -565,10 +565,17 @@ function heuristicImagePurpose(img, usageEntry) {
     const maxSide = Math.max(p.cx, p.cy);
     const minSide = Math.min(p.cx, p.cy);
 
+    const isConvertedVector = /^(emf|wmf|svg)$/i.test(img.sourceFormat || img.convertedFrom || '');
+
     if (areaRatio > 0.82) {
-      return { purpose: 'decorative', relevant: false, reason: 'Covers most of the slide — likely background art' };
+      // Full-slide pasted payout scales / Excel screenshots look like "backgrounds" by size.
+      // Only skip true master chrome; send content-slide full images to the classifier.
+      if (usageEntry.onMaster && !isConvertedVector && img.bytes < 80000) {
+        return { purpose: 'decorative', relevant: false, reason: 'Full-slide master graphic — likely theme background' };
+      }
+      return null;
     }
-    if (usageEntry.onMaster && areaRatio > 0.25) {
+    if (usageEntry.onMaster && areaRatio > 0.25 && !isConvertedVector && img.bytes < 40000) {
       return { purpose: 'decorative', relevant: false, reason: 'Large image on slide master/layout — theme decoration' };
     }
     if (areaRatio < 0.025 && img.bytes < 60000 && maxSide < 1200000) {
@@ -684,7 +691,18 @@ Photos of people, products, buildings, landscapes, logos, icons, and decorative 
           || (Array.isArray(parsed) ? parsed[bi] : null);
         if (row) {
           const norm = normalizeImageClassification(row, img.name);
-          decided.push({ img, purpose: norm.purpose, relevant: norm.relevant, reason: norm.reason });
+          const converted = /^(emf|wmf)$/i.test(img.sourceFormat || img.convertedFrom || '');
+          // Office charts are often EMF — don't drop them as decoration after conversion.
+          if (!norm.relevant && converted && (img.bytes || 0) > 8000) {
+            decided.push({
+              img,
+              purpose: 'chart',
+              relevant: true,
+              reason: 'Converted EMF/WMF chart — included for extract',
+            });
+          } else {
+            decided.push({ img, purpose: norm.purpose, relevant: norm.relevant, reason: norm.reason });
+          }
         } else {
           decided.push({ img, purpose: 'decorative', relevant: false, reason: 'No classification — ignored by default' });
         }
@@ -2914,6 +2932,8 @@ ${stepInstruction}`;
       let ignoredPurposeCount = 0;
       let imageNotes = [];
       let imagePreviews = [];
+      let imageInventoryLines = [];
+      let visionError = '';
       try {
         const extracted = await extractProposalImages(file, { textLength: extractedText.length });
         const finalized = await finalizeProposalImages(
@@ -2952,6 +2972,13 @@ ${stepInstruction}`;
             src: s.src,
           })),
         ];
+        imageInventoryLines = imagePreviews.map((img) => {
+          const flag = img.included ? 'INCLUDED' : 'SKIPPED';
+          const purpose = purposeLabel(img.purpose || img.kind);
+          const from = img.sourceFormat ? ` from ${String(img.sourceFormat).toUpperCase()}` : '';
+          const why = img.reason ? ` — ${img.reason}` : '';
+          return `- [${flag}] ${img.name} (${purpose}${from}${img.bytes ? `, ${Math.round(img.bytes / 1024)}KB` : ''})${why}`;
+        });
 
         if (images.length || skipped.length || structuredText) {
           const purposeBits = ignoredPurpose.length
@@ -2975,10 +3002,11 @@ ${stepInstruction}`;
           );
         }
       } catch (visionErr) {
+        visionError = visionErr.message || 'vision failed';
         console.warn('Proposal image interpretation failed:', visionErr);
         setMessages((prev) => [...prev, {
           role: 'system',
-          content: `⚠️ Image reading skipped: ${visionErr.message || 'vision failed'}. Continuing with text extract.`,
+          content: `⚠️ Image reading skipped: ${visionError}. Continuing with text extract.`,
         }]);
       }
 
@@ -2992,18 +3020,40 @@ ${stepInstruction}`;
         .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
       if (uploadError) throw new Error(uploadError.message || 'Cloud upload failed');
 
-      // Persist extracts next to the original for reuse / debugging
+      // Persist extracts next to the original — always include image inventory + vision section
       try {
         const combinedPersist = [
-          extractedText && `=== DOCUMENT TEXT ===\n${extractedText}`,
-          structuredText && `=== NATIVE CHARTS / EMBEDDED SPREADSHEETS ===\n${structuredText}`,
-          visionText && `=== IMAGE / VISION EXTRACT ===\n${visionText}`,
+          [
+            '=== EXTRACT META ===',
+            `File: ${file.name}`,
+            `Type: ${fileType}`,
+            `Scheme images sent to vision: ${imageCount}`,
+            `Non-scheme images ignored: ${ignoredPurposeCount}`,
+            imageNotes.length ? `Notes: ${imageNotes.join(' ')}` : null,
+            visionError ? `Vision error: ${visionError}` : null,
+          ].filter(Boolean).join('\n'),
+          extractedText
+            ? `=== DOCUMENT / SLIDE TEXT ===\n${extractedText}`
+            : '=== DOCUMENT / SLIDE TEXT ===\n(none — screenshot/chart content would appear in vision/chart sections)',
+          structuredText
+            ? `=== NATIVE CHARTS / EMBEDDED SPREADSHEETS ===\n${structuredText}`
+            : null,
+          `=== IMAGE INVENTORY ===\n${imageInventoryLines.length ? imageInventoryLines.join('\n') : '(no embedded images found)'}`,
+          visionText
+            ? `=== IMAGE / VISION EXTRACT (payout scales, tables, screenshots) ===\n${visionText}`
+            : `=== IMAGE / VISION EXTRACT (payout scales, tables, screenshots) ===\n(none — ${imageCount ? 'vision returned empty text' : ignoredPurposeCount ? 'all images were classified as logo/decoration/icon and not sent to vision' : visionError || 'no scheme-relevant images were sent to vision'})`,
         ].filter(Boolean).join('\n\n');
-        const textBlob = new Blob([combinedPersist || extractedText], { type: 'text/plain' });
-        await supabase.storage
+        const textBlob = new Blob([combinedPersist], { type: 'text/plain' });
+        const { error: extractUploadError } = await supabase.storage
           .from('intelligence')
           .upload(`${storagePath}.extracted.txt`, textBlob, { upsert: true, contentType: 'text/plain' });
-      } catch { /* non-fatal */ }
+        if (extractUploadError) throw new Error(extractUploadError.message);
+      } catch (persistErr) {
+        setMessages((prev) => [...prev, {
+          role: 'system',
+          content: `⚠️ Saved the original file but could not write the extract sidecar: ${persistErr.message || persistErr}. Assessment will still use in-memory extracts.`,
+        }]);
+      }
 
       const cappedText = extractedText.length > 70000
         ? `${extractedText.slice(0, 70000)}\n\n[… truncated for model context …]`
