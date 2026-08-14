@@ -68,46 +68,51 @@ Use ## headers, tables, **bold**, and emoji (✅❌⚠️🎯📊) in your respo
   handoffAddon: `You have been assigned a specific sub-task by the workflow orchestrator.
 
 If this workflow waits for users and you need input, number clarifying questions as 1. 2. 3. … so they can reply 1 = … 2 = …. If auto-advance is on, continue without waiting — flag missing facts as gaps only; never invent or assume them.`,
-  proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, pasted Excel grids, or payment/payout scales shown as pictures).
+  proposalImageInterpretPrompt: `You read images from an uploaded IC / incentive scheme proposal (slides, screenshots, pasted Excel, charts, diagrams, process maps, or comms mock-ups).
 
-Extract ALL readable scheme information into clear structured markdown:
-- Payment / payout scales and attainment curves (thresholds, multipliers, accelerators, caps)
-- Tables (reproduce as markdown tables with headers/rows — preserve every readable cell)
-- Component names, weights, metrics, eligibility, gates, cliffs
-- Axis labels, legends, footnotes, caveats
+For EACH image, extract the scheme-relevant content so later specialists do not lose it. Use this structure:
+
+### Image: <filename>
+**Type:** payout scale | table | chart | diagram | process | eligibility | comms | other
+**Key points / message:** 2–6 bullets of what this image is communicating (the takeaway, not decoration).
+**Extracted content:**
+- Reproduce tables as markdown tables (every readable cell)
+- Reproduce payout/attainment scales completely (thresholds, multipliers, accelerators, caps)
+- Capture labels, legends, footnotes, weights, gates, timelines, rules shown as graphics
+- If it is a diagram/process/comms visual, describe the flow and any text on the graphic
 
 Rules:
 - Be faithful to what is visible — do not invent numbers.
 - If a cell or label is unreadable, write [unclear].
-- If multiple images, label each as Image 1, Image 2, …
-- Prefer reproducing numeric payout scales completely when present.
-- Return ONLY the extracted content (no preamble about being an AI).`,
-  proposalImageClassifyPrompt: `You classify images extracted from an uploaded IC / incentive scheme proposal (PowerPoint/PDF).
+- Include the message even when there are few numbers (e.g. "cliff at 90% attainment" shown only as a graphic).
+- Return ONLY the extracted markdown (no preamble about being an AI).`,
+  proposalImageClassifyPrompt: `You classify images from an uploaded IC / incentive scheme proposal (PowerPoint/PDF).
 
-DEFAULT: relevant=false. Only mark relevant=true when the image clearly contains scheme assessment data you can read.
+Decide whether each image carries scheme context that assessors would lose if ignored.
 
-RELEVANT (relevant=true) — must show readable IC / incentive content:
-- Payment / payout scales, attainment curves, accelerators, caps (with numbers or axis labels)
-- Tables or pasted Excel grids with scheme numbers (weights, thresholds, multipliers, targets)
-- Charts plotting payout or attainment with readable data
-- Scheme structure diagrams that include numeric plan details (weights %, component amounts)
+RELEVANT (relevant=true) — any IC / incentive content, including:
+- Payment / payout scales, attainment curves, accelerators, caps
+- Tables or pasted Excel (weights, thresholds, targets, multipliers, earnings)
+- Charts of payout, attainment, mix, or performance vs target
+- Scheme structure / component diagrams (even without every number)
+- Eligibility, governance, process, timeline, or comms visuals that state plan rules
+- Org / role graphics that define who is on the plan
 
-NOT RELEVANT (relevant=false) — ignore completely:
-- Company / product logos, brand marks, partner badges
-- Decorative backgrounds, gradients, abstract shapes, hero banners
-- Stock photos (people, handshakes, offices, landscapes, product packs)
-- Title-slide artwork with no numeric scheme content
-- Icons, bullets, separators, clip-art, map decorations
-- Random marketing imagery with no payout/table/weight data
+NOT RELEVANT (relevant=false) — no scheme meaning:
+- Logos, brand marks, partner badges
+- Decorative backgrounds, gradients, abstract shapes
+- Stock photos (people, handshakes, offices, landscapes, product packs) with no plan text
+- Icons, bullets, separators, clip-art used as chrome
+
+UNSURE (relevant="unsure") — might contain scheme context but you cannot tell (busy screenshot, small text, mixed photo+table, unclear chart). The user will confirm.
 
 Return ONLY a JSON array (no markdown fences):
-[{"name":"<exact filename>","purpose":"payment_scale|table|chart|scheme_diagram|logo|decorative|stock_photo|icon|other","relevant":true|false,"reason":"≤12 words"}]
+[{"name":"<exact filename>","purpose":"payment_scale|table|chart|scheme_diagram|eligibility|process|comms|governance|timeline|org_chart|logo|decorative|stock_photo|icon|other","relevant":true|false|"unsure","reason":"≤12 words"}]
 
 Rules:
-- Prefer false positives of "ignore" over sending junk to the assessment.
-- purpose "other" should almost always have relevant=false unless numbers are clearly visible.
-- Do NOT mark photos or logos as payment_scale / scheme_diagram.
-- Use the exact filename provided in the user message for each image.`,
+- Prefer relevant=true or "unsure" over dropping possible scheme content.
+- relevant=false only when clearly logo / decoration / stock photo / icon.
+- Use the exact filename provided for each image.`,
   pptxRepairPrompt: 'Return ONLY a complete valid JSON object for a PowerPoint with a "slides" array. No markdown. Repair/finish the previous truncated JSON using the conversation facts only.',
 };
 

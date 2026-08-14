@@ -593,37 +593,35 @@ function heuristicImagePurpose(img, usageEntry) {
   return null;
 }
 
-const SCHEME_IMAGE_PURPOSES = new Set(['payment_scale', 'table', 'chart', 'scheme_diagram']);
+const SCHEME_IMAGE_PURPOSES = new Set([
+  'payment_scale', 'table', 'chart', 'scheme_diagram', 'scheme_content',
+  'eligibility', 'process', 'comms', 'governance', 'timeline', 'org_chart', 'other_ic',
+]);
 const IGNORE_IMAGE_PURPOSES = new Set(['logo', 'decorative', 'stock_photo', 'icon']);
 
 function normalizeImageClassification(row, fallbackName) {
   const purpose = String(row?.purpose || 'other').toLowerCase().replace(/\s+/g, '_');
-  let relevant = row?.relevant === true;
-  if (IGNORE_IMAGE_PURPOSES.has(purpose)) relevant = false;
-  else if (SCHEME_IMAGE_PURPOSES.has(purpose)) relevant = true;
-  else if (purpose === 'other' || purpose === 'scheme_content') {
-    // "other" / vague labels: only keep if the model explicitly said relevant
-    // AND the reason hints at numbers/tables (otherwise treat as decorative).
-    const reason = String(row?.reason || '').toLowerCase();
-    const looksNumeric = /table|payout|scale|attain|weight|threshold|%|percent|multiplier|grid|excel|chart|curve|cap|accelerator/.test(reason);
-    relevant = row?.relevant === true && looksNumeric;
-    if (!looksNumeric) {
-      return {
-        purpose: relevant ? purpose : 'decorative',
-        relevant: false,
-        reason: String(row?.reason || 'No clear scheme numbers — ignored'),
-        name: fallbackName,
-      };
-    }
-  } else {
-    relevant = false;
+  const rawRel = row?.relevant;
+  const reason = String(row?.reason || '').trim();
+  const unsureFlag = rawRel === 'unsure' || rawRel === 'maybe' || row?.unsure === true
+    || String(row?.confidence || '').toLowerCase() === 'low';
+
+  if (IGNORE_IMAGE_PURPOSES.has(purpose) && !unsureFlag && rawRel !== true) {
+    return { purpose, relevant: false, unsure: false, reason: reason || 'Not scheme-relevant', name: fallbackName };
   }
-  return {
-    purpose,
-    relevant,
-    reason: String(row?.reason || (relevant ? 'Scheme content' : 'Not scheme-relevant')),
-    name: fallbackName,
-  };
+  if (SCHEME_IMAGE_PURPOSES.has(purpose) || rawRel === true) {
+    return { purpose, relevant: true, unsure: false, reason: reason || 'Scheme content', name: fallbackName };
+  }
+  if (unsureFlag || purpose === 'other' || rawRel == null) {
+    return {
+      purpose: purpose === 'other' ? 'other_ic' : purpose,
+      relevant: false,
+      unsure: true,
+      reason: reason || 'Unclear — confirm with user',
+      name: fallbackName,
+    };
+  }
+  return { purpose, relevant: false, unsure: false, reason: reason || 'Not scheme-relevant', name: fallbackName };
 }
 
 function parseJsonArrayFromModel(text) {
@@ -641,7 +639,7 @@ function parseJsonArrayFromModel(text) {
  * Returns images to send to full vision extract plus ignored inventory for chat previews.
  */
 async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = {}) {
-  if (!images?.length) return { relevant: [], ignored: [], classifications: [] };
+  if (!images?.length) return { relevant: [], unsure: [], ignored: [], classifications: [] };
 
   const needsVision = [];
   const decided = [];
@@ -668,8 +666,9 @@ async function filterProposalImagesByPurpose(images, classifyPrompt, usageMap = 
         type: 'text',
         text: `Classify these ${batch.length} proposal image(s). Filenames in order: ${batch.map((img) => img.name).join(', ')}.
 
-Default relevant=false. Only relevant=true when you can SEE scheme numbers, payout/attainment scales, weight tables, or IC charts with readable data.
-Photos of people, products, buildings, landscapes, logos, icons, and decorative graphics are NOT relevant.`,
+relevant=true for any IC/scheme content (payout scales, tables, charts, diagrams, eligibility, process, comms, governance — not only numbers).
+relevant=false only for logos, decoration, stock photos, icons.
+relevant="unsure" if it might contain scheme context but you cannot tell.`,
       },
     ];
     try {
@@ -692,38 +691,56 @@ Photos of people, products, buildings, landscapes, logos, icons, and decorative 
         if (row) {
           const norm = normalizeImageClassification(row, img.name);
           const converted = /^(emf|wmf)$/i.test(img.sourceFormat || img.convertedFrom || '');
-          // Office charts are often EMF — don't drop them as decoration after conversion.
-          if (!norm.relevant && converted && (img.bytes || 0) > 8000) {
+          if (!norm.relevant && !norm.unsure && converted && (img.bytes || 0) > 8000) {
             decided.push({
               img,
               purpose: 'chart',
               relevant: true,
+              unsure: false,
               reason: 'Converted EMF/WMF chart — included for extract',
             });
           } else {
-            decided.push({ img, purpose: norm.purpose, relevant: norm.relevant, reason: norm.reason });
+            decided.push({
+              img,
+              purpose: norm.purpose,
+              relevant: norm.relevant,
+              unsure: !!norm.unsure,
+              reason: norm.reason,
+            });
           }
         } else {
-          decided.push({ img, purpose: 'decorative', relevant: false, reason: 'No classification — ignored by default' });
+          decided.push({
+            img,
+            purpose: 'other_ic',
+            relevant: false,
+            unsure: true,
+            reason: 'No classification — confirm with user',
+          });
         }
       }
     } catch (err) {
       console.warn('Image purpose classification failed:', err);
-      // On failure, include larger images only (possible payment-scale screenshots); skip small ones
       for (const img of batch) {
-        const keep = (img.bytes || 0) > 80000 || (img.dimensions && img.dimensions.width * img.dimensions.height > 400000);
+        const tiny = (img.bytes || 0) < 8000;
         decided.push({
           img,
-          purpose: keep ? 'other' : 'decorative',
-          relevant: keep,
-          reason: keep ? 'Classification failed — large image kept as possible scheme content' : 'Classification failed — small image ignored',
+          purpose: tiny ? 'icon' : 'other_ic',
+          relevant: false,
+          unsure: !tiny,
+          reason: tiny ? 'Classification failed — tiny asset ignored' : 'Classification failed — confirm with user',
         });
       }
     }
   }
 
-  const relevant = decided.filter((d) => d.relevant).map((d) => d.img);
-  const ignored = decided.filter((d) => !d.relevant).map((d) => ({
+  const relevant = decided.filter((d) => d.relevant && !d.unsure).map((d) => d.img);
+  const unsure = decided.filter((d) => d.unsure).map((d) => ({
+    ...d.img,
+    purpose: d.purpose,
+    reason: d.reason,
+    unsure: true,
+  }));
+  const ignored = decided.filter((d) => !d.relevant && !d.unsure).map((d) => ({
     name: d.img.name,
     bytes: d.img.bytes,
     included: false,
@@ -735,11 +752,13 @@ Photos of people, products, buildings, landscapes, logos, icons, and decorative 
 
   return {
     relevant,
+    unsure,
     ignored,
     classifications: decided.map((d) => ({
       name: d.img.name,
       purpose: d.purpose,
       relevant: d.relevant,
+      unsure: !!d.unsure,
       reason: d.reason,
     })),
   };
@@ -752,6 +771,13 @@ function purposeLabel(purpose) {
     chart: 'Chart',
     scheme_diagram: 'Scheme diagram',
     scheme_content: 'Scheme content',
+    eligibility: 'Eligibility',
+    process: 'Process',
+    comms: 'Comms',
+    governance: 'Governance',
+    timeline: 'Timeline',
+    org_chart: 'Org / roles',
+    other_ic: 'Possible scheme content',
     logo: 'Logo',
     decorative: 'Decorative',
     stock_photo: 'Stock photo',
@@ -760,6 +786,41 @@ function purposeLabel(purpose) {
     vector: 'Convert failed',
   };
   return map[purpose] || purpose || 'Unknown';
+}
+
+function buildProposalImagePreviews(included, unsure, skipped) {
+  return [
+    ...(included || []).map((img) => ({
+      name: img.name,
+      bytes: img.bytes,
+      included: true,
+      pending: false,
+      purpose: img.purpose || 'scheme_content',
+      reason: img.reason,
+      sourceFormat: img.sourceFormat || img.convertedFrom || null,
+      src: `data:${img.mediaType};base64,${img.base64}`,
+    })),
+    ...(unsure || []).map((img) => ({
+      name: img.name,
+      bytes: img.bytes,
+      included: false,
+      pending: true,
+      purpose: img.purpose || 'other_ic',
+      reason: img.reason,
+      sourceFormat: img.sourceFormat || img.convertedFrom || null,
+      src: `data:${img.mediaType};base64,${img.base64}`,
+    })),
+    ...(skipped || []).map((s) => ({
+      name: s.name,
+      bytes: s.bytes || 0,
+      included: false,
+      pending: false,
+      reason: s.reason,
+      kind: s.kind,
+      purpose: s.purpose,
+      src: s.src,
+    })),
+  ];
 }
 
 /** Pull numeric/category caches from native PowerPoint chart XML (not an image). */
@@ -1072,7 +1133,7 @@ async function finalizeProposalImages(extracted, classifyPrompt, { maxImages = 2
   const skipped = [...(extracted.skipped || [])];
   const usageMap = extracted.usageMap || {};
 
-  const { relevant, ignored, classifications } = await filterProposalImagesByPurpose(
+  const { relevant, unsure = [], ignored, classifications } = await filterProposalImagesByPurpose(
     candidates,
     classifyPrompt,
     usageMap,
@@ -1092,6 +1153,7 @@ async function finalizeProposalImages(extracted, classifyPrompt, { maxImages = 2
 
   return {
     images,
+    unsure,
     skipped: [...skipped, ...ignored],
     classifications,
     notes: extracted.notes || [],
@@ -1130,7 +1192,7 @@ async function interpretProposalImages(images, systemPrompt) {
       })),
       {
         type: 'text',
-        text: `Extract ALL readable IC / payout-scale / attainment / table content from these ${batch.length} image(s): ${batch.map((i) => i.name).join(', ')}. Pay special attention to payment scales, payout curves, threshold tables, and pasted Excel grids.`,
+        text: `Extract ALL readable IC content from these ${batch.length} image(s): ${batch.map((i) => i.name).join(', ')}. Capture payout scales, tables, charts, diagrams, process/eligibility/comms graphics, plus each image's key points / message.`,
       },
     ];
     const res = await anthropicMessagesPost({
@@ -1605,6 +1667,7 @@ export default function CommercialExcellenceApp() {
   const [knowledgeLoadStatus, setKnowledgeLoadStatus] = useState('idle'); // idle | loading | ready | error
   const [uploadedFile, setUploadedFile] = useState(null);
   const [imageLightbox, setImageLightbox] = useState(null); // { src, name, purpose, reason, included }
+  const [pendingImageReview, setPendingImageReview] = useState(null); // pause ingest until user confirms unsure images
   const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
 
   const [topics, setTopics] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).topics);
@@ -2898,6 +2961,230 @@ ${stepInstruction}`;
     }
   };
 
+  const completeProposalIngest = async (job) => {
+    const {
+      file,
+      fileType,
+      extractedText,
+      structuredText,
+      imageNotes,
+      images,
+      skipped,
+    } = job;
+    setIsLoading(true);
+    let visionText = '';
+    let visionError = '';
+    const imageCount = images.length;
+    const ignoredPurposeCount = (skipped || []).filter((s) =>
+      ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
+    ).length;
+    const imagePreviews = buildProposalImagePreviews(images, [], skipped);
+    const imageInventoryLines = imagePreviews.map((img) => {
+      const flag = img.included ? 'INCLUDED' : 'SKIPPED';
+      const purpose = purposeLabel(img.purpose || img.kind);
+      const from = img.sourceFormat ? ` from ${String(img.sourceFormat).toUpperCase()}` : '';
+      const why = img.reason ? ` — ${img.reason}` : '';
+      return `- [${flag}] ${img.name} (${purpose}${from}${img.bytes ? `, ${Math.round(img.bytes / 1024)}KB` : ''})${why}`;
+    });
+
+    try {
+      if (images.length) {
+        setMessages((prev) => [...prev, {
+          role: 'system',
+          content: `🖼️ Extracting content and key points from **${images.length}** scheme image(s)…`,
+        }]);
+        visionText = await interpretProposalImages(
+          images,
+          withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
+        );
+      }
+    } catch (visionErr) {
+      visionError = visionErr.message || 'vision failed';
+      console.warn('Proposal image interpretation failed:', visionErr);
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `⚠️ Image reading skipped: ${visionError}. Continuing with text extract.`,
+      }]);
+    }
+
+    try {
+      if ((!extractedText || extractedText.length < 40) && !visionText && !structuredText) {
+        throw new Error('Could not extract usable text or image content. Try a text-based PDF/.pptx, or ensure tables/charts are visible in the file.');
+      }
+
+      const storagePath = userProposalRemotePath(currentUser.id, file.name);
+      const { error: uploadError } = await supabase.storage
+        .from('intelligence')
+        .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
+      if (uploadError) throw new Error(uploadError.message || 'Cloud upload failed');
+
+      try {
+        const combinedPersist = [
+          [
+            '=== EXTRACT META ===',
+            `File: ${file.name}`,
+            `Type: ${fileType}`,
+            `Scheme images sent to vision: ${imageCount}`,
+            `Non-scheme images ignored: ${ignoredPurposeCount}`,
+            imageNotes.length ? `Notes: ${imageNotes.join(' ')}` : null,
+            visionError ? `Vision error: ${visionError}` : null,
+          ].filter(Boolean).join('\n'),
+          extractedText
+            ? `=== DOCUMENT / SLIDE TEXT ===\n${extractedText}`
+            : '=== DOCUMENT / SLIDE TEXT ===\n(none — screenshot/chart content would appear in vision/chart sections)',
+          structuredText
+            ? `=== NATIVE CHARTS / EMBEDDED SPREADSHEETS ===\n${structuredText}`
+            : null,
+          `=== IMAGE INVENTORY ===\n${imageInventoryLines.length ? imageInventoryLines.join('\n') : '(no embedded images found)'}`,
+          visionText
+            ? `=== IMAGE / VISION EXTRACT (content, key points, message) ===\n${visionText}`
+            : `=== IMAGE / VISION EXTRACT (content, key points, message) ===\n(none — ${imageCount ? 'vision returned empty text' : ignoredPurposeCount ? 'all images were classified as logo/decoration/icon and not sent to vision' : visionError || 'no scheme-relevant images were sent to vision'})`,
+        ].filter(Boolean).join('\n\n');
+        const textBlob = new Blob([combinedPersist], { type: 'text/plain' });
+        const { error: extractUploadError } = await supabase.storage
+          .from('intelligence')
+          .upload(`${storagePath}.extracted.txt`, textBlob, { upsert: true, contentType: 'text/plain' });
+        if (extractUploadError) throw new Error(extractUploadError.message);
+      } catch (persistErr) {
+        setMessages((prev) => [...prev, {
+          role: 'system',
+          content: `⚠️ Saved the original file but could not write the extract sidecar: ${persistErr.message || persistErr}. Assessment will still use in-memory extracts.`,
+        }]);
+      }
+
+      const cappedText = extractedText.length > 70000
+        ? `${extractedText.slice(0, 70000)}\n\n[… truncated for model context …]`
+        : extractedText;
+      const cappedVision = visionText.length > 40000
+        ? `${visionText.slice(0, 40000)}\n\n[… vision extract truncated …]`
+        : visionText;
+      const cappedStructured = structuredText.length > 30000
+        ? `${structuredText.slice(0, 30000)}\n\n[… structured extract truncated …]`
+        : structuredText;
+
+      setUploadedFile({
+        name: file.name,
+        size: file.size,
+        fileType,
+        storagePath,
+        storageBucket: 'intelligence',
+        extractedText: cappedText,
+        visionExtract: cappedVision || null,
+        structuredExtract: cappedStructured || null,
+        imageCount,
+        uploadedAt: new Date().toISOString(),
+      });
+
+      const focusedContext = [
+        'UPLOADED IC PROPOSAL (source of truth for this analysis)',
+        `File: ${file.name}`,
+        `Type: ${fileType}`,
+        `Stored at: intelligence/${storagePath}`,
+        `Slide/document text chars: ${cappedText.length}`,
+        imageCount ? `Scheme-relevant images interpreted: ${imageCount}` : 'Scheme-relevant images interpreted: 0',
+        ignoredPurposeCount ? `Non-scheme images ignored: ${ignoredPurposeCount} (logos, decoration, icons)` : null,
+        imageNotes.length ? `Image notes: ${imageNotes.join(' ')}` : null,
+        '',
+        'Use BOTH sections below: slide text AND image/chart extracts. Do not ignore either source.',
+        '',
+        cappedText
+          ? `EXTRACTED DOCUMENT / SLIDE TEXT:\n${cappedText}`
+          : 'EXTRACTED DOCUMENT / SLIDE TEXT: (little or no text layer — rely on image/chart extracts below)',
+        cappedStructured
+          ? `\n\nEXTRACTED FROM NATIVE CHARTS / EMBEDDED SPREADSHEETS (payment-scale series often live here):\n${cappedStructured}`
+          : null,
+        cappedVision
+          ? `\n\nEXTRACTED FROM SCHEME IMAGES — CONTENT / KEY POINTS / MESSAGE (payout scales, tables, diagrams, comms, process):\n${cappedVision}`
+          : '\n\nEXTRACTED FROM SCHEME IMAGES: (none after purpose filter / conversion)',
+      ].filter((line) => line != null).join('\n');
+
+      const bits = [
+        cappedText ? `${Math.round(cappedText.length / 1000)}k text` : null,
+        cappedVision ? `${Math.round(cappedVision.length / 1000)}k image extract` : null,
+        imageCount ? `${imageCount} scheme image${imageCount === 1 ? '' : 's'}` : null,
+        cappedStructured ? 'charts/Excel parsed' : null,
+      ].filter(Boolean).join(', ');
+
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${bits || 'minimal extract'}).\n\nPassing **slide text + scheme image extracts** into **Analyze Existing IC**…`,
+      }]);
+      setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
+
+      await launchWorkflowDirect(
+        'analyze_ic',
+        'Assess my IC using the uploaded proposal. Use BOTH the extracted slide/document text AND any scheme image extracts (content, key points, and message — not only payout scales) — do not ask the user to restate details already present in either source.',
+        focusedContext,
+      );
+    } catch (err) {
+      setUploadedFile(null);
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `❌ Could not process proposal: ${err.message || 'Unknown error'}`,
+      }]);
+      setIsLoading(false);
+    }
+  };
+
+  const applyUnsureImageDecision = async (nameOrAll, include) => {
+    const prev = pendingImageReview;
+    if (!prev) return;
+    let included = [...(prev.included || [])];
+    let unsure = [...(prev.unsure || [])];
+    let skipped = [...(prev.skipped || [])];
+
+    const decide = (img, keep) => {
+      if (keep) included.push(img);
+      else {
+        skipped.push({
+          name: img.name,
+          bytes: img.bytes || 0,
+          included: false,
+          reason: 'User skipped — not scheme-relevant',
+          kind: 'skipped_by_user',
+          purpose: img.purpose || 'other_ic',
+          src: `data:${img.mediaType};base64,${img.base64}`,
+        });
+      }
+    };
+
+    if (nameOrAll === '*') {
+      unsure.forEach((img) => decide(img, include));
+      unsure = [];
+    } else {
+      const img = unsure.find((i) => i.name === nameOrAll);
+      if (!img) return;
+      decide(img, include);
+      unsure = unsure.filter((i) => i.name !== nameOrAll);
+    }
+
+    const next = { ...prev, included, unsure, skipped };
+    const previews = buildProposalImagePreviews(included, unsure, skipped);
+    setMessages((msgs) => {
+      const copy = [...msgs];
+      for (let i = copy.length - 1; i >= 0; i--) {
+        if (copy[i].imageReviewPending) {
+          copy[i] = {
+            ...copy[i],
+            content: unsure.length
+              ? `🖼️ **${included.length}** scheme image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry IC context.`
+              : `🖼️ **${included.length}** scheme image(s) selected for extract.`,
+            imagePreviews: previews,
+          };
+          break;
+        }
+      }
+      return copy;
+    });
+
+    if (unsure.length) {
+      setPendingImageReview(next);
+      return;
+    }
+    setPendingImageReview(null);
+    await completeProposalIngest(next);
+  };
+
   const handleFileUpload = async (event) => {
     const file = event.target.files?.[0];
     event.target.value = '';
@@ -2923,17 +3210,9 @@ ${stepInstruction}`;
 
       setMessages((prev) => [...prev, {
         role: 'system',
-        content: '🖼️ Scanning embedded images — detecting logos/decoration vs scheme content (tables, payout scales)…',
+        content: '🖼️ Scanning embedded images — detecting IC content vs logos/decoration…',
       }]);
 
-      let visionText = '';
-      let structuredText = '';
-      let imageCount = 0;
-      let ignoredPurposeCount = 0;
-      let imageNotes = [];
-      let imagePreviews = [];
-      let imageInventoryLines = [];
-      let visionError = '';
       try {
         const extracted = await extractProposalImages(file, { textLength: extractedText.length });
         const finalized = await finalizeProposalImages(
@@ -2941,185 +3220,77 @@ ${stepInstruction}`;
           withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt),
         );
         const images = finalized.images || [];
+        const unsure = finalized.unsure || [];
         const skipped = finalized.skipped || [];
         const classifications = finalized.classifications || [];
-        imageNotes = finalized.notes || [];
-        structuredText = finalized.structuredText || '';
-        imageCount = images.length;
+        const imageNotes = finalized.notes || [];
+        const structuredText = finalized.structuredText || '';
 
         const classByName = Object.fromEntries(classifications.map((c) => [c.name, c]));
+        const included = images.map((img) => ({
+          ...img,
+          purpose: classByName[img.name]?.purpose || img.purpose || 'scheme_content',
+          reason: classByName[img.name]?.reason || img.reason,
+        }));
         const ignoredPurpose = skipped.filter((s) =>
           ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
         );
-        ignoredPurposeCount = ignoredPurpose.length;
-        imagePreviews = [
-          ...images.map((img) => ({
-            name: img.name,
-            bytes: img.bytes,
-            included: true,
-            purpose: classByName[img.name]?.purpose || 'scheme_content',
-            reason: classByName[img.name]?.reason,
-            sourceFormat: img.sourceFormat || img.convertedFrom || null,
-            src: `data:${img.mediaType};base64,${img.base64}`,
-          })),
-          ...skipped.map((s) => ({
-            name: s.name,
-            bytes: s.bytes || 0,
-            included: false,
-            reason: s.reason,
-            kind: s.kind,
-            purpose: s.purpose,
-            src: s.src,
-          })),
-        ];
-        imageInventoryLines = imagePreviews.map((img) => {
-          const flag = img.included ? 'INCLUDED' : 'SKIPPED';
-          const purpose = purposeLabel(img.purpose || img.kind);
-          const from = img.sourceFormat ? ` from ${String(img.sourceFormat).toUpperCase()}` : '';
-          const why = img.reason ? ` — ${img.reason}` : '';
-          return `- [${flag}] ${img.name} (${purpose}${from}${img.bytes ? `, ${Math.round(img.bytes / 1024)}KB` : ''})${why}`;
-        });
+        const imagePreviews = buildProposalImagePreviews(included, unsure, skipped);
 
-        if (images.length || skipped.length || structuredText) {
-          const purposeBits = ignoredPurpose.length
-            ? ` · ignored ${ignoredPurpose.length} non-scheme (${ignoredPurpose.map((s) => purposeLabel(s.purpose || s.kind)).slice(0, 4).join(', ')}${ignoredPurpose.length > 4 ? '…' : ''})`
-            : '';
-          const skipSummary = skipped.length
-            ? `\n_Skipped ${skipped.length} total${purposeBits}_`
-            : '';
+        if (included.length || unsure.length || skipped.length || structuredText) {
           setMessages((prev) => [...prev, {
             role: 'system',
-            content: images.length
-              ? `🖼️ **Scheme images for vision:** ${images.length} included${ignoredPurpose.length ? `, ${ignoredPurpose.length} ignored as logo/decoration` : ''}${structuredText ? '; also parsed native charts / embedded Excel' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`
-              : `⚠️ **No scheme-relevant images** for vision${ignoredPurpose.length ? ` (${ignoredPurpose.length} logo/decorative images ignored)` : ''}${structuredText ? '; using native chart / Excel extracts instead' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}${skipSummary}`,
+            content: unsure.length
+              ? `🖼️ **${included.length}** scheme image(s) will be extracted. **${unsure.length}** might contain IC context — include any that matter (diagrams, comms, process, tables — not only payout scales).`
+              : included.length
+                ? `🖼️ **Scheme images for vision:** ${included.length} included${ignoredPurpose.length ? `, ${ignoredPurpose.length} ignored as logo/decoration` : ''}${structuredText ? '; also parsed native charts / embedded Excel' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}`
+                : `⚠️ **No scheme-relevant images** for vision${ignoredPurpose.length ? ` (${ignoredPurpose.length} logo/decorative images ignored)` : ''}${structuredText ? '; using native chart / Excel extracts instead' : ''}.${imageNotes.length ? `\n_${imageNotes.join(' ')}_` : ''}`,
             imagePreviews,
+            imageReviewPending: unsure.length > 0,
           }]);
         }
-        if (images.length) {
-          visionText = await interpretProposalImages(
-            images,
-            withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt),
-          );
+
+        if (unsure.length) {
+          setPendingImageReview({
+            file,
+            fileType,
+            extractedText,
+            structuredText,
+            imageNotes,
+            included,
+            unsure,
+            skipped,
+          });
+          setIsLoading(false);
+          return;
         }
+
+        await completeProposalIngest({
+          file,
+          fileType,
+          extractedText,
+          structuredText,
+          imageNotes,
+          images: included,
+          skipped,
+        });
+        return;
       } catch (visionErr) {
-        visionError = visionErr.message || 'vision failed';
         console.warn('Proposal image interpretation failed:', visionErr);
         setMessages((prev) => [...prev, {
           role: 'system',
-          content: `⚠️ Image reading skipped: ${visionError}. Continuing with text extract.`,
+          content: `⚠️ Image reading skipped: ${visionErr.message || 'vision failed'}. Continuing with text extract.`,
         }]);
+        await completeProposalIngest({
+          file,
+          fileType,
+          extractedText,
+          structuredText: '',
+          imageNotes: [],
+          images: [],
+          skipped: [],
+        });
       }
-
-      if ((!extractedText || extractedText.length < 40) && !visionText && !structuredText) {
-        throw new Error('Could not extract usable text or image content. Try a text-based PDF/.pptx, or ensure tables/charts are visible in the file.');
-      }
-
-      const storagePath = userProposalRemotePath(currentUser.id, file.name);
-      const { error: uploadError } = await supabase.storage
-        .from('intelligence')
-        .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
-      if (uploadError) throw new Error(uploadError.message || 'Cloud upload failed');
-
-      // Persist extracts next to the original — always include image inventory + vision section
-      try {
-        const combinedPersist = [
-          [
-            '=== EXTRACT META ===',
-            `File: ${file.name}`,
-            `Type: ${fileType}`,
-            `Scheme images sent to vision: ${imageCount}`,
-            `Non-scheme images ignored: ${ignoredPurposeCount}`,
-            imageNotes.length ? `Notes: ${imageNotes.join(' ')}` : null,
-            visionError ? `Vision error: ${visionError}` : null,
-          ].filter(Boolean).join('\n'),
-          extractedText
-            ? `=== DOCUMENT / SLIDE TEXT ===\n${extractedText}`
-            : '=== DOCUMENT / SLIDE TEXT ===\n(none — screenshot/chart content would appear in vision/chart sections)',
-          structuredText
-            ? `=== NATIVE CHARTS / EMBEDDED SPREADSHEETS ===\n${structuredText}`
-            : null,
-          `=== IMAGE INVENTORY ===\n${imageInventoryLines.length ? imageInventoryLines.join('\n') : '(no embedded images found)'}`,
-          visionText
-            ? `=== IMAGE / VISION EXTRACT (payout scales, tables, screenshots) ===\n${visionText}`
-            : `=== IMAGE / VISION EXTRACT (payout scales, tables, screenshots) ===\n(none — ${imageCount ? 'vision returned empty text' : ignoredPurposeCount ? 'all images were classified as logo/decoration/icon and not sent to vision' : visionError || 'no scheme-relevant images were sent to vision'})`,
-        ].filter(Boolean).join('\n\n');
-        const textBlob = new Blob([combinedPersist], { type: 'text/plain' });
-        const { error: extractUploadError } = await supabase.storage
-          .from('intelligence')
-          .upload(`${storagePath}.extracted.txt`, textBlob, { upsert: true, contentType: 'text/plain' });
-        if (extractUploadError) throw new Error(extractUploadError.message);
-      } catch (persistErr) {
-        setMessages((prev) => [...prev, {
-          role: 'system',
-          content: `⚠️ Saved the original file but could not write the extract sidecar: ${persistErr.message || persistErr}. Assessment will still use in-memory extracts.`,
-        }]);
-      }
-
-      const cappedText = extractedText.length > 70000
-        ? `${extractedText.slice(0, 70000)}\n\n[… truncated for model context …]`
-        : extractedText;
-      const cappedVision = visionText.length > 40000
-        ? `${visionText.slice(0, 40000)}\n\n[… vision extract truncated …]`
-        : visionText;
-      const cappedStructured = structuredText.length > 30000
-        ? `${structuredText.slice(0, 30000)}\n\n[… structured extract truncated …]`
-        : structuredText;
-
-      const proposalMeta = {
-        name: file.name,
-        size: file.size,
-        fileType,
-        storagePath,
-        storageBucket: 'intelligence',
-        extractedText: cappedText,
-        visionExtract: cappedVision || null,
-        structuredExtract: cappedStructured || null,
-        imageCount,
-        uploadedAt: new Date().toISOString(),
-      };
-      setUploadedFile(proposalMeta);
-
-      const focusedContext = [
-        'UPLOADED IC PROPOSAL (source of truth for this analysis)',
-        `File: ${file.name}`,
-        `Type: ${fileType}`,
-        `Stored at: intelligence/${storagePath}`,
-        `Slide/document text chars: ${cappedText.length}`,
-        imageCount ? `Scheme-relevant images interpreted: ${imageCount}` : 'Scheme-relevant images interpreted: 0',
-        ignoredPurposeCount ? `Non-scheme images ignored: ${ignoredPurposeCount} (logos, decoration, icons)` : null,
-        imageNotes.length ? `Image notes: ${imageNotes.join(' ')}` : null,
-        '',
-        'Use BOTH sections below: slide text AND image/chart extracts. Do not ignore either source.',
-        '',
-        cappedText
-          ? `EXTRACTED DOCUMENT / SLIDE TEXT:\n${cappedText}`
-          : 'EXTRACTED DOCUMENT / SLIDE TEXT: (little or no text layer — rely on image/chart extracts below)',
-        cappedStructured
-          ? `\n\nEXTRACTED FROM NATIVE CHARTS / EMBEDDED SPREADSHEETS (payment-scale series often live here):\n${cappedStructured}`
-          : null,
-        cappedVision
-          ? `\n\nEXTRACTED FROM SCHEME IMAGES — PAYOUT SCALES / TABLES / CHARTS / SCREENSHOTS (treat as primary evidence for curves and tables):\n${cappedVision}`
-          : '\n\nEXTRACTED FROM SCHEME IMAGES: (none after purpose filter / conversion)',
-      ].filter((line) => line != null).join('\n');
-
-      const bits = [
-        cappedText ? `${Math.round(cappedText.length / 1000)}k text` : null,
-        cappedVision ? `${Math.round(cappedVision.length / 1000)}k image extract` : null,
-        imageCount ? `${imageCount} scheme image${imageCount === 1 ? '' : 's'}` : null,
-        cappedStructured ? 'charts/Excel parsed' : null,
-      ].filter(Boolean).join(', ');
-
-      setMessages((prev) => [...prev, {
-        role: 'system',
-        content: `✅ Proposal saved to \`intelligence/${storagePath}\` (${bits || 'minimal extract'}).\n\nPassing **slide text + scheme image extracts** into **Analyze Existing IC**…`,
-      }]);
-      setMessages((prev) => [...prev, { role: 'user', content: 'Assess my IC' }]);
-
-      await launchWorkflowDirect(
-        'analyze_ic',
-        'Assess my IC using the uploaded proposal. Use BOTH the extracted slide/document text AND any scheme image/table/chart extracts in context — do not ask the user to restate details already present in either source.',
-        focusedContext,
-      );
     } catch (err) {
       setUploadedFile(null);
       setMessages((prev) => [...prev, {
@@ -4332,6 +4503,32 @@ ${stepInstruction}`;
     if (e) e.preventDefault();
     const messageContent = overrideInput || input.trim();
     if (!messageContent || isLoading) return;
+
+    if (pendingImageReview?.unsure?.length && !currentWorkflow) {
+      setInput('');
+      const lower = messageContent.toLowerCase().trim();
+      setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+      if (/\b(include all|all of them|yes all|keep all)\b/.test(lower) || lower === 'all' || lower === 'yes') {
+        await applyUnsureImageDecision('*', true);
+        return;
+      }
+      if (/\b(skip all|ignore all|none|no all)\b/.test(lower) || lower === 'none' || lower === 'no') {
+        await applyUnsureImageDecision('*', false);
+        return;
+      }
+      const named = pendingImageReview.unsure.find((img) => lower.includes(String(img.name || '').toLowerCase()));
+      if (named) {
+        const keep = !/\b(skip|ignore|drop|no)\b/.test(lower);
+        await applyUnsureImageDecision(named.name, keep);
+        return;
+      }
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: 'Reply **include all** or **skip all**, or use the Include / Skip buttons on each thumbnail.',
+      }]);
+      return;
+    }
+
     setInput('');
     // Capture before clearing — needed to route Continue / typed replies correctly
     const pendingDecision = orchestratorDecision;
@@ -4709,19 +4906,21 @@ ${stepInstruction}`;
                                   }
                                 }}
                                 className={`rounded-lg overflow-hidden border text-left ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''} ${
-                                  img.included
+                                  img.pending
+                                    ? 'border-amber-400/70 bg-amber-950/40'
+                                    : img.included
                                     ? 'border-emerald-400/40 bg-slate-900/40'
                                     : ['logo', 'decorative', 'icon', 'stock_photo'].includes(img.kind || img.purpose)
                                       ? 'border-slate-500/50 bg-slate-900/30'
                                       : 'border-amber-400/40 bg-amber-950/30'
                                 }`}
-                                title={img.src ? `Click to enlarge — ${img.included ? (img.reason || 'Included') : (img.reason || 'Skipped')}` : (img.reason || 'Skipped')}
+                                title={img.src ? `Click to enlarge — ${img.pending ? (img.reason || 'Confirm') : img.included ? (img.reason || 'Included') : (img.reason || 'Skipped')}` : (img.reason || 'Skipped')}
                               >
                                 {img.src ? (
                                   <img
                                     src={img.src}
                                     alt={img.name}
-                                    className={`block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50 ${img.included ? '' : 'opacity-60 grayscale-[35%]'}`}
+                                    className={`block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50 ${img.included || img.pending ? '' : 'opacity-60 grayscale-[35%]'}`}
                                   />
                                 ) : (
                                   <div className="h-20 w-[120px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
@@ -4729,15 +4928,51 @@ ${stepInstruction}`;
                                   </div>
                                 )}
                                 <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px]">
-                                  <div className="truncate">{img.included ? '✓ ' : '✗ '}{img.name}</div>
-                                  <div className={`truncate ${img.included ? 'text-emerald-300/90' : 'text-slate-400'}`}>
+                                  <div className="truncate">{img.pending ? '? ' : img.included ? '✓ ' : '✗ '}{img.name}</div>
+                                  <div className={`truncate ${img.pending ? 'text-amber-300' : img.included ? 'text-emerald-300/90' : 'text-slate-400'}`}>
                                     {purposeLabel(img.purpose || img.kind)}
                                     {img.sourceFormat ? ` · from ${String(img.sourceFormat).toUpperCase()}` : ''}
                                     {img.bytes ? ` · ${(img.bytes / 1024).toFixed(0)}KB` : ''}
                                   </div>
+                                  {img.pending && (
+                                    <div className="flex gap-1 mt-1">
+                                      <button
+                                        type="button"
+                                        className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100 text-[10px] font-semibold"
+                                        onClick={(e) => { e.stopPropagation(); applyUnsureImageDecision(img.name, true); }}
+                                      >
+                                        Include
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 hover:bg-slate-500/70 text-slate-100 text-[10px] font-semibold"
+                                        onClick={(e) => { e.stopPropagation(); applyUnsureImageDecision(img.name, false); }}
+                                      >
+                                        Skip
+                                      </button>
+                                    </div>
+                                  )}
                                 </figcaption>
                               </figure>
                             ))}
+                          </div>
+                        )}
+                        {message.imageReviewPending && pendingImageReview?.unsure?.length > 0 && (
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => applyUnsureImageDecision('*', true)}
+                              className="px-3 py-1.5 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold"
+                            >
+                              Include all unsure
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => applyUnsureImageDecision('*', false)}
+                              className="px-3 py-1.5 bg-slate-600/50 hover:bg-slate-500/60 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold"
+                            >
+                              Skip all unsure
+                            </button>
                           </div>
                         )}
                         {index === messages.length - 1 && pendingWorkflow && message.content.includes('Would you like me to start this workflow') && (
@@ -4883,7 +5118,7 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
+                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !pendingImageReview && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
                   <div className="mb-3">
                     <div className="text-xs text-blue-300/70 mb-2 flex items-center gap-2"><span>💡 Suggested next steps:</span></div>
                     <div className="flex flex-wrap gap-2">

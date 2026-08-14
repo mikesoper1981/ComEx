@@ -208,6 +208,15 @@ export function mergeWorkflowRuntime(partial) {
   for (const key of Object.keys(DEFAULT_WORKFLOW_RUNTIME)) {
     if (w[key] != null) out[key] = String(w[key]);
   }
+  // Refresh stale factory prompts that dropped scheme images / vision extracts
+  const classify = String(out.proposalImageClassifyPrompt || '');
+  if (classify.includes('Prefer false positives of') || classify.includes('DEFAULT: relevant=false')) {
+    out.proposalImageClassifyPrompt = DEFAULT_WORKFLOW_RUNTIME.proposalImageClassifyPrompt;
+  }
+  const interpret = String(out.proposalImageInterpretPrompt || '');
+  if (!/key points/i.test(interpret)) {
+    out.proposalImageInterpretPrompt = DEFAULT_WORKFLOW_RUNTIME.proposalImageInterpretPrompt;
+  }
   return out;
 }
 
