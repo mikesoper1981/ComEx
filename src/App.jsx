@@ -10,6 +10,8 @@ import {
   clearCurrentUser,
   userSettingsLocalKey,
   userSettingsRemotePath,
+  userSettingsRemotePathCandidates,
+  userStorageFolder,
   userPptxTemplateRemotePath,
   userProposalRemotePath,
   productIntelligenceLocalKey,
@@ -301,22 +303,23 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
   return doc;
 }
 
-async function uploadUserSettingsJson(userId, doc) {
+async function uploadUserSettingsJson(user, doc) {
   const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
   const { error } = await supabase.storage
     .from('intelligence')
-    .upload(userSettingsRemotePath(userId), blob, { upsert: true, contentType: 'application/json' });
+    .upload(userSettingsRemotePath(user), blob, { upsert: true, contentType: 'application/json' });
   if (error) throw error;
 }
 
 const userSettingsUploadSlots = new Map();
 
 /** Last-write-wins cloud save so a slower chat autosave cannot wipe a newer context upload. */
-function queueUserSettingsUpload(userId, doc) {
-  let slot = userSettingsUploadSlots.get(userId);
+function queueUserSettingsUpload(user, doc) {
+  const key = String(user?.id || userStorageFolder(user));
+  let slot = userSettingsUploadSlots.get(key);
   if (!slot) {
     slot = { pending: null, chain: Promise.resolve() };
-    userSettingsUploadSlots.set(userId, slot);
+    userSettingsUploadSlots.set(key, slot);
   }
   slot.pending = doc;
   slot.chain = slot.chain.then(async () => {
@@ -325,10 +328,10 @@ function queueUserSettingsUpload(userId, doc) {
       const toWrite = slot.pending;
       slot.pending = null;
       try {
-        await uploadUserSettingsJson(userId, toWrite);
+        await uploadUserSettingsJson(user, toWrite);
       } catch (err) {
         ok = false;
-        console.warn(`Could not save ${userSettingsRemotePath(userId)}:`, err?.message || err);
+        console.warn(`Could not save ${userSettingsRemotePath(user)}:`, err?.message || err);
       }
     }
     return ok;
@@ -2409,10 +2412,10 @@ export default function CommercialExcellenceApp() {
         let intel = extractProductIntelligence(intelParsed);
         let migratedFromUser = false;
         if (!intel) {
-          const adminId = HARDCODED_USERS.find((u) => u.role === 'admin')?.id || getHardcodedUser().id;
+          const admin = HARDCODED_USERS.find((u) => u.role === 'admin') || getHardcodedUser();
           const adminCandidates = [
-            userSettingsRemotePath(adminId),
-            ...(currentUser.id === adminId ? [LEGACY_USER_SETTINGS_FILE] : []),
+            ...userSettingsRemotePathCandidates(admin),
+            ...(currentUser.id === admin.id ? [LEGACY_USER_SETTINGS_FILE] : []),
           ];
           for (const candidate of adminCandidates) {
             try {
@@ -2450,18 +2453,21 @@ export default function CommercialExcellenceApp() {
         }
       } catch { /* product intel falls back to factory defaults */ }
 
-      // User settings scoped by current userId (users/<id>/settings.json).
+      // User settings scoped by account name (users/<display name>/settings.json).
       try {
-        const path = userSettingsRemotePath(currentUser.id);
+        const pathCandidates = [
+          ...userSettingsRemotePathCandidates(currentUser),
+          ...(currentUser.id === getHardcodedUser().id ? [LEGACY_USER_SETTINGS_FILE] : []),
+        ];
         let parsed = null;
-        {
-          const { data, error } = await supabase.storage.from('intelligence').download(path);
-          if (!error && data) parsed = safeJsonParse(await data.text());
-        }
-        // Migrate legacy flat file once for the hardcoded default user.
-        if (!parsed && currentUser.id === getHardcodedUser().id) {
-          const { data, error } = await supabase.storage.from('intelligence').download(LEGACY_USER_SETTINGS_FILE);
-          if (!error && data) parsed = safeJsonParse(await data.text());
+        for (const candidate of pathCandidates) {
+          try {
+            const { data, error } = await supabase.storage.from('intelligence').download(candidate);
+            if (!error && data) {
+              parsed = safeJsonParse(await data.text());
+              if (parsed) break;
+            }
+          } catch { /* try next path */ }
         }
         if (parsed && typeof parsed === 'object') {
           const merged = normalizeLoadedUserSettings(parsed);
@@ -2487,7 +2493,7 @@ export default function CommercialExcellenceApp() {
               userName: currentUser.name,
             });
             localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(cleaned));
-            await queueUserSettingsUpload(currentUser.id, cleaned);
+            await queueUserSettingsUpload(currentUser, cleaned);
           } catch { /* ignore */ }
         } else {
           // First visit for this user — create users/<id>/settings.json so context is not browser-only.
@@ -2502,7 +2508,7 @@ export default function CommercialExcellenceApp() {
           try {
             localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(seeded));
           } catch { /* ignore */ }
-          const ok = await queueUserSettingsUpload(currentUser.id, seeded);
+          const ok = await queueUserSettingsUpload(currentUser, seeded);
           setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
           setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
         }
@@ -2567,7 +2573,7 @@ export default function CommercialExcellenceApp() {
         localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
       } catch { /* ignore */ }
       try {
-        await queueUserSettingsUpload(currentUser.id, doc);
+        await queueUserSettingsUpload(currentUser, doc);
       } catch { /* local is enough */ }
     }, 1200);
     return () => clearTimeout(persistChatsTimerRef.current);
@@ -3062,7 +3068,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* private mode / quota — continue to cloud */ }
     try {
-      const ok = await queueUserSettingsUpload(currentUser.id, doc);
+      const ok = await queueUserSettingsUpload(currentUser, doc);
       setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
       setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
     } catch (err) {
@@ -3083,7 +3089,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* ignore */ }
     try {
-      await queueUserSettingsUpload(currentUser.id, doc);
+      await queueUserSettingsUpload(currentUser, doc);
     } catch { /* local is enough */ }
   };
 
@@ -3192,7 +3198,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
     try {
       const theme = await extractPptxThemeFromFile(file);
       setPptxTemplateStatus('uploading');
-      const storagePath = userPptxTemplateRemotePath(currentUser.id);
+      const storagePath = userPptxTemplateRemotePath(currentUser);
       const { error: upErr } = await supabase.storage
         .from('intelligence')
         .upload(storagePath, file, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
@@ -3215,7 +3221,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
   };
 
   const handleRemovePptxTemplate = async () => {
-    const path = userSettings.pptxTemplate?.storagePath || userPptxTemplateRemotePath(currentUser.id);
+    const path = userSettings.pptxTemplate?.storagePath || userPptxTemplateRemotePath(currentUser);
     try {
       await supabase.storage.from('intelligence').remove([path]);
     } catch { /* ignore missing file */ }
@@ -4006,7 +4012,7 @@ ${stepInstruction}`;
         }]);
       }
 
-      const storagePath = userProposalRemotePath(currentUser.id, file.name);
+      const storagePath = userProposalRemotePath(currentUser, file.name);
       const { error: uploadError } = await supabase.storage
         .from('intelligence')
         .upload(storagePath, file, { upsert: true, contentType: file.type || 'application/octet-stream' });
@@ -4535,8 +4541,8 @@ ${stepInstruction}`;
           Upload a file and use the chat to add more context. Detected content from the file appears below so you can confirm, edit, or remove it. Only those saved fields are sent to the AI as guidance in {moduleLabelFor(moduleId)}.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
-          Saved for this user in Supabase Storage <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser.id)}</code>
-          {' '}(user id <code className="text-cyan-300/70">{currentUser.id}</code>). Extract and notes only — the original file is not kept.
+          Saved for this user in Supabase Storage <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.
+          {' '}Extract and notes only — the original file is not kept.
           {userSettingsSaveStatus === 'saved-local' && (
             <span className="block mt-1 text-amber-300/90">Cloud sync unavailable — this copy is in the browser only until Supabase accepts the upload.</span>
           )}
@@ -7213,11 +7219,10 @@ ${stepInstruction}`;
                 {userSettingsPane === 'general' && (
                   <>
                     <p className="text-xs text-blue-300/70 mb-5">
-                      These apply across the hub. Saved per user in this browser and in Supabase Storage bucket
+                      These apply across the hub. Saved per named account in this browser and in Supabase Storage bucket
                       {' '}<code className="text-cyan-300/80">intelligence</code>
-                      {' '}→ folder <code className="text-cyan-300/80">users/{currentUser.id}</code>
-                      {' '}→ <code className="text-cyan-300/80">settings.json</code>
-                      {' '}({currentUser.name}’s id is <code className="text-cyan-300/80">{currentUser.id}</code>, not the display name).
+                      {' '}→ <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/settings.json</code>.
+                      {' '}Later accounts use the same pattern (for example <code className="text-cyan-300/80">users/Standard User 1/settings.json</code>).
                     </p>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
@@ -7315,7 +7320,7 @@ ${stepInstruction}`;
                     <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
                     <p className="text-xs text-blue-300/60 mb-4">
                       Used when exporting Incentive Compensation decks. Upload a branded .pptx — exports take its colours, fonts and background. Without a template, ComEx uses the default style. Stored at{' '}
-                      <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser.id)}</code>.
+                      <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser)}</code>.
                     </p>
                     {userSettings.pptxTemplate ? (
                       <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 space-y-3">
@@ -7445,7 +7450,7 @@ ${stepInstruction}`;
                   </button>
                   <button
                     onClick={async () => {
-                      const path = userSettings.pptxTemplate?.storagePath || userPptxTemplateRemotePath(currentUser.id);
+                      const path = userSettings.pptxTemplate?.storagePath || userPptxTemplateRemotePath(currentUser);
                       if (userSettings.pptxTemplate) {
                         try { await supabase.storage.from('intelligence').remove([path]); } catch { /* ignore */ }
                       }

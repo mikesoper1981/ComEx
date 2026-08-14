@@ -46,7 +46,7 @@ function sanitizeUser(user) {
   const listed = findHardcodedUser(user?.id);
   return {
     id: String(user?.id || listed?.id || getHardcodedUser().id),
-    name: String(user?.name || listed?.name || user?.id || 'User'),
+    name: String(listed?.name || user?.name || user?.id || 'User'),
     role: listed?.role || (user?.role === 'admin' ? 'admin' : 'user'),
   };
 }
@@ -80,8 +80,29 @@ export function userSettingsLocalKey(userId) {
   return `comex-user-settings:${userId}`;
 }
 
-export function userSettingsRemotePath(userId) {
-  return `users/${userId}/settings.json`;
+/** Storage folder is the account display name (e.g. "Standard User"), not the internal id. */
+export function userStorageFolder(userOrName) {
+  const raw = userOrName && typeof userOrName === 'object'
+    ? (userOrName.name || userOrName.id)
+    : userOrName;
+  const folder = String(raw || '')
+    .replace(/[\\/:*?"<>|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+  return folder || 'user';
+}
+
+export function userSettingsRemotePath(userOrName) {
+  return `users/${userStorageFolder(userOrName)}/settings.json`;
+}
+
+/** Named path first, then older users/<id>/settings.json for migration. */
+export function userSettingsRemotePathCandidates(user) {
+  const named = userSettingsRemotePath(user);
+  const id = String(user?.id || '').trim();
+  const byId = id ? `users/${id}/settings.json` : '';
+  return byId && byId !== named ? [named, byId] : [named];
 }
 
 /** Shared Admin / product intelligence (agents, workflows, prompts). Not per-user. */
@@ -93,27 +114,27 @@ export function productIntelligenceRemotePath() {
   return 'product.json';
 }
 
-export function userPptxTemplateRemotePath(userId) {
-  return `users/${userId}/pptx-template.pptx`;
+export function userPptxTemplateRemotePath(userOrName) {
+  return `users/${userStorageFolder(userOrName)}/pptx-template.pptx`;
 }
 
 /** Per-user IC proposal uploads (Assess Proposal). */
-export function userProposalRemotePath(userId, fileName) {
+export function userProposalRemotePath(userOrName, fileName) {
   const safe = String(fileName || 'proposal')
     .replace(/[^\w.\-() ]+/g, '_')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120) || 'proposal';
-  return `users/${userId}/proposals/${Date.now()}_${safe}`;
+  return `users/${userStorageFolder(userOrName)}/proposals/${Date.now()}_${safe}`;
 }
 
 /** Per-user module context originals (strategy decks, territory Excel, etc.). */
-export function userModuleContextRemotePath(userId, moduleId, fileName) {
+export function userModuleContextRemotePath(userOrName, moduleId, fileName) {
   const mod = String(moduleId || 'context').replace(/[^\w-]+/g, '') || 'context';
   const safe = String(fileName || 'file')
     .replace(/[^\w.\-() ]+/g, '_')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120) || 'file';
-  return `users/${userId}/context/${mod}/${Date.now()}_${safe}`;
+  return `users/${userStorageFolder(userOrName)}/context/${mod}/${Date.now()}_${safe}`;
 }
