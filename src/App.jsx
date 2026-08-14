@@ -197,6 +197,40 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
 
 const MAX_STORED_CHATS = 25;
 const MAX_STORED_MESSAGES = 80;
+const MAX_VISIBLE_CHATS = 5;
+
+const CHAT_MODULE_META = {
+  incentives: { id: 'incentives', label: 'Incentives', tab: 'chat' },
+  territory: { id: 'territory', label: 'Territory', tab: 'territory' },
+  stella: { id: 'stella', label: 'Stella Insights', tab: 'stella' },
+};
+
+function inferChatModule({ currentWorkflow } = {}) {
+  const topic = String(currentWorkflow?.topicId || '');
+  if (topic.includes('territory')) return 'territory';
+  if (topic.includes('stella')) return 'stella';
+  return 'incentives';
+}
+
+function chatModuleMeta(chat) {
+  return CHAT_MODULE_META[chat?.module] || CHAT_MODULE_META.incentives;
+}
+
+function upsertChatInPlace(list, snap) {
+  const arr = [...(list || [])];
+  const i = arr.findIndex((c) => c.id === snap.id);
+  if (i >= 0) arr[i] = { ...arr[i], ...snap, module: snap.module || arr[i].module || 'incentives' };
+  else arr.unshift(snap);
+  return arr.slice(0, MAX_STORED_CHATS);
+}
+
+function recentChats(list) {
+  return (list || [])
+    .filter((c) => chatHasUserContent(c.messages))
+    .slice()
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+    .slice(0, MAX_VISIBLE_CHATS);
+}
 
 function newChatId() {
   return `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -233,12 +267,13 @@ function sanitizeMessageForStorage(m) {
   return out;
 }
 
-function serializeChatSnapshot({ id, title, updatedAt, messages, currentWorkflow, pendingWorkflow, uploadedFile }) {
+function serializeChatSnapshot({ id, title, updatedAt, messages, currentWorkflow, pendingWorkflow, uploadedFile, module }) {
   const safeMessages = (messages || []).slice(-MAX_STORED_MESSAGES).map(sanitizeMessageForStorage).filter(Boolean);
   return {
     id: id || newChatId(),
     title: title && title !== 'New chat' ? title : deriveChatTitle(safeMessages),
     updatedAt: updatedAt || new Date().toISOString(),
+    module: module || inferChatModule({ currentWorkflow }),
     messages: safeMessages,
     currentWorkflow: currentWorkflow
       ? {
@@ -287,6 +322,7 @@ function normalizeStoredChats(raw) {
       ...c,
       title: c.title || deriveChatTitle(c.messages),
       updatedAt: c.updatedAt || new Date().toISOString(),
+      module: c.module || inferChatModule(c),
     }));
 }
 
@@ -1917,6 +1953,16 @@ export default function CommercialExcellenceApp() {
   const uploadedFileRef = useRef(uploadedFile);
   const persistChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
+  const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
+    try { return localStorage.getItem('comex-chat-history-collapsed') === '1'; } catch { return false; }
+  });
+  const toggleChatHistoryCollapsed = () => {
+    setChatHistoryCollapsed((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('comex-chat-history-collapsed', next ? '1' : '0'); } catch { /* ignore */ }
+      return next;
+    });
+  };
   const [agents, setAgents] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).agents);
 
   const [topics, setTopics] = useState(() => mergeIntelligenceContext(readLocalUserSettings(getCurrentUser().id)).topics);
@@ -2179,14 +2225,19 @@ export default function CommercialExcellenceApp() {
         activeChatIdRef.current = id;
         setActiveChatId(id);
       }
+      const existing = (chatSessionsRef.current || []).find((c) => c.id === id);
+      const sameThread = existing && (existing.messages || []).length === (messagesRef.current || []).length
+        && String(existing.messages?.[existing.messages.length - 1]?.content || '') === String(messagesRef.current?.[messagesRef.current.length - 1]?.content || '');
       const snap = serializeChatSnapshot({
         id,
         messages: messagesRef.current,
         currentWorkflow: currentWorkflowRef.current,
         pendingWorkflow: pendingWorkflowRef.current,
         uploadedFile: uploadedFileRef.current,
+        module: existing?.module,
+        updatedAt: sameThread ? existing.updatedAt : undefined,
       });
-      const next = [snap, ...(chatSessionsRef.current || []).filter((c) => c.id !== snap.id)].slice(0, MAX_STORED_CHATS);
+      const next = upsertChatInPlace(chatSessionsRef.current, snap);
       chatSessionsRef.current = next;
       setChatSessions(next);
       let settingsDoc = userSettings;
@@ -2616,9 +2667,10 @@ export default function CommercialExcellenceApp() {
       currentWorkflow: currentWorkflowRef.current,
       pendingWorkflow: pendingWorkflowRef.current,
       uploadedFile: uploadedFileRef.current,
+      module: (chatSessionsRef.current || []).find((c) => c.id === (activeChatIdRef.current))?.module,
     });
     const liveChats = chatHasUserContent(liveSnap.messages)
-      ? [liveSnap, ...(chatSessionsRef.current || []).filter((c) => c.id !== liveSnap.id)].slice(0, MAX_STORED_CHATS)
+      ? upsertChatInPlace(chatSessionsRef.current, liveSnap)
       : (chatSessionsRef.current || []);
     const doc = buildUserSettingsDocument(currentUser.id, settings, {
       chats: liveChats,
@@ -2675,21 +2727,24 @@ export default function CommercialExcellenceApp() {
     } catch { /* local is enough */ }
   };
 
-  const flushActiveChat = () => {
+  const flushActiveChat = ({ preserveUpdatedAt = false } = {}) => {
     const id = activeChatIdRef.current || newChatId();
     if (!activeChatIdRef.current) {
       activeChatIdRef.current = id;
       setActiveChatId(id);
     }
+    const existing = (chatSessionsRef.current || []).find((c) => c.id === id);
     const snap = serializeChatSnapshot({
       id,
       messages: messagesRef.current,
       currentWorkflow: currentWorkflowRef.current,
       pendingWorkflow: pendingWorkflowRef.current,
       uploadedFile: uploadedFileRef.current,
+      module: existing?.module,
+      updatedAt: preserveUpdatedAt ? existing?.updatedAt : undefined,
     });
     const next = chatHasUserContent(snap.messages)
-      ? [snap, ...(chatSessionsRef.current || []).filter((c) => c.id !== snap.id)].slice(0, MAX_STORED_CHATS)
+      ? upsertChatInPlace(chatSessionsRef.current, snap)
       : (chatSessionsRef.current || []).filter((c) => c.id !== snap.id);
     chatSessionsRef.current = next;
     setChatSessions(next);
@@ -2727,15 +2782,18 @@ export default function CommercialExcellenceApp() {
 
   const continueChat = (chatId) => {
     if (chatId === activeChatIdRef.current) {
+      const current = (chatSessionsRef.current || []).find((c) => c.id === chatId);
       setShowLanding(false);
-      setActiveTab('chat');
+      setActiveTab(chatModuleMeta(current).tab);
       return;
     }
-    const { list } = flushActiveChat();
+    const { list } = flushActiveChat({ preserveUpdatedAt: true });
     const found = list.find((c) => c.id === chatId) || (chatSessionsRef.current || []).find((c) => c.id === chatId);
     if (!found) return;
     resetLiveChat(found.id, found);
     persistChatList(list, found.id);
+    const tab = chatModuleMeta(found).tab;
+    setActiveTab(tab);
   };
 
   const deleteChat = (chatId, event) => {
@@ -5322,29 +5380,23 @@ ${stepInstruction}`;
             ))}
           </div>
 
-          {chatSessions.filter((c) => chatHasUserContent(c.messages)).length > 0 && (
+          {recentChats(chatSessions).length > 0 && (
             <div className="mt-10">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <History className="w-5 h-5 text-cyan-300" />
-                  <h3 className="text-lg font-semibold text-white">Your chats</h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={startNewChat}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-400/40 rounded-lg text-xs text-blue-100 font-semibold"
-                >
-                  <Plus className="w-3.5 h-3.5" /> New chat
-                </button>
+              <div className="flex items-center gap-2 mb-4">
+                <History className="w-5 h-5 text-cyan-300" />
+                <h3 className="text-lg font-semibold text-white">Recent chats</h3>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {chatSessions.filter((c) => chatHasUserContent(c.messages)).slice(0, 9).map((chat) => (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
+                {recentChats(chatSessions).map((chat) => {
+                  const mod = chatModuleMeta(chat);
+                  return (
                   <div
                     key={chat.id}
                     className="text-left bg-slate-800/50 hover:bg-slate-700/55 border border-blue-400/20 hover:border-blue-400/45 rounded-xl p-4 transition-all group"
                   >
                     <div className="flex items-start justify-between gap-2">
                       <button type="button" onClick={() => continueChat(chat.id)} className="min-w-0 text-left flex-1">
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/90 mb-1">{mod.label}</div>
                         <div className="text-sm font-semibold text-white truncate">{chat.title || 'Chat'}</div>
                         <div className="text-[11px] text-blue-300/60 mt-1">
                           {formatChatTime(chat.updatedAt)}
@@ -5363,7 +5415,8 @@ ${stepInstruction}`;
                       </button>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -5381,24 +5434,49 @@ ${stepInstruction}`;
           }>
           {activeTab === 'chat' ? (
             <div className="flex gap-3 h-full min-h-0">
+              {chatHistoryCollapsed ? (
+                <aside className="hidden md:flex w-10 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
+                  <button
+                    type="button"
+                    title="Show chat history"
+                    onClick={toggleChatHistoryCollapsed}
+                    className="flex-1 flex flex-col items-center gap-2 py-3 text-blue-200 hover:bg-slate-700/40"
+                  >
+                    <History className="w-4 h-4" />
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </aside>
+              ) : (
               <aside className="hidden md:flex w-56 lg:w-64 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
                 <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
                     <History className="w-3.5 h-3.5" /> Chats
                   </div>
-                  <button
-                    type="button"
-                    onClick={startNewChat}
-                    className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-[11px] text-blue-100 font-semibold"
-                  >
-                    <Plus className="w-3 h-3" /> New
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={startNewChat}
+                      className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-[11px] text-blue-100 font-semibold"
+                    >
+                      <Plus className="w-3 h-3" /> New
+                    </button>
+                    <button
+                      type="button"
+                      title="Collapse chat history"
+                      onClick={toggleChatHistoryCollapsed}
+                      className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
+                    >
+                      <ChevronDown className="w-3.5 h-3.5 -rotate-90" />
+                    </button>
+                  </div>
                 </div>
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1">
-                  {chatSessions.filter((c) => chatHasUserContent(c.messages)).length === 0 && (
+                  {recentChats(chatSessions).length === 0 && (
                     <div className="text-[11px] text-blue-300/50 px-2 py-3">No saved chats yet. Start a conversation and it will appear here.</div>
                   )}
-                  {chatSessions.filter((c) => chatHasUserContent(c.messages)).map((chat) => (
+                  {recentChats(chatSessions).map((chat) => {
+                    const mod = chatModuleMeta(chat);
+                    return (
                     <div
                       key={chat.id}
                       className={`group flex items-start gap-1 rounded-lg border ${chat.id === activeChatId ? 'bg-blue-500/20 border-blue-400/40' : 'border-transparent hover:bg-slate-700/40 hover:border-blue-400/20'}`}
@@ -5408,6 +5486,7 @@ ${stepInstruction}`;
                         onClick={() => continueChat(chat.id)}
                         className="flex-1 min-w-0 text-left px-2.5 py-2"
                       >
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/80">{mod.label}</div>
                         <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
                         <div className="text-[10px] text-blue-300/55 mt-0.5">
                           {formatChatTime(chat.updatedAt)}
@@ -5423,9 +5502,11 @@ ${stepInstruction}`;
                         <Trash2 className="w-3 h-3" />
                       </button>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </aside>
+              )}
               <div className="flex flex-col h-full min-w-0 flex-1">
               {/* Quick Actions */}
               <div className="flex flex-wrap gap-2 mb-3 flex-shrink-0">
