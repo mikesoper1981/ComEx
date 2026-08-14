@@ -36,6 +36,8 @@ import {
   detectContextFileKind,
   extractSpreadsheetText,
   mergeModuleContext,
+  mergeModuleContextPreferRich,
+  moduleContextContentScore,
   serializeModuleContextForPersist,
   upsertModuleContextFile,
   patchModuleContextFile,
@@ -304,34 +306,58 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
 }
 
 async function uploadUserSettingsJson(user, doc) {
+  const path = userSettingsRemotePath(user);
   const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
-  const { error } = await supabase.storage
-    .from('intelligence')
-    .upload(userSettingsRemotePath(user), blob, { upsert: true, contentType: 'application/json' });
-  if (error) throw error;
+  const opts = { upsert: true, contentType: 'application/json', cacheControl: '0' };
+  const { error } = await supabase.storage.from('intelligence').upload(path, blob, opts);
+  if (!error) return;
+  const { error: updateError } = await supabase.storage.from('intelligence').update(path, blob, opts);
+  if (updateError) throw updateError;
 }
 
 const userSettingsUploadSlots = new Map();
 
-/** Last-write-wins cloud save so a slower chat autosave cannot wipe a newer context upload. */
-function queueUserSettingsUpload(user, doc) {
-  const key = String(user?.id || userStorageFolder(user));
+function userSettingsUploadSlotKey(user) {
+  return String(user?.id || userStorageFolder(user));
+}
+
+function lastUserSettingsUploadError(user) {
+  return userSettingsUploadSlots.get(userSettingsUploadSlotKey(user))?.lastError || '';
+}
+
+/**
+ * Single-flight flush. The payload is built when the write runs so a chat
+ * autosave cannot overwrite a newer context extract with a stale snapshot.
+ */
+function queueUserSettingsUpload(user, docOrBuilder) {
+  const key = userSettingsUploadSlotKey(user);
   let slot = userSettingsUploadSlots.get(key);
   if (!slot) {
-    slot = { pending: null, chain: Promise.resolve() };
+    slot = { builder: null, lastError: '', chain: Promise.resolve() };
     userSettingsUploadSlots.set(key, slot);
   }
-  slot.pending = doc;
+  slot.builder = typeof docOrBuilder === 'function' ? docOrBuilder : () => docOrBuilder;
   slot.chain = slot.chain.then(async () => {
     let ok = true;
-    while (slot.pending) {
-      const toWrite = slot.pending;
-      slot.pending = null;
+    slot.lastError = '';
+    while (slot.builder) {
+      const build = slot.builder;
+      slot.builder = null;
+      let toWrite;
       try {
-        await uploadUserSettingsJson(user, toWrite);
+        toWrite = build();
       } catch (err) {
         ok = false;
-        console.warn(`Could not save ${userSettingsRemotePath(user)}:`, err?.message || err);
+        slot.lastError = err?.message || String(err);
+        continue;
+      }
+      try {
+        await uploadUserSettingsJson(user, toWrite);
+        slot.lastError = '';
+      } catch (err) {
+        ok = false;
+        slot.lastError = err?.message || String(err);
+        console.warn(`Could not save ${userSettingsRemotePath(user)}:`, slot.lastError);
       }
     }
     return ok;
@@ -2164,6 +2190,7 @@ export default function CommercialExcellenceApp() {
   const [userSettings, setUserSettings] = useState(() => readLocalUserSettings(getCurrentUser().id));
   const [productIntel, setProductIntel] = useState(() => readLocalProductIntelligence());
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
+  const [userSettingsCloudError, setUserSettingsCloudError] = useState('');
   const [userSettingsPane, setUserSettingsPane] = useState('general'); // general | incentives | stella
   const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
   const [pptxTemplateError, setPptxTemplateError] = useState('');
@@ -2453,9 +2480,16 @@ export default function CommercialExcellenceApp() {
           } catch { /* try next path */ }
         }
         if (parsed && typeof parsed === 'object') {
-          const merged = normalizeLoadedUserSettings(parsed);
+          const remoteSettings = normalizeLoadedUserSettings(parsed);
+          const localSettings = mergeUserSettingsFields(userSettingsRef.current);
+          const merged = {
+            ...localSettings,
+            ...remoteSettings,
+            moduleContext: mergeModuleContextPreferRich(localSettings.moduleContext, remoteSettings.moduleContext),
+          };
           const { chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(parsed);
           setUserSettings(merged);
+          userSettingsRef.current = merged;
           if (remoteChats.length) {
             skipChatPersistRef.current = true;
             setChatSessions(remoteChats);
@@ -2476,24 +2510,42 @@ export default function CommercialExcellenceApp() {
               userName: currentUser.name,
             });
             localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(cleaned));
-            await queueUserSettingsUpload(currentUser, cleaned);
+            // Push local extracts if this browser already has context the cloud file lacks.
+            if (moduleContextContentScore(localSettings.moduleContext) > moduleContextContentScore(remoteSettings.moduleContext)) {
+              const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+                currentUser.id,
+                mergeUserSettingsFields(userSettingsRef.current),
+                {
+                  chats: chatSessionsRef.current,
+                  activeChatId: activeChatIdRef.current,
+                  userName: currentUser.name,
+                },
+              ));
+              setUserSettingsCloudError(ok ? '' : lastUserSettingsUploadError(currentUser));
+              setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
+              setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
+            }
           } catch { /* ignore */ }
         } else {
-          // First visit for this user — create users/<id>/settings.json so context is not browser-only.
+          // First visit — keep browser settings. Do not seed an empty cloud file
+          // (that empty object later wins upserts and wipes extracts).
           const localMerged = mergeUserSettingsFields(userSettingsRef.current);
-          const localDoc = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
-          const { chats: localChats, activeChatId: localActive } = extractChatsFromDocument(localDoc);
-          const seeded = buildUserSettingsDocument(currentUser.id, localMerged, {
-            chats: localChats.length ? localChats : (chatSessionsRef.current || []),
-            activeChatId: localActive || activeChatIdRef.current,
-            userName: currentUser.name,
-          });
-          try {
-            localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(seeded));
-          } catch { /* ignore */ }
-          const ok = await queueUserSettingsUpload(currentUser, seeded);
-          setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
-          setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
+          if (moduleContextContentScore(localMerged.moduleContext) > 0) {
+            const localDoc = safeJsonParse(localStorage.getItem(userSettingsLocalKey(currentUser.id)));
+            const { chats: localChats, activeChatId: localActive } = extractChatsFromDocument(localDoc);
+            const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+              currentUser.id,
+              mergeUserSettingsFields(userSettingsRef.current),
+              {
+                chats: localChats.length ? localChats : (chatSessionsRef.current || []),
+                activeChatId: localActive || activeChatIdRef.current,
+                userName: currentUser.name,
+              },
+            ));
+            setUserSettingsCloudError(ok ? '' : lastUserSettingsUploadError(currentUser));
+            setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
+            setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
+          }
         }
       } catch { /* per-user settings may not exist yet */ }
     };
@@ -2556,7 +2608,15 @@ export default function CommercialExcellenceApp() {
         localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
       } catch { /* ignore */ }
       try {
-        await queueUserSettingsUpload(currentUser, doc);
+        await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+          currentUser.id,
+          mergeUserSettingsFields(userSettingsRef.current),
+          {
+            chats: chatSessionsRef.current,
+            activeChatId: activeChatIdRef.current,
+            userName: currentUser.name,
+          },
+        ));
       } catch { /* local is enough */ }
     }, 1200);
     return () => clearTimeout(persistChatsTimerRef.current);
@@ -3051,11 +3111,21 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* private mode / quota — continue to cloud */ }
     try {
-      const ok = await queueUserSettingsUpload(currentUser, doc);
+      const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+        currentUser.id,
+        mergeUserSettingsFields(userSettingsRef.current),
+        {
+          chats: chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats,
+          activeChatId: activeChatIdRef.current || liveSnap.id,
+          userName: currentUser.name,
+        },
+      ));
+      setUserSettingsCloudError(ok ? '' : lastUserSettingsUploadError(currentUser));
       setUserSettingsSaveStatus(ok ? 'saved' : 'saved-local');
       setTimeout(() => setUserSettingsSaveStatus('idle'), ok ? 3000 : 6000);
     } catch (err) {
       console.warn('User settings cloud save failed:', err?.message || err);
+      setUserSettingsCloudError(err?.message || String(err));
       setUserSettingsSaveStatus('saved-local');
       setTimeout(() => setUserSettingsSaveStatus('idle'), 6000);
     }
@@ -3072,7 +3142,15 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* ignore */ }
     try {
-      await queueUserSettingsUpload(currentUser, doc);
+      await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+        currentUser.id,
+        mergeUserSettingsFields(userSettingsRef.current),
+        {
+          chats: list,
+          activeChatId: activeId,
+          userName: currentUser.name,
+        },
+      ));
     } catch { /* local is enough */ }
   };
 
@@ -4526,8 +4604,13 @@ ${stepInstruction}`;
         <p className="text-[11px] text-blue-300/45 mb-4">
           Saved for this user in Supabase Storage <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.
           {' '}Extract and notes only — the original file is not kept.
+          {userSettingsSaveStatus === 'saved' && (
+            <span className="block mt-1 text-emerald-300/80">Cloud copy updated.</span>
+          )}
           {userSettingsSaveStatus === 'saved-local' && (
-            <span className="block mt-1 text-amber-300/90">Cloud sync unavailable — this copy is in the browser only until Supabase accepts the upload.</span>
+            <span className="block mt-1 text-amber-300/90">
+              Cloud sync unavailable{userSettingsCloudError ? `: ${userSettingsCloudError}` : ''} — this copy is in the browser only until Supabase accepts the upload.
+            </span>
           )}
         </p>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">

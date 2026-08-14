@@ -200,6 +200,44 @@ export function mergeModuleContext(raw) {
   return out;
 }
 
+export function contextFileContentScore(fileRec) {
+  const rec = normalizeContextFile(fileRec);
+  if (!rec) return 0;
+  let n = 0;
+  n += (rec.extractedText || '').length;
+  n += (rec.visionExtract || '').length;
+  n += (rec.structuredExtract || '').length;
+  n += (rec.summary || '').length;
+  n += (rec.notes || []).reduce((s, note) => s + String(note?.text || '').length, 0);
+  if (rec.capturedContext) n += JSON.stringify(rec.capturedContext).length;
+  return n;
+}
+
+export function moduleContextContentScore(raw) {
+  const merged = mergeModuleContext(raw);
+  let n = 0;
+  for (const id of MODULE_CONTEXT_IDS) {
+    for (const f of merged[id].files || []) n += contextFileContentScore(f);
+  }
+  return n;
+}
+
+/** Keep the richer extract/notes when the same file id exists on both sides. */
+export function mergeModuleContextPreferRich(a, b) {
+  const left = mergeModuleContext(a);
+  const right = mergeModuleContext(b);
+  const out = {};
+  for (const id of MODULE_CONTEXT_IDS) {
+    const byId = new Map();
+    for (const f of [...(left[id].files || []), ...(right[id].files || [])]) {
+      const prev = byId.get(f.id);
+      if (!prev || contextFileContentScore(f) >= contextFileContentScore(prev)) byId.set(f.id, f);
+    }
+    out[id] = { files: [...byId.values()] };
+  }
+  return out;
+}
+
 /** Disk shape: detected file content + curated blocks. Never intake chat. */
 export function serializeContextFileForPersist(fileRec) {
   const rec = normalizeContextFile(fileRec);
