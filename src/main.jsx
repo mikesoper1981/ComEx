@@ -1,9 +1,8 @@
-import { Component, StrictMode, Suspense, lazy } from 'react'
+import { Component, StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
+import App from './App.jsx'
 import PasswordGate from './PasswordGate.jsx'
-
-const App = lazy(() => import('./App.jsx'))
 
 class RootErrorBoundary extends Component {
   constructor(props) {
@@ -35,9 +34,7 @@ createRoot(document.getElementById('root')).render(
   <StrictMode>
     <RootErrorBoundary>
       <PasswordGate>
-        <Suspense fallback={<div style={{ minHeight: '100vh', background: '#0f172a' }} />}>
-          <App />
-        </Suspense>
+        <App />
       </PasswordGate>
     </RootErrorBoundary>
   </StrictMode>,

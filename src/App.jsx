@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
+import { Component, useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map, MapPin, Layers, UserCog, History, LogOut } from 'lucide-react';
 import { supabase } from './supabase';
 import {
@@ -2033,7 +2033,7 @@ const MOCK_PERFORMANCE = {
 };
 
 // Prevents a single bad message/chart render from blanking the whole app.
-class MessageErrorBoundary extends React.Component {
+class MessageErrorBoundary extends Component {
   constructor(props) {
     super(props);
     this.state = { hasError: false };
