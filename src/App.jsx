@@ -2164,6 +2164,7 @@ export default function CommercialExcellenceApp() {
   const currentWorkflowRef = useRef(currentWorkflow);
   const pendingWorkflowRef = useRef(pendingWorkflow);
   const uploadedFileRef = useRef(uploadedFile);
+  const userSettingsRef = useRef(userSettings);
   const persistChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
@@ -2468,6 +2469,7 @@ export default function CommercialExcellenceApp() {
     currentWorkflowRef.current = currentWorkflow;
     pendingWorkflowRef.current = pendingWorkflow;
     uploadedFileRef.current = uploadedFile;
+    userSettingsRef.current = userSettings;
     activeChatIdRef.current = activeChatId;
     chatSessionsRef.current = chatSessions;
   });
@@ -2504,13 +2506,13 @@ export default function CommercialExcellenceApp() {
       const next = upsertChatInPlace(chatSessionsRef.current, snap);
       chatSessionsRef.current = next;
       setChatSessions(next);
-      const mergedSettings = mergeUserSettingsFields(userSettings);
+      const mergedSettings = mergeUserSettingsFields(userSettingsRef.current);
       const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, { chats: next, activeChatId: id });
       try {
         localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
       } catch { /* ignore */ }
       try {
-        const blob = new Blob([JSON.stringify(doc)], { type: 'application/json' });
+        const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
         await supabase.storage.from('intelligence').upload(
           userSettingsRemotePath(currentUser.id),
           blob,
@@ -3003,6 +3005,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       activeChatId: activeChatIdRef.current || liveSnap.id,
     });
     setUserSettings(settings);
+    userSettingsRef.current = settings;
     setUserSettingsSaveStatus('saving');
     try {
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
@@ -3022,7 +3025,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
   };
 
   const persistChatList = async (list, activeId) => {
-    const mergedSettings = mergeUserSettingsFields(userSettings);
+    const mergedSettings = mergeUserSettingsFields(userSettingsRef.current);
     const doc = buildUserSettingsDocument(currentUser.id, mergedSettings, {
       chats: list,
       activeChatId: activeId,
@@ -3031,7 +3034,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       localStorage.setItem(userSettingsLocalKey(currentUser.id), JSON.stringify(doc));
     } catch { /* ignore */ }
     try {
-      const blob = new Blob([JSON.stringify(doc)], { type: 'application/json' });
+      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
       await supabase.storage.from('intelligence').upload(
         userSettingsRemotePath(currentUser.id),
         blob,
