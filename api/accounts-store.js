@@ -40,6 +40,14 @@ function parseJsonSafe(text) {
   }
 }
 
+function isMissingStorageObject(status, parsed, text) {
+  if (Number(status) === 404) return true;
+  const code = parsed?.statusCode ?? parsed?.status;
+  if (String(code) === '404') return true;
+  if (String(parsed?.error || '').toLowerCase() === 'not_found') return true;
+  return /object not found/i.test(String(parsed?.message || text || ''));
+}
+
 function tokenSecret() {
   return envStr('AUTH_SECRET') || envStr('SUPABASE_SERVICE_KEY');
 }
@@ -168,12 +176,12 @@ async function downloadObject(path) {
   const url = `${supabaseUrl}/storage/v1/object/intelligence/${encodeObjectPath(path)}`;
   const upstream = await fetch(url, { headers: storageHeaders(serviceKey) });
   const text = await upstream.text();
-  if (upstream.status === 404) return null;
+  const parsed = parseJsonSafe(text);
+  if (isMissingStorageObject(upstream.status, parsed, text)) return null;
   if (!upstream.ok) {
-    const parsed = parseJsonSafe(text);
     throw new Error(parsed?.message || parsed?.error || text || 'Download failed');
   }
-  return parseJsonSafe(text);
+  return parsed;
 }
 
 async function uploadObject(path, doc) {
@@ -390,4 +398,5 @@ module.exports = {
   verifyToken,
   usageForUser,
   deleteUserFolder,
+  isMissingStorageObject,
 };

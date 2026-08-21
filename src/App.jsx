@@ -478,7 +478,9 @@ async function downloadUserJsonDocument(user, file = 'settings.json') {
       return null;
     } else {
       const data = await res.json().catch(() => ({}));
-      throw new Error(data?.error?.message || `Could not load ${file} (${res.status})`);
+      const message = data?.error?.message || `Could not load ${file} (${res.status})`;
+      if (/object not found/i.test(message)) return null;
+      throw new Error(message);
     }
   } catch (err) {
     if (err?.message && /Could not load /i.test(err.message)) throw err;

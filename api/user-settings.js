@@ -9,7 +9,7 @@
  *   SUPABASE_SERVICE_KEY
  */
 
-const { loadAccounts, findAccount, storageFolder } = require('./accounts-store');
+const { loadAccounts, findAccount, storageFolder, isMissingStorageObject } = require('./accounts-store');
 
 function allowedUserFile(raw) {
   const name = String(raw || 'settings.json').trim().toLowerCase();
@@ -95,16 +95,15 @@ module.exports = async function handler(req, res) {
     if (req.method === 'GET') {
       const url = `${supabaseUrl}/storage/v1/object/intelligence/${encodeObjectPath(writePath)}`;
       const upstream = await fetch(url, { headers: storageHeaders(serviceKey) });
-      if (upstream.status === 404) {
+      const text = await upstream.text();
+      const parsed = parseJsonSafe(text);
+      if (isMissingStorageObject(upstream.status, parsed, text)) {
         return res.status(404).json({ error: { message: `${file} not found` }, path: writePath });
       }
-      const text = await upstream.text();
       if (!upstream.ok) {
-        const parsed = parseJsonSafe(text);
         const message = parsed?.message || parsed?.error || text || 'Download failed';
         return res.status(upstream.status).json({ error: { message } });
       }
-      const parsed = parseJsonSafe(text);
       if (parsed && typeof parsed === 'object') {
         return res.status(200).json({ path: writePath, document: parsed });
       }
