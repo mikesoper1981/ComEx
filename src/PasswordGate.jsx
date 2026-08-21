@@ -50,7 +50,7 @@ export default function PasswordGate({ children }) {
           Choose who you are, then enter that account password.
         </p>
         <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="grid grid-cols-2 gap-2">
+          <div className={`grid gap-2 ${HARDCODED_USERS.length >= 3 ? 'grid-cols-3' : 'grid-cols-2'}`}>
             {HARDCODED_USERS.map((u) => {
               const active = u.id === selected?.id;
               const Icon = u.role === 'admin' ? Shield : User;

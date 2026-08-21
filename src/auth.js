@@ -26,6 +26,12 @@ export const HARDCODED_USERS = [
     role: 'user',
     password: envStr('VITE_APP_USER2_PASSWORD', envStr('VITE_APP_PASSWORD', '')),
   },
+  {
+    id: envStr('VITE_APP_USER3_ID', 'oscar'),
+    name: envStr('VITE_APP_USER3_NAME', 'Oscar'),
+    role: 'user',
+    password: envStr('VITE_APP_USER2_PASSWORD', envStr('VITE_APP_PASSWORD', '')),
+  },
 ];
 
 export function getHardcodedUser() {

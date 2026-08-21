@@ -18,6 +18,7 @@ function listedUsers() {
   return [
     { id: envStr('VITE_APP_USER_ID', 'default'), name: envStr('VITE_APP_USER_NAME', 'Admin') },
     { id: envStr('VITE_APP_USER2_ID', 'consultant'), name: envStr('VITE_APP_USER2_NAME', 'Standard User') },
+    { id: envStr('VITE_APP_USER3_ID', 'oscar'), name: envStr('VITE_APP_USER3_NAME', 'Oscar') },
   ];
 }
 

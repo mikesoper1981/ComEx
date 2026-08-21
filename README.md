@@ -16,6 +16,8 @@ Set these in your local `.env` and in your Vercel project settings:
 | `VITE_APP_USER2_ID` | Browser | Second (non-admin) user id (default `consultant`) |
 | `VITE_APP_USER2_NAME` | Browser | Second user display name (default `Standard User`). This name is also the Supabase folder: `intelligence/users/<name>/settings.json` |
 | `VITE_APP_USER2_PASSWORD` | Browser | Password for the second user (falls back to `VITE_APP_PASSWORD`) |
+| `VITE_APP_USER3_ID` | Browser | Third (non-admin) user id (default `oscar`) |
+| `VITE_APP_USER3_NAME` | Browser | Third user display name (default `Oscar`). Storage folder: `intelligence/users/Oscar/settings.json` |
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |
 | `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used for Stella Insights queries and to read/write each user's `intelligence/users/<name>/settings.json`. |
