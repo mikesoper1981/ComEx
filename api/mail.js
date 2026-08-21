@@ -245,22 +245,12 @@ async function sendViaResend({ to, from, subject, html }) {
 async function sendEmail({ to, subject, html }) {
   if (!to) throw new Error('No email address');
   const from = fromAddress();
-  if (envStr('MS_CLIENT_ID') && envStr('MS_REFRESH_TOKEN')) {
-    await sendViaGraph({ to, subject, html });
-    return;
-  }
-  if (!from) throw new Error('EMAIL_FROM or SMTP_USER is not configured');
-  const smtpUser = envStr('SMTP_USER');
-  const smtpPass = envStr('SMTP_PASS');
-  if (smtpUser && smtpPass) {
-    await sendViaSmtp({ to, from, subject, html });
-    return;
-  }
   if (envStr('RESEND_API_KEY')) {
+    if (!from) throw new Error('EMAIL_FROM is not configured');
     await sendViaResend({ to, from, subject, html });
     return;
   }
-  throw new Error('Email is not configured. For Hotmail set MS_CLIENT_ID and MS_REFRESH_TOKEN (see README).');
+  throw new Error('Email is not configured. Set RESEND_API_KEY and EMAIL_FROM in Vercel.');
 }
 
 module.exports = {
