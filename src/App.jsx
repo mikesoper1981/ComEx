@@ -229,37 +229,70 @@ const RESPONSE_LENGTH_MIN = 1;
 const RESPONSE_LENGTH_MAX = 5;
 const DEFAULT_RESPONSE_LENGTH = 3;
 
-/** Length of chat/agent replies (not how many facts to include). 1 = executive, 5 = teaching. */
+/** Length/mode of chat/agent replies. Each stop is a different kind of reply, not a small length tweak. */
 const RESPONSE_LENGTH_LEVELS = [
   {
     value: 1,
     label: 'Executive',
-    hint: 'Short and snappy — still a complete, clear answer.',
-    instruction: 'Write like a briefing for a busy director. Still give a complete, clear answer — never omit a needed fact, number, question, or recommendation to save words. Keep it short: lead with the point, use short sentences and tight bullets, no preamble, no recap of the question, no teaching asides, no worked examples unless the answer cannot be understood without one. Stop as soon as the answer is clear.',
+    hint: 'Decide now. Verdict, then a few bullets — no how, no why.',
+    instruction: `MODE: board briefing for an expert.
+HARD TARGET: 80–150 words (tables may run a little longer).
+SHAPE (use exactly this, nothing else):
+1) Verdict — one sentence.
+2) At most 5 short bullets of the decision points / numbers.
+Then stop.
+MUST NOT: how-to steps, rationale, examples, trade-offs, definitions, impact, or a second paragraph of explanation.`,
   },
   {
     value: 2,
     label: 'Brief',
-    hint: 'Compact and direct, with little setup.',
-    instruction: 'Keep replies compact and direct. One short paragraph or a tight bullet list per point. Minimal setup. Skip extra “why” unless it is required to act on the answer.',
+    hint: 'Act now. What to do, how to do it, one watch-out — no rationale.',
+    instruction: `MODE: action note for someone who already knows the job and just needs the move.
+HARD TARGET: 150–250 words. Must read clearly longer than Executive and clearly shorter than Standard.
+SHAPE (use exactly this):
+1) Verdict — one or two sentences.
+2) Do this — a short numbered list of actions (how, not why).
+3) Watch-out — one sentence only.
+MUST NOT: a Because / Why section, a worked example, a trade-off discussion, definitions, or “why this matters / impact if you get it wrong”. Those belong to later levels.`,
   },
   {
     value: 3,
     label: 'Standard',
-    hint: 'Clear professional length — useful context, no lecture.',
-    instruction: 'Use a clear professional length. Give enough context to be useful. Do not lecture, and do not pad with recap or filler.',
+    hint: 'Working recommendation. What, how, and a short because — no example yet.',
+    instruction: `MODE: working note to a peer in the same role. They know the job; they want a usable recommendation.
+HARD TARGET: 250–400 words. Must read clearly longer than Brief and clearly shorter than Expanded.
+SHAPE (use exactly this):
+1) Verdict.
+2) How to apply it — the working steps or design.
+3) Because — one short paragraph total (not a lesson, not per-point essays) so they can defend the choice.
+MUST NOT: a worked example, a trade-off section, onboarding, term definitions, or “impact if you get this wrong”. Example + trade-off = Expanded. Why-it-matters + impact = Teaching.`,
   },
   {
     value: 4,
     label: 'Expanded',
-    hint: 'More room to explain, with brief rationale.',
-    instruction: 'Write a fuller reply. Include brief rationale and a short example where it helps the user apply the answer. Stay structured and scannable.',
+    hint: 'Design review. What, because, one example, and the trade-off — still not a beginner class.',
+    instruction: `MODE: design review with an experienced colleague who wants the thinking, not a class.
+HARD TARGET: 400–650 words. Must read clearly longer than Standard and clearly less tutorial than Teaching.
+SHAPE (use exactly this):
+1) Verdict.
+2) Recommendation with a short “because” under each major point (the design logic, not role onboarding).
+3) One worked example in this context.
+4) Trade-off — the main alternative and why you are not picking it.
+MUST NOT: write as if they are new to the role. Do not define basic job terms. Do not add “why this matters in your job”, business-impact-if-you-get-it-wrong, or common-new-hire-mistake sections — that is Teaching only.`,
   },
   {
     value: 5,
     label: 'Teaching',
-    hint: 'Walk through the thinking — explain and teach.',
-    instruction: 'Explain as you would to a capable colleague learning the topic. Walk through the reasoning, define terms, show examples, and say why a recommendation holds. Keep it structured and scannable — longer, not rambling.',
+    hint: 'New to the role: what it is, why it matters, and the impact if you get it wrong.',
+    instruction: `MODE: lesson for someone new to this role. Teach; do not stay at Expanded length.
+HARD TARGET: 650–1100 words, or as long as the lesson needs.
+For every important recommendation or concept, cover ALL of:
+1) What it is — plain language; define terms the first time they appear.
+2) Why it matters in this role — what job it does for the business, the field force, or governance.
+3) Impact — what goes well if you get it right, and what breaks (cost, fairness, compliance, sales behaviour, IC credibility) if you get it wrong or skip it.
+4) How to apply it — a concrete example in this context.
+5) A common mistake someone new to the role makes, and what to do instead.
+Structure with short headings so it is a lesson they can scan. Never assume they already know why a rule exists.`,
   },
 ];
 
@@ -276,8 +309,10 @@ function getResponseLengthLevel(settings) {
 
 function formatResponseLengthPrompt(settings) {
   const level = getResponseLengthLevel(settings);
-  return `RESPONSE LENGTH (mandatory for chat and agent replies the user reads, including Stella):
-This setting controls HOW LONG you write — not whether you skip facts, questions, numbers, or recommendations. The shortest setting is still a complete, clear explanation; it is just short and snappy. The longest setting explains and teaches.
+  return `RESPONSE LENGTH — MATCH THIS LEVEL STRICTLY (chat and agent replies the user reads, including Stella).
+The five levels are different kinds of reply, not small length tweaks. Do not collapse 2–4 into a generic mid-length answer.
+1 Executive = verdict + bullets. 2 Brief = what/how + one watch-out (no because). 3 Standard = what/how + a short because (no example). 4 Expanded = because + example + trade-off (not a beginner class). 5 Teaching = new to the role: why it matters + impact.
+Never omit a needed fact, number, question, or recommendation to hit a word target — cut explanation, not substance.
 
 Current setting: ${level.value} of ${RESPONSE_LENGTH_MAX} — ${level.label}.
 ${level.instruction}
@@ -285,12 +320,12 @@ ${level.instruction}
 Do not apply this to exported PowerPoint/document content, structured JSON, classification, extraction, or schema-only tasks; those must follow their specified format and stay compact.`;
 }
 
-/** Scale a user-facing token budget with the length slider (1 ≈ 55% of base, 5 ≈ 140%). */
+/** Scale a user-facing token budget with the length slider (1 ≈ 40% of base, 5 ≈ 175%). */
 function scaleUserFacingMaxTokens(base, settings) {
   const n = normalizeResponseLength(settings?.responseLength);
   const t = (n - 1) / (RESPONSE_LENGTH_MAX - 1);
-  const factor = 0.55 + t * 0.85;
-  return Math.max(600, Math.min(8192, Math.round(Number(base) * factor)));
+  const factor = 0.4 + t * 1.35;
+  return Math.max(700, Math.min(8192, Math.round(Number(base) * factor)));
 }
 
 const DEFAULT_USER_SETTINGS = {
@@ -7529,7 +7564,7 @@ ${stepInstruction}`;
                             <div>
                               <label htmlFor="response-length" className="block text-sm font-semibold text-white">Response length</label>
                               <p className="text-xs text-blue-300/60 mt-1">
-                                How long chat and agent replies are. This is length, not how much substance to include — the shortest setting is still a complete, clear explanation.
+                                How chat and agent replies are written. Executive = decide. Brief = act. Standard = recommend. Expanded = design review. Teaching = lesson for someone new to the role (why it matters and the impact).
                               </p>
                             </div>
                             <div className="text-right shrink-0">
