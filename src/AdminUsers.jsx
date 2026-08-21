@@ -274,7 +274,7 @@ export default function AdminUsers({ currentUserId }) {
                 <th className="pb-2 pr-3 font-semibold">Role</th>
                 <th className="pb-2 pr-3 font-semibold">Last login</th>
                 <th className="pb-2 pr-3 font-semibold text-right">Chats (7d)</th>
-                <th className="pb-2 pr-3 font-semibold text-right">New convos (7d)</th>
+                <th className="pb-2 pr-3 font-semibold text-right">Conversations (7d)</th>
                 <th className="pb-2 font-semibold text-right">Actions</th>
               </tr>
             </thead>
@@ -340,7 +340,7 @@ export default function AdminUsers({ currentUserId }) {
           </table>
         </div>
         <p className="text-[11px] text-blue-300/40 mt-3">
-          Chats (7d) counts messages in the last 7 days. New convos (7d) counts conversations started in that window, regardless of how many messages they contain.
+          Chats (7d) counts questions the user asked in the last 7 days. Conversations (7d) counts distinct threads that had at least one of those questions.
         </p>
       </div>
     </div>

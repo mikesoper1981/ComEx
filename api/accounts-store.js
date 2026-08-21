@@ -345,12 +345,19 @@ function usageFromChatsDocument(doc) {
   let conversationsLast7Days = 0;
   for (const chat of chats) {
     const created = Date.parse(chat.createdAt || '') || createdAtFromChatId(chat.id);
-    if (created >= since) conversationsLast7Days += 1;
     const msgs = Array.isArray(chat.messages) ? chat.messages : [];
-    for (const m of msgs) {
-      if (!['user', 'assistant', 'orchestrator'].includes(m?.role)) continue;
-      const t = Date.parse(m.at || '') || Date.parse(chat.updatedAt || '') || created;
-      if (t >= since) messagesLast7Days += 1;
+    let questionsThisChat = 0;
+    msgs.forEach((m, i) => {
+      if (m?.role !== 'user') return;
+      const stamped = Date.parse(m.at || '');
+      const t = Number.isFinite(stamped)
+        ? stamped
+        : (i === msgs.length - 1 ? Date.parse(chat.updatedAt || '') : created);
+      if (Number.isFinite(t) && t >= since) questionsThisChat += 1;
+    });
+    if (questionsThisChat > 0) {
+      conversationsLast7Days += 1;
+      messagesLast7Days += questionsThisChat;
     }
   }
   return { messagesLast7Days, conversationsLast7Days };
