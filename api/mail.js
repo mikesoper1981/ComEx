@@ -123,7 +123,79 @@ function fromAddress() {
   return envStr('EMAIL_FROM') || envStr('SMTP_USER');
 }
 
+function smtpHost() {
+  return envStr('SMTP_HOST', 'smtp-mail.outlook.com').toLowerCase();
+}
+
+function isOutlookMailbox() {
+  const host = smtpHost();
+  const user = envStr('SMTP_USER').toLowerCase();
+  return /outlook\.com|hotmail\.com|live\.com|office365\.com|microsoft\.com/.test(host)
+    || /@(outlook|hotmail|live|msn)\./.test(user);
+}
+
+function graphTenant() {
+  return envStr('MS_TENANT', 'consumers');
+}
+
+async function graphAccessToken() {
+  const clientId = envStr('MS_CLIENT_ID');
+  const refreshToken = envStr('MS_REFRESH_TOKEN');
+  if (!clientId || !refreshToken) return '';
+  const body = new URLSearchParams({
+    client_id: clientId,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+    scope: 'https://graph.microsoft.com/Mail.Send offline_access',
+  });
+  const secret = envStr('MS_CLIENT_SECRET');
+  if (secret) body.set('client_secret', secret);
+  const upstream = await fetch(`https://login.microsoftonline.com/${graphTenant()}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  const text = await upstream.text();
+  let parsed = {};
+  try { parsed = JSON.parse(text); } catch { /* ignore */ }
+  if (!upstream.ok || !parsed.access_token) {
+    throw new Error(parsed.error_description || parsed.error || 'Could not refresh Microsoft Graph token');
+  }
+  return parsed.access_token;
+}
+
+async function sendViaGraph({ to, subject, html }) {
+  const token = await graphAccessToken();
+  const upstream = await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      message: {
+        subject,
+        body: { contentType: 'HTML', content: html },
+        toRecipients: [{ emailAddress: { address: to } }],
+      },
+      saveToSentItems: true,
+    }),
+  });
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    let message = text;
+    try {
+      const parsed = JSON.parse(text);
+      message = parsed?.error?.message || parsed?.error_description || text;
+    } catch { /* keep text */ }
+    throw new Error(String(message).slice(0, 400));
+  }
+}
+
 async function sendViaSmtp({ to, from, subject, html }) {
+  if (isOutlookMailbox()) {
+    throw new Error('Hotmail/Outlook has disabled password SMTP (error 535 5.7.139). Set MS_CLIENT_ID and MS_REFRESH_TOKEN, or use Gmail SMTP / Resend.');
+  }
   let nodemailer;
   try {
     nodemailer = require('nodemailer');
@@ -132,7 +204,7 @@ async function sendViaSmtp({ to, from, subject, html }) {
   }
   const user = envStr('SMTP_USER');
   const pass = envStr('SMTP_PASS');
-  const host = envStr('SMTP_HOST', 'smtp-mail.outlook.com');
+  const host = smtpHost();
   const port = Number(envStr('SMTP_PORT', '587')) || 587;
   const transporter = nodemailer.createTransport({
     host,
@@ -173,6 +245,10 @@ async function sendViaResend({ to, from, subject, html }) {
 async function sendEmail({ to, subject, html }) {
   if (!to) throw new Error('No email address');
   const from = fromAddress();
+  if (envStr('MS_CLIENT_ID') && envStr('MS_REFRESH_TOKEN')) {
+    await sendViaGraph({ to, subject, html });
+    return;
+  }
   if (!from) throw new Error('EMAIL_FROM or SMTP_USER is not configured');
   const smtpUser = envStr('SMTP_USER');
   const smtpPass = envStr('SMTP_PASS');
@@ -184,7 +260,7 @@ async function sendEmail({ to, subject, html }) {
     await sendViaResend({ to, from, subject, html });
     return;
   }
-  throw new Error('Email is not configured. Set SMTP_USER and SMTP_PASS for Hotmail, or RESEND_API_KEY.');
+  throw new Error('Email is not configured. For Hotmail set MS_CLIENT_ID and MS_REFRESH_TOKEN (see README).');
 }
 
 module.exports = {
