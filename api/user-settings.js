@@ -9,37 +9,7 @@
  *   SUPABASE_SERVICE_KEY
  */
 
-function envStr(key, fallback) {
-  const v = String(process.env[key] || '').trim();
-  return v || fallback;
-}
-
-function listedUsers() {
-  return [
-    { id: envStr('VITE_APP_USER_ID', 'default'), name: envStr('VITE_APP_USER_NAME', 'Admin') },
-    { id: envStr('VITE_APP_USER2_ID', 'consultant'), name: envStr('VITE_APP_USER2_NAME', 'Standard User') },
-    { id: envStr('VITE_APP_USER3_ID', 'oscar'), name: envStr('VITE_APP_USER3_NAME', 'Oscar') },
-  ];
-}
-
-function storageFolder(userOrName) {
-  const raw = userOrName && typeof userOrName === 'object'
-    ? (userOrName.name || userOrName.id)
-    : userOrName;
-  const folder = String(raw || '')
-    .replace(/[\\/:*?"<>|]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 80);
-  return folder || 'user';
-}
-
-function resolveUser(userId, userName) {
-  const listed = listedUsers();
-  return listed.find((u) => u.id === String(userId || ''))
-    || listed.find((u) => u.name === String(userName || ''))
-    || null;
-}
+const { loadAccounts, findAccount, storageFolder } = require('./accounts-store');
 
 function allowedUserFile(raw) {
   const name = String(raw || 'settings.json').trim().toLowerCase();
@@ -114,15 +84,14 @@ module.exports = async function handler(req, res) {
     return res.status(405).json({ error: { message: 'Method not allowed' } });
   }
 
-  const user = resolveUser(userId, userName);
-  if (!user) {
-    return res.status(400).json({ error: { message: 'Unknown user' } });
-  }
-  const folderUser = { id: user.id, name: String(userName || user.name) };
-
-  const writePath = objectPath(folderUser, file);
-
   try {
+    const accounts = await loadAccounts();
+    const user = findAccount(accounts, userId, userName);
+    if (!user) {
+      return res.status(400).json({ error: { message: 'Unknown user' } });
+    }
+    const folderUser = { id: user.id, name: String(userName || user.name) };
+    const writePath = objectPath(folderUser, file);
     if (req.method === 'GET') {
       const url = `${supabaseUrl}/storage/v1/object/intelligence/${encodeObjectPath(writePath)}`;
       const upstream = await fetch(url, { headers: storageHeaders(serviceKey) });

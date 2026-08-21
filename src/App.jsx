@@ -20,6 +20,7 @@ import {
 } from './auth';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
+import AdminUsers from './AdminUsers';
 import {
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_PPTX_CLARIFY,
@@ -607,6 +608,18 @@ function newChatId() {
   return `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createdAtFromChatId(id) {
+  const m = String(id || '').match(/^chat_([0-9a-z]+)_/i);
+  if (!m) return '';
+  const n = parseInt(m[1], 36);
+  if (!Number.isFinite(n) || n < 1e11) return '';
+  try {
+    return new Date(n).toISOString();
+  } catch {
+    return '';
+  }
+}
+
 function deriveChatTitle(messages) {
   const userMsg = (messages || []).find((m) => m.role === 'user' && String(m.content || '').trim());
   if (!userMsg) return 'New chat';
@@ -618,12 +631,14 @@ function chatHasUserContent(messages) {
   return (Array.isArray(messages) ? messages : []).some((m) => m.role === 'user' && String(m.content || '').trim());
 }
 
-function sanitizeMessageForStorage(m) {
+function sanitizeMessageForStorage(m, { stampNow = false } = {}) {
   if (!m || typeof m !== 'object') return null;
   const out = {
     role: m.role,
     content: String(m.content || '').slice(0, 20000),
   };
+  if (m.at) out.at = m.at;
+  else if (stampNow) out.at = new Date().toISOString();
   if (Array.isArray(m.imagePreviews) && m.imagePreviews.length) {
     out.imagePreviews = m.imagePreviews.slice(0, 24).map((img) => ({
       name: img.name,
@@ -638,12 +653,18 @@ function sanitizeMessageForStorage(m) {
   return out;
 }
 
-function serializeChatSnapshot({ id, title, updatedAt, messages, currentWorkflow, pendingWorkflow, uploadedFile, module }) {
-  const safeMessages = (messages || []).slice(-MAX_STORED_MESSAGES).map(sanitizeMessageForStorage).filter(Boolean);
+function serializeChatSnapshot({ id, title, updatedAt, createdAt, messages, currentWorkflow, pendingWorkflow, uploadedFile, module }) {
+  const cid = id || newChatId();
+  const now = new Date().toISOString();
+  const list = messages || [];
+  const safeMessages = list.slice(-MAX_STORED_MESSAGES).map((m, i, arr) => (
+    sanitizeMessageForStorage(m, { stampNow: i === arr.length - 1 && !m?.at })
+  )).filter(Boolean);
   return {
-    id: id || newChatId(),
+    id: cid,
     title: title && title !== 'New chat' ? title : deriveChatTitle(safeMessages),
-    updatedAt: updatedAt || new Date().toISOString(),
+    createdAt: createdAt || createdAtFromChatId(cid) || now,
+    updatedAt: updatedAt || now,
     module: module || inferChatModule({ currentWorkflow }),
     messages: safeMessages,
     currentWorkflow: currentWorkflow
@@ -2793,6 +2814,7 @@ export default function CommercialExcellenceApp() {
         pendingWorkflow: pendingWorkflowRef.current,
         uploadedFile: uploadedFileRef.current,
         module: existing?.module,
+        createdAt: existing?.createdAt,
         updatedAt: sameThread ? existing.updatedAt : undefined,
       });
       const next = upsertChatInPlace(chatSessionsRef.current, snap);
@@ -3318,6 +3340,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       pendingWorkflow: pendingWorkflowRef.current,
       uploadedFile: uploadedFileRef.current,
       module: (chatSessionsRef.current || []).find((c) => c.id === (activeChatIdRef.current))?.module,
+      createdAt: (chatSessionsRef.current || []).find((c) => c.id === (activeChatIdRef.current))?.createdAt,
     });
     const liveChats = chatHasUserContent(liveSnap.messages)
       ? upsertChatInPlace(chatSessionsRef.current, liveSnap)
@@ -3389,6 +3412,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       pendingWorkflow: pendingWorkflowRef.current,
       uploadedFile: uploadedFileRef.current,
       module: existing?.module,
+      createdAt: existing?.createdAt,
       updatedAt: preserveUpdatedAt ? existing?.updatedAt : undefined,
     });
     const next = chatHasUserContent(snap.messages)
@@ -7930,7 +7954,7 @@ ${stepInstruction}`;
             // ADMIN
             <div className="space-y-4 sm:space-y-6 overflow-y-auto h-full custom-scrollbar pr-1 sm:pr-2">
               <div className="flex gap-2 pb-1 overflow-x-auto">
-                {[{ id: 'incentive', label: 'Incentive Comp' }, { id: 'territory', label: 'Territory' }, { id: 'stella', label: 'Stella Insights' }].map(m => (
+                {[{ id: 'incentive', label: 'Incentive Comp' }, { id: 'territory', label: 'Territory' }, { id: 'stella', label: 'Stella Insights' }, { id: 'users', label: 'Users' }].map(m => (
                   <button key={m.id} onClick={() => setAdminModule(m.id)} className={`px-4 py-2 rounded-lg text-sm font-bold whitespace-nowrap transition-all ${adminModule === m.id ? 'bg-white/15 text-white border border-white/20' : 'bg-slate-800/40 text-blue-300/70 hover:bg-slate-700/50'}`}>{m.label}</button>
                 ))}
               </div>
@@ -8466,8 +8490,11 @@ ${stepInstruction}`;
                   )}
                 </div>
               )}
+
+              {adminModule === 'users' && (
+                <AdminUsers currentUserId={currentUser.id} />
+              )}
             </div>
-          ) : null}
           </MessageErrorBoundary>
         </div>
       )}

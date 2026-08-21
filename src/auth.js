@@ -1,36 +1,33 @@
 /**
- * Temporary hardcoded auth until real multi-user login exists.
- * PasswordGate validates per-user passwords; identity is what User Settings,
- * chat history, and later per-user data are keyed by.
+ * Session identity. Passwords are verified server-side (/api/users login)
+ * and never stored in the client bundle.
  */
 
 export const SESSION_UNLOCKED_KEY = 'comex_app_unlocked';
 export const SESSION_USER_KEY = 'comex_current_user';
+export const SESSION_TOKEN_KEY = 'comex_auth_token';
 
 function envStr(key, fallback) {
   const v = String(import.meta.env[key] ?? '').trim();
   return v || fallback;
 }
 
-/** Add more users here when you introduce real login. First user is admin. */
+/** Directory seed / admin fallback. Passwords are not included. */
 export const HARDCODED_USERS = [
   {
     id: envStr('VITE_APP_USER_ID', 'default'),
     name: envStr('VITE_APP_USER_NAME', 'Admin'),
     role: 'admin',
-    password: envStr('VITE_APP_PASSWORD', ''),
   },
   {
     id: envStr('VITE_APP_USER2_ID', 'consultant'),
     name: envStr('VITE_APP_USER2_NAME', 'Standard User'),
     role: 'user',
-    password: envStr('VITE_APP_USER2_PASSWORD', envStr('VITE_APP_PASSWORD', '')),
   },
   {
     id: envStr('VITE_APP_USER3_ID', 'oscar'),
     name: envStr('VITE_APP_USER3_NAME', 'Oscar'),
     role: 'user',
-    password: envStr('VITE_APP_USER2_PASSWORD', envStr('VITE_APP_PASSWORD', '')),
   },
 ];
 
@@ -55,11 +52,10 @@ export function isAdminUser(user) {
 
 function sanitizeUser(user) {
   const listed = findHardcodedUser(user?.id);
-  const fallback = HARDCODED_USERS[0] || {};
   return {
-    id: String(user?.id || listed?.id || fallback.id || 'default'),
-    name: String(listed?.name || user?.name || user?.id || 'User'),
-    role: listed?.role || (user?.role === 'admin' ? 'admin' : 'user'),
+    id: String(user?.id || listed?.id || 'default'),
+    name: String(user?.name || listed?.name || user?.id || 'User'),
+    role: user?.role === 'admin' || listed?.role === 'admin' ? 'admin' : 'user',
   };
 }
 
@@ -83,9 +79,26 @@ export function setCurrentUser(user) {
   return next;
 }
 
+export function setSessionToken(token) {
+  if (token) sessionStorage.setItem(SESSION_TOKEN_KEY, String(token));
+  else sessionStorage.removeItem(SESSION_TOKEN_KEY);
+}
+
+export function getSessionToken() {
+  return sessionStorage.getItem(SESSION_TOKEN_KEY) || '';
+}
+
+export function authHeaders(extra = {}) {
+  const token = getSessionToken();
+  return token
+    ? { ...extra, Authorization: `Bearer ${token}` }
+    : { ...extra };
+}
+
 export function clearCurrentUser() {
   sessionStorage.removeItem(SESSION_USER_KEY);
   sessionStorage.removeItem(SESSION_UNLOCKED_KEY);
+  sessionStorage.removeItem(SESSION_TOKEN_KEY);
 }
 
 export function userSettingsLocalKey(userId) {

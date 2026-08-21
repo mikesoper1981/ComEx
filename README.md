@@ -10,17 +10,23 @@ Set these in your local `.env` and in your Vercel project settings:
 | --- | --- | --- |
 | `VITE_SUPABASE_URL` | Browser | Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | Browser | Supabase anon key (used by `src/supabase.js`) |
-| `VITE_APP_PASSWORD` | Browser | Password for the admin user |
-| `VITE_APP_USER_ID` | Browser | Admin user id (default `default`) |
-| `VITE_APP_USER_NAME` | Browser | Admin display name (default `Admin`) |
-| `VITE_APP_USER2_ID` | Browser | Second (non-admin) user id (default `consultant`) |
-| `VITE_APP_USER2_NAME` | Browser | Second user display name (default `Standard User`). This name is also the Supabase folder: `intelligence/users/<name>/settings.json` and `chats.json` |
-| `VITE_APP_USER2_PASSWORD` | Browser | Password for the second user (falls back to `VITE_APP_PASSWORD`) |
-| `VITE_APP_USER3_ID` | Browser | Third (non-admin) user id (default `oscar`) |
-| `VITE_APP_USER3_NAME` | Browser | Third user display name (default `Oscar`). Storage folder: `intelligence/users/Oscar/settings.json` |
+| `VITE_APP_PASSWORD` | Server (seed) | Initial admin password, hashed into `intelligence/accounts.json` on first boot. Not used for login after that. |
+| `VITE_APP_USER_ID` | Browser / seed | Admin user id (default `default`) |
+| `VITE_APP_USER_NAME` | Browser / seed | Admin display name (default `Admin`) |
+| `VITE_APP_USER2_ID` | Seed | Second user id (default `consultant`) |
+| `VITE_APP_USER2_NAME` | Seed | Second user display name (default `Standard User`) |
+| `VITE_APP_USER2_PASSWORD` | Server (seed) | Initial password for seeded standard users (falls back to `VITE_APP_PASSWORD`) |
+| `VITE_APP_USER3_ID` | Seed | Third user id (default `oscar`) |
+| `VITE_APP_USER_EMAIL` | Seed | Optional email for the seeded admin (only used when `accounts.json` is first created). |
+| `VITE_APP_USER2_EMAIL` | Seed | Optional email for the seeded standard user. |
+| `VITE_APP_USER3_EMAIL` | Seed | Optional email for the seeded Oscar user. |
+| `AUTH_SECRET` | Server (`api/users.js`) | Optional HMAC secret for login tokens. Falls back to `SUPABASE_SERVICE_KEY`. |
+| `RESEND_API_KEY` | Server (`api/mail.js`) | [Resend](https://resend.com) API key for welcome and password-reset emails. |
+| `EMAIL_FROM` | Server (`api/mail.js`) | From address, e.g. `ComEx <noreply@yourdomain.com>`. Must be a verified Resend domain/sender. |
+| `APP_URL` | Server (`api/mail.js`) | Public login URL included in emails (falls back to the request origin). |
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |
-| `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used for Stella Insights queries and to read/write each user's `intelligence/users/<name>/settings.json` and `chats.json`. |
+| `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.js`, `api/user-settings.js`, `api/users.js`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used for Stella Insights, user JSON, and the account registry (`intelligence/accounts.json`) with hashed passwords. |
 
 ## Stella Insights setup
 
