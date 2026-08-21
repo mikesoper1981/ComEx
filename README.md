@@ -21,8 +21,12 @@ Set these in your local `.env` and in your Vercel project settings:
 | `VITE_APP_USER2_EMAIL` | Seed | Optional email for the seeded standard user. |
 | `VITE_APP_USER3_EMAIL` | Seed | Optional email for the seeded Oscar user. |
 | `AUTH_SECRET` | Server (`api/users.js`) | Optional HMAC secret for login tokens. Falls back to `SUPABASE_SERVICE_KEY`. |
-| `RESEND_API_KEY` | Server (`api/mail.js`) | [Resend](https://resend.com) API key for welcome and password-reset emails. |
-| `EMAIL_FROM` | Server (`api/mail.js`) | From address, e.g. `ComEx <noreply@yourdomain.com>`. Must be a verified Resend domain/sender. |
+| `SMTP_USER` | Server (`api/mail.js`) | Hotmail/Outlook address used to send welcome and reset emails, e.g. `you@hotmail.com`. |
+| `SMTP_PASS` | Server (`api/mail.js`) | Hotmail **app password** (not your normal login password). Create one at [account.microsoft.com/security](https://account.microsoft.com/security). |
+| `SMTP_HOST` | Server (`api/mail.js`) | Optional. Defaults to `smtp-mail.outlook.com`. |
+| `SMTP_PORT` | Server (`api/mail.js`) | Optional. Defaults to `587`. |
+| `EMAIL_FROM` | Server (`api/mail.js`) | From address. For Hotmail this should match `SMTP_USER`, e.g. `ComEx <you@hotmail.com>`. |
+| `RESEND_API_KEY` | Server (`api/mail.js`) | Optional. Used only if SMTP is not set. |
 | `APP_URL` | Server (`api/mail.js`) | Public login URL included in emails (falls back to the request origin). |
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |

@@ -1,5 +1,8 @@
 /**
- * Transactional email via Resend. Set RESEND_API_KEY and EMAIL_FROM.
+ * Transactional email via Hotmail/Outlook SMTP, or Resend if SMTP is not set.
+ *
+ * SMTP (Hotmail): SMTP_USER, SMTP_PASS, EMAIL_FROM (defaults to SMTP_USER)
+ * Resend:        RESEND_API_KEY, EMAIL_FROM
  */
 
 function envStr(key, fallback = '') {
@@ -116,12 +119,33 @@ function resetEmail({ name, username, password, loginUrl }) {
   };
 }
 
-async function sendEmail({ to, subject, html }) {
+function fromAddress() {
+  return envStr('EMAIL_FROM') || envStr('SMTP_USER');
+}
+
+async function sendViaSmtp({ to, from, subject, html }) {
+  let nodemailer;
+  try {
+    nodemailer = require('nodemailer');
+  } catch {
+    throw new Error('nodemailer is not installed');
+  }
+  const user = envStr('SMTP_USER');
+  const pass = envStr('SMTP_PASS');
+  const host = envStr('SMTP_HOST', 'smtp-mail.outlook.com');
+  const port = Number(envStr('SMTP_PORT', '587')) || 587;
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    requireTLS: port !== 465,
+    auth: { user, pass },
+  });
+  await transporter.sendMail({ from, to, subject, html });
+}
+
+async function sendViaResend({ to, from, subject, html }) {
   const apiKey = envStr('RESEND_API_KEY');
-  const from = envStr('EMAIL_FROM');
-  if (!apiKey) throw new Error('RESEND_API_KEY is not configured');
-  if (!from) throw new Error('EMAIL_FROM is not configured');
-  if (!to) throw new Error('No email address');
   const upstream = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -144,6 +168,23 @@ async function sendEmail({ to, subject, html }) {
     } catch { /* keep text */ }
     throw new Error(String(message).slice(0, 400));
   }
+}
+
+async function sendEmail({ to, subject, html }) {
+  if (!to) throw new Error('No email address');
+  const from = fromAddress();
+  if (!from) throw new Error('EMAIL_FROM or SMTP_USER is not configured');
+  const smtpUser = envStr('SMTP_USER');
+  const smtpPass = envStr('SMTP_PASS');
+  if (smtpUser && smtpPass) {
+    await sendViaSmtp({ to, from, subject, html });
+    return;
+  }
+  if (envStr('RESEND_API_KEY')) {
+    await sendViaResend({ to, from, subject, html });
+    return;
+  }
+  throw new Error('Email is not configured. Set SMTP_USER and SMTP_PASS for Hotmail, or RESEND_API_KEY.');
 }
 
 module.exports = {
