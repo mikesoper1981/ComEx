@@ -234,25 +234,26 @@ const RESPONSE_LENGTH_LEVELS = [
   {
     value: 1,
     label: 'Executive',
-    hint: 'Decide now. Verdict, then a few bullets — no how, no why.',
-    instruction: `MODE: board briefing for an expert.
-HARD TARGET: 80–150 words (tables may run a little longer).
+    hint: 'Decide now. Verdict, then a tight table or icon bullets — formatted, not a wall of text.',
+    instruction: `MODE: board briefing for an expert. Short, but still visually formatted — never a plain paragraph.
+HARD TARGET: 80–150 words of prose (tables do not count against this).
 SHAPE (use exactly this, nothing else):
-1) Verdict — one sentence.
-2) At most 5 short bullets of the decision points / numbers.
+1) Verdict — one bold sentence, with a status icon (✅ / ⚠️ / 🎯).
+2) Put numbers, options, thresholds, or component splits in a compact markdown table. If there are no numbers to tabulate, use at most 5 icon bullets instead.
 Then stop.
-MUST NOT: how-to steps, rationale, examples, trade-offs, definitions, impact, or a second paragraph of explanation.`,
+MUST: tables, icons, and **bold** on the decision and key figures. Clean and scannable.
+MUST NOT: how-to steps, rationale, examples, trade-offs, definitions, impact, or extra prose around the table.`,
   },
   {
     value: 2,
     label: 'Brief',
-    hint: 'Act now. What to do, how to do it, one watch-out — no rationale.',
+    hint: 'Act now. What to do, how to do it, one watch-out — formatted, no rationale.',
     instruction: `MODE: action note for someone who already knows the job and just needs the move.
 HARD TARGET: 150–250 words. Must read clearly longer than Executive and clearly shorter than Standard.
 SHAPE (use exactly this):
-1) Verdict — one or two sentences.
-2) Do this — a short numbered list of actions (how, not why).
-3) Watch-out — one sentence only.
+1) Verdict — one or two sentences, bold the decision, optional status icon.
+2) Do this — a short numbered or icon list of actions (how, not why). Use a compact table if the actions are options, weights, or numbers.
+3) Watch-out — one sentence only, with ⚠️.
 MUST NOT: a Because / Why section, a worked example, a trade-off discussion, definitions, or “why this matters / impact if you get it wrong”. Those belong to later levels.`,
   },
   {
@@ -311,7 +312,8 @@ function formatResponseLengthPrompt(settings) {
   const level = getResponseLengthLevel(settings);
   return `RESPONSE LENGTH — MATCH THIS LEVEL STRICTLY (chat and agent replies the user reads, including Stella).
 The five levels are different kinds of reply, not small length tweaks. Do not collapse 2–4 into a generic mid-length answer.
-1 Executive = verdict + bullets. 2 Brief = what/how + one watch-out (no because). 3 Standard = what/how + a short because (no example). 4 Expanded = because + example + trade-off (not a beginner class). 5 Teaching = new to the role: why it matters + impact.
+1 Executive = verdict + table/icon bullets. 2 Brief = what/how + one watch-out (no because). 3 Standard = what/how + a short because (no example). 4 Expanded = because + example + trade-off (not a beginner class). 5 Teaching = new to the role: why it matters + impact.
+RICH FORMAT AT EVERY LEVEL, including Executive: markdown tables for numbers/comparisons, emoji icons (✅ ⚠️ 🎯 📊) on key points, **bold** on the decision and figures. Short does not mean plain text — keep it scannable and clean, with no extra prose.
 Never omit a needed fact, number, question, or recommendation to hit a word target — cut explanation, not substance.
 
 Current setting: ${level.value} of ${RESPONSE_LENGTH_MAX} — ${level.label}.
