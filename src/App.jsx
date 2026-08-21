@@ -225,6 +225,74 @@ const STELLA_STORAGE_CANDIDATES = [
 const LEGACY_USER_SETTINGS_STORAGE_KEY = 'comex-user-settings';
 const LEGACY_USER_SETTINGS_FILE = 'user-settings.json';
 
+const RESPONSE_LENGTH_MIN = 1;
+const RESPONSE_LENGTH_MAX = 5;
+const DEFAULT_RESPONSE_LENGTH = 3;
+
+/** Length of chat/agent replies (not how many facts to include). 1 = executive, 5 = teaching. */
+const RESPONSE_LENGTH_LEVELS = [
+  {
+    value: 1,
+    label: 'Executive',
+    hint: 'Short and snappy — still a complete, clear answer.',
+    instruction: 'Write like a briefing for a busy director. Still give a complete, clear answer — never omit a needed fact, number, question, or recommendation to save words. Keep it short: lead with the point, use short sentences and tight bullets, no preamble, no recap of the question, no teaching asides, no worked examples unless the answer cannot be understood without one. Stop as soon as the answer is clear.',
+  },
+  {
+    value: 2,
+    label: 'Brief',
+    hint: 'Compact and direct, with little setup.',
+    instruction: 'Keep replies compact and direct. One short paragraph or a tight bullet list per point. Minimal setup. Skip extra “why” unless it is required to act on the answer.',
+  },
+  {
+    value: 3,
+    label: 'Standard',
+    hint: 'Clear professional length — useful context, no lecture.',
+    instruction: 'Use a clear professional length. Give enough context to be useful. Do not lecture, and do not pad with recap or filler.',
+  },
+  {
+    value: 4,
+    label: 'Expanded',
+    hint: 'More room to explain, with brief rationale.',
+    instruction: 'Write a fuller reply. Include brief rationale and a short example where it helps the user apply the answer. Stay structured and scannable.',
+  },
+  {
+    value: 5,
+    label: 'Teaching',
+    hint: 'Walk through the thinking — explain and teach.',
+    instruction: 'Explain as you would to a capable colleague learning the topic. Walk through the reasoning, define terms, show examples, and say why a recommendation holds. Keep it structured and scannable — longer, not rambling.',
+  },
+];
+
+function normalizeResponseLength(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_RESPONSE_LENGTH;
+  return Math.min(RESPONSE_LENGTH_MAX, Math.max(RESPONSE_LENGTH_MIN, Math.round(n)));
+}
+
+function getResponseLengthLevel(settings) {
+  const value = normalizeResponseLength(settings?.responseLength);
+  return RESPONSE_LENGTH_LEVELS[value - 1];
+}
+
+function formatResponseLengthPrompt(settings) {
+  const level = getResponseLengthLevel(settings);
+  return `RESPONSE LENGTH (mandatory for chat and agent replies the user reads, including Stella):
+This setting controls HOW LONG you write — not whether you skip facts, questions, numbers, or recommendations. The shortest setting is still a complete, clear explanation; it is just short and snappy. The longest setting explains and teaches.
+
+Current setting: ${level.value} of ${RESPONSE_LENGTH_MAX} — ${level.label}.
+${level.instruction}
+
+Do not apply this to exported PowerPoint/document content, structured JSON, classification, extraction, or schema-only tasks; those must follow their specified format and stay compact.`;
+}
+
+/** Scale a user-facing token budget with the length slider (1 ≈ 55% of base, 5 ≈ 140%). */
+function scaleUserFacingMaxTokens(base, settings) {
+  const n = normalizeResponseLength(settings?.responseLength);
+  const t = (n - 1) / (RESPONSE_LENGTH_MAX - 1);
+  const factor = 0.55 + t * 0.85;
+  return Math.max(600, Math.min(8192, Math.round(Number(base) * factor)));
+}
+
 const DEFAULT_USER_SETTINGS = {
   companyName: '',
   industry: '',
@@ -236,6 +304,7 @@ const DEFAULT_USER_SETTINGS = {
   constraints: '',
   customContext: '',
   memory: [],
+  responseLength: DEFAULT_RESPONSE_LENGTH,
   moduleContext: mergeModuleContext({}),
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
@@ -272,6 +341,7 @@ function mergeUserSettingsFields(raw = {}) {
     constraints: String(src.constraints || ''),
     customContext: String(src.customContext || ''),
     memory: normalizeMemoryItems(src.memory),
+    responseLength: normalizeResponseLength(src.responseLength),
     moduleContext: mergeModuleContext(src.moduleContext),
     pptxTemplate: src.pptxTemplate || null,
   };
@@ -728,24 +798,25 @@ function hasNumberedClarifyingQuestions(text) {
 
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
 function buildUserSettingsPromptBlock(settings) {
-  if (!settings || typeof settings !== 'object') return '';
+  const s = settings && typeof settings === 'object' ? settings : {};
   const lines = [];
   const push = (label, value) => {
     if (isEmptyContextValue(value)) return;
     lines.push(`- ${label}: ${String(value).trim()}`);
   };
-  push('Company', settings.companyName);
-  push('Industry / therapeutic area', settings.industry);
-  push('User role', settings.role);
-  push('Preferred currency / units', settings.currency);
-  push('Company metrics & definitions', settings.metrics);
-  push('Abbreviations & terminology', settings.abbreviations);
-  push('Preferences', settings.preferences);
-  push('Hard constraints', settings.constraints);
-  const extra = isEmptyContextValue(settings.customContext) ? '' : String(settings.customContext).trim();
-  const memoryBlock = formatMemoryPromptBlock(settings);
-  if (!lines.length && !extra && !memoryBlock) return '';
-  return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, and constraints in every response; do not contradict them):\n${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}\n`;
+  push('Company', s.companyName);
+  push('Industry / therapeutic area', s.industry);
+  push('User role', s.role);
+  push('Preferred currency / units', s.currency);
+  push('Company metrics & definitions', s.metrics);
+  push('Abbreviations & terminology', s.abbreviations);
+  push('Preferences', s.preferences);
+  push('Hard constraints', s.constraints);
+  const extra = isEmptyContextValue(s.customContext) ? '' : String(s.customContext).trim();
+  const memoryBlock = formatMemoryPromptBlock(s);
+  const lengthBlock = formatResponseLengthPrompt(s);
+  const identity = `${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}`;
+  return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, constraints, and response length in every response; do not contradict them):\n${identity ? `${identity}\n\n` : ''}${lengthBlock}\n`;
 }
 
 const MEMORY_CAP = 30;
@@ -3397,7 +3468,7 @@ ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 ${taskBlock}
 
 ${clarifyingPolicy}`);
-    return await callAnthropic(system, messages, 3000);
+    return await callAnthropic(system, messages, scaleUserFacingMaxTokens(3000, userSettings));
   };
 
   const normalizeOrchestratorAction = (action) => {
@@ -3548,7 +3619,7 @@ Rules:
     const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 ${getWorkflowRuntime().handoffAddon}`);
-    return await callAnthropic(system, [{ role: 'user', content: task }], 2000);
+    return await callAnthropic(system, [{ role: 'user', content: task }], scaleUserFacingMaxTokens(2000, userSettings));
   };
 
   const executeOrchestrator = async (topic, userMessage, stepIndex = null, focusedContextOverride = null) => {
@@ -6497,7 +6568,7 @@ ${stepInstruction}`;
           ...messages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
           { role: 'user', content: messageContent }
         ],
-        max_tokens: 4000,
+        max_tokens: scaleUserFacingMaxTokens(4000, userSettings),
       });
       const data = await response.json();
       const assistantMessage = anthropicAssistantText(data);
@@ -7450,6 +7521,55 @@ ${stepInstruction}`;
                       {' '}→ <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/settings.json</code>.
                       {' '}Later accounts use the same pattern (for example <code className="text-cyan-300/80">users/Standard User 1/settings.json</code>).
                     </p>
+                    {(() => {
+                      const lengthLevel = getResponseLengthLevel(userSettings);
+                      return (
+                        <div className="mb-6 bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 sm:p-5">
+                          <div className="flex items-start justify-between gap-3 mb-2">
+                            <div>
+                              <label htmlFor="response-length" className="block text-sm font-semibold text-white">Response length</label>
+                              <p className="text-xs text-blue-300/60 mt-1">
+                                How long chat and agent replies are. This is length, not how much substance to include — the shortest setting is still a complete, clear explanation.
+                              </p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <div className="text-sm font-bold text-cyan-300">{lengthLevel.label}</div>
+                              <div className="text-[10px] text-blue-300/50">{lengthLevel.value} of {RESPONSE_LENGTH_MAX}</div>
+                            </div>
+                          </div>
+                          <input
+                            id="response-length"
+                            type="range"
+                            min={RESPONSE_LENGTH_MIN}
+                            max={RESPONSE_LENGTH_MAX}
+                            step={1}
+                            value={lengthLevel.value}
+                            onChange={(e) => setUserSettings((prev) => ({
+                              ...prev,
+                              responseLength: normalizeResponseLength(e.target.value),
+                            }))}
+                            className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                            aria-valuemin={RESPONSE_LENGTH_MIN}
+                            aria-valuemax={RESPONSE_LENGTH_MAX}
+                            aria-valuenow={lengthLevel.value}
+                            aria-valuetext={lengthLevel.label}
+                          />
+                          <div className="flex justify-between mt-2">
+                            {RESPONSE_LENGTH_LEVELS.map((level) => (
+                              <button
+                                key={level.value}
+                                type="button"
+                                onClick={() => setUserSettings((prev) => ({ ...prev, responseLength: level.value }))}
+                                className={`text-[10px] sm:text-xs font-semibold px-0.5 sm:px-1 ${level.value === lengthLevel.value ? 'text-cyan-300' : 'text-blue-300/40 hover:text-blue-200/70'}`}
+                              >
+                                {level.label}
+                              </button>
+                            ))}
+                          </div>
+                          <p className="text-xs text-blue-200/70 mt-3">{lengthLevel.hint}</p>
+                        </div>
+                      );
+                    })()}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
@@ -7513,7 +7633,7 @@ ${stepInstruction}`;
                           value={userSettings.preferences}
                           onChange={(e) => setUserSettings(prev => ({ ...prev, preferences: e.target.value }))}
                           rows={3}
-                          placeholder={"e.g. Prefer concise answers with tables"}
+                          placeholder={"e.g. Prefer tables over long paragraphs, UK spelling"}
                           className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y"
                         />
                       </div>
