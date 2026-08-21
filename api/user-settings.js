@@ -1,9 +1,9 @@
 /**
- * Read/write intelligence/users/<display name>/settings.json using the
+ * Read/write intelligence/users/<display name>/{settings|chats}.json using the
  * service-role key so Storage RLS cannot drop Standard User saves.
  *
- * GET  /api/user-settings?userId=&userName=
- * POST /api/user-settings { userId, userName, document }
+ * GET  /api/user-settings?userId=&userName=&file=settings.json|chats.json
+ * POST /api/user-settings { userId, userName, file, document }
  *
  *   SUPABASE_URL         (falls back to VITE_SUPABASE_URL)
  *   SUPABASE_SERVICE_KEY
@@ -41,8 +41,13 @@ function resolveUser(userId, userName) {
     || null;
 }
 
-function objectPath(user) {
-  return `users/${storageFolder(user)}/settings.json`;
+function allowedUserFile(raw) {
+  const name = String(raw || 'settings.json').trim().toLowerCase();
+  return name === 'chats.json' ? 'chats.json' : 'settings.json';
+}
+
+function objectPath(user, file) {
+  return `users/${storageFolder(user)}/${allowedUserFile(file)}`;
 }
 
 function encodeObjectPath(path) {
@@ -82,10 +87,12 @@ module.exports = async function handler(req, res) {
   let userId = '';
   let userName = '';
   let document = null;
+  let file = 'settings.json';
 
   if (req.method === 'GET') {
     userId = String(req.query?.userId || '');
     userName = String(req.query?.userName || '');
+    file = allowedUserFile(req.query?.file);
   } else if (req.method === 'POST') {
     let body = req.body;
     if (typeof body === 'string') {
@@ -97,6 +104,7 @@ module.exports = async function handler(req, res) {
     }
     userId = String(body?.userId || '');
     userName = String(body?.userName || '');
+    file = allowedUserFile(body?.file);
     document = body?.document;
     if (!document || typeof document !== 'object') {
       return res.status(400).json({ error: { message: 'document is required' } });
@@ -112,14 +120,14 @@ module.exports = async function handler(req, res) {
   }
   const folderUser = { id: user.id, name: String(userName || user.name) };
 
-  const writePath = objectPath(folderUser);
+  const writePath = objectPath(folderUser, file);
 
   try {
     if (req.method === 'GET') {
       const url = `${supabaseUrl}/storage/v1/object/intelligence/${encodeObjectPath(writePath)}`;
       const upstream = await fetch(url, { headers: storageHeaders(serviceKey) });
       if (upstream.status === 404) {
-        return res.status(404).json({ error: { message: 'settings.json not found' }, path: writePath });
+        return res.status(404).json({ error: { message: `${file} not found` }, path: writePath });
       }
       const text = await upstream.text();
       if (!upstream.ok) {
@@ -131,7 +139,7 @@ module.exports = async function handler(req, res) {
       if (parsed && typeof parsed === 'object') {
         return res.status(200).json({ path: writePath, document: parsed });
       }
-      return res.status(404).json({ error: { message: 'settings.json not found' }, path: writePath });
+      return res.status(404).json({ error: { message: `${file} not found` }, path: writePath });
     }
 
     const body = JSON.stringify(document, null, 2);

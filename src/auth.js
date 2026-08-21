@@ -113,6 +113,11 @@ export function userSettingsRemotePath(userOrName) {
   return `users/${userStorageFolder(userOrName)}/settings.json`;
 }
 
+/** Chat transcripts — sibling of settings.json, not mixed into user preferences. */
+export function userChatsRemotePath(userOrName) {
+  return `users/${userStorageFolder(userOrName)}/chats.json`;
+}
+
 /** Named path first, then older users/<id>/settings.json for migration. */
 export function userSettingsRemotePathCandidates(user) {
   const named = userSettingsRemotePath(user);

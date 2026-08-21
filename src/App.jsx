@@ -10,6 +10,7 @@ import {
   clearCurrentUser,
   userSettingsLocalKey,
   userSettingsRemotePath,
+  userChatsRemotePath,
   userSettingsRemotePathCandidates,
   userStorageFolder,
   userPptxTemplateRemotePath,
@@ -226,16 +227,17 @@ const LEGACY_USER_SETTINGS_STORAGE_KEY = 'comex-user-settings';
 const LEGACY_USER_SETTINGS_FILE = 'user-settings.json';
 
 const RESPONSE_LENGTH_MIN = 1;
-const RESPONSE_LENGTH_MAX = 5;
-const DEFAULT_RESPONSE_LENGTH = 3;
+const RESPONSE_LENGTH_MAX = 3;
+const DEFAULT_RESPONSE_LENGTH = 2;
 
-/** Length/mode of chat/agent replies. Each stop is a different kind of reply, not a small length tweak. */
+/** Length/mode of chat/agent replies. Three distinct shapes — not small length tweaks. */
 const RESPONSE_LENGTH_LEVELS = [
   {
     value: 1,
+    id: 'executive',
     label: 'Executive',
     hint: 'Decide now. Verdict, then a tight table or icon bullets — formatted, not a wall of text.',
-    instruction: `MODE: board briefing for an expert. Short, but still visually formatted — never a plain paragraph.
+    instruction: `MODE: board briefing. Short, but still visually formatted — never a plain paragraph.
 HARD TARGET: 80–150 words of prose (tables do not count against this).
 SHAPE (use exactly this, nothing else):
 1) Verdict — one bold sentence, with a status icon (✅ / ⚠️ / 🎯).
@@ -246,61 +248,51 @@ MUST NOT: how-to steps, rationale, examples, trade-offs, definitions, impact, or
   },
   {
     value: 2,
-    label: 'Brief',
-    hint: 'Act now. What to do, how to do it, one watch-out — formatted, no rationale.',
-    instruction: `MODE: action note for someone who already knows the job and just needs the move.
-HARD TARGET: 150–250 words. Must read clearly longer than Executive and clearly shorter than Standard.
+    id: 'standard',
+    label: 'Standard',
+    hint: 'Working recommendation. What to do, how, and a short because — no walkthrough.',
+    instruction: `MODE: working recommendation to a competent colleague. The middle ground — clearly longer than Executive, clearly not a tutorial.
+HARD TARGET: 250–450 words.
 SHAPE (use exactly this):
-1) Verdict — one or two sentences, bold the decision, optional status icon.
-2) Do this — a short numbered or icon list of actions (how, not why). Use a compact table if the actions are options, weights, or numbers.
-3) Watch-out — one sentence only, with ⚠️.
-MUST NOT: a Because / Why section, a worked example, a trade-off discussion, definitions, or “why this matters / impact if you get it wrong”. Those belong to later levels.`,
+1) Verdict — bold the decision, optional status icon.
+2) How — the working steps, design, or numbers. Use a table for options, weights, or thresholds.
+3) Because — one short paragraph total so they can stand behind the choice. Not a point-by-point essay.
+MUST: tables/icons/bold where they help scanning.
+MUST NOT: a worked example, a walkthrough, a trade-off lesson, or an “impact if you get this wrong” tutorial. Those belong to Teaching. Do not shrink to an Executive briefing.`,
   },
   {
     value: 3,
-    label: 'Standard',
-    hint: 'Working recommendation. What, how, and a short because — no example yet.',
-    instruction: `MODE: working note to a peer in the same role. They know the job; they want a usable recommendation.
-HARD TARGET: 250–400 words. Must read clearly longer than Brief and clearly shorter than Expanded.
-SHAPE (use exactly this):
-1) Verdict.
-2) How to apply it — the working steps or design.
-3) Because — one short paragraph total (not a lesson, not per-point essays) so they can defend the choice.
-MUST NOT: a worked example, a trade-off section, onboarding, term definitions, or “impact if you get this wrong”. Example + trade-off = Expanded. Why-it-matters + impact = Teaching.`,
-  },
-  {
-    value: 4,
-    label: 'Expanded',
-    hint: 'Design review. What, because, one example, and the trade-off — still not a beginner class.',
-    instruction: `MODE: design review with an experienced colleague who wants the thinking, not a class.
-HARD TARGET: 400–650 words. Must read clearly longer than Standard and clearly less tutorial than Teaching.
-SHAPE (use exactly this):
-1) Verdict.
-2) Recommendation with a short “because” under each major point (the design logic, not role onboarding).
-3) One worked example in this context.
-4) Trade-off — the main alternative and why you are not picking it.
-MUST NOT: write as if they are new to the role. Do not define basic job terms. Do not add “why this matters in your job”, business-impact-if-you-get-it-wrong, or common-new-hire-mistake sections — that is Teaching only.`,
-  },
-  {
-    value: 5,
+    id: 'teaching',
     label: 'Teaching',
-    hint: 'New to the role: what it is, why it matters, and the impact if you get it wrong.',
-    instruction: `MODE: lesson for someone new to this role. Teach; do not stay at Expanded length.
-HARD TARGET: 650–1100 words, or as long as the lesson needs.
-For every important recommendation or concept, cover ALL of:
-1) What it is — plain language; define terms the first time they appear.
-2) Why it matters in this role — what job it does for the business, the field force, or governance.
-3) Impact — what goes well if you get it right, and what breaks (cost, fairness, compliance, sales behaviour, IC credibility) if you get it wrong or skip it.
-4) How to apply it — a concrete example in this context.
-5) A common mistake someone new to the role makes, and what to do instead.
-Structure with short headings so it is a lesson they can scan. Never assume they already know why a rule exists.`,
+    hint: 'Explain it. Why it matters, the impact, and a concrete example.',
+    instruction: `MODE: a proper explanation — not a briefing and not a padded Standard reply. Walk the thinking through.
+HARD TARGET: 650–1100 words, or as long as the explanation needs.
+For every important recommendation or concept, cover:
+1) What it is — plain language; define a term if it would otherwise be ambiguous.
+2) Why it matters — what it does for the business, the field force, or governance.
+3) Impact — what goes well if you get it right, and what breaks (cost, fairness, compliance, sales behaviour, credibility) if you get it wrong or skip it.
+4) A concrete example in this context.
+5) What to watch for — the usual pitfall and what to do instead.
+Structure with short headings so it is scannable. Write as a clear explainer, not a beginner class and not a lecture about being new.`,
   },
 ];
 
 function normalizeResponseLength(raw) {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (s === 'executive') return 1;
+  if (s === 'standard') return 2;
+  if (s === 'teaching') return 3;
   const n = Number(raw);
   if (!Number.isFinite(n)) return DEFAULT_RESPONSE_LENGTH;
-  return Math.min(RESPONSE_LENGTH_MAX, Math.max(RESPONSE_LENGTH_MIN, Math.round(n)));
+  const rounded = Math.round(n);
+  // Legacy 5-stop slider: 1 Exec, 2 Brief, 3 Standard, 4 Expanded, 5 Teaching
+  if (rounded <= 1) return 1;
+  if (rounded >= 4) return 3;
+  return 2;
+}
+
+function storedResponseLength(raw) {
+  return RESPONSE_LENGTH_LEVELS[normalizeResponseLength(raw) - 1].id;
 }
 
 function getResponseLengthLevel(settings) {
@@ -311,8 +303,8 @@ function getResponseLengthLevel(settings) {
 function formatResponseLengthPrompt(settings) {
   const level = getResponseLengthLevel(settings);
   return `RESPONSE LENGTH — MATCH THIS LEVEL STRICTLY (chat and agent replies the user reads, including Stella).
-The five levels are different kinds of reply, not small length tweaks. Do not collapse 2–4 into a generic mid-length answer.
-1 Executive = verdict + table/icon bullets. 2 Brief = what/how + one watch-out (no because). 3 Standard = what/how + a short because (no example). 4 Expanded = because + example + trade-off (not a beginner class). 5 Teaching = new to the role: why it matters + impact.
+The three levels are different kinds of reply, not small length tweaks. Do not drift toward a generic mid-length answer.
+1 Executive = verdict + table/icon bullets (no how, no why). 2 Standard = what + how + a short because (no example walkthrough). 3 Teaching = explain: why it matters, impact, and a concrete example.
 RICH FORMAT AT EVERY LEVEL, including Executive: markdown tables for numbers/comparisons, emoji icons (✅ ⚠️ 🎯 📊) on key points, **bold** on the decision and figures. Short does not mean plain text — keep it scannable and clean, with no extra prose.
 Never omit a needed fact, number, question, or recommendation to hit a word target — cut explanation, not substance.
 
@@ -322,7 +314,7 @@ ${level.instruction}
 Do not apply this to exported PowerPoint/document content, structured JSON, classification, extraction, or schema-only tasks; those must follow their specified format and stay compact.`;
 }
 
-/** Scale a user-facing token budget with the length slider (1 ≈ 40% of base, 5 ≈ 175%). */
+/** Scale a user-facing token budget with the length slider (1 ≈ 40% of base, 3 ≈ 175%). */
 function scaleUserFacingMaxTokens(base, settings) {
   const n = normalizeResponseLength(settings?.responseLength);
   const t = (n - 1) / (RESPONSE_LENGTH_MAX - 1);
@@ -341,7 +333,7 @@ const DEFAULT_USER_SETTINGS = {
   constraints: '',
   customContext: '',
   memory: [],
-  responseLength: DEFAULT_RESPONSE_LENGTH,
+  responseLength: 'standard',
   moduleContext: mergeModuleContext({}),
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
@@ -378,7 +370,7 @@ function mergeUserSettingsFields(raw = {}) {
     constraints: String(src.constraints || ''),
     customContext: String(src.customContext || ''),
     memory: normalizeMemoryItems(src.memory),
-    responseLength: normalizeResponseLength(src.responseLength),
+    responseLength: storedResponseLength(src.responseLength),
     moduleContext: mergeModuleContext(src.moduleContext),
     pptxTemplate: src.pptxTemplate || null,
   };
@@ -396,8 +388,8 @@ function normalizeLoadedUserSettings(parsed) {
   return mergeUserSettingsFields(raw);
 }
 
-/** Document shape saved to intelligence/users/<name>/settings.json. */
-function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId = null, userName = '' } = {}) {
+/** Document shape saved to intelligence/users/<name>/settings.json (preferences only). */
+function buildUserSettingsDocument(userId, settings, { userName = '' } = {}) {
   const merged = mergeUserSettingsFields(settings || {});
   const doc = {
     userId,
@@ -406,6 +398,16 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
       ...merged,
       moduleContext: serializeModuleContextForPersist(merged.moduleContext),
     },
+  };
+  if (userName) doc.userName = userName;
+  return doc;
+}
+
+/** Document shape saved to intelligence/users/<name>/chats.json. */
+function buildUserChatsDocument(userId, { chats = [], activeChatId = null, userName = '' } = {}) {
+  const doc = {
+    userId,
+    updatedAt: new Date().toISOString(),
     chats: normalizeStoredChats(chats),
     activeChatId: activeChatId || null,
   };
@@ -413,8 +415,12 @@ function buildUserSettingsDocument(userId, settings, { chats = [], activeChatId 
   return doc;
 }
 
-async function uploadUserSettingsJsonDirect(user, doc) {
-  const path = userSettingsRemotePath(user);
+function userJsonRemotePath(user, file) {
+  return file === 'chats.json' ? userChatsRemotePath(user) : userSettingsRemotePath(user);
+}
+
+async function uploadUserJsonDirect(user, doc, file = 'settings.json') {
+  const path = userJsonRemotePath(user, file);
   const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
   const opts = { upsert: true, contentType: 'application/json', cacheControl: '0' };
   const { error } = await supabase.storage.from('intelligence').upload(path, blob, opts);
@@ -423,8 +429,8 @@ async function uploadUserSettingsJsonDirect(user, doc) {
   if (updateError) throw updateError;
 }
 
-/** Create or overwrite the same settings.json via the service-role API. */
-async function uploadUserSettingsJson(user, doc) {
+/** Create or overwrite settings.json / chats.json via the service-role API. */
+async function uploadUserJson(user, doc, file = 'settings.json') {
   try {
     const res = await fetch('/api/user-settings', {
       method: 'POST',
@@ -432,30 +438,32 @@ async function uploadUserSettingsJson(user, doc) {
       body: JSON.stringify({
         userId: user?.id,
         userName: user?.name,
+        file,
         document: doc,
       }),
     });
     if (res.ok) return;
     if (res.status === 404) {
-      await uploadUserSettingsJsonDirect(user, doc);
+      await uploadUserJsonDirect(user, doc, file);
       return;
     }
     const data = await res.json().catch(() => ({}));
-    throw new Error(data?.error?.message || `Could not save settings.json (${res.status})`);
+    throw new Error(data?.error?.message || `Could not save ${file} (${res.status})`);
   } catch (err) {
     if (err?.name === 'TypeError' || /failed to fetch/i.test(String(err?.message || ''))) {
-      await uploadUserSettingsJsonDirect(user, doc);
+      await uploadUserJsonDirect(user, doc, file);
       return;
     }
     throw err;
   }
 }
 
-async function downloadUserSettingsDocument(user) {
-  const path = userSettingsRemotePath(user);
+async function downloadUserJsonDocument(user, file = 'settings.json') {
+  const path = userJsonRemotePath(user, file);
   const q = new URLSearchParams({
     userId: String(user?.id || ''),
     userName: String(user?.name || ''),
+    file,
   });
   try {
     const res = await fetch(`/api/user-settings?${q}`);
@@ -469,10 +477,10 @@ async function downloadUserSettingsDocument(user) {
       return null;
     } else {
       const data = await res.json().catch(() => ({}));
-      throw new Error(data?.error?.message || `Could not load settings.json (${res.status})`);
+      throw new Error(data?.error?.message || `Could not load ${file} (${res.status})`);
     }
   } catch (err) {
-    if (err?.message && /Could not load settings\.json/i.test(err.message)) throw err;
+    if (err?.message && /Could not load /i.test(err.message)) throw err;
   }
   try {
     const { data, error } = await supabase.storage.from('intelligence').download(path);
@@ -484,26 +492,26 @@ async function downloadUserSettingsDocument(user) {
   return null;
 }
 
-const userSettingsUploadSlots = new Map();
+const userJsonUploadSlots = new Map();
 
-function userSettingsUploadSlotKey(user) {
-  return String(user?.id || userStorageFolder(user));
+function userJsonUploadSlotKey(user, file = 'settings.json') {
+  return `${String(user?.id || userStorageFolder(user))}:${file}`;
 }
 
 function lastUserSettingsUploadError(user) {
-  return userSettingsUploadSlots.get(userSettingsUploadSlotKey(user))?.lastError || '';
+  return userJsonUploadSlots.get(userJsonUploadSlotKey(user, 'settings.json'))?.lastError || '';
 }
 
 /**
- * Single-flight flush. The payload is built when the write runs so a chat
- * autosave cannot overwrite a newer context extract with a stale snapshot.
+ * Single-flight flush per user+file. Payload is built when the write runs so a
+ * chat autosave cannot overwrite a newer settings snapshot (and vice versa).
  */
-function queueUserSettingsUpload(user, docOrBuilder) {
-  const key = userSettingsUploadSlotKey(user);
-  let slot = userSettingsUploadSlots.get(key);
+function queueUserJsonUpload(user, file, docOrBuilder) {
+  const key = userJsonUploadSlotKey(user, file);
+  let slot = userJsonUploadSlots.get(key);
   if (!slot) {
     slot = { builder: null, lastError: '', chain: Promise.resolve() };
-    userSettingsUploadSlots.set(key, slot);
+    userJsonUploadSlots.set(key, slot);
   }
   slot.builder = typeof docOrBuilder === 'function' ? docOrBuilder : () => docOrBuilder;
   slot.chain = slot.chain.then(async () => {
@@ -521,17 +529,25 @@ function queueUserSettingsUpload(user, docOrBuilder) {
         continue;
       }
       try {
-        await uploadUserSettingsJson(user, toWrite);
+        await uploadUserJson(user, toWrite, file);
         slot.lastError = '';
       } catch (err) {
         ok = false;
         slot.lastError = err?.message || String(err);
-        console.warn(`Could not save ${userSettingsRemotePath(user)}:`, slot.lastError);
+        console.warn(`Could not save ${userJsonRemotePath(user, file)}:`, slot.lastError);
       }
     }
     return ok;
   });
   return slot.chain;
+}
+
+function queueUserSettingsUpload(user, docOrBuilder) {
+  return queueUserJsonUpload(user, 'settings.json', docOrBuilder);
+}
+
+function queueUserChatsUpload(user, docOrBuilder) {
+  return queueUserJsonUpload(user, 'chats.json', docOrBuilder);
 }
 
 function buildProductIntelligenceDocument(intel) {
@@ -2655,7 +2671,8 @@ export default function CommercialExcellenceApp() {
         }
       } catch { /* product intel falls back to factory defaults */ }
 
-      // User settings: only intelligence/users/<display name>/settings.json — never users/<id>/.
+      // User settings: intelligence/users/<display name>/settings.json
+      // Chat history:  intelligence/users/<display name>/chats.json
       try {
         try {
           localStorage.removeItem(userSettingsLocalKey(currentUser.id));
@@ -2664,7 +2681,8 @@ export default function CommercialExcellenceApp() {
             .filter((k) => k.startsWith('comex-user-settings'))
             .forEach((k) => localStorage.removeItem(k));
         } catch { /* ignore */ }
-        const parsed = await downloadUserSettingsDocument(currentUser);
+        const parsed = await downloadUserJsonDocument(currentUser, 'settings.json');
+        const chatsParsed = await downloadUserJsonDocument(currentUser, 'chats.json');
         if (parsed && typeof parsed === 'object') {
           const remoteSettings = normalizeLoadedUserSettings(parsed);
           const liveSettings = mergeUserSettingsFields(userSettingsRef.current);
@@ -2672,40 +2690,58 @@ export default function CommercialExcellenceApp() {
             ...remoteSettings,
             moduleContext: mergeModuleContextPreferRich(liveSettings.moduleContext, remoteSettings.moduleContext),
           };
-          const { chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(parsed);
           setUserSettings(merged);
           userSettingsRef.current = merged;
-          skipChatPersistRef.current = true;
-          setChatSessions(remoteChats);
-          chatSessionsRef.current = remoteChats;
-          if (remoteChats.length) {
-            const pick = remoteChats.find((c) => c.id === remoteActive) || remoteChats[0];
-            setActiveChatId(pick.id);
-            activeChatIdRef.current = pick.id;
-            if (pick.messages?.length) setMessages(pick.messages);
-            setCurrentWorkflow(pick.currentWorkflow || null);
-            setPendingWorkflow(pick.pendingWorkflow || null);
-            setUploadedFile(pick.uploadedFile || null);
-          } else {
-            setActiveChatId(null);
-            activeChatIdRef.current = null;
-            setMessages([consultationWelcome()]);
-            setCurrentWorkflow(null);
-            setPendingWorkflow(null);
-            setUploadedFile(null);
-          }
-          setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+        }
+        let remoteChats = [];
+        let remoteActive = null;
+        let migratedChats = false;
+        if (chatsParsed && typeof chatsParsed === 'object') {
+          ({ chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(chatsParsed));
         } else {
-          skipChatPersistRef.current = true;
-          setChatSessions([]);
-          chatSessionsRef.current = [];
+          const fromSettings = extractChatsFromDocument(parsed);
+          remoteChats = fromSettings.chats;
+          remoteActive = fromSettings.activeChatId;
+          migratedChats = remoteChats.length > 0;
+        }
+        skipChatPersistRef.current = true;
+        setChatSessions(remoteChats);
+        chatSessionsRef.current = remoteChats;
+        if (remoteChats.length) {
+          const pick = remoteChats.find((c) => c.id === remoteActive) || remoteChats[0];
+          setActiveChatId(pick.id);
+          activeChatIdRef.current = pick.id;
+          if (pick.messages?.length) setMessages(pick.messages);
+          setCurrentWorkflow(pick.currentWorkflow || null);
+          setPendingWorkflow(pick.pendingWorkflow || null);
+          setUploadedFile(pick.uploadedFile || null);
+        } else {
           setActiveChatId(null);
           activeChatIdRef.current = null;
           setMessages([consultationWelcome()]);
           setCurrentWorkflow(null);
           setPendingWorkflow(null);
           setUploadedFile(null);
-          setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+        }
+        setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+        if (migratedChats) {
+          try {
+            await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
+              currentUser.id,
+              {
+                chats: chatSessionsRef.current,
+                activeChatId: activeChatIdRef.current,
+                userName: currentUser.name,
+              },
+            ));
+            if (parsed && typeof parsed === 'object') {
+              await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+                currentUser.id,
+                mergeUserSettingsFields(userSettingsRef.current),
+                { userName: currentUser.name },
+              ));
+            }
+          } catch { /* one-time split is best-effort */ }
         }
       } catch (err) {
         setUserSettingsCloudError(err?.message || 'Could not load settings.json');
@@ -2763,9 +2799,8 @@ export default function CommercialExcellenceApp() {
       chatSessionsRef.current = next;
       setChatSessions(next);
       try {
-        await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+        await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
-          mergeUserSettingsFields(userSettingsRef.current),
           {
             chats: chatSessionsRef.current,
             activeChatId: activeChatIdRef.current,
@@ -3178,11 +3213,7 @@ Return JSON only: {"facts":["..."]}. Max 5 facts. Each fact one short sentence. 
       await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
         currentUser.id,
         mergeUserSettingsFields(userSettingsRef.current),
-        {
-          chats: chatSessionsRef.current,
-          activeChatId: activeChatIdRef.current,
-          userName: currentUser.name,
-        },
+        { userName: currentUser.name },
       ));
     } catch { /* memory is best-effort */ }
     harvestMemoryBusyRef.current = false;
@@ -3295,14 +3326,22 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
     userSettingsRef.current = settings;
     setUserSettingsSaveStatus('saving');
     try {
-      const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+      if (liveChats !== chatSessionsRef.current) {
+        chatSessionsRef.current = liveChats;
+        setChatSessions(liveChats);
+      }
+      void queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
         currentUser.id,
-        mergeUserSettingsFields(userSettingsRef.current),
         {
           chats: chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats,
           activeChatId: activeChatIdRef.current || liveSnap.id,
           userName: currentUser.name,
         },
+      ));
+      const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+        currentUser.id,
+        mergeUserSettingsFields(userSettingsRef.current),
+        { userName: currentUser.name },
       ));
       if (!ok) {
         const msg = lastUserSettingsUploadError(currentUser) || 'Could not save settings.json';
@@ -3325,9 +3364,8 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
   const persistChatList = async (list, activeId) => {
     if (!userSettingsReadyRef.current) return;
     try {
-      await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+      await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
         currentUser.id,
-        mergeUserSettingsFields(userSettingsRef.current),
         {
           chats: list,
           activeChatId: activeId,
@@ -6730,7 +6768,7 @@ ${stepInstruction}`;
                 <h3 className="text-lg font-semibold text-white">Recent chats</h3>
               </div>
               <p className="text-[11px] text-blue-300/45 mb-4">
-                From <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code> only.
+                From <code className="text-cyan-300/70">intelligence/{userChatsRemotePath(currentUser)}</code> only.
               </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
                 {recentChats(chatSessions).map((chat) => {
@@ -7553,10 +7591,10 @@ ${stepInstruction}`;
                 {userSettingsPane === 'general' && (
                   <>
                     <p className="text-xs text-blue-300/70 mb-5">
-                      These apply across the hub. Saved per named account in this browser and in Supabase Storage bucket
+                      These apply across the hub. Saved per named account in Supabase Storage bucket
                       {' '}<code className="text-cyan-300/80">intelligence</code>
                       {' '}→ <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/settings.json</code>.
-                      {' '}Later accounts use the same pattern (for example <code className="text-cyan-300/80">users/Standard User 1/settings.json</code>).
+                      {' '}Chat history is a sibling file <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/chats.json</code>.
                     </p>
                     {(() => {
                       const lengthLevel = getResponseLengthLevel(userSettings);
@@ -7566,7 +7604,7 @@ ${stepInstruction}`;
                             <div>
                               <label htmlFor="response-length" className="block text-sm font-semibold text-white">Response length</label>
                               <p className="text-xs text-blue-300/60 mt-1">
-                                How chat and agent replies are written. Executive = decide. Brief = act. Standard = recommend. Expanded = design review. Teaching = lesson for someone new to the role (why it matters and the impact).
+                                How chat and agent replies are written. Executive = decide. Standard = recommend. Teaching = explain with why, impact, and an example.
                               </p>
                             </div>
                             <div className="text-right shrink-0">
@@ -7583,7 +7621,7 @@ ${stepInstruction}`;
                             value={lengthLevel.value}
                             onChange={(e) => setUserSettings((prev) => ({
                               ...prev,
-                              responseLength: normalizeResponseLength(e.target.value),
+                              responseLength: storedResponseLength(e.target.value),
                             }))}
                             className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-400"
                             aria-valuemin={RESPONSE_LENGTH_MIN}
@@ -7596,7 +7634,7 @@ ${stepInstruction}`;
                               <button
                                 key={level.value}
                                 type="button"
-                                onClick={() => setUserSettings((prev) => ({ ...prev, responseLength: level.value }))}
+                                onClick={() => setUserSettings((prev) => ({ ...prev, responseLength: level.id }))}
                                 className={`text-[10px] sm:text-xs font-semibold px-0.5 sm:px-1 ${level.value === lengthLevel.value ? 'text-cyan-300' : 'text-blue-300/40 hover:text-blue-200/70'}`}
                               >
                                 {level.label}
