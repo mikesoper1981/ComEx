@@ -25,6 +25,8 @@ const {
   normalizeEmail,
   isEmail,
   generateTempPassword,
+  recordLogin,
+  loginHistoryForUser,
 } = require('./accounts-store');
 const { appLoginUrl, welcomeEmail, resetEmail, sendEmail } = require('./mail');
 
@@ -90,6 +92,16 @@ module.exports = async function handler(req, res) {
         }
         return res.status(200).json({ users });
       }
+      if (action === 'login-history') {
+        if (!requireAdmin(req, res)) return;
+        const accounts = await loadAccounts();
+        const user = findAccount(accounts, req.query?.userId, req.query?.userName);
+        if (!user) {
+          return res.status(404).json({ error: { message: 'User not found' } });
+        }
+        const days = await loginHistoryForUser(user);
+        return res.status(200).json({ user: publicUser(user), days });
+      }
       return res.status(400).json({ error: { message: 'Unknown action' } });
     }
 
@@ -125,7 +137,7 @@ module.exports = async function handler(req, res) {
           user: publicUser(user),
         });
       }
-      user.lastLoginAt = new Date().toISOString();
+      recordLogin(user);
       await saveAccounts(accounts);
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
@@ -180,7 +192,7 @@ module.exports = async function handler(req, res) {
       user.passwordHash = hashPassword(password);
       user.mustChangePassword = false;
       user.otpExpiresAt = null;
-      user.lastLoginAt = new Date().toISOString();
+      recordLogin(user);
       await saveAccounts(accounts);
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
@@ -196,16 +208,12 @@ module.exports = async function handler(req, res) {
     if (action === 'create') {
       const name = String(body.name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
       const email = normalizeEmail(body.email);
-      const password = String(body.password || '');
       const role = body.role === 'admin' ? 'admin' : 'user';
       if (name.length < 2) {
         return res.status(400).json({ error: { message: 'Name must be at least 2 characters' } });
       }
       if (!isEmail(email)) {
         return res.status(400).json({ error: { message: 'A valid email is required' } });
-      }
-      if (password.length < 8) {
-        return res.status(400).json({ error: { message: 'Password must be at least 8 characters' } });
       }
       const accounts = await loadAccounts();
       let id = slugId(name);
@@ -223,6 +231,7 @@ module.exports = async function handler(req, res) {
         id = `${slugId(name)}-${n}`;
         n += 1;
       }
+      const password = generateTempPassword();
       const created = {
         id,
         name,
@@ -231,8 +240,9 @@ module.exports = async function handler(req, res) {
         passwordHash: hashPassword(password),
         createdAt: new Date().toISOString(),
         lastLoginAt: null,
-        mustChangePassword: false,
-        otpExpiresAt: null,
+        mustChangePassword: true,
+        otpExpiresAt: new Date(Date.now() + OTP_TTL_MS).toISOString(),
+        loginHistory: [],
       };
       accounts.users.push(created);
       await saveAccounts(accounts);

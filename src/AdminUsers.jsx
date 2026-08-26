@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, KeyRound, Mail, Plus, Trash2, Users } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, History, KeyRound, Mail, Plus, Trash2, Users } from 'lucide-react';
 import { authHeaders } from './auth';
 
 function formatLogin(iso) {
@@ -19,6 +19,32 @@ function formatLogin(iso) {
   }
 }
 
+function formatDay(iso) {
+  try {
+    return new Date(iso).toLocaleDateString('en-GB', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+      timeZone: 'Europe/London',
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function formatTime(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'Europe/London',
+    });
+  } catch {
+    return '';
+  }
+}
+
 export default function AdminUsers({ currentUserId }) {
   const [users, setUsers] = useState([]);
   const [status, setStatus] = useState('loading');
@@ -26,12 +52,14 @@ export default function AdminUsers({ currentUserId }) {
   const [notice, setNotice] = useState('');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [role, setRole] = useState('user');
   const [editEmail, setEditEmail] = useState('');
   const [busy, setBusy] = useState(false);
   const [passwordUser, setPasswordUser] = useState(null);
   const [newPassword, setNewPassword] = useState('');
+  const [historyUser, setHistoryUser] = useState(null);
+  const [historyDays, setHistoryDays] = useState([]);
+  const [historyStatus, setHistoryStatus] = useState('idle');
 
   const load = async () => {
     setStatus('loading');
@@ -73,17 +101,15 @@ export default function AdminUsers({ currentUserId }) {
         action: 'create',
         name,
         email,
-        password,
         role,
         loginUrl: window.location.origin,
       });
       setName('');
       setEmail('');
-      setPassword('');
       setRole('user');
       setNotice(
         data?.emailSent
-          ? 'User created and welcome email sent.'
+          ? 'User created. A one-time password has been emailed; they must change it on first sign-in.'
           : `User created, but the welcome email was not sent${data?.emailError ? `: ${data.emailError}` : '.'}`
       );
       await load();
@@ -151,6 +177,83 @@ export default function AdminUsers({ currentUserId }) {
     }
   };
 
+  const openHistory = async (user) => {
+    setHistoryUser(user);
+    setHistoryDays([]);
+    setHistoryStatus('loading');
+    setError('');
+    try {
+      const q = new URLSearchParams({ action: 'login-history', userId: user.id, userName: user.name });
+      const res = await fetch(`/api/users?${q}`, { headers: authHeaders() });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || 'Could not load login history');
+      setHistoryDays(Array.isArray(data.days) ? data.days : []);
+      setHistoryStatus('ready');
+    } catch (err) {
+      setHistoryStatus('error');
+      setError(err?.message || 'Could not load login history');
+    }
+  };
+
+  if (historyUser) {
+    return (
+      <div className="space-y-4">
+        <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
+          <button
+            type="button"
+            onClick={() => { setHistoryUser(null); setHistoryDays([]); setHistoryStatus('idle'); setError(''); }}
+            className="mb-4 px-3 py-1.5 bg-slate-700/50 hover:bg-slate-600/50 border border-blue-400/20 rounded-lg text-xs text-blue-200 font-semibold inline-flex items-center gap-1.5"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" /> Back to users
+          </button>
+          <h2 className="text-xl font-bold mb-1 flex items-center gap-2">
+            <History className="w-6 h-6 text-cyan-400" /> Login history
+          </h2>
+          <p className="text-sm text-blue-300/70 mb-5">
+            {historyUser.name}{historyUser.email ? ` · ${historyUser.email}` : ''} — last 10 login days
+          </p>
+          {error && (
+            <div className="mb-4 text-sm text-red-300 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4" /> {error}
+            </div>
+          )}
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-[11px] uppercase tracking-wide text-blue-300/50 border-b border-blue-400/15">
+                  <th className="pb-2 pr-3 font-semibold">Day</th>
+                  <th className="pb-2 pr-3 font-semibold">Time</th>
+                  <th className="pb-2 pr-3 font-semibold text-right">Unique chats</th>
+                  <th className="pb-2 font-semibold text-right">Conversations</th>
+                </tr>
+              </thead>
+              <tbody>
+                {historyStatus === 'loading' && (
+                  <tr>
+                    <td colSpan={4} className="py-6 text-blue-300/50">Loading history…</td>
+                  </tr>
+                )}
+                {historyStatus === 'ready' && historyDays.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="py-6 text-blue-300/50">No logins recorded yet.</td>
+                  </tr>
+                )}
+                {historyDays.map((row) => (
+                  <tr key={row.at} className="border-b border-blue-400/10">
+                    <td className="py-3 pr-3 font-semibold text-white whitespace-nowrap">{formatDay(row.at)}</td>
+                    <td className="py-3 pr-3 text-blue-100/80">{formatTime(row.at)}</td>
+                    <td className="py-3 pr-3 text-right font-semibold text-white">{row.chats ?? 0}</td>
+                    <td className="py-3 text-right font-semibold text-white">{row.conversations ?? 0}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
       <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
@@ -158,10 +261,10 @@ export default function AdminUsers({ currentUserId }) {
           <Users className="w-6 h-6 text-cyan-400" /> Users
         </h2>
         <p className="text-sm text-blue-300/70 mb-5">
-          Create and remove accounts. New users receive a welcome email with the login URL, username, and password. Passwords are hashed on the server.
+          Create and remove accounts. New users get a one-time password by email and must choose a new one on first sign-in.
         </p>
 
-        <form onSubmit={handleCreate} className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 mb-6 grid grid-cols-1 md:grid-cols-6 gap-3 items-end">
+        <form onSubmit={handleCreate} className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 mb-6 grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
           <div>
             <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Name</label>
             <input
@@ -183,17 +286,6 @@ export default function AdminUsers({ currentUserId }) {
             />
           </div>
           <div>
-            <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Min 8 characters"
-              autoComplete="new-password"
-              className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
-            />
-          </div>
-          <div>
             <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Role</label>
             <select
               value={role}
@@ -206,7 +298,7 @@ export default function AdminUsers({ currentUserId }) {
           </div>
           <button
             type="submit"
-            disabled={busy || name.trim().length < 2 || !email.includes('@') || password.length < 8}
+            disabled={busy || name.trim().length < 2 || !email.includes('@')}
             className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2"
           >
             <Plus className="w-4 h-4" /> Create
@@ -304,7 +396,19 @@ export default function AdminUsers({ currentUserId }) {
                       <div className="text-[11px] text-cyan-300/80 mt-1">Must change password</div>
                     ) : null}
                   </td>
-                  <td className="py-3 pr-3 text-blue-100/80 whitespace-nowrap">{formatLogin(u.lastLoginAt)}</td>
+                  <td className="py-3 pr-3 whitespace-nowrap">
+                    {u.lastLoginAt ? (
+                      <button
+                        type="button"
+                        onClick={() => openHistory(u)}
+                        className="text-cyan-300 hover:text-cyan-200 underline decoration-cyan-400/40 underline-offset-2 font-medium"
+                      >
+                        {formatLogin(u.lastLoginAt)}
+                      </button>
+                    ) : (
+                      <span className="text-blue-100/50">Never</span>
+                    )}
+                  </td>
                   <td className="py-3 pr-3 text-right font-semibold text-white">{u.messagesLast7Days ?? 0}</td>
                   <td className="py-3 pr-3 text-right font-semibold text-white">{u.conversationsLast7Days ?? 0}</td>
                   <td className="py-3 text-right">
@@ -339,9 +443,6 @@ export default function AdminUsers({ currentUserId }) {
             </tbody>
           </table>
         </div>
-        <p className="text-[11px] text-blue-300/40 mt-3">
-          Chats (7d) counts questions the user asked in the last 7 days. Conversations (7d) counts distinct threads that had at least one of those questions.
-        </p>
       </div>
     </div>
   );

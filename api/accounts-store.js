@@ -165,6 +165,7 @@ function seedUsersFromEnv() {
       lastLoginAt: null,
       mustChangePassword: false,
       otpExpiresAt: null,
+      loginHistory: [],
     }));
 }
 
@@ -247,6 +248,7 @@ async function loadAccounts() {
         lastLoginAt: u.lastLoginAt || null,
         mustChangePassword: !!u.mustChangePassword,
         otpExpiresAt: u.otpExpiresAt || null,
+        loginHistory: Array.isArray(u.loginHistory) ? u.loginHistory : [],
       })).filter((u) => u.id),
     };
   }
@@ -273,6 +275,7 @@ async function saveAccounts(doc) {
       lastLoginAt: u.lastLoginAt || null,
       mustChangePassword: !!u.mustChangePassword,
       otpExpiresAt: u.otpExpiresAt || null,
+      loginHistory: Array.isArray(u.loginHistory) ? u.loginHistory : [],
     })),
   };
   await uploadObject(ACCOUNTS_PATH, next);
@@ -336,6 +339,107 @@ function createdAtFromChatId(id) {
   if (!m) return 0;
   const n = parseInt(m[1], 36);
   return Number.isFinite(n) && n > 1e11 ? n : 0;
+}
+
+function dayKeyLondon(ms) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/London',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date(ms));
+  } catch {
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+}
+
+function messageTime(m, chat, index) {
+  const stamped = Date.parse(m?.at || '');
+  if (Number.isFinite(stamped)) return stamped;
+  const created = Date.parse(chat?.createdAt || '') || createdAtFromChatId(chat?.id);
+  const msgs = Array.isArray(chat?.messages) ? chat.messages : [];
+  if (index === msgs.length - 1) {
+    const updated = Date.parse(chat?.updatedAt || '');
+    if (Number.isFinite(updated)) return updated;
+  }
+  return created || 0;
+}
+
+function usageForCalendarDay(doc, dayKey) {
+  const chats = Array.isArray(doc?.chats) ? doc.chats : [];
+  let questions = 0;
+  let conversations = 0;
+  for (const chat of chats) {
+    const msgs = Array.isArray(chat.messages) ? chat.messages : [];
+    let questionsThisChat = 0;
+    msgs.forEach((m, i) => {
+      if (m?.role !== 'user') return;
+      const t = messageTime(m, chat, i);
+      if (t && dayKeyLondon(t) === dayKey) questionsThisChat += 1;
+    });
+    if (questionsThisChat > 0) {
+      conversations += 1;
+      questions += questionsThisChat;
+    }
+  }
+  return { chats: questions, conversations };
+}
+
+function normalizeLoginHistory(raw, lastLoginAt) {
+  const list = (Array.isArray(raw) ? raw : [])
+    .map((e) => {
+      const at = typeof e === 'string' ? e : e?.at;
+      const t = Date.parse(at || '');
+      return Number.isFinite(t) ? { at: new Date(t).toISOString() } : null;
+    })
+    .filter(Boolean);
+  if (!list.length && lastLoginAt && Date.parse(lastLoginAt)) {
+    list.push({ at: new Date(lastLoginAt).toISOString() });
+  }
+  return list.slice(-40);
+}
+
+function recordLogin(user) {
+  const at = new Date().toISOString();
+  user.lastLoginAt = at;
+  const hist = normalizeLoginHistory(user.loginHistory, null);
+  hist.push({ at });
+  user.loginHistory = hist.slice(-40);
+}
+
+function buildLoginHistory(user, chatsDoc) {
+  const hist = normalizeLoginHistory(user.loginHistory, user.lastLoginAt);
+  const byDay = new Map();
+  for (const entry of hist) {
+    const t = Date.parse(entry.at);
+    if (!Number.isFinite(t)) continue;
+    const key = dayKeyLondon(t);
+    const prev = byDay.get(key);
+    if (!prev || t > prev.t) byDay.set(key, { at: entry.at, t, dayKey: key });
+  }
+  return [...byDay.values()]
+    .sort((a, b) => b.t - a.t)
+    .slice(0, 10)
+    .map((row) => {
+      const usage = usageForCalendarDay(chatsDoc, row.dayKey);
+      return {
+        at: row.at,
+        dayKey: row.dayKey,
+        chats: usage.chats,
+        conversations: usage.conversations,
+      };
+    });
+}
+
+async function loginHistoryForUser(user) {
+  let doc = null;
+  try {
+    doc = await downloadObject(`users/${storageFolder(user)}/chats.json`);
+  } catch {
+    doc = null;
+  }
+  return buildLoginHistory(user, doc);
 }
 
 function usageFromChatsDocument(doc) {
@@ -406,4 +510,6 @@ module.exports = {
   usageForUser,
   deleteUserFolder,
   isMissingStorageObject,
+  recordLogin,
+  loginHistoryForUser,
 };
