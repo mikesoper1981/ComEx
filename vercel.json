@@ -7,8 +7,7 @@
       "maxDuration": 30
     },
     "api/users.js": {
-      "maxDuration": 30,
-      "includeFiles": "api/email-bg.png"
+      "maxDuration": 30
     }
   }
 }
