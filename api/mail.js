@@ -124,7 +124,7 @@ function fromAddress() {
 }
 
 function smtpHost() {
-  return envStr('SMTP_HOST', 'smtp-mail.outlook.com').toLowerCase();
+  return envStr('SMTP_HOST', 'smtp.gmail.com').toLowerCase();
 }
 
 function isOutlookMailbox() {
@@ -194,7 +194,7 @@ async function sendViaGraph({ to, subject, html }) {
 
 async function sendViaSmtp({ to, from, subject, html }) {
   if (isOutlookMailbox()) {
-    throw new Error('Hotmail/Outlook has disabled password SMTP (error 535 5.7.139). Set MS_CLIENT_ID and MS_REFRESH_TOKEN, or use Gmail SMTP / Resend.');
+    throw new Error('Hotmail/Outlook has disabled password SMTP. Use a Gmail address with an app password.');
   }
   let nodemailer;
   try {
@@ -203,16 +203,20 @@ async function sendViaSmtp({ to, from, subject, html }) {
     throw new Error('nodemailer is not installed');
   }
   const user = envStr('SMTP_USER');
-  const pass = envStr('SMTP_PASS');
+  const pass = envStr('SMTP_PASS').replace(/\s+/g, '');
   const host = smtpHost();
   const port = Number(envStr('SMTP_PORT', '587')) || 587;
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    requireTLS: port !== 465,
-    auth: { user, pass },
-  });
+  const transporter = nodemailer.createTransport(
+    host.includes('gmail.com')
+      ? { service: 'gmail', auth: { user, pass } }
+      : {
+        host,
+        port,
+        secure: port === 465,
+        requireTLS: port !== 465,
+        auth: { user, pass },
+      },
+  );
   await transporter.sendMail({ from, to, subject, html });
 }
 
@@ -245,12 +249,19 @@ async function sendViaResend({ to, from, subject, html }) {
 async function sendEmail({ to, subject, html }) {
   if (!to) throw new Error('No email address');
   const from = fromAddress();
+  const smtpUser = envStr('SMTP_USER');
+  const smtpPass = envStr('SMTP_PASS');
+  if (smtpUser && smtpPass) {
+    if (!from) throw new Error('EMAIL_FROM or SMTP_USER is not configured');
+    await sendViaSmtp({ to, from, subject, html });
+    return;
+  }
   if (envStr('RESEND_API_KEY')) {
     if (!from) throw new Error('EMAIL_FROM is not configured');
     await sendViaResend({ to, from, subject, html });
     return;
   }
-  throw new Error('Email is not configured. Set RESEND_API_KEY and EMAIL_FROM in Vercel.');
+  throw new Error('Email is not configured. Set SMTP_USER and SMTP_PASS for Gmail, or RESEND_API_KEY.');
 }
 
 module.exports = {

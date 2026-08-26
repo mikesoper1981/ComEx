@@ -21,12 +21,25 @@ Set these in your local `.env` and in your Vercel project settings:
 | `VITE_APP_USER2_EMAIL` | Seed | Optional email for the seeded standard user. |
 | `VITE_APP_USER3_EMAIL` | Seed | Optional email for the seeded Oscar user. |
 | `AUTH_SECRET` | Server (`api/users.js`) | Optional HMAC secret for login tokens. Falls back to `SUPABASE_SERVICE_KEY`. |
-| `RESEND_API_KEY` | Server (`api/mail.js`) | [Resend](https://resend.com) API key for welcome and password-reset emails. |
-| `EMAIL_FROM` | Server (`api/mail.js`) | From address, e.g. `ComEx <noreply@yourdomain.com>`. Must be a verified Resend domain/sender. |
+| `SMTP_USER` | Server (`api/mail.js`) | Gmail address that sends welcome and reset emails, e.g. `you@gmail.com`. |
+| `SMTP_PASS` | Server (`api/mail.js`) | Gmail **app password** (16 characters). Not your normal Gmail password. |
+| `EMAIL_FROM` | Server (`api/mail.js`) | From address, e.g. `ComEx <you@gmail.com>`. Must match `SMTP_USER` for Gmail. |
+| `RESEND_API_KEY` | Server (`api/mail.js`) | Optional. Used only if Gmail SMTP is not set. |
 | `APP_URL` | Server (`api/mail.js`) | Public login URL included in emails (falls back to the request origin). |
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |
 | `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.js`, `api/user-settings.js`, `api/users.js`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used for Stella Insights, user JSON, and the account registry (`intelligence/accounts.json`) with hashed passwords. |
+
+## Gmail email
+
+Welcome and password-reset mail can send from a Gmail account:
+
+1. Google Account → [Security](https://myaccount.google.com/security) → turn on **2-Step Verification**.
+2. [App passwords](https://myaccount.google.com/apppasswords) → create one named ComEx → copy the 16-character code.
+3. In Vercel set `SMTP_USER` (your Gmail), `SMTP_PASS` (the app password, spaces optional), and `EMAIL_FROM` to `ComEx <you@gmail.com>`.
+4. Redeploy.
+
+Do not use your normal Gmail password. Hotmail SMTP will not work.
 
 ## Stella Insights setup
 
