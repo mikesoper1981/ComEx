@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, ArrowLeft, History, KeyRound, Mail, Plus, Trash2, Users } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, History, Mail, Pencil, Plus, Trash2, Users } from 'lucide-react';
 import { authHeaders } from './auth';
+import {
+  GENERAL_SETTINGS_DEFAULTS,
+  RESPONSE_LENGTH_OPTIONS,
+  mergeGeneralIntoDocument,
+  pickGeneralSettings,
+} from './userGeneralSettings';
 
 function formatLogin(iso) {
   if (!iso) return 'Never';
@@ -45,7 +51,7 @@ function formatTime(iso) {
   }
 }
 
-export default function AdminUsers({ currentUserId }) {
+export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
   const [users, setUsers] = useState([]);
   const [status, setStatus] = useState('loading');
   const [error, setError] = useState('');
@@ -53,10 +59,12 @@ export default function AdminUsers({ currentUserId }) {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [role, setRole] = useState('user');
-  const [editEmail, setEditEmail] = useState('');
   const [busy, setBusy] = useState(false);
-  const [passwordUser, setPasswordUser] = useState(null);
-  const [newPassword, setNewPassword] = useState('');
+  const [editUser, setEditUser] = useState(null);
+  const [editEmail, setEditEmail] = useState('');
+  const [editGeneral, setEditGeneral] = useState(GENERAL_SETTINGS_DEFAULTS);
+  const [editDoc, setEditDoc] = useState(null);
+  const [editStatus, setEditStatus] = useState('idle');
   const [historyUser, setHistoryUser] = useState(null);
   const [historyDays, setHistoryDays] = useState([]);
   const [historyStatus, setHistoryStatus] = useState('idle');
@@ -120,26 +128,97 @@ export default function AdminUsers({ currentUserId }) {
     }
   };
 
-  const handleSetPassword = async (e) => {
+  const setGeneralField = (key, value) => {
+    setEditGeneral((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const openEdit = async (user) => {
+    setEditUser(user);
+    setEditEmail(user.email || '');
+    setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+    setEditDoc(null);
+    setEditStatus('loading');
+    setError('');
+    setNotice('');
+    try {
+      const q = new URLSearchParams({
+        userId: user.id,
+        userName: user.name,
+        file: 'settings.json',
+      });
+      const res = await fetch(`/api/user-settings?${q}`);
+      if (res.status === 404) {
+        setEditDoc(null);
+        setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+        setEditStatus('ready');
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const message = data?.error?.message || `Could not load settings (${res.status})`;
+        if (/object not found/i.test(message)) {
+          setEditDoc(null);
+          setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+          setEditStatus('ready');
+          return;
+        }
+        throw new Error(message);
+      }
+      const doc = data?.document && typeof data.document === 'object' ? data.document : data;
+      setEditDoc(doc);
+      setEditGeneral(pickGeneralSettings(doc));
+      setEditStatus('ready');
+    } catch (err) {
+      setEditStatus('error');
+      setError(err?.message || 'Could not load settings');
+    }
+  };
+
+  const closeEdit = () => {
+    setEditUser(null);
+    setEditEmail('');
+    setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+    setEditDoc(null);
+    setEditStatus('idle');
+    setError('');
+  };
+
+  const handleSaveEdit = async (e) => {
     e.preventDefault();
-    if (!passwordUser) return;
+    if (!editUser) return;
     setBusy(true);
     setError('');
     setNotice('');
     try {
-      await call({
-        action: 'set-password',
-        userId: passwordUser.id,
-        password: newPassword,
-        email: editEmail,
+      const nextEmail = editEmail.trim();
+      const prevEmail = String(editUser.email || '').trim();
+      if (nextEmail && nextEmail !== prevEmail) {
+        await call({
+          action: 'set-password',
+          userId: editUser.id,
+          email: nextEmail,
+        });
+      }
+      const document = mergeGeneralIntoDocument(editDoc, editGeneral, editUser);
+      const res = await fetch('/api/user-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: editUser.id,
+          userName: editUser.name,
+          file: 'settings.json',
+          document,
+        }),
       });
-      setPasswordUser(null);
-      setNewPassword('');
-      setEditEmail('');
-      setNotice(`Account updated for ${passwordUser.name}.`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || `Could not save settings (${res.status})`);
+      onGeneralSettingsSaved?.(editUser.id, { ...editGeneral });
+      const savedName = editUser.name;
+      closeEdit();
+      setNotice(`Updated ${savedName}. General settings now apply for that account.`);
       await load();
     } catch (err) {
-      setError(err?.message || 'Could not update password');
+      setError(err?.message || 'Could not save user');
     } finally {
       setBusy(false);
     }
@@ -254,6 +333,191 @@ export default function AdminUsers({ currentUserId }) {
     );
   }
 
+  if (editUser) {
+    const fieldClass = 'w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400';
+    const labelClass = 'block text-xs text-blue-300/70 font-semibold mb-2';
+    return (
+      <div className="space-y-4">
+        <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
+          <button
+            type="button"
+            onClick={closeEdit}
+            className="mb-4 px-3 py-1.5 bg-slate-700/50 hover:bg-slate-600/50 border border-blue-400/20 rounded-lg text-xs text-blue-200 font-semibold inline-flex items-center gap-1.5"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" /> Back to users
+          </button>
+          <h2 className="text-xl font-bold mb-1 flex items-center gap-2">
+            <Pencil className="w-6 h-6 text-cyan-400" /> Edit user
+          </h2>
+          <p className="text-sm text-blue-300/70 mb-5">
+            {editUser.name}{editUser.email ? ` · ${editUser.email}` : ''} — email and General settings for this account
+          </p>
+          {error && (
+            <div className="mb-4 text-sm text-red-300 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4" /> {error}
+            </div>
+          )}
+          {editStatus === 'loading' && (
+            <p className="text-sm text-blue-300/50">Loading settings…</p>
+          )}
+          {editStatus === 'error' && (
+            <button
+              type="button"
+              onClick={() => openEdit(editUser)}
+              className="px-4 py-2 bg-slate-700/60 text-slate-200 text-sm font-semibold rounded-lg"
+            >
+              Retry
+            </button>
+          )}
+          {editStatus === 'ready' && (
+            <form onSubmit={handleSaveEdit} className="space-y-6">
+              <div>
+                <label className={labelClass}>Email</label>
+                <input
+                  type="email"
+                  value={editEmail}
+                  onChange={(e) => setEditEmail(e.target.value)}
+                  placeholder="name@company.com"
+                  className={fieldClass}
+                />
+              </div>
+
+              <div>
+                <h3 className="text-sm font-bold text-white mb-1">General settings</h3>
+                <p className="text-xs text-blue-300/60 mb-4">
+                  Same fields as User Settings → General. Saved for {editUser.name}; they take effect the next time that user loads the hub.
+                </p>
+                <div className="mb-6 bg-slate-900/40 border border-blue-400/20 rounded-xl p-4">
+                  <label className="block text-sm font-semibold text-white mb-1">Response length</label>
+                  <p className="text-xs text-blue-300/60 mb-3">
+                    How chat and agent replies are written. Executive = decide. Standard = recommend. Teaching = explain.
+                  </p>
+                  <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit">
+                    {RESPONSE_LENGTH_OPTIONS.map((level) => (
+                      <button
+                        key={level.id}
+                        type="button"
+                        onClick={() => setGeneralField('responseLength', level.id)}
+                        className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${editGeneral.responseLength === level.id ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+                      >
+                        {level.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className={labelClass}>Company name</label>
+                    <input
+                      value={editGeneral.companyName}
+                      onChange={(e) => setGeneralField('companyName', e.target.value)}
+                      placeholder="e.g. Acme Pharma UK"
+                      className={fieldClass}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClass}>Industry / therapeutic area</label>
+                    <input
+                      value={editGeneral.industry}
+                      onChange={(e) => setGeneralField('industry', e.target.value)}
+                      placeholder="e.g. Specialty pharma — oncology"
+                      className={fieldClass}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClass}>Role</label>
+                    <input
+                      value={editGeneral.role}
+                      onChange={(e) => setGeneralField('role', e.target.value)}
+                      placeholder="e.g. Incentive Compensation Manager"
+                      className={fieldClass}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClass}>Preferred currency / units</label>
+                    <input
+                      value={editGeneral.currency}
+                      onChange={(e) => setGeneralField('currency', e.target.value)}
+                      placeholder="e.g. GBP, % of target"
+                      className={fieldClass}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Company metrics &amp; definitions</label>
+                    <textarea
+                      value={editGeneral.metrics}
+                      onChange={(e) => setGeneralField('metrics', e.target.value)}
+                      rows={3}
+                      placeholder={'e.g. Attainment = actual / quota'}
+                      className={`${fieldClass} resize-y`}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Abbreviations &amp; terminology</label>
+                    <textarea
+                      value={editGeneral.abbreviations}
+                      onChange={(e) => setGeneralField('abbreviations', e.target.value)}
+                      rows={4}
+                      placeholder={'e.g. AE = Account Executive'}
+                      className={`${fieldClass} resize-y`}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Preferences</label>
+                    <textarea
+                      value={editGeneral.preferences}
+                      onChange={(e) => setGeneralField('preferences', e.target.value)}
+                      rows={3}
+                      placeholder="e.g. Prefer tables over long paragraphs, UK spelling"
+                      className={`${fieldClass} resize-y`}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Hard constraints</label>
+                    <textarea
+                      value={editGeneral.constraints}
+                      onChange={(e) => setGeneralField('constraints', e.target.value)}
+                      rows={3}
+                      placeholder="e.g. Must comply with ABPI"
+                      className={`${fieldClass} resize-y`}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Additional context</label>
+                    <textarea
+                      value={editGeneral.customContext}
+                      onChange={(e) => setGeneralField('customContext', e.target.value)}
+                      rows={4}
+                      placeholder="Anything else the AI should always know across tools."
+                      className={`${fieldClass} resize-y`}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  type="submit"
+                  disabled={busy || editStatus === 'error'}
+                  className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white text-sm font-semibold rounded-lg"
+                >
+                  {busy ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  type="button"
+                  onClick={closeEdit}
+                  className="px-4 py-2 bg-slate-700/60 text-slate-200 text-sm font-semibold rounded-lg"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
       <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
@@ -266,7 +530,7 @@ export default function AdminUsers({ currentUserId }) {
 
         <form onSubmit={handleCreate} className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 mb-6 grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
           <div>
-            <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Name</label>
+            <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Username</label>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -312,50 +576,6 @@ export default function AdminUsers({ currentUserId }) {
         )}
         {notice && (
           <div className="mb-4 text-sm text-emerald-300">{notice}</div>
-        )}
-
-        {passwordUser && (
-          <form onSubmit={handleSetPassword} className="mb-6 bg-slate-900/50 border border-cyan-400/25 rounded-xl p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 items-end">
-            <div>
-              <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">
-                Email for {passwordUser.name}
-              </label>
-              <input
-                type="email"
-                value={editEmail}
-                onChange={(e) => setEditEmail(e.target.value)}
-                placeholder="name@company.com"
-                className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">
-                New password
-              </label>
-              <input
-                type="password"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="Leave blank to keep current"
-                autoComplete="new-password"
-                className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={busy || (newPassword.length > 0 && newPassword.length < 8) || (!editEmail.trim() && !newPassword)}
-              className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/30 text-cyan-200 text-sm font-semibold rounded-lg disabled:opacity-40"
-            >
-              Save
-            </button>
-            <button
-              type="button"
-              onClick={() => { setPasswordUser(null); setNewPassword(''); setEditEmail(''); }}
-              className="px-4 py-2 bg-slate-700/60 text-slate-200 text-sm font-semibold rounded-lg"
-            >
-              Cancel
-            </button>
-          </form>
         )}
 
         <div className="overflow-x-auto">
@@ -423,10 +643,10 @@ export default function AdminUsers({ currentUserId }) {
                       </button>
                       <button
                         type="button"
-                        onClick={() => { setPasswordUser(u); setNewPassword(''); setEditEmail(u.email || ''); setNotice(''); }}
+                        onClick={() => openEdit(u)}
                         className="px-2.5 py-1.5 bg-slate-700/50 hover:bg-slate-600/50 border border-blue-400/20 rounded-lg text-xs text-blue-200 font-semibold inline-flex items-center gap-1"
                       >
-                        <KeyRound className="w-3.5 h-3.5" /> Edit
+                        <Pencil className="w-3.5 h-3.5" /> Edit
                       </button>
                       <button
                         type="button"

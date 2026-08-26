@@ -8494,7 +8494,17 @@ ${stepInstruction}`;
               )}
 
               {adminModule === 'users' && (
-                <AdminUsers currentUserId={currentUser.id} />
+                <AdminUsers
+                  currentUserId={currentUser.id}
+                  onGeneralSettingsSaved={(userId, general) => {
+                    if (String(userId) !== String(currentUser.id)) return;
+                    setUserSettings((prev) => {
+                      const next = mergeUserSettingsFields({ ...prev, ...general });
+                      userSettingsRef.current = next;
+                      return next;
+                    });
+                  }}
+                />
               )}
             </div>
           ) : null}
