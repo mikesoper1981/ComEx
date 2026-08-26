@@ -30,31 +30,29 @@ function wrapEmail({ title, preheader, bodyHtml }) {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(title)}</title>
 </head>
-<body style="margin:0;padding:0;background-color:#000000;color:#ffffff;">
-  <div style="display:none;max-height:0;overflow:hidden;font-size:1px;line-height:1px;color:#000000;">${escapeHtml(preheader)}</div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#000000" style="background-color:#000000;">
+<body style="margin:0;padding:0;background-color:#0f172a;font-family:Arial,Helvetica,sans-serif;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;">${escapeHtml(preheader)}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#0f172a" style="background-color:#0f172a;">
     <tr>
-      <td align="center" bgcolor="#000000" style="background-color:#000000;padding:32px 16px;">
-        <table role="presentation" width="520" cellpadding="0" cellspacing="0" border="0" bgcolor="#2563eb" style="width:100%;max-width:520px;background-color:#2563eb;">
+      <td align="center" bgcolor="#0f172a" style="background-color:#0f172a;padding:32px 16px;">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" bgcolor="#0b1220" style="width:100%;max-width:560px;background-color:#0b1220;">
           <tr>
-            <td bgcolor="#2563eb" style="background-color:#2563eb;padding:22px 24px 8px;font-family:Arial,Helvetica,sans-serif;color:#ffffff;font-size:22px;font-weight:700;">
+            <td bgcolor="#0b1220" style="background-color:#0b1220;padding:28px 28px 8px;font-family:Arial,Helvetica,sans-serif;color:#ffffff;font-size:20px;font-weight:700;">
               ComEx
             </td>
           </tr>
           <tr>
-            <td bgcolor="#2563eb" style="background-color:#2563eb;padding:0 24px 20px;font-family:Arial,Helvetica,sans-serif;color:#dbeafe;font-size:12px;font-weight:700;">
+            <td bgcolor="#0b1220" style="background-color:#0b1220;padding:0 28px 24px;font-family:Arial,Helvetica,sans-serif;color:#cbd5e1;font-size:13px;">
               Commercial Excellence Hub
             </td>
           </tr>
           <tr>
-            <td bgcolor="#2563eb" style="background-color:#2563eb;padding:0 24px 24px;font-family:Arial,Helvetica,sans-serif;">
+            <td bgcolor="#0b1220" style="background-color:#0b1220;padding:0 28px 28px;font-family:Arial,Helvetica,sans-serif;">
               ${bodyHtml}
             </td>
           </tr>
-        </table>
-        <table role="presentation" width="520" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:520px;">
           <tr>
-            <td align="center" bgcolor="#000000" style="background-color:#000000;padding:16px 8px 0;font-family:Arial,Helvetica,sans-serif;font-size:11px;color:#94a3b8;">
+            <td bgcolor="#0b1220" style="background-color:#0b1220;padding:0 28px 24px;font-family:Arial,Helvetica,sans-serif;color:#64748b;font-size:11px;line-height:1.5;">
               This email was sent by ComEx. If you were not expecting it, you can ignore it.
             </td>
           </tr>
@@ -67,10 +65,16 @@ function wrapEmail({ title, preheader, bodyHtml }) {
 }
 
 function credentialBox(rowsHtml) {
-  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#1d4ed8" style="background-color:#1d4ed8;margin:0 0 20px;">
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#60a5fa" style="background-color:#60a5fa;margin:0 0 22px;">
     <tr>
-      <td style="padding:12px 16px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${rowsHtml}</table>
+      <td style="padding:1px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#1e293b" style="background-color:#1e293b;">
+          <tr>
+            <td style="padding:10px 16px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${rowsHtml}</table>
+            </td>
+          </tr>
+        </table>
       </td>
     </tr>
   </table>`;
@@ -78,29 +82,24 @@ function credentialBox(rowsHtml) {
 
 function credentialRow(label, value) {
   return `<tr>
-    <td style="padding:8px 0;color:#bfdbfe;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;width:150px;vertical-align:top;font-family:Arial,Helvetica,sans-serif;">${escapeHtml(label)}</td>
-    <td style="padding:8px 0;color:#ffffff;font-size:16px;font-weight:700;font-family:Arial,Helvetica,sans-serif;">${escapeHtml(value)}</td>
+    <td style="padding:8px 0;color:#93c5fd;font-size:12px;font-weight:700;width:150px;vertical-align:top;font-family:Arial,Helvetica,sans-serif;">${escapeHtml(label)}</td>
+    <td style="padding:8px 0;color:#ffffff;font-size:14px;font-family:Consolas,Monaco,monospace;">${escapeHtml(value)}</td>
   </tr>`;
 }
 
 function ctaButton(url, label) {
-  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0">
-    <tr>
-      <td bgcolor="#000000" style="background-color:#000000;">
-        <a href="${escapeHtml(url)}" style="display:inline-block;background-color:#000000;color:#ffffff;text-decoration:none;font-weight:700;font-size:14px;font-family:Arial,Helvetica,sans-serif;padding:12px 22px;">${escapeHtml(label)}</a>
-      </td>
-    </tr>
-  </table>
-  <p style="margin:12px 0 0;color:#dbeafe;font-size:12px;word-break:break-all;font-family:Arial,Helvetica,sans-serif;">${escapeHtml(url)}</p>`;
+  return `<a href="${escapeHtml(url)}" style="display:inline-block;color:#ffffff;text-decoration:none;font-weight:700;font-size:16px;font-family:Arial,Helvetica,sans-serif;">${escapeHtml(label)}</a>
+  <p style="margin:10px 0 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.5;word-break:break-all;">
+    <a href="${escapeHtml(url)}" style="color:#7dd3fc;text-decoration:underline;">${escapeHtml(url)}</a>
+  </p>`;
 }
 
 function welcomeEmail({ name, username, password, loginUrl }) {
   const url = loginUrl || appLoginUrl();
   const bodyHtml = `
-    <p style="margin:0 0 8px;color:#dbeafe;font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;font-family:Arial,Helvetica,sans-serif;">Welcome</p>
-    <p style="margin:0 0 12px;color:#ffffff;font-size:22px;font-weight:700;font-family:Arial,Helvetica,sans-serif;">Your ComEx account is ready</p>
-    <p style="margin:0 0 20px;color:#dbeafe;font-size:14px;line-height:1.6;font-family:Arial,Helvetica,sans-serif;">
-      Hi ${escapeHtml(name || username)}, sign in with the one-time password below. You will be asked to choose a new password as soon as you log in.
+    <p style="margin:0 0 12px;color:#ffffff;font-size:18px;font-weight:700;font-family:Arial,Helvetica,sans-serif;">Welcome to ComEx</p>
+    <p style="margin:0 0 20px;color:#cbd5e1;font-size:14px;line-height:1.55;font-family:Arial,Helvetica,sans-serif;">
+      Hi ${escapeHtml(name || username)}, your account is ready. Sign in with the details below.
     </p>
     ${credentialBox(`${credentialRow('Username', username)}${credentialRow('One-time password', password)}`)}
     ${ctaButton(url, 'Open ComEx')}
@@ -118,10 +117,9 @@ function welcomeEmail({ name, username, password, loginUrl }) {
 function resetEmail({ name, username, password, loginUrl }) {
   const url = loginUrl || appLoginUrl();
   const bodyHtml = `
-    <p style="margin:0 0 8px;color:#dbeafe;font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;font-family:Arial,Helvetica,sans-serif;">Password reset</p>
-    <p style="margin:0 0 12px;color:#ffffff;font-size:22px;font-weight:700;font-family:Arial,Helvetica,sans-serif;">Your one-time password</p>
-    <p style="margin:0 0 20px;color:#dbeafe;font-size:14px;line-height:1.6;font-family:Arial,Helvetica,sans-serif;">
-      Hi ${escapeHtml(name || username)}, this password expires in 24 hours. You will be asked to choose a new password when you sign in.
+    <p style="margin:0 0 12px;color:#ffffff;font-size:18px;font-weight:700;font-family:Arial,Helvetica,sans-serif;">Password reset</p>
+    <p style="margin:0 0 20px;color:#cbd5e1;font-size:14px;line-height:1.55;font-family:Arial,Helvetica,sans-serif;">
+      Hi ${escapeHtml(name || username)}, here is a one-time password for ComEx. It expires in 24 hours and you will be asked to choose a new password when you sign in.
     </p>
     ${credentialBox(`${credentialRow('Username', username)}${credentialRow('One-time password', password)}`)}
     ${ctaButton(url, 'Sign in to ComEx')}
