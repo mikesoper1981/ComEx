@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, ArrowLeft, History, Mail, Pencil, Plus, Trash2, Users } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, History, Mail, Pencil, Plus, Trash2, Users, X } from 'lucide-react';
 import { authHeaders } from './auth';
 import {
   GENERAL_SETTINGS_DEFAULTS,
   RESPONSE_LENGTH_OPTIONS,
   mergeGeneralIntoDocument,
   pickGeneralSettings,
+  pickMemoryItems,
 } from './userGeneralSettings';
 
 function formatLogin(iso) {
@@ -63,6 +64,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
   const [editUser, setEditUser] = useState(null);
   const [editEmail, setEditEmail] = useState('');
   const [editGeneral, setEditGeneral] = useState(GENERAL_SETTINGS_DEFAULTS);
+  const [editMemory, setEditMemory] = useState([]);
   const [editDoc, setEditDoc] = useState(null);
   const [editStatus, setEditStatus] = useState('idle');
   const [historyUser, setHistoryUser] = useState(null);
@@ -136,6 +138,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
     setEditUser(user);
     setEditEmail(user.email || '');
     setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+    setEditMemory([]);
     setEditDoc(null);
     setEditStatus('loading');
     setError('');
@@ -150,6 +153,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
       if (res.status === 404) {
         setEditDoc(null);
         setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+        setEditMemory([]);
         setEditStatus('ready');
         return;
       }
@@ -159,6 +163,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
         if (/object not found/i.test(message)) {
           setEditDoc(null);
           setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+          setEditMemory([]);
           setEditStatus('ready');
           return;
         }
@@ -167,6 +172,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
       const doc = data?.document && typeof data.document === 'object' ? data.document : data;
       setEditDoc(doc);
       setEditGeneral(pickGeneralSettings(doc));
+      setEditMemory(pickMemoryItems(doc));
       setEditStatus('ready');
     } catch (err) {
       setEditStatus('error');
@@ -178,9 +184,26 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
     setEditUser(null);
     setEditEmail('');
     setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+    setEditMemory([]);
     setEditDoc(null);
     setEditStatus('idle');
     setError('');
+  };
+
+  const persistUserSettings = async (user, document) => {
+    const res = await fetch('/api/user-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: user.id,
+        userName: user.name,
+        file: 'settings.json',
+        document,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `Could not save settings (${res.status})`);
+    return document;
   };
 
   const handleSaveEdit = async (e) => {
@@ -199,26 +222,33 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
           email: nextEmail,
         });
       }
-      const document = mergeGeneralIntoDocument(editDoc, editGeneral, editUser);
-      const res = await fetch('/api/user-settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: editUser.id,
-          userName: editUser.name,
-          file: 'settings.json',
-          document,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.error?.message || `Could not save settings (${res.status})`);
-      onGeneralSettingsSaved?.(editUser.id, { ...editGeneral });
+      const document = mergeGeneralIntoDocument(editDoc, editGeneral, editUser, editMemory);
+      await persistUserSettings(editUser, document);
+      onGeneralSettingsSaved?.(editUser.id, { ...editGeneral, memory: editMemory });
       const savedName = editUser.name;
       closeEdit();
       setNotice(`Updated ${savedName}. General settings now apply for that account.`);
       await load();
     } catch (err) {
       setError(err?.message || 'Could not save user');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRemoveMemory = async (item) => {
+    if (!editUser) return;
+    const nextMemory = editMemory.filter((m) => m.id !== item.id);
+    setBusy(true);
+    setError('');
+    try {
+      const document = mergeGeneralIntoDocument(editDoc, pickGeneralSettings(editDoc), editUser, nextMemory);
+      await persistUserSettings(editUser, document);
+      setEditDoc(document);
+      setEditMemory(nextMemory);
+      onGeneralSettingsSaved?.(editUser.id, { ...pickGeneralSettings(editDoc), memory: nextMemory });
+    } catch (err) {
+      setError(err?.message || 'Could not remove memory');
     } finally {
       setBusy(false);
     }
@@ -491,6 +521,32 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                       placeholder="Anything else the AI should always know across tools."
                       className={`${fieldClass} resize-y`}
                     />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Remembered from chats</label>
+                    <p className="text-[11px] text-blue-300/45 mb-2">
+                      Short facts stored for this user. Remove one and it stops applying immediately.
+                    </p>
+                    {editMemory.length === 0 ? (
+                      <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet.</div>
+                    ) : (
+                      <ul className="space-y-2">
+                        {editMemory.map((item) => (
+                          <li key={item.id} className="flex items-start gap-2 bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
+                            <span className="flex-1 text-xs text-slate-200 leading-relaxed">{item.text}</span>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleRemoveMemory(item)}
+                              className="text-blue-300/50 hover:text-red-300 p-0.5 disabled:opacity-40"
+                              aria-label="Forget this fact"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 </div>
               </div>

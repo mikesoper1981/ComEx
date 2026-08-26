@@ -27,10 +27,14 @@ function storedLength(raw) {
   return 'standard';
 }
 
+function settingsFrom(doc) {
+  if (!doc || typeof doc !== 'object') return {};
+  if (doc.settings && typeof doc.settings === 'object') return doc.settings;
+  return doc;
+}
+
 export function pickGeneralSettings(doc) {
-  const raw = doc && typeof doc === 'object'
-    ? (doc.settings && typeof doc.settings === 'object' ? doc.settings : doc)
-    : {};
+  const raw = settingsFrom(doc);
   return {
     companyName: String(raw.companyName || ''),
     industry: String(raw.industry || ''),
@@ -45,7 +49,18 @@ export function pickGeneralSettings(doc) {
   };
 }
 
-export function mergeGeneralIntoDocument(existing, general, user) {
+export function pickMemoryItems(doc) {
+  const raw = settingsFrom(doc);
+  if (!Array.isArray(raw.memory)) return [];
+  return raw.memory
+    .map((item, i) => ({
+      id: String(item?.id || `mem_${i + 1}`),
+      text: String(item?.text || (typeof item === 'string' ? item : '')).trim(),
+    }))
+    .filter((item) => item.text);
+}
+
+export function mergeGeneralIntoDocument(existing, general, user, memory) {
   const prev = existing && typeof existing === 'object' ? existing : {};
   const prevSettings = prev.settings && typeof prev.settings === 'object'
     ? prev.settings
@@ -53,13 +68,15 @@ export function mergeGeneralIntoDocument(existing, general, user) {
         const { userId: _id, updatedAt: _at, settings: _s, userName: _n, ...fields } = prev;
         return fields;
       })();
+  const settings = {
+    ...prevSettings,
+    ...pickGeneralSettings(general),
+  };
+  if (Array.isArray(memory)) settings.memory = memory;
   return {
     userId: user.id,
     userName: user.name,
     updatedAt: new Date().toISOString(),
-    settings: {
-      ...prevSettings,
-      ...pickGeneralSettings(general),
-    },
+    settings,
   };
 }
