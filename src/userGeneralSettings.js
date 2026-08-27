@@ -60,7 +60,7 @@ export function pickMemoryItems(doc) {
     .filter((item) => item.text);
 }
 
-export function mergeGeneralIntoDocument(existing, general, user, memory) {
+export function mergeGeneralIntoDocument(existing, general, user, memory, extra = {}) {
   const prev = existing && typeof existing === 'object' ? existing : {};
   const prevSettings = prev.settings && typeof prev.settings === 'object'
     ? prev.settings
@@ -73,6 +73,12 @@ export function mergeGeneralIntoDocument(existing, general, user, memory) {
     ...pickGeneralSettings(general),
   };
   if (Array.isArray(memory)) settings.memory = memory;
+  if (extra.stellaBusinessContext) {
+    settings.stellaBusinessContext = extra.stellaBusinessContext;
+  }
+  if (extra.stellaConnections) {
+    settings.stellaConnections = extra.stellaConnections;
+  }
   return {
     userId: user.id,
     userName: user.name,

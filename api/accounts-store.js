@@ -208,13 +208,26 @@ async function uploadObject(path, doc) {
   }
 }
 
+function joinStoragePath(prefix, name) {
+  const n = String(name || '').replace(/^\/+/, '');
+  if (!n) return '';
+  if (n.startsWith('users/')) return n.replace(/\/+/g, '/');
+  const base = String(prefix || '').replace(/\/+$/, '');
+  return `${base}/${n}`.replace(/\/+/g, '/');
+}
+
 async function listObjects(prefix) {
   const { supabaseUrl, serviceKey } = supabaseConfig();
+  if (!supabaseUrl || !serviceKey) return [];
   const url = `${supabaseUrl}/storage/v1/object/list/intelligence`;
   const upstream = await fetch(url, {
     method: 'POST',
     headers: storageHeaders(serviceKey, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ prefix, limit: 1000 }),
+    body: JSON.stringify({
+      prefix: String(prefix || '').replace(/^\/+|\/+$/g, ''),
+      limit: 1000,
+      offset: 0,
+    }),
   });
   const text = await upstream.text();
   if (!upstream.ok) return [];
@@ -222,15 +235,82 @@ async function listObjects(prefix) {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+async function listObjectsRecursive(prefix) {
+  const root = String(prefix || '').replace(/\/+$/, '');
+  const files = [];
+  const queue = [root];
+  const seen = new Set();
+  while (queue.length) {
+    const folder = queue.shift();
+    if (!folder || seen.has(folder)) continue;
+    seen.add(folder);
+    const items = await listObjects(folder);
+    for (const item of items) {
+      const name = String(item?.name || '');
+      if (!name || name === '.emptyFolderPlaceholder') continue;
+      const full = joinStoragePath(folder, name);
+      if (!full || seen.has(full)) continue;
+      const isFolder = item.id == null;
+      if (isFolder) {
+        queue.push(full);
+      } else {
+        files.push(full);
+        seen.add(full);
+      }
+    }
+  }
+  return files;
+}
+
+function extraPathsFromSettings(doc) {
+  const settings = doc && typeof doc === 'object'
+    ? (doc.settings && typeof doc.settings === 'object' ? doc.settings : doc)
+    : {};
+  const out = [];
+  const pptx = settings.pptxTemplate?.storagePath;
+  if (pptx) out.push(String(pptx));
+  const buckets = settings.moduleContext && typeof settings.moduleContext === 'object'
+    ? Object.values(settings.moduleContext)
+    : [];
+  for (const bucket of buckets) {
+    for (const file of bucket?.files || []) {
+      if (file?.storagePath) {
+        out.push(String(file.storagePath));
+        out.push(`${file.storagePath}.extracted.txt`);
+      }
+    }
+  }
+  return out;
+}
+
 async function removeObjects(paths) {
-  if (!paths.length) return;
+  const unique = [...new Set((paths || []).map((p) => String(p || '').replace(/^\/+/, '')).filter(Boolean))];
+  if (!unique.length) return;
   const { supabaseUrl, serviceKey } = supabaseConfig();
-  const url = `${supabaseUrl}/storage/v1/object/remove/intelligence`;
-  await fetch(url, {
-    method: 'POST',
-    headers: storageHeaders(serviceKey, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ prefixes: paths }),
-  });
+  if (!supabaseUrl || !serviceKey) {
+    throw new Error('Supabase is not configured');
+  }
+  const headers = storageHeaders(serviceKey, { 'Content-Type': 'application/json' });
+  for (let i = 0; i < unique.length; i += 100) {
+    const chunk = unique.slice(i, i + 100);
+    let upstream = await fetch(`${supabaseUrl}/storage/v1/object/intelligence`, {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({ prefixes: chunk }),
+    });
+    if (!upstream.ok) {
+      upstream = await fetch(`${supabaseUrl}/storage/v1/object/remove/intelligence`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ prefixes: chunk }),
+      });
+    }
+    if (!upstream.ok) {
+      const text = await upstream.text();
+      const parsed = parseJsonSafe(text);
+      throw new Error(parsed?.message || parsed?.error || text || 'Could not delete user files');
+    }
+  }
 }
 
 async function loadAccounts() {
@@ -478,17 +558,88 @@ async function usageForUser(user) {
 }
 
 async function deleteUserFolder(user) {
-  const folder = storageFolder(user);
-  const prefix = `users/${folder}`;
-  const items = await listObjects(`${prefix}/`);
-  const paths = items.map((item) => {
-    const name = String(item.name || '');
-    if (!name) return '';
-    return name.startsWith('users/') ? name : `${prefix}/${name}`;
-  }).filter(Boolean);
-  const known = [`${prefix}/settings.json`, `${prefix}/chats.json`, `${prefix}/pptx-template.pptx`];
-  const unique = [...new Set([...known, ...paths])];
-  await removeObjects(unique);
+  const named = storageFolder(user);
+  const prefixes = [`users/${named}`];
+  const id = String(user?.id || '').trim();
+  if (id && id !== named) prefixes.push(`users/${id}`);
+
+  const paths = [];
+  for (const prefix of prefixes) {
+    const settingsDoc = await downloadObject(`${prefix}/settings.json`).catch(() => null);
+    paths.push(...extraPathsFromSettings(settingsDoc));
+    paths.push(
+      `${prefix}/settings.json`,
+      `${prefix}/chats.json`,
+      `${prefix}/pptx-template.pptx`,
+    );
+    paths.push(...await listObjectsRecursive(prefix));
+  }
+  await removeObjects(paths);
+}
+
+function restHeaders(serviceKey) {
+  return {
+    Authorization: `Bearer ${serviceKey}`,
+    apikey: serviceKey,
+    'Content-Type': 'application/json',
+    Prefer: 'return=representation',
+  };
+}
+
+async function removeFromBucket(bucket, paths) {
+  const unique = [...new Set((paths || []).map((p) => String(p || '').replace(/^\/+/, '')).filter(Boolean))];
+  if (!unique.length) return;
+  const { supabaseUrl, serviceKey } = supabaseConfig();
+  if (!supabaseUrl || !serviceKey) return;
+  const headers = storageHeaders(serviceKey, { 'Content-Type': 'application/json' });
+  for (let i = 0; i < unique.length; i += 100) {
+    const chunk = unique.slice(i, i + 100);
+    let upstream = await fetch(`${supabaseUrl}/storage/v1/object/${bucket}`, {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({ prefixes: chunk }),
+    });
+    if (!upstream.ok) {
+      await fetch(`${supabaseUrl}/storage/v1/object/remove/${bucket}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ prefixes: chunk }),
+      }).catch(() => null);
+    }
+  }
+}
+
+async function deleteUserStellaData(user) {
+  const { supabaseUrl, serviceKey } = supabaseConfig();
+  const userId = String(user?.id || '').trim();
+  if (!supabaseUrl || !serviceKey || !userId) return;
+  const orgId = `user:${userId}`;
+  const headers = restHeaders(serviceKey);
+  const listUrl = `${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}&select=id,table_name,storage_path`;
+  const listRes = await fetch(listUrl, { headers }).catch(() => null);
+  const files = listRes && listRes.ok ? await listRes.json().catch(() => []) : [];
+  const storagePaths = [];
+  for (const file of Array.isArray(files) ? files : []) {
+    if (file?.table_name) {
+      await fetch(`${supabaseUrl}/rest/v1/rpc/stella_drop_table`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ p_table_name: file.table_name }),
+      }).catch(() => null);
+    }
+    if (file?.storage_path) {
+      storagePaths.push(String(file.storage_path));
+      storagePaths.push(`${file.storage_path}.extracted.txt`);
+    }
+  }
+  await fetch(`${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}`, {
+    method: 'DELETE',
+    headers,
+  }).catch(() => null);
+  const folder = `users/${storageFolder(user)}/stella`;
+  storagePaths.push(folder);
+  await removeFromBucket('intelligence', storagePaths);
+  await removeFromBucket('stella-data', storagePaths);
 }
 
 module.exports = {
@@ -509,6 +660,7 @@ module.exports = {
   verifyToken,
   usageForUser,
   deleteUserFolder,
+  deleteUserStellaData,
   isMissingStorageObject,
   recordLogin,
   loginHistoryForUser,

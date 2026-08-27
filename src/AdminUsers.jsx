@@ -8,6 +8,11 @@ import {
   pickGeneralSettings,
   pickMemoryItems,
 } from './userGeneralSettings';
+import {
+  DEFAULT_STELLA_BUSINESS_CONTEXT,
+  mergeStellaBusinessContext,
+  pickStellaBusinessContext,
+} from './stellaUserSettings';
 
 function formatLogin(iso) {
   if (!iso) return 'Never';
@@ -64,12 +69,14 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
   const [editUser, setEditUser] = useState(null);
   const [editEmail, setEditEmail] = useState('');
   const [editGeneral, setEditGeneral] = useState(GENERAL_SETTINGS_DEFAULTS);
+  const [editStellaBiz, setEditStellaBiz] = useState(DEFAULT_STELLA_BUSINESS_CONTEXT);
   const [editMemory, setEditMemory] = useState([]);
   const [editDoc, setEditDoc] = useState(null);
   const [editStatus, setEditStatus] = useState('idle');
   const [historyUser, setHistoryUser] = useState(null);
   const [historyDays, setHistoryDays] = useState([]);
   const [historyStatus, setHistoryStatus] = useState('idle');
+  const [pendingDelete, setPendingDelete] = useState(null);
 
   const load = async () => {
     setStatus('loading');
@@ -138,6 +145,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
     setEditUser(user);
     setEditEmail(user.email || '');
     setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+    setEditStellaBiz({ ...DEFAULT_STELLA_BUSINESS_CONTEXT });
     setEditMemory([]);
     setEditDoc(null);
     setEditStatus('loading');
@@ -153,6 +161,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
       if (res.status === 404) {
         setEditDoc(null);
         setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+        setEditStellaBiz({ ...DEFAULT_STELLA_BUSINESS_CONTEXT });
         setEditMemory([]);
         setEditStatus('ready');
         return;
@@ -163,6 +172,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
         if (/object not found/i.test(message)) {
           setEditDoc(null);
           setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+          setEditStellaBiz({ ...DEFAULT_STELLA_BUSINESS_CONTEXT });
           setEditMemory([]);
           setEditStatus('ready');
           return;
@@ -172,6 +182,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
       const doc = data?.document && typeof data.document === 'object' ? data.document : data;
       setEditDoc(doc);
       setEditGeneral(pickGeneralSettings(doc));
+      setEditStellaBiz(pickStellaBusinessContext(doc));
       setEditMemory(pickMemoryItems(doc));
       setEditStatus('ready');
     } catch (err) {
@@ -184,6 +195,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
     setEditUser(null);
     setEditEmail('');
     setEditGeneral({ ...GENERAL_SETTINGS_DEFAULTS });
+    setEditStellaBiz({ ...DEFAULT_STELLA_BUSINESS_CONTEXT });
     setEditMemory([]);
     setEditDoc(null);
     setEditStatus('idle');
@@ -222,12 +234,18 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
           email: nextEmail,
         });
       }
-      const document = mergeGeneralIntoDocument(editDoc, editGeneral, editUser, editMemory);
+      const document = mergeGeneralIntoDocument(editDoc, editGeneral, editUser, editMemory, {
+        stellaBusinessContext: mergeStellaBusinessContext(editStellaBiz),
+      });
       await persistUserSettings(editUser, document);
-      onGeneralSettingsSaved?.(editUser.id, { ...editGeneral, memory: editMemory });
+      onGeneralSettingsSaved?.(editUser.id, {
+        ...editGeneral,
+        memory: editMemory,
+        stellaBusinessContext: mergeStellaBusinessContext(editStellaBiz),
+      });
       const savedName = editUser.name;
       closeEdit();
-      setNotice(`Updated ${savedName}. General settings now apply for that account.`);
+      setNotice(`Updated ${savedName}. Settings now apply for that account.`);
       await load();
     } catch (err) {
       setError(err?.message || 'Could not save user');
@@ -268,16 +286,27 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
     }
   };
 
-  const handleRemove = async (user) => {
+  const handleRemove = (user) => {
     if (user.id === currentUserId) return;
-    const ok = window.confirm(`Remove ${user.name}? Their settings and chat history will be deleted.`);
-    if (!ok) return;
+    setError('');
+    setNotice('');
+    setPendingDelete(user);
+  };
+
+  const confirmRemove = async () => {
+    const user = pendingDelete;
+    if (!user) return;
     setBusy(true);
     setError('');
     setNotice('');
     try {
-      await call({ action: 'delete', userId: user.id });
-      setNotice(`${user.name} removed.`);
+      const data = await call({ action: 'delete', userId: user.id, userName: user.name });
+      setPendingDelete(null);
+      setNotice(
+        data?.warning
+          ? `${user.name} was removed. ${data.warning}`
+          : `${user.name} removed, including chat history, settings, and uploaded context.`
+      );
       await load();
     } catch (err) {
       setError(err?.message || 'Could not remove user');
@@ -380,7 +409,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             <Pencil className="w-6 h-6 text-cyan-400" /> Edit user
           </h2>
           <p className="text-sm text-blue-300/70 mb-5">
-            {editUser.name}{editUser.email ? ` · ${editUser.email}` : ''} — email and General settings for this account
+            {editUser.name}{editUser.email ? ` · ${editUser.email}` : ''} — email, General, and Stella Insights settings for this account
           </p>
           {error && (
             <div className="mb-4 text-sm text-red-300 flex items-center gap-2">
@@ -547,6 +576,58 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                         ))}
                       </ul>
                     )}
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-sm font-bold text-white mb-1">Stella Insights</h3>
+                <p className="text-xs text-blue-300/60 mb-4">
+                  Business context for this account. Dataset files and connectors are uploaded from that user&apos;s User Settings → Stella Insights → Connections.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className={labelClass}>Company name</label>
+                    <input
+                      value={editStellaBiz.companyName}
+                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, companyName: e.target.value }))}
+                      className={fieldClass}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClass}>Industry</label>
+                    <input
+                      value={editStellaBiz.industry}
+                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, industry: e.target.value }))}
+                      className={fieldClass}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Key goals</label>
+                    <textarea
+                      value={editStellaBiz.keyGoals}
+                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, keyGoals: e.target.value }))}
+                      rows={3}
+                      className={`${fieldClass} resize-y`}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Key metrics</label>
+                    <textarea
+                      value={editStellaBiz.keyMetrics}
+                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, keyMetrics: e.target.value }))}
+                      rows={3}
+                      className={`${fieldClass} resize-y`}
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className={labelClass}>Terminology / definitions</label>
+                    <textarea
+                      value={editStellaBiz.terminology}
+                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, terminology: e.target.value }))}
+                      rows={4}
+                      className={`${fieldClass} resize-y`}
+                    />
                   </div>
                 </div>
               </div>
@@ -720,6 +801,42 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
           </table>
         </div>
       </div>
+      {pendingDelete && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-lg bg-slate-900 border border-red-400/30 rounded-2xl p-6 shadow-xl shadow-black/40">
+            <h3 className="text-lg font-bold text-white mb-2">Remove {pendingDelete.name}?</h3>
+            <p className="text-sm text-blue-100/80 mb-3">
+              This permanently deletes their account. They will no longer be able to sign in, and all of their data across the hub will be removed:
+            </p>
+            <ul className="text-sm text-blue-100/75 space-y-1.5 mb-4 list-disc pl-5">
+              <li>Chat history and conversations</li>
+              <li>General settings and remembered facts</li>
+              <li>Stella Insights business context, uploaded files, and connections</li>
+              <li>PowerPoint template and proposal uploads</li>
+              <li>Login history for this account</li>
+            </ul>
+            <p className="text-xs text-red-300/90 mb-5">This cannot be undone.</p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setPendingDelete(null)}
+                className="px-4 py-2 bg-slate-700/60 text-slate-200 text-sm font-semibold rounded-lg disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={confirmRemove}
+                className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white text-sm font-semibold rounded-lg disabled:opacity-40"
+              >
+                {busy ? 'Removing…' : 'Remove user and all data'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -22,6 +22,7 @@ const {
   slugId,
   usageForUser,
   deleteUserFolder,
+  deleteUserStellaData,
   normalizeEmail,
   isEmail,
   generateTempPassword,
@@ -338,12 +339,20 @@ module.exports = async function handler(req, res) {
       if (user.role === 'admin' && admins.length <= 1) {
         return res.status(400).json({ error: { message: 'Cannot remove the last admin' } });
       }
-      accounts.users = (accounts.users || []).filter((u) => u.id !== user.id);
-      await saveAccounts(accounts);
+      let storageError = '';
       try {
         await deleteUserFolder(user);
-      } catch {
-        /* folder cleanup is best-effort */
+        await deleteUserStellaData(user);
+      } catch (err) {
+        storageError = err?.message || 'Could not delete stored files';
+      }
+      accounts.users = (accounts.users || []).filter((u) => u.id !== user.id);
+      await saveAccounts(accounts);
+      if (storageError) {
+        return res.status(200).json({
+          ok: true,
+          warning: `Account removed, but some files may remain: ${storageError}`,
+        });
       }
       return res.status(200).json({ ok: true });
     }

@@ -2,7 +2,7 @@
 
 export const DEFAULT_WELCOME_MESSAGES = {
   consultation: "Hello! I'm your Commercial Excellence AI assistant. I can help you design motivating sales incentive schemes, assess existing proposals, and provide best practice guidance. What would you like to work on today?",
-  stella: 'Welcome to **Stella Insights**. Upload a dataset in the **Data** tab, define your **Business Context**, then ask me questions here — I can analyse trends and generate charts.',
+  stella: 'Welcome to **Stella Insights**. Upload files in **User Settings → Stella Insights → Connections → Files**, define your **Business Context**, then ask me questions here — I can analyse trends and generate charts.',
 };
 
 export const DEFAULT_PPTX_CLARIFY = {

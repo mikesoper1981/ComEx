@@ -6,7 +6,9 @@
 create extension if not exists pgcrypto;
 
 -- ---------------------------------------------------------------------
--- Registry of every file Stella knows about (tabular datasets + docs)
+-- Registry of every file Stella knows about (tabular datasets + docs).
+-- org_id is 'user:<userId>' so each account has its own files. Legacy rows
+-- used org_id = 'default' and are claimed by the first admin on load.
 -- ---------------------------------------------------------------------
 create table if not exists public.stella_files (
   id           uuid primary key default gen_random_uuid(),

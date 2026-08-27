@@ -15,9 +15,17 @@ import {
   userStorageFolder,
   userPptxTemplateRemotePath,
   userProposalRemotePath,
+  userStellaStoragePrefix,
   productIntelligenceLocalKey,
   productIntelligenceRemotePath,
 } from './auth';
+import {
+  DEFAULT_STELLA_BUSINESS_CONTEXT,
+  STELLA_CONNECTORS,
+  mergeStellaBusinessContext,
+  stellaBusinessContextIsEmpty,
+  stellaOrgIdForUser,
+} from './stellaUserSettings';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
 import AdminUsers from './AdminUsers';
@@ -338,6 +346,8 @@ const DEFAULT_USER_SETTINGS = {
   moduleContext: mergeModuleContext({}),
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
+  stellaBusinessContext: mergeStellaBusinessContext({}),
+  stellaConnections: {},
 };
 
 function mergeProductIntelligence(raw = {}) {
@@ -374,6 +384,10 @@ function mergeUserSettingsFields(raw = {}) {
     responseLength: storedResponseLength(src.responseLength),
     moduleContext: mergeModuleContext(src.moduleContext),
     pptxTemplate: src.pptxTemplate || null,
+    stellaBusinessContext: mergeStellaBusinessContext(src.stellaBusinessContext),
+    stellaConnections: (src.stellaConnections && typeof src.stellaConnections === 'object')
+      ? src.stellaConnections
+      : {},
   };
 }
 
@@ -2397,7 +2411,8 @@ export default function CommercialExcellenceApp() {
   const [currentWorkflow, setCurrentWorkflow] = useState(null);
   const [pendingWorkflow, setPendingWorkflow] = useState(null);
   const [uploadedFile, setUploadedFile] = useState(null);
-  const [stellaTab, setStellaTab] = useState('chat'); // chat | data | business | connections
+  const [stellaSettingsTab, setStellaSettingsTab] = useState('business'); // business | connections
+  const [stellaConnectionsTab, setStellaConnectionsTab] = useState('files'); // files | connector id
   const [stellaMessages, setStellaMessages] = useState(() => [{
     role: 'assistant',
     content: readLocalProductIntelligence()?.welcomeMessages?.stella || 'Ask a question about your uploaded datasets.',
@@ -2407,13 +2422,7 @@ export default function CommercialExcellenceApp() {
   const [stellaDataFiles, setStellaDataFiles] = useState([]); // { id, name, type, size, uploadedAt, storageBucket, storagePath, metaPath, summary, capturedContext, intakeMessages }
   const [activeStellaDataId, setActiveStellaDataId] = useState(null);
   const [stellaIntakeInput, setStellaIntakeInput] = useState('');
-  const [stellaBusinessContext, setStellaBusinessContext] = useState({
-    companyName: '',
-    industry: '',
-    keyGoals: '',
-    keyMetrics: '',
-    terminology: '',
-  });
+  const [stellaBusinessContext, setStellaBusinessContext] = useState(() => mergeStellaBusinessContext({}));
   const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
   const [userSettings, setUserSettings] = useState(() => mergeUserSettingsFields({}));
   const [productIntel, setProductIntel] = useState(() => readLocalProductIntelligence());
@@ -2614,15 +2623,33 @@ export default function CommercialExcellenceApp() {
     loadIntelligenceFiles();
   }, []);
 
-  // ── SUPABASE: Load Stella registry + business context on startup ──
+  // ── SUPABASE: Load Stella registry + product intel + user settings on startup ──
   useEffect(() => {
     const loadStella = async () => {
-      // File registry (stella_files table).
+      const userOrg = stellaOrgIdForUser(currentUser.id);
+      // File registry (stella_files table), scoped to this user.
       try {
+        if (isAdmin) {
+          const { data: own } = await supabase
+            .from('stella_files')
+            .select('id')
+            .eq('org_id', userOrg)
+            .limit(1);
+          if (!own?.length) {
+            const { data: legacy } = await supabase
+              .from('stella_files')
+              .select('id')
+              .eq('org_id', 'default')
+              .limit(1);
+            if (legacy?.length) {
+              await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', 'default');
+            }
+          }
+        }
         const { data, error } = await supabase
           .from('stella_files')
           .select('*')
-          .eq('org_id', 'default')
+          .eq('org_id', userOrg)
           .order('uploaded_at', { ascending: true });
         if (!error && Array.isArray(data)) {
           const mapped = data.map(stellaMapRegistryRow);
@@ -2632,16 +2659,6 @@ export default function CommercialExcellenceApp() {
           });
         }
       } catch { /* stella_files table may not exist yet */ }
-
-      // Business context (persisted as JSON in storage).
-      for (const candidate of STELLA_STORAGE_CANDIDATES) {
-        try {
-          const { data, error } = await supabase.storage.from(candidate.bucket).download(`${candidate.prefix}business-context.json`);
-          if (error || !data) continue;
-          const parsed = safeJsonParse(await data.text());
-          if (parsed && typeof parsed === 'object') { setStellaBusinessContext(prev => ({ ...prev, ...parsed })); break; }
-        } catch { /* try next candidate */ }
-      }
 
       // Shared product intelligence (admin-owned). Fall back to admin user JSON once, then factory defaults.
       try {
@@ -2706,16 +2723,40 @@ export default function CommercialExcellenceApp() {
         } catch { /* ignore */ }
         const parsed = await downloadUserJsonDocument(currentUser, 'settings.json');
         const chatsParsed = await downloadUserJsonDocument(currentUser, 'chats.json');
+        let merged = mergeUserSettingsFields(userSettingsRef.current);
         if (parsed && typeof parsed === 'object') {
           const remoteSettings = normalizeLoadedUserSettings(parsed);
           const liveSettings = mergeUserSettingsFields(userSettingsRef.current);
-          const merged = {
+          merged = {
             ...remoteSettings,
             moduleContext: mergeModuleContextPreferRich(liveSettings.moduleContext, remoteSettings.moduleContext),
           };
-          setUserSettings(merged);
-          userSettingsRef.current = merged;
         }
+        let biz = mergeStellaBusinessContext(merged.stellaBusinessContext);
+        if (stellaBusinessContextIsEmpty(biz)) {
+          for (const candidate of STELLA_STORAGE_CANDIDATES) {
+            try {
+              const { data, error } = await supabase.storage.from(candidate.bucket).download(`${candidate.prefix}business-context.json`);
+              if (error || !data) continue;
+              const parsedBiz = safeJsonParse(await data.text());
+              if (parsedBiz && typeof parsedBiz === 'object' && !stellaBusinessContextIsEmpty(parsedBiz)) {
+                biz = mergeStellaBusinessContext(parsedBiz);
+                merged = { ...merged, stellaBusinessContext: biz };
+                try {
+                  await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+                    currentUser.id,
+                    mergeUserSettingsFields(merged),
+                    { userName: currentUser.name },
+                  ));
+                } catch { /* one-time migrate is best-effort */ }
+                break;
+              }
+            } catch { /* try next candidate */ }
+          }
+        }
+        setUserSettings(merged);
+        userSettingsRef.current = merged;
+        setStellaBusinessContext(biz);
         let remoteChats = [];
         let remoteActive = null;
         let migratedChats = false;
@@ -3373,16 +3414,18 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
         setUserSettingsCloudError(msg);
         setUserSettingsSaveStatus('error');
         setTimeout(() => setUserSettingsSaveStatus('idle'), 8000);
-        return;
+        return false;
       }
       setUserSettingsCloudError('');
       setUserSettingsSaveStatus('saved');
       setTimeout(() => setUserSettingsSaveStatus('idle'), 3000);
+      return true;
     } catch (err) {
       console.warn('User settings save failed:', err?.message || err);
       setUserSettingsCloudError(err?.message || String(err));
       setUserSettingsSaveStatus('error');
       setTimeout(() => setUserSettingsSaveStatus('idle'), 8000);
+      return false;
     }
   };
 
@@ -5325,11 +5368,17 @@ ${stepInstruction}`;
   };
 
   // ── STELLA: Supabase storage helpers ──
+  const stellaUserPrefix = () => userStellaStoragePrefix(currentUser);
+  const stellaUploadCandidates = () => ([
+    { bucket: 'intelligence', prefix: stellaUserPrefix() },
+    { bucket: 'stella-data', prefix: stellaUserPrefix() },
+  ]);
+
   const stellaResolveStoragePath = (candidate, path) => `${candidate.prefix}${path}`;
 
   const stellaUploadToStorage = async (path, blobOrFile, contentType) => {
     let lastErr = null;
-    for (const candidate of STELLA_STORAGE_CANDIDATES) {
+    for (const candidate of stellaUploadCandidates()) {
       try {
         const objectPath = stellaResolveStoragePath(candidate, path);
         const { error } = await supabase.storage
@@ -5342,27 +5391,6 @@ ${stepInstruction}`;
     throw new Error(lastErr?.message || 'Upload failed');
   };
 
-  const stellaDownloadJson = async (bucket, path) => {
-    const { data, error } = await supabase.storage.from(bucket).download(path);
-    if (error || !data) throw error || new Error('Download failed');
-    return safeJsonParse(await data.text());
-  };
-
-  const reloadStellaBusinessContextFromSupabase = async () => {
-    for (const candidate of STELLA_STORAGE_CANDIDATES) {
-      try {
-        const parsed = await stellaDownloadJson(candidate.bucket, stellaResolveStoragePath(candidate, 'business-context.json'));
-        if (parsed && typeof parsed === 'object') {
-          setStellaBusinessContext(prev => ({ ...prev, ...parsed }));
-          return parsed;
-        }
-      } catch {
-        // try next candidate
-      }
-    }
-    return null;
-  };
-
   // ── STELLA: DB registry (stella_files) + local state helpers ──
   const stellaPatchLocal = (fileId, patch) =>
     setStellaDataFiles(prev => prev.map(f => (f.id === fileId ? { ...f, ...patch } : f)));
@@ -5372,7 +5400,7 @@ ${stepInstruction}`;
       const { data, error } = await supabase
         .from('stella_files')
         .select('*')
-        .eq('org_id', 'default')
+        .eq('org_id', stellaOrgIdForUser(currentUser.id))
         .order('uploaded_at', { ascending: true });
       if (error || !Array.isArray(data)) return null;
       const mapped = data.map(stellaMapRegistryRow);
@@ -5398,7 +5426,7 @@ ${stepInstruction}`;
   const stellaInsertRegistry = async (record) => {
     const { data, error } = await supabase
       .from('stella_files')
-      .insert({ org_id: 'default', ...record })
+      .insert({ org_id: stellaOrgIdForUser(currentUser.id), ...record })
       .select()
       .single();
     if (error) throw new Error(`Registry insert failed: ${error.message}`);
@@ -5427,7 +5455,14 @@ ${stepInstruction}`;
   const stellaRemoveStorage = async (objectPath) => {
     if (!objectPath) return;
     const rel = objectPath.replace(/^stella\//, '');
-    const paths = [...new Set([objectPath, rel, `stella/${rel}`])];
+    const userRel = objectPath.replace(new RegExp(`^${stellaUserPrefix().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), '');
+    const paths = [...new Set([objectPath, rel, `stella/${rel}`, `${stellaUserPrefix()}${rel}`, `${stellaUserPrefix()}${userRel}`])];
+    const buckets = ['intelligence', 'stella-data'];
+    for (const bucket of buckets) {
+      for (const p of paths) {
+        try { await supabase.storage.from(bucket).remove([p]); } catch { /* ignore */ }
+      }
+    }
     for (const candidate of STELLA_STORAGE_CANDIDATES) {
       for (const p of paths) {
         try { await supabase.storage.from(candidate.bucket).remove([p]); } catch { /* ignore */ }
@@ -5440,7 +5475,16 @@ ${stepInstruction}`;
   const stellaDownloadStorageBlob = async (objectPath) => {
     if (!objectPath) return null;
     const rel = objectPath.replace(/^stella\//, '');
-    const paths = [...new Set([objectPath, rel, `stella/${rel}`])];
+    const paths = [...new Set([objectPath, rel, `stella/${rel}`, `${stellaUserPrefix()}${rel}`])];
+    const buckets = ['intelligence', 'stella-data'];
+    for (const bucket of buckets) {
+      for (const p of paths) {
+        try {
+          const { data, error } = await supabase.storage.from(bucket).download(p);
+          if (!error && data) return data;
+        } catch { /* try next */ }
+      }
+    }
     for (const candidate of STELLA_STORAGE_CANDIDATES) {
       for (const p of paths) {
         try {
@@ -5513,17 +5557,20 @@ ${stepInstruction}`;
   };
 
   const stellaSaveBusinessContext = async (next) => {
-    setStellaBusinessContext(next);
+    const ctx = mergeStellaBusinessContext(next);
+    setStellaBusinessContext(ctx);
     setStellaBizSaveStatus('saving');
     try {
-      const payload = new Blob([JSON.stringify(next, null, 2)], { type: 'application/json' });
-      await stellaUploadToStorage('business-context.json', payload, 'application/json');
-      await reloadStellaBusinessContextFromSupabase();
+      const ok = await saveUserSettings({ stellaBusinessContext: ctx });
+      if (!ok) {
+        setStellaBizSaveStatus('error');
+        return;
+      }
       setStellaBizSaveStatus('saved');
       setTimeout(() => setStellaBizSaveStatus('idle'), 3000);
     } catch (e) {
       setStellaBizSaveStatus('error');
-      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not persist business context to Supabase: ${e.message}` }]);
+      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not save business context: ${e.message}` }]);
     }
   };
 
@@ -5647,7 +5694,8 @@ ${stepInstruction}`;
       intakeComplete: false, processing: true,
     }]);
     setActiveStellaDataId(tempId);
-    setStellaTab('data');
+    setStellaSettingsTab('connections');
+    setStellaConnectionsTab('files');
 
     try {
       let tableName = null;
@@ -5784,14 +5832,22 @@ ${stepInstruction}`;
   };
 
   // ── STELLA: Reusable admin panels ──
+  const patchStellaBusinessField = (key, value) => {
+    setStellaBusinessContext((prev) => {
+      const next = { ...prev, [key]: value };
+      setUserSettings((s) => ({ ...s, stellaBusinessContext: mergeStellaBusinessContext(next) }));
+      return next;
+    });
+  };
+
   const renderStellaDataPanel = () => (
     <div className="flex flex-col lg:flex-row gap-4">
       <div className="w-full lg:w-2/5">
         <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-sm font-bold text-white">Datasets</div>
-              <div className="text-xs text-blue-300/60 mt-1">Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions.</div>
+              <div className="text-sm font-bold text-white">Files</div>
+              <div className="text-xs text-blue-300/60 mt-1">Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions. Files are stored for your account only.</div>
             </div>
             <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
               <Upload className="w-4 h-4" /> Upload
@@ -5803,7 +5859,7 @@ ${stepInstruction}`;
         <div className="space-y-3">
           {stellaDataFiles.length === 0 && (
             <div className="bg-slate-800/20 border border-slate-700/40 rounded-xl p-5 text-sm text-blue-300/60">
-              No datasets uploaded yet. Upload a file to begin intake.
+              No files uploaded yet. Upload a file to begin intake.
             </div>
           )}
           {stellaDataFiles.map(f => (
@@ -5890,38 +5946,38 @@ ${stepInstruction}`;
   const renderStellaBusinessPanel = () => (
     <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
       <h3 className="text-lg font-bold text-white mb-2">Business Context</h3>
-      <p className="text-xs text-blue-300/60 mb-6">This context is injected into every Stella chat prompt.</p>
+      <p className="text-xs text-blue-300/60 mb-6">Saved for your account and injected into every Stella chat. Other users have their own copy.</p>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
           <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
-          <input value={stellaBusinessContext.companyName} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, companyName: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
+          <input value={stellaBusinessContext.companyName} onChange={(e) => patchStellaBusinessField('companyName', e.target.value)} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
         </div>
         <div>
           <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry</label>
-          <input value={stellaBusinessContext.industry} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, industry: e.target.value }))} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
+          <input value={stellaBusinessContext.industry} onChange={(e) => patchStellaBusinessField('industry', e.target.value)} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
         </div>
         <div className="md:col-span-2">
           <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key goals</label>
-          <textarea value={stellaBusinessContext.keyGoals} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyGoals: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+          <textarea value={stellaBusinessContext.keyGoals} onChange={(e) => patchStellaBusinessField('keyGoals', e.target.value)} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
         </div>
         <div className="md:col-span-2">
           <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key metrics</label>
-          <textarea value={stellaBusinessContext.keyMetrics} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, keyMetrics: e.target.value }))} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+          <textarea value={stellaBusinessContext.keyMetrics} onChange={(e) => patchStellaBusinessField('keyMetrics', e.target.value)} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
         </div>
         <div className="md:col-span-2">
           <label className="block text-xs text-blue-300/70 font-semibold mb-2">Terminology / definitions</label>
-          <textarea value={stellaBusinessContext.terminology} onChange={(e) => setStellaBusinessContext(prev => ({ ...prev, terminology: e.target.value }))} rows={4} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
+          <textarea value={stellaBusinessContext.terminology} onChange={(e) => patchStellaBusinessField('terminology', e.target.value)} rows={4} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
         </div>
       </div>
       <div className="flex items-center gap-3 mt-6">
         <button onClick={() => stellaSaveBusinessContext(stellaBusinessContext)} disabled={stellaBizSaveStatus === 'saving'} className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 text-white font-semibold rounded-lg transition-all flex items-center gap-2">
           <Save className="w-4 h-4" /> {stellaBizSaveStatus === 'saving' ? 'Saving…' : 'Save'}
         </button>
-        <button onClick={() => stellaSaveBusinessContext({ companyName: '', industry: '', keyGoals: '', keyMetrics: '', terminology: '' })} className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30">
+        <button onClick={() => stellaSaveBusinessContext(DEFAULT_STELLA_BUSINESS_CONTEXT)} className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30">
           Reset
         </button>
         {stellaBizSaveStatus === 'saved' && (
-          <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved to Supabase</span>
+          <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved to your settings</span>
         )}
         {stellaBizSaveStatus === 'error' && (
           <span className="flex items-center gap-1.5 text-sm text-red-400 font-semibold"><AlertTriangle className="w-4 h-4" /> Save failed — see chat</span>
@@ -5930,33 +5986,44 @@ ${stepInstruction}`;
     </div>
   );
 
-  const renderStellaConnectionsPanel = () => (
-    <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
-      <h3 className="text-lg font-bold text-white mb-2">Connections</h3>
-      <p className="text-xs text-blue-300/60 mb-6">Direct connectors (APIs / databases / CRM) will be enabled here in a future release.</p>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-        {[
-          { name: 'Salesforce' },
-          { name: 'Veeva' },
-          { name: 'SAP' },
-          { name: 'Power BI' },
-          { name: 'Google Analytics' },
-          { name: 'Databricks' },
-        ].map(c => (
-          <div key={c.name} className="bg-slate-800/20 border border-slate-700/50 rounded-2xl p-5 opacity-60">
-            <div className="flex items-start justify-between">
+  const renderStellaConnectionsPanel = () => {
+    const connector = STELLA_CONNECTORS.find(c => c.id === stellaConnectionsTab);
+    return (
+      <div className="space-y-4">
+        <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit flex-wrap">
+          <button
+            type="button"
+            onClick={() => setStellaConnectionsTab('files')}
+            className={`px-3 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${stellaConnectionsTab === 'files' ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+          >
+            Files
+          </button>
+          {STELLA_CONNECTORS.map(c => (
+            <button
+              key={c.id}
+              type="button"
+              onClick={() => setStellaConnectionsTab(c.id)}
+              className={`px-3 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${stellaConnectionsTab === c.id ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+            >
+              {c.name}
+            </button>
+          ))}
+        </div>
+        {stellaConnectionsTab === 'files' ? renderStellaDataPanel() : (
+          <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
+            <div className="flex items-start justify-between gap-3">
               <div>
-                <div className="text-sm font-bold text-slate-200">{c.name}</div>
-                <div className="text-xs text-slate-400 mt-1">Connector</div>
+                <h3 className="text-lg font-bold text-white">{connector?.name || 'Connector'}</h3>
+                <p className="text-xs text-blue-300/60 mt-2">Direct connectors (APIs / databases / CRM) will be enabled here in a future release. Saved per user when available.</p>
               </div>
-              <span className="px-2 py-1 bg-slate-700/50 text-slate-300 text-xs rounded border border-slate-600/50">Coming Soon</span>
+              <span className="px-2 py-1 bg-slate-700/50 text-slate-300 text-xs rounded border border-slate-600/50 flex-shrink-0">Coming Soon</span>
             </div>
-            <div className="mt-4 text-xs text-slate-400/80">Authentication, schema mapping, and scheduled sync will be available.</div>
+            <div className="mt-4 text-xs text-slate-400/80">Authentication, schema mapping, and scheduled sync will be available for this account.</div>
           </div>
-        ))}
+        )}
       </div>
-    </div>
-  );
+    );
+  };
 
   // ── STELLA: Chat prompt builder + submit ──
   const buildStellaSystemPrompt = (filesArg) => {
@@ -6771,7 +6838,7 @@ ${stepInstruction}`;
               <p className="text-xs text-blue-300/60 leading-relaxed">Assess and optimise territory structures.</p>
               <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
             </button>
-            <button onClick={() => { setShowLanding(false); setActiveTab('stella'); setStellaTab('chat'); }} className="text-left bg-slate-800/60 hover:bg-slate-700/60 border border-cyan-400/30 hover:border-cyan-400/60 rounded-2xl p-6 transition-all group hover:shadow-xl hover:shadow-cyan-500/10 hover:-translate-y-0.5">
+            <button onClick={() => { setShowLanding(false); setActiveTab('stella'); }} className="text-left bg-slate-800/60 hover:bg-slate-700/60 border border-cyan-400/30 hover:border-cyan-400/60 rounded-2xl p-6 transition-all group hover:shadow-xl hover:shadow-cyan-500/10 hover:-translate-y-0.5">
               <div className="w-12 h-12 bg-gradient-to-br from-cyan-500 to-blue-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><Layers className="w-6 h-6 text-white" /></div>
               <h3 className="font-bold text-white text-base mb-1">Stella Insights</h3>
               <p className="text-xs text-blue-300/60 leading-relaxed">Chat with your data, run analysis and generate charts.</p>
@@ -7522,9 +7589,7 @@ ${stepInstruction}`;
                       <p className="text-cyan-100 text-xs">Chat with your data — analyse trends and chart insights</p>
                     </div>
                   </div>
-                  {isAdmin && (
-                  <button onClick={() => { setActiveTab('admin'); setAdminModule('stella'); setStellaTab('data'); }} className="flex items-center gap-2 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold transition-all"><Settings className="w-4 h-4" /> Manage data & context</button>
-                  )}
+                  <button onClick={() => { setShowLanding(false); setActiveTab('user-settings'); setUserSettingsPane('stella'); setStellaSettingsTab('connections'); setStellaConnectionsTab('files'); }} className="flex items-center gap-2 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold transition-all"><Settings className="w-4 h-4" /> Manage data & context</button>
                 </div>
               </div>
 
@@ -7895,10 +7960,31 @@ ${stepInstruction}`;
 
                 {userSettingsPane === 'stella' && (
                   <>
-                    <p className="text-xs text-blue-300/70 mb-2">
-                      Optional background for Stella Insights (strategy notes, definitions). Tabular datasets still upload in the Stella <span className="text-cyan-300">Data</span> tab.
+                    <p className="text-xs text-blue-300/70 mb-4">
+                      Business context, files, and connections are saved for your account only.
                     </p>
-                    {renderModuleContextPanel('stella')}
+                    <div className="flex gap-1 bg-slate-900/50 rounded-lg p-1 w-fit mb-5">
+                      {[['business', 'Business Context'], ['connections', 'Connections']].map(([id, label]) => (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => setStellaSettingsTab(id)}
+                          className={`px-3 sm:px-4 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${stellaSettingsTab === id ? 'bg-cyan-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                    {stellaSettingsTab === 'business' && (
+                      <>
+                        {renderStellaBusinessPanel()}
+                        <p className="text-xs text-blue-300/70 mt-6 mb-2">
+                          Optional background notes (strategy, definitions) used as guidance in Stella. Dataset files live under Connections → Files.
+                        </p>
+                        {renderModuleContextPanel('stella')}
+                      </>
+                    )}
+                    {stellaSettingsTab === 'connections' && renderStellaConnectionsPanel()}
                   </>
                 )}
 
@@ -7914,6 +8000,7 @@ ${stepInstruction}`;
                   }}
                 />
 
+                {userSettingsPane !== 'stella' && (
                 <div className="flex flex-wrap items-center gap-3 mt-6">
                   <button
                     onClick={() => saveUserSettings(userSettings)}
@@ -7936,6 +8023,7 @@ ${stepInstruction}`;
                       }
                       setPptxTemplateError('');
                       setPptxTemplateStatus('idle');
+                      setStellaBusinessContext(mergeStellaBusinessContext({}));
                       await saveUserSettings({ ...DEFAULT_USER_SETTINGS });
                     }}
                     className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30"
@@ -7949,6 +8037,7 @@ ${stepInstruction}`;
                     <span className="flex items-center gap-1.5 text-sm text-red-400 font-semibold"><AlertTriangle className="w-4 h-4" /> {userSettingsCloudError || 'Save failed'}</span>
                   )}
                 </div>
+                )}
               </div>
             </div>
 
@@ -8435,60 +8524,48 @@ ${stepInstruction}`;
 
               {adminModule === 'stella' && (
                 <div className="space-y-4">
-                  <div className="flex gap-2 border-b border-blue-400/20 pb-3 overflow-x-auto">
-                    {[{ id: 'data', label: 'Data' }, { id: 'business', label: 'Business Context' }, { id: 'connections', label: 'Connections' }, { id: 'prompts', label: 'Prompts' }].map(tab => (
-                      <button key={tab.id} onClick={() => setStellaTab(tab.id)} className={`px-4 py-2 rounded-lg text-sm font-semibold whitespace-nowrap transition-all ${stellaTab === tab.id ? 'bg-gradient-to-r from-blue-500 to-cyan-500 text-white' : 'bg-slate-700/30 text-blue-300 hover:bg-slate-700/50'}`}>{tab.label}</button>
-                    ))}
+                  <div>
+                    <h3 className="text-lg font-bold text-white">Stella prompts</h3>
+                    <p className="text-xs text-blue-300/55 mt-1">
+                      Welcome message and AI prompts for data intake / analysis. Stored in the shared product JSON — separate from per-user business context, files, and connections (those live in User Settings).
+                    </p>
                   </div>
-                  {(stellaTab === 'data' || stellaTab === 'chat') && renderStellaDataPanel()}
-                  {stellaTab === 'business' && renderStellaBusinessPanel()}
-                  {stellaTab === 'connections' && renderStellaConnectionsPanel()}
-                  {stellaTab === 'prompts' && (
-                    <div className="space-y-6">
-                      <div>
-                        <h3 className="text-lg font-bold text-white">Stella prompts</h3>
-                        <p className="text-xs text-blue-300/55 mt-1">
-                          Welcome message and AI prompts for data intake / analysis. Stored in the shared product JSON — separate from Incentive Comp runtime.
-                        </p>
+                  {[
+                    ['welcomeMessages.stella', 'Welcome message'],
+                    ['stellaPrompts.contentSummary', 'Content summary'],
+                    ['stellaPrompts.intake', 'Intake'],
+                    ['stellaPrompts.analyst', 'Analyst'],
+                  ].map(([path, title]) => {
+                    const [root, key] = path.split('.');
+                    const value = productIntel?.[root]?.[key] ?? '';
+                    return (
+                      <div key={path} className="bg-slate-800/40 border border-cyan-400/20 rounded-xl p-4">
+                        <div className="text-sm font-semibold text-white mb-2">{title}</div>
+                        <textarea
+                          value={value}
+                          onChange={(e) => setProductIntel(prev => ({
+                            ...prev,
+                            [root]: { ...(prev[root] || {}), [key]: e.target.value },
+                          }))}
+                          rows={8}
+                          className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-cyan-400/20 focus:border-cyan-400/50 focus:outline-none font-mono resize-y"
+                        />
                       </div>
-                      {[
-                        ['welcomeMessages.stella', 'Welcome message'],
-                        ['stellaPrompts.contentSummary', 'Content summary'],
-                        ['stellaPrompts.intake', 'Intake'],
-                        ['stellaPrompts.analyst', 'Analyst'],
-                      ].map(([path, title]) => {
-                        const [root, key] = path.split('.');
-                        const value = productIntel?.[root]?.[key] ?? '';
-                        return (
-                          <div key={path} className="bg-slate-800/40 border border-cyan-400/20 rounded-xl p-4">
-                            <div className="text-sm font-semibold text-white mb-2">{title}</div>
-                            <textarea
-                              value={value}
-                              onChange={(e) => setProductIntel(prev => ({
-                                ...prev,
-                                [root]: { ...(prev[root] || {}), [key]: e.target.value },
-                              }))}
-                              rows={8}
-                              className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-cyan-400/20 focus:border-cyan-400/50 focus:outline-none font-mono resize-y"
-                            />
-                          </div>
-                        );
-                      })}
-                      <button
-                        type="button"
-                        onClick={() => persistIntelligenceSettings({
-                          welcomeMessages: productIntel.welcomeMessages,
-                          stellaPrompts: productIntel.stellaPrompts,
-                        })}
-                        disabled={userSettingsSaveStatus === 'saving'}
-                        className="px-5 py-2.5 bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
-                      >
-                        <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save Stella prompts'}
-                      </button>
-                      {userSettingsSaveStatus === 'saved' && (
-                        <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved</span>
-                      )}
-                    </div>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => persistIntelligenceSettings({
+                      welcomeMessages: productIntel.welcomeMessages,
+                      stellaPrompts: productIntel.stellaPrompts,
+                    })}
+                    disabled={userSettingsSaveStatus === 'saving'}
+                    className="px-5 py-2.5 bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
+                  >
+                    <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save Stella prompts'}
+                  </button>
+                  {userSettingsSaveStatus === 'saved' && (
+                    <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved</span>
                   )}
                 </div>
               )}
@@ -8503,6 +8580,9 @@ ${stepInstruction}`;
                       userSettingsRef.current = next;
                       return next;
                     });
+                    if (general?.stellaBusinessContext) {
+                      setStellaBusinessContext(mergeStellaBusinessContext(general.stellaBusinessContext));
+                    }
                   }}
                 />
               )}

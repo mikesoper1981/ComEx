@@ -162,6 +162,11 @@ export function userProposalRemotePath(userOrName, fileName) {
   return `users/${userStorageFolder(userOrName)}/proposals/${Date.now()}_${safe}`;
 }
 
+/** Folder for this user's Stella file uploads (CSV/PDF/etc.). */
+export function userStellaStoragePrefix(userOrName) {
+  return `users/${userStorageFolder(userOrName)}/stella/`;
+}
+
 /** Per-user module context originals (strategy decks, territory Excel, etc.). */
 export function userModuleContextRemotePath(userOrName, moduleId, fileName) {
   const mod = String(moduleId || 'context').replace(/[^\w-]+/g, '') || 'context';
