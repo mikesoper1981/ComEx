@@ -553,9 +553,25 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                   </div>
                   <div className="md:col-span-2">
                     <label className={labelClass}>Remembered from chats</label>
+                    <label className="flex items-start gap-2 mb-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={editGeneral.memoryEnabled !== false}
+                        onChange={(e) => setGeneralField('memoryEnabled', e.target.checked)}
+                        className="rounded border-blue-400/40 mt-0.5"
+                      />
+                      <span className="text-[11px] text-blue-300/70 leading-relaxed">
+                        Remember key facts from this user&apos;s chats. Unique to this account and stored in their settings.json. When off, facts are kept but not sent to the AI.
+                      </span>
+                    </label>
                     <p className="text-[11px] text-blue-300/45 mb-2">
-                      Short facts stored for this user. Remove one and it stops applying immediately.
+                      Captured from this user&apos;s own chats (not by opening this screen). You can turn memory off or delete a fact.
                     </p>
+                    {editGeneral.memoryEnabled === false && (
+                      <div className="text-xs text-amber-200/70 border border-amber-400/20 rounded-lg px-3 py-2 mb-2">
+                        Chat memory is off — existing facts are not passed as context.
+                      </div>
+                    )}
                     {editMemory.length === 0 ? (
                       <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet.</div>
                     ) : (

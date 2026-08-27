@@ -1,3 +1,5 @@
+import { normalizeMemoryItems } from './chatMemory';
+
 export const GENERAL_SETTINGS_DEFAULTS = {
   companyName: '',
   industry: '',
@@ -9,6 +11,7 @@ export const GENERAL_SETTINGS_DEFAULTS = {
   constraints: '',
   customContext: '',
   responseLength: 'standard',
+  memoryEnabled: true,
 };
 
 export const RESPONSE_LENGTH_OPTIONS = [
@@ -46,18 +49,13 @@ export function pickGeneralSettings(doc) {
     constraints: String(raw.constraints || ''),
     customContext: String(raw.customContext || ''),
     responseLength: storedLength(raw.responseLength),
+    memoryEnabled: raw.memoryEnabled !== false,
   };
 }
 
 export function pickMemoryItems(doc) {
   const raw = settingsFrom(doc);
-  if (!Array.isArray(raw.memory)) return [];
-  return raw.memory
-    .map((item, i) => ({
-      id: String(item?.id || `mem_${i + 1}`),
-      text: String(item?.text || (typeof item === 'string' ? item : '')).trim(),
-    }))
-    .filter((item) => item.text);
+  return normalizeMemoryItems(raw.memory);
 }
 
 export function mergeGeneralIntoDocument(existing, general, user, memory, extra = {}) {
@@ -72,6 +70,7 @@ export function mergeGeneralIntoDocument(existing, general, user, memory, extra 
     ...prevSettings,
     ...pickGeneralSettings(general),
   };
+  if (typeof general?.memoryEnabled === 'boolean') settings.memoryEnabled = general.memoryEnabled;
   if (Array.isArray(memory)) settings.memory = memory;
   if (extra.stellaBusinessContext) {
     settings.stellaBusinessContext = extra.stellaBusinessContext;

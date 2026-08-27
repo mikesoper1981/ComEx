@@ -26,6 +26,21 @@ import {
   stellaBusinessContextIsEmpty,
   stellaOrgIdForUser,
 } from './stellaUserSettings';
+import {
+  MEMORY_HARVEST_SYSTEM,
+  MEMORY_BACKFILL_SYSTEM,
+  normalizeMemoryItems,
+  mergeMemoryFacts,
+  formatMemoryPromptBlock,
+  shouldHarvestChatMemory,
+  parseMemoryFacts,
+  compactChatsForMemory,
+  memoryBackfillNeeded,
+  buildHarvestExchange,
+  buildBackfillExchange,
+  isMemoryEnabled,
+  memorySignature,
+} from './chatMemory';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
 import AdminUsers from './AdminUsers';
@@ -342,6 +357,7 @@ const DEFAULT_USER_SETTINGS = {
   constraints: '',
   customContext: '',
   memory: [],
+  memoryEnabled: true,
   responseLength: 'standard',
   moduleContext: mergeModuleContext({}),
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
@@ -381,6 +397,7 @@ function mergeUserSettingsFields(raw = {}) {
     constraints: String(src.constraints || ''),
     customContext: String(src.customContext || ''),
     memory: normalizeMemoryItems(src.memory),
+    memoryEnabled: src.memoryEnabled !== false,
     responseLength: storedResponseLength(src.responseLength),
     moduleContext: mergeModuleContext(src.moduleContext),
     pptxTemplate: src.pptxTemplate || null,
@@ -907,78 +924,6 @@ function buildUserSettingsPromptBlock(settings) {
   const lengthBlock = formatResponseLengthPrompt(s);
   const identity = `${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}`;
   return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, constraints, and response length in every response; do not contradict them):\n${identity ? `${identity}\n\n` : ''}${lengthBlock}\n`;
-}
-
-const MEMORY_CAP = 30;
-const MEMORY_TEXT_MAX = 280;
-
-function normalizeMemoryItems(raw) {
-  if (!Array.isArray(raw)) return [];
-  const out = [];
-  const seen = new Set();
-  for (const item of raw) {
-    const text = String(item?.text || (typeof item === 'string' ? item : ''))
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, MEMORY_TEXT_MAX);
-    if (!text || text.length < 12 || isEmptyContextValue(text)) continue;
-    const key = text.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({
-      id: String(item?.id || `mem_${out.length + 1}`),
-      text,
-      module: ['incentives', 'territory', 'stella'].includes(item?.module) ? item.module : '',
-      updatedAt: item?.updatedAt || new Date().toISOString(),
-    });
-    if (out.length >= MEMORY_CAP) break;
-  }
-  return out;
-}
-
-function mergeMemoryFacts(existing, incoming, { module = '' } = {}) {
-  const base = normalizeMemoryItems(existing);
-  const now = new Date().toISOString();
-  for (const raw of incoming || []) {
-    const text = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, MEMORY_TEXT_MAX);
-    if (text.length < 12 || isEmptyContextValue(text)) continue;
-    const key = text.toLowerCase();
-    const dup = base.findIndex((m) => {
-      const t = m.text.toLowerCase();
-      return t === key || t.includes(key) || key.includes(t);
-    });
-    if (dup >= 0) {
-      base[dup] = {
-        ...base[dup],
-        text: text.length >= base[dup].text.length ? text : base[dup].text,
-        module: module || base[dup].module,
-        updatedAt: now,
-      };
-      continue;
-    }
-    base.unshift({
-      id: `mem_${Date.now()}_${stellaNanoId(4)}`,
-      text,
-      module,
-      updatedAt: now,
-    });
-  }
-  return normalizeMemoryItems(base).slice(0, MEMORY_CAP);
-}
-
-function formatMemoryPromptBlock(settings) {
-  const items = normalizeMemoryItems(settings?.memory);
-  if (!items.length) return '';
-  let body = items.map((m) => `- ${m.text}`).join('\n');
-  if (body.length > 3500) body = `${body.slice(0, 3500)}\n- [… older remembered facts omitted …]`;
-  return `\n\nREMEMBERED FROM PRIOR CHATS (facts the user already confirmed — clarifying answers, plan rules, definitions. Use them. Do not re-ask unless the user contradicts them):\n${body}`;
-}
-
-function shouldHarvestChatMemory(_assistantText, userText) {
-  const user = String(userText || '').trim();
-  if (user.length < 8) return false;
-  if (/^(y|yes|yeah|yep|sure|ok|okay|start|go|continue|proceed|no|cancel|thanks|thank you)[\s.!]*$/i.test(user)) return false;
-  return true;
 }
 
 // Short, URL/identifier-safe random id (used for stella_data_<id> tables).
@@ -2458,6 +2403,8 @@ export default function CommercialExcellenceApp() {
   const skipChatPersistRef = useRef(false);
   const userSettingsReadyRef = useRef(false);
   const harvestMemoryBusyRef = useRef(false);
+  const harvestMemoryPendingRef = useRef(null);
+  const memoryBackfillDoneRef = useRef(false);
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
     try { return localStorage.getItem('comex-chat-history-collapsed') === '1'; } catch { return false; }
   });
@@ -2626,6 +2573,8 @@ export default function CommercialExcellenceApp() {
   // ── SUPABASE: Load Stella registry + product intel + user settings on startup ──
   useEffect(() => {
     const loadStella = async () => {
+      userSettingsReadyRef.current = false;
+      memoryBackfillDoneRef.current = false;
       const userOrg = stellaOrgIdForUser(currentUser.id);
       // File registry (stella_files table), scoped to this user.
       try {
@@ -2807,10 +2756,43 @@ export default function CommercialExcellenceApp() {
             }
           } catch { /* one-time split is best-effort */ }
         }
+        if (!memoryBackfillDoneRef.current && memoryBackfillNeeded(userSettingsRef.current.memory, chatSessionsRef.current, userSettingsRef.current)) {
+          memoryBackfillDoneRef.current = true;
+          try {
+            const blob = compactChatsForMemory(chatSessionsRef.current);
+            const raw = await callAnthropic(
+              MEMORY_BACKFILL_SYSTEM,
+              [{ role: 'user', content: buildBackfillExchange(blob, userSettingsRef.current.memory) }],
+              800,
+            );
+            const facts = parseMemoryFacts(raw);
+            if (facts.length) {
+              const before = memorySignature(userSettingsRef.current.memory);
+              const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts);
+              if (memorySignature(memory) !== before) {
+                const nextSettings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
+                setUserSettings(nextSettings);
+                userSettingsRef.current = nextSettings;
+                await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+                  currentUser.id,
+                  mergeUserSettingsFields(userSettingsRef.current),
+                  { userName: currentUser.name },
+                ));
+              }
+            }
+          } catch (err) {
+            console.warn('Chat memory backfill failed:', err?.message || err);
+          }
+        } else {
+          memoryBackfillDoneRef.current = true;
+        }
       } catch (err) {
         setUserSettingsCloudError(err?.message || 'Could not load settings.json');
       }
       userSettingsReadyRef.current = true;
+      const pendingHarvest = harvestMemoryPendingRef.current;
+      harvestMemoryPendingRef.current = null;
+      if (pendingHarvest) void harvestChatMemory(pendingHarvest.assistantText, pendingHarvest.userText, pendingHarvest.recentTurns);
     };
     loadStella();
   }, [currentUser.id]);
@@ -3251,38 +3233,60 @@ Return ${n} clickable follow-ups that continue this thread. Each must mention a 
     return anthropicAssistantText(data);
   };
 
-  const harvestChatMemory = async (assistantText, userText) => {
-    if (harvestMemoryBusyRef.current || !userSettingsReadyRef.current) return;
+  const harvestChatMemory = async (assistantText, userText, recentTurns = []) => {
+    if (!isMemoryEnabled(userSettingsRef.current)) return;
     if (!shouldHarvestChatMemory(assistantText, userText)) return;
+    if (!userSettingsReadyRef.current || harvestMemoryBusyRef.current) {
+      harvestMemoryPendingRef.current = { assistantText, userText, recentTurns };
+      return;
+    }
     harvestMemoryBusyRef.current = true;
     try {
       const raw = await callAnthropic(
-        `You extract durable memory for a commercial-excellence copilot.
-From the exchange, list facts the USER stated that should be remembered in later chats.
-Include volunteered facts (e.g. "our products are X"), answers to clarifying questions, plan rules, metrics, dates, roles, constraints, and preferences.
-Skip greetings, "yes start the workflow", process chatter, the assistant's own advice, and unanswered questions.
-Return JSON only: {"facts":["..."]}. Max 5 facts. Each fact one short sentence. If nothing durable, {"facts":[]}.`,
+        MEMORY_HARVEST_SYSTEM,
         [{
           role: 'user',
-          content: `Recent assistant message (may be empty):\n${String(assistantText || '').slice(0, 2500)}\n\nUser said:\n${String(userText || '').slice(0, 2500)}`,
+          content: buildHarvestExchange({
+            assistantText,
+            userText,
+            recentTurns,
+            existingMemory: userSettingsRef.current.memory,
+          }),
         }],
         400,
       );
-      const parsed = safeJsonParse(String(raw || '').replace(/```(?:json)?/gi, '').replace(/```/g, '').trim());
-      const facts = Array.isArray(parsed?.facts) ? parsed.facts : [];
-      if (!facts.length) return;
-      const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts, { module: resolvePromptModule() });
-      const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
-      setUserSettings(settings);
-      userSettingsRef.current = settings;
-      await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
-        currentUser.id,
-        mergeUserSettingsFields(userSettingsRef.current),
-        { userName: currentUser.name },
-      ));
-    } catch { /* memory is best-effort */ }
+      const facts = parseMemoryFacts(raw);
+      if (facts.length) {
+        const before = memorySignature(userSettingsRef.current.memory);
+        const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts, { module: resolvePromptModule() });
+        if (memorySignature(memory) !== before) {
+          const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
+          setUserSettings(settings);
+          userSettingsRef.current = settings;
+          await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+            currentUser.id,
+            mergeUserSettingsFields(userSettingsRef.current),
+            { userName: currentUser.name },
+          ));
+        }
+      }
+    } catch (err) {
+      console.warn('Chat memory harvest failed:', err?.message || err);
+    }
     harvestMemoryBusyRef.current = false;
+    const pending = harvestMemoryPendingRef.current;
+    harvestMemoryPendingRef.current = null;
+    if (pending && (pending.userText !== userText || pending.assistantText !== assistantText)) {
+      void harvestChatMemory(pending.assistantText, pending.userText, pending.recentTurns);
+    }
   };
+
+  const recentChatTurnsForMemory = (list) => (
+    (list || messagesRef.current || [])
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator'))
+      .slice(-8)
+      .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content }))
+  );
 
   /** Append mandatory user preferences/context to any system prompt. */
   const resolvePromptModule = () => {
@@ -3852,10 +3856,6 @@ ${introInstr}`);
       return;
     }
     logActivity('agent', `${agent.name} continuing conversation`);
-    const priorAsk = [...(currentWorkflow?.stepMessages || []), ...(messagesRef.current || [])]
-      .reverse()
-      .find((m) => m.role === 'assistant' || m.role === 'orchestrator');
-    void harvestChatMemory(priorAsk?.content, userReply);
     try {
       const priorMessages = currentWorkflow?.stepMessages || [];
       const fullMessages = [...priorMessages, { role: 'user', content: userReply }];
@@ -4010,6 +4010,10 @@ ${introInstr}`);
     const effectiveInput = typedInput || userMessage;
     const focusedContext = currentWorkflow?.focusedContext ?? null;
     const normalized = normalizeOrchestratorAction(action);
+    if (shouldHarvestChatMemory('', typedInput || '')) {
+      const priorAsk = [...(messagesRef.current || [])].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+      void harvestChatMemory(priorAsk?.content, typedInput, recentChatTurnsForMemory());
+    }
     if (normalized === 'proceed') {
       setCurrentWorkflow(prev => prev ? { ...prev, waitingForUser: false, awaitingAgentReply: false, stepMessages: [] } : null);
       await advanceToNextStep(topic, stepIndex, context, effectiveInput, focusedContext);
@@ -4071,6 +4075,10 @@ ${introInstr}`);
   };
 
   const runWorkflowStep = async (topic, stepIndex, userMessage, workflowContext, focusedContextOverride = null) => {
+    if (shouldHarvestChatMemory('', userMessage) && !/^User (feedback|instruction|request):/i.test(String(userMessage || ''))) {
+      const priorAsk = [...(messagesRef.current || [])].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+      void harvestChatMemory(priorAsk?.content, userMessage, recentChatTurnsForMemory());
+    }
     const step = topic.workflow[stepIndex];
     const agentId = step.agents[0];
     const agent = agents.find(a => a.id === agentId);
@@ -4548,6 +4556,7 @@ ${stepInstruction}`;
     const intake = pendingProposalIntakeRef.current || pendingProposalIntake;
     if (!intake) return;
     const nextMessages = [...(intake.intakeMessages || []), { role: 'user', content: userText }];
+    void harvestChatMemory(intake.intakeMessages?.[intake.intakeMessages.length - 1]?.content, userText, nextMessages);
     setIsLoading(true);
     let launched = false;
     try {
@@ -6288,6 +6297,8 @@ ${stepInstruction}`;
 
       const cleaned = stellaStripSqlBlocks(finalText) || finalText || 'I couldn\'t find enough to answer that from the available data.';
       setStellaMessages(prev => [...prev, { role: 'assistant', content: cleaned, steps }]);
+      const priorAsk = [...stellaMessages].reverse().find((m) => m.role === 'assistant');
+      void harvestChatMemory(priorAsk?.content, messageContent, recentChatTurnsForMemory(stellaMessages));
     } catch (error) {
       setStellaMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: Unable to process request.\n\n${error?.message || 'Unknown error'}` }]);
     } finally {
@@ -6602,6 +6613,10 @@ ${stepInstruction}`;
     setPptxOffers(null);
     setMessages(prev => [...prev, { role: 'user', content: messageContent }]);
     setIsLoading(true);
+    if (shouldHarvestChatMemory('', messageContent)) {
+      const priorAsk = [...(messagesRef.current || [])].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+      void harvestChatMemory(priorAsk?.content, messageContent, recentChatTurnsForMemory());
+    }
 
     // Uploaded IC proposal → always Analyze Existing IC workflow (never PPT export).
     if (isFileAnalysis && !currentWorkflow) {
@@ -6740,8 +6755,6 @@ ${stepInstruction}`;
       });
       const data = await response.json();
       const assistantMessage = anthropicAssistantText(data);
-      const priorAsk = [...messages].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
-      if (!isFileAnalysis) void harvestChatMemory(priorAsk?.content, messageContent);
       setMessages(prev => {
         const updated = [...prev, { role: 'assistant', content: assistantMessage }];
         setTimeout(() => generateSuggestions(updated), 500);
@@ -7825,11 +7838,27 @@ ${stepInstruction}`;
                       </div>
                       <div className="md:col-span-2">
                         <label className="block text-xs text-blue-300/70 font-semibold mb-2">Remembered from chats</label>
+                        <label className="flex items-start gap-2 mb-3 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={userSettings.memoryEnabled !== false}
+                            onChange={(e) => saveUserSettings({ memoryEnabled: e.target.checked })}
+                            className="rounded border-blue-400/40 mt-0.5"
+                          />
+                          <span className="text-[11px] text-blue-300/70 leading-relaxed">
+                            Remember key facts from my chats (products, competitors, territories, definitions, and anything I ask to remember). When this is off, facts are kept but not sent to the AI.
+                          </span>
+                        </label>
                         <p className="text-[11px] text-blue-300/45 mb-2">
-                          Short facts from chat, in addition to the settings fields above and any uploaded context files. Not the full transcript.
+                          Saved only on this account in settings.json. Review and delete any fact. Similar facts are not stored twice.
                         </p>
+                        {userSettings.memoryEnabled === false && (
+                          <div className="text-xs text-amber-200/70 border border-amber-400/20 rounded-lg px-3 py-2 mb-2">
+                            Chat memory is off — existing facts are not passed as context.
+                          </div>
+                        )}
                         {(userSettings.memory || []).length === 0 ? (
-                          <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet.</div>
+                          <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet. Key facts from conversations appear here automatically.</div>
                         ) : (
                           <ul className="space-y-2">
                             {(userSettings.memory || []).map((item) => (
