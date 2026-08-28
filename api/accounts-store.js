@@ -466,7 +466,7 @@ function usageForCalendarDay(doc, dayKey) {
   return { chats: questions, conversations };
 }
 
-function clipWorkflowText(text, max = 240) {
+function clipWorkflowText(text, max = 500) {
   return String(text || '').replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
@@ -480,7 +480,9 @@ function normalizeWorkflowRun(raw, fallbackAt) {
     topicName: String(raw.topicName || raw.topicId || 'Workflow'),
     status: allowed.includes(status) ? status : 'offered',
     trigger: String(raw.trigger || ''),
-    triggerText: clipWorkflowText(raw.triggerText, 280),
+    triggerPhrase: String(raw.triggerPhrase || ''),
+    triggerReason: String(raw.triggerReason || ''),
+    triggerText: clipWorkflowText(raw.triggerText, 500),
     at: raw.at || fallbackAt || null,
     completedAt: raw.completedAt || null,
     chatId: String(raw.chatId || ''),
@@ -515,7 +517,9 @@ function inferWorkflowRunsFromChat(chat) {
         topicName: titleMatch ? titleMatch[1] : 'Workflow',
         status: 'offered',
         trigger: 'keyword',
-        triggerText: clipWorkflowText(prevUser?.content, 280),
+        triggerPhrase: '',
+        triggerReason: prevUser?.content ? `User message: ${clipWorkflowText(prevUser.content, 180)}` : 'Trigger not recorded',
+        triggerText: clipWorkflowText(prevUser?.content, 500),
         at,
         completedAt: null,
         chatId: chat?.id || '',

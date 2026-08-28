@@ -81,10 +81,23 @@ function workflowStatusClass(status) {
 function workflowTriggerLabel(trigger) {
   const t = String(trigger || '').toLowerCase();
   if (t === 'keyword') return 'Keyword / phrase';
+  if (t === 'context') return 'Conversation context';
   if (t === 'file') return 'File upload';
   if (t === 'direct') return 'Started from UI';
   if (t === 'offer-accepted') return 'Accepted offer';
-  return trigger || 'Trigger';
+  return trigger || 'Trigger not recorded';
+}
+
+function describeHistoryTrigger(run) {
+  const reason = String(run?.triggerReason || '').trim();
+  if (reason) return reason;
+  const phrase = String(run?.triggerPhrase || '').trim();
+  if (phrase) return `Keyword / phrase: “${phrase}”`;
+  const kind = workflowTriggerLabel(run?.trigger);
+  const text = String(run?.triggerText || '').trim();
+  if (text && kind && kind !== 'Trigger not recorded') return `${kind}: ${text}`;
+  if (text) return text;
+  return 'Trigger not recorded';
 }
 
 function summarizeWorkflowStatus(byStatus) {
@@ -476,10 +489,13 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                                           <span className={`text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${workflowStatusClass(run.status)}`}>
                                             {workflowStatusLabel(run.status)}
                                           </span>
+                                          <span className="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border border-blue-400/25 text-blue-200/80">
+                                            {workflowTriggerLabel(run.trigger)}
+                                          </span>
                                           <span className="text-[11px] text-blue-300/55">{formatTime(run.at)}</span>
                                         </div>
                                         <div className="text-xs text-blue-200/70 mt-1 line-clamp-2">
-                                          {run.triggerText || 'No trigger text stored'}
+                                          {describeHistoryTrigger(run)}
                                         </div>
                                       </button>
                                     </li>
@@ -503,12 +519,26 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                                     <span className={`px-1.5 py-0.5 rounded border ${workflowStatusClass(historyRunDetail.status)}`}>
                                       {workflowStatusLabel(historyRunDetail.status)}
                                     </span>
-                                    <span className="text-blue-300/70">{workflowTriggerLabel(historyRunDetail.trigger)}</span>
+                                    <span className="px-1.5 py-0.5 rounded border border-blue-400/25 text-blue-200/80">
+                                      {workflowTriggerLabel(historyRunDetail.trigger)}
+                                    </span>
                                   </div>
+                                  {historyRunDetail.triggerPhrase ? (
+                                    <div>
+                                      <div className="text-[11px] uppercase tracking-wide text-blue-300/50 mb-1">Matched phrase</div>
+                                      <p className="text-blue-100/90">“{historyRunDetail.triggerPhrase}”</p>
+                                    </div>
+                                  ) : null}
                                   <div>
                                     <div className="text-[11px] uppercase tracking-wide text-blue-300/50 mb-1">What triggered it</div>
-                                    <p className="text-blue-100/90 whitespace-pre-wrap">{historyRunDetail.triggerText || 'Not recorded'}</p>
+                                    <p className="text-blue-100/90 whitespace-pre-wrap">{describeHistoryTrigger(historyRunDetail)}</p>
                                   </div>
+                                  {historyRunDetail.triggerText && historyRunDetail.triggerText !== describeHistoryTrigger(historyRunDetail) ? (
+                                    <div>
+                                      <div className="text-[11px] uppercase tracking-wide text-blue-300/50 mb-1">User message</div>
+                                      <p className="text-blue-100/90 whitespace-pre-wrap">{historyRunDetail.triggerText}</p>
+                                    </div>
+                                  ) : null}
                                   <div className="text-xs text-blue-300/60">
                                     Chat: {historyRunDetail.chatTitle || historyRunDetail.chatId || 'Unknown'}
                                     {historyRunDetail.at ? ` · ${formatDay(historyRunDetail.at)} ${formatTime(historyRunDetail.at)}` : ''}

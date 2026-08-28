@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2 } from 'lucide-react';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
@@ -46,6 +46,9 @@ import {
   factsAreSimilar,
   activeMemoryItems,
   formatMemoryStamp,
+  filterMemoryFacts,
+  isDurableMemoryFact,
+  isExplicitRememberRequest,
 } from './chatMemory';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -72,7 +75,12 @@ import {
   upsertModuleContextFile,
   patchModuleContextFile,
   removeModuleContextFile,
-  formatModuleContextPromptBlock,
+  formatLinkedModulesPromptBlock,
+  mergeModuleConnections,
+  toggleModuleConnection,
+  connectedModuleIds,
+  modulesAreConnected,
+  MODULE_CONTEXT_LABELS,
   listModuleContextBlocks,
   isThinContextExtract,
   knowledgeStemPattern,
@@ -368,6 +376,7 @@ const DEFAULT_USER_SETTINGS = {
   memoryEnabled: true,
   responseLength: 'standard',
   moduleContext: mergeModuleContext({}),
+  moduleConnections: [],
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
   stellaBusinessContext: mergeStellaBusinessContext({}),
@@ -408,6 +417,7 @@ function mergeUserSettingsFields(raw = {}) {
     memoryEnabled: src.memoryEnabled !== false,
     responseLength: storedResponseLength(src.responseLength),
     moduleContext: mergeModuleContext(src.moduleContext),
+    moduleConnections: mergeModuleConnections(src.moduleConnections),
     pptxTemplate: src.pptxTemplate || null,
     stellaBusinessContext: mergeStellaBusinessContext(src.stellaBusinessContext),
     stellaConnections: (src.stellaConnections && typeof src.stellaConnections === 'object')
@@ -617,6 +627,39 @@ const CHAT_MODULE_META = {
   territory: { id: 'territory', label: 'Territory', tab: 'territory' },
   stella: { id: 'stella', label: 'Stella Insights', tab: 'stella' },
 };
+
+const ACTIVE_HUB_MODULES = [
+  {
+    id: 'incentives',
+    tab: 'chat',
+    title: 'Incentive Compensation',
+    desc: 'Design, assess and optimise sales incentive schemes.',
+    Icon: DollarSign,
+    ring: 'border-blue-400/30 hover:border-blue-400/60',
+    shadow: 'hover:shadow-blue-500/10',
+    iconBg: 'bg-gradient-to-br from-blue-500 to-cyan-500',
+  },
+  {
+    id: 'territory',
+    tab: 'territory',
+    title: 'Territory Design',
+    desc: 'Assess and optimise territory structures.',
+    Icon: MapIcon,
+    ring: 'border-emerald-400/30 hover:border-emerald-400/60',
+    shadow: 'hover:shadow-emerald-500/10',
+    iconBg: 'bg-gradient-to-br from-emerald-500 to-teal-500',
+  },
+  {
+    id: 'stella',
+    tab: 'stella',
+    title: 'Stella Insights',
+    desc: 'Chat with your data, run analysis and generate charts.',
+    Icon: Layers,
+    ring: 'border-cyan-400/30 hover:border-cyan-400/60',
+    shadow: 'hover:shadow-cyan-500/10',
+    iconBg: 'bg-gradient-to-br from-cyan-500 to-blue-500',
+  },
+];
 
 function inferChatModule({ currentWorkflow } = {}) {
   const topic = String(currentWorkflow?.topicId || '');
@@ -926,12 +969,31 @@ function matchTopicByTriggers(topics, message) {
   for (const topic of topics || []) {
     if (topic.status !== 'active') continue;
     const kws = Array.isArray(topic.triggerKeywords) ? topic.triggerKeywords : [];
-    if (kws.some((kw) => {
-      const k = String(kw || '').toLowerCase().trim();
-      return k.length >= 4 && msg.includes(k);
-    })) return topic;
+    const matchedKeywords = kws
+      .map((kw) => String(kw || '').trim())
+      .filter((k) => k.length >= 4 && msg.includes(k.toLowerCase()));
+    if (matchedKeywords.length) return { topic, matchedKeywords };
   }
   return null;
+}
+
+function buildWorkflowTriggerRecord({ trigger, phrase, message, reason } = {}) {
+  const t = String(trigger || '').trim();
+  const p = String(phrase || '').trim();
+  const msg = String(message || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  const why = String(reason || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  let triggerReason = '';
+  if (t === 'keyword') triggerReason = p ? `Keyword / phrase: “${p}”` : 'Keyword / phrase match';
+  else if (t === 'context') triggerReason = why ? `Conversation context: ${why}` : 'Conversation context';
+  else if (t === 'file') triggerReason = msg ? `File upload — ${msg}` : 'File upload';
+  else if (t === 'direct') triggerReason = msg ? `Started from UI — ${msg}` : 'Started from UI';
+  else triggerReason = why || msg || (t ? `Trigger: ${t}` : 'Trigger not recorded');
+  return {
+    trigger: t,
+    triggerPhrase: p,
+    triggerReason,
+    triggerText: msg,
+  };
 }
 
 function isWorkflowAccept(text) {
@@ -989,7 +1051,7 @@ function looksLikeInfoRequest(text) {
 }
 
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
-function buildUserSettingsPromptBlock(settings) {
+function buildUserSettingsPromptBlock(settings, { moduleId = '' } = {}) {
   const s = settings && typeof settings === 'object' ? settings : {};
   const lines = [];
   const push = (label, value) => {
@@ -1005,7 +1067,8 @@ function buildUserSettingsPromptBlock(settings) {
   push('Preferences', s.preferences);
   push('Hard constraints', s.constraints);
   const extra = isEmptyContextValue(s.customContext) ? '' : String(s.customContext).trim();
-  const memoryBlock = formatMemoryPromptBlock(s);
+  const linkedIds = moduleId ? connectedModuleIds(s.moduleConnections, moduleId) : [];
+  const memoryBlock = formatMemoryPromptBlock(s, { moduleId, linkedIds });
   const lengthBlock = formatResponseLengthPrompt(s);
   const identity = `${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}`;
   return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, constraints, and response length in every response; do not contradict them):\n${identity ? `${identity}\n\n` : ''}${lengthBlock}\n`;
@@ -2732,6 +2795,11 @@ export default function CommercialExcellenceApp() {
   const [contextIntakeInput, setContextIntakeInput] = useState('');
   const [contextIntakeBusy, setContextIntakeBusy] = useState(false);
   const [contextEditSaveStatus, setContextEditSaveStatus] = useState('idle');
+  const [landingLinkDrag, setLandingLinkDrag] = useState(null);
+  const [landingCardRects, setLandingCardRects] = useState({});
+  const [landingLinkNotice, setLandingLinkNotice] = useState('');
+  const landingBoardRef = useRef(null);
+  const landingCardRefs = useRef({});
   const chatSessionsRef = useRef(chatSessions);
   const activeChatIdRef = useRef(activeChatId);
   const messagesRef = useRef(messages);
@@ -3115,7 +3183,7 @@ export default function CommercialExcellenceApp() {
               [{ role: 'user', content: buildBackfillExchange(blob, userSettingsRef.current.memory) }],
               800,
             );
-            const facts = parseMemoryFacts(raw);
+            const facts = filterMemoryFacts(parseMemoryFacts(raw));
             if (facts.length) {
               const before = memorySignature(userSettingsRef.current.memory);
               const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts);
@@ -3221,9 +3289,14 @@ export default function CommercialExcellenceApp() {
       || (patch.topicId && r.topicId === patch.topicId && (r.status === 'offered' || r.status === 'running')),
     );
     if (matchIdx >= 0) {
+      const nextPatch = { ...patch };
+      if (!nextPatch.trigger) delete nextPatch.trigger;
+      if (!nextPatch.triggerPhrase) delete nextPatch.triggerPhrase;
+      if (!nextPatch.triggerReason) delete nextPatch.triggerReason;
+      if (nextPatch.triggerText === undefined || nextPatch.triggerText === '') delete nextPatch.triggerText;
       runs[matchIdx] = {
         ...runs[matchIdx],
-        ...patch,
+        ...nextPatch,
         at: runs[matchIdx].at || now,
         completedAt: ['completed', 'declined', 'cancelled'].includes(patch.status) ? (patch.completedAt || now) : runs[matchIdx].completedAt,
       };
@@ -3234,7 +3307,9 @@ export default function CommercialExcellenceApp() {
         topicName: patch.topicName || patch.topicId || 'Workflow',
         status: patch.status || 'offered',
         trigger: patch.trigger || '',
-        triggerText: String(patch.triggerText || '').slice(0, 280),
+        triggerPhrase: patch.triggerPhrase || '',
+        triggerReason: patch.triggerReason || '',
+        triggerText: String(patch.triggerText || '').slice(0, 500),
         at: patch.at || now,
         completedAt: patch.completedAt || null,
         chatId: id,
@@ -3592,7 +3667,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
       const pptxCtx = getPptxContext(productIntel);
       const response = await anthropicMessagesPost({
-        system: `${pptxCtx.intentDetection}${buildUserSettingsPromptBlock(userSettings)}`,
+        system: `${pptxCtx.intentDetection}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule() })}`,
         messages: [{ role: 'user', content: `Conversation:\n${recentMessages}` }],
         max_tokens: 400,
       });
@@ -3658,10 +3733,16 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
         500,
       );
       const { facts: harvestedFacts, conflicts: harvestedConflicts } = parseMemoryHarvest(raw);
+      const allowExplicit = isExplicitRememberRequest(userText);
       const existingActive = activeMemoryItems({ memory: userSettingsRef.current.memory });
       const facts = [];
-      const conflicts = [...(harvestedConflicts || [])];
-      for (const fact of harvestedFacts) {
+      const conflicts = [];
+      for (const conflict of harvestedConflicts || []) {
+        if (conflict?.proposed && isDurableMemoryFact(conflict.proposed, { allowExplicit })) {
+          conflicts.push(conflict);
+        }
+      }
+      for (const fact of filterMemoryFacts(harvestedFacts, { allowExplicit })) {
         const match = existingActive.find((m) => factsAreSimilar(m.text, fact) && m.text.toLowerCase() !== String(fact).toLowerCase());
         if (match) {
           if (!conflicts.some((c) => (c.existingId && c.existingId === match.id) || factsAreSimilar(c.proposed, fact))) {
@@ -3741,9 +3822,9 @@ Do not cite sources. Never name knowledge files, intelligence documents, or file
       prompt = prompt.replace(/loaded from intelligence files/gi, 'best-practice guidance');
     }
     const moduleBlock = moduleContext
-      ? formatModuleContextPromptBlock(userSettings, resolvePromptModule())
+      ? formatLinkedModulesPromptBlock(userSettings, resolvePromptModule(), { stellaFiles: stellaDataFiles })
       : '';
-    const base = `${prompt}${buildUserSettingsPromptBlock(userSettings)}${moduleBlock}`;
+    const base = `${prompt}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule() })}${moduleBlock}`;
     if (isAdmin) return base;
     return `${base}
 
@@ -3864,6 +3945,89 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       setTimeout(() => setUserSettingsSaveStatus('idle'), 8000);
       return false;
     }
+  };
+
+  const measureLandingCards = () => {
+    const board = landingBoardRef.current?.getBoundingClientRect();
+    if (!board) return;
+    const next = {};
+    for (const mod of ACTIVE_HUB_MODULES) {
+      const el = landingCardRefs.current[mod.id];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      next[mod.id] = {
+        cx: r.left + r.width / 2 - board.left,
+        cy: r.top + r.height / 2 - board.top,
+      };
+    }
+    setLandingCardRects(next);
+  };
+
+  useEffect(() => {
+    if (!showLanding) return undefined;
+    const tick = () => measureLandingCards();
+    tick();
+    const t = window.setTimeout(tick, 50);
+    window.addEventListener('resize', tick);
+    return () => {
+      window.clearTimeout(t);
+      window.removeEventListener('resize', tick);
+    };
+  }, [showLanding, userSettings.moduleConnections]);
+
+  const persistModuleConnection = async (a, b, { unlink = false } = {}) => {
+    const left = MODULE_CONTEXT_LABELS[a] || a;
+    const right = MODULE_CONTEXT_LABELS[b] || b;
+    const already = modulesAreConnected(userSettingsRef.current.moduleConnections, a, b);
+    if (!unlink && already) {
+      setLandingLinkNotice(`${left} and ${right} already share context.`);
+      window.setTimeout(() => setLandingLinkNotice(''), 4000);
+      return;
+    }
+    if (unlink && !already) return;
+    const next = toggleModuleConnection(userSettingsRef.current.moduleConnections, a, b);
+    const linked = modulesAreConnected(next, a, b);
+    setLandingLinkNotice(linked
+      ? `${left} and ${right} now share context.`
+      : `${left} and ${right} are no longer linked.`);
+    window.setTimeout(() => setLandingLinkNotice(''), 4000);
+    await saveUserSettings({ moduleConnections: next });
+  };
+
+  const startLandingLinkDrag = (event, fromId) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const board = landingBoardRef.current?.getBoundingClientRect();
+    if (!board) return;
+    setLandingLinkDrag({
+      fromId,
+      x: event.clientX - board.left,
+      y: event.clientY - board.top,
+    });
+    const onMove = (e) => {
+      const b = landingBoardRef.current?.getBoundingClientRect();
+      if (!b) return;
+      setLandingLinkDrag((prev) => (prev ? { ...prev, x: e.clientX - b.left, y: e.clientY - b.top } : prev));
+    };
+    const onUp = (e) => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      setLandingLinkDrag(null);
+      let hit = null;
+      for (const mod of ACTIVE_HUB_MODULES) {
+        if (mod.id === fromId) continue;
+        const el = landingCardRefs.current[mod.id];
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) {
+          hit = mod.id;
+          break;
+        }
+      }
+      if (hit) void persistModuleConnection(fromId, hit);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
   };
 
   const persistChatList = async (list, activeId) => {
@@ -4274,12 +4438,15 @@ ${introInstr}`);
     setPptxOffers(null);
     setCurrentWorkflow({ topicId: topic.id, currentStep: 0, context: [], waitingForUser: false, focusedContext });
     setPendingWorkflow(null);
+    const fileName = uploadedFileRef.current?.name || '';
+    const triggerRec = source === 'file'
+      ? buildWorkflowTriggerRecord({ trigger: 'file', message: fileName || userMessage })
+      : buildWorkflowTriggerRecord({ trigger: source || 'direct', message: userMessage });
     patchWorkflowRun({
       topicId: topic.id,
       topicName: topic.name,
       status: 'running',
-      trigger: source || 'direct',
-      triggerText: String(userMessage || '').slice(0, 280),
+      ...triggerRec,
     });
     logActivity('workflow', `Direct launch: ${topic.name}`);
     try {
@@ -6875,6 +7042,59 @@ ${stepInstruction}`;
     };
   };
 
+  const matchTopicByConversationContext = async (messageContent) => {
+    const active = (topics || []).filter((t) => t.status === 'active');
+    if (!active.length) return null;
+    const recent = (messagesRef.current || [])
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator'))
+      .slice(-8)
+      .map((m) => `${m.role}: ${String(m.content || '').replace(/\s+/g, ' ').trim().slice(0, 400)}`)
+      .join('\n');
+    if (!recent.trim()) return null;
+    const workflowList = active.map((t) => (
+      `- id: ${t.id}\n  name: ${t.name}\n  trigger phrases: ${(t.triggerKeywords || []).join(', ') || '(none)'}\n  when: ${t.description || t.name}`
+    )).join('\n');
+    try {
+      const raw = await callAnthropic(
+        fillTemplate(getWorkflowRuntime().matchDetectorPrompt, { workflowList }),
+        [{ role: 'user', content: `CURRENT USER MESSAGE:\n${messageContent}\n\nRECENT CONVERSATION:\n${recent}` }],
+        250,
+      );
+      const parsed = extractJsonObject(raw);
+      const rawId = String(parsed?.id || (!parsed ? raw : '') || '').trim().toLowerCase();
+      const id = rawId.replace(/[^a-z0-9_-]/g, '').split(/\s+/)[0];
+      if (!id || id === 'none') return null;
+      const topic = active.find((t) => t.id === id);
+      if (!topic || declinedWorkflowIdsRef.current.has(topic.id)) return null;
+      const reason = String(parsed?.reason || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+      return { topic, reason: reason || 'The conversation indicated this guided workflow.' };
+    } catch {
+      return null;
+    }
+  };
+
+  const offerMatchedWorkflow = (topic, triggerRecord, triggerMessage) => {
+    const workflowSummary = (topic.workflow || []).map((s, i) => `**Step ${i + 1}:** ${s.name}\n   _${s.goal}_`).join('\n\n');
+    const runId = `wf_${Date.now().toString(36)}`;
+    patchWorkflowRun({
+      id: runId,
+      topicId: topic.id,
+      topicName: topic.name,
+      status: 'offered',
+      ...triggerRecord,
+    });
+    setMessages((prev) => [...prev, {
+      role: 'assistant',
+      content: fillTemplate(getWorkflowRuntime().offerTemplate, {
+        description: topic.description,
+        stepCount: topic.workflow.length,
+        workflowSummary,
+      }),
+    }]);
+    setPendingWorkflow({ topicId: topic.id, triggerMessage, runId });
+    setIsLoading(false);
+  };
+
   /** Route a user message using pptxContext.messageClassify from settings JSON (no hardcoded intent rules). */
   const classifyUserMessageIntent = async (messageContent) => {
     const text = String(messageContent || '').trim();
@@ -6882,7 +7102,7 @@ ${stepInstruction}`;
     try {
       const pptxCtx = getPptxContext(productIntel);
       const raw = await callAnthropic(
-        `${pptxCtx.messageClassify}${buildUserSettingsPromptBlock(userSettings)}`,
+        `${pptxCtx.messageClassify}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule() })}`,
         [{ role: 'user', content: `User message:\n${text}` }],
         350,
       );
@@ -7293,8 +7513,6 @@ ${stepInstruction}`;
           topicId: topic.id,
           topicName: topic.name,
           status: 'running',
-          trigger: 'offer-accepted',
-          triggerText: triggerMessage || messageContent,
         });
         await executeOrchestrator(topic, triggerMessage || messageContent, 0);
         return;
@@ -7328,29 +7546,34 @@ ${stepInstruction}`;
       }
     }
 
-    const matchedTopic = matchTopicByTriggers(topics, messageContent);
-    if (matchedTopic && !currentWorkflow && !declinedWorkflowIdsRef.current.has(matchedTopic.id)) {
-      const workflowSummary = matchedTopic.workflow.map((s, i) => `**Step ${i + 1}:** ${s.name}\n   _${s.goal}_`).join('\n\n');
-      const runId = `wf_${Date.now().toString(36)}`;
-      patchWorkflowRun({
-        id: runId,
-        topicId: matchedTopic.id,
-        topicName: matchedTopic.name,
-        status: 'offered',
-        trigger: 'keyword',
-        triggerText: messageContent,
-      });
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: fillTemplate(getWorkflowRuntime().offerTemplate, {
-          description: matchedTopic.description,
-          stepCount: matchedTopic.workflow.length,
-          workflowSummary,
+    const keywordMatch = matchTopicByTriggers(topics, messageContent);
+    if (keywordMatch?.topic && !currentWorkflow && !declinedWorkflowIdsRef.current.has(keywordMatch.topic.id)) {
+      offerMatchedWorkflow(
+        keywordMatch.topic,
+        buildWorkflowTriggerRecord({
+          trigger: 'keyword',
+          phrase: keywordMatch.matchedKeywords.join(', '),
+          message: messageContent,
         }),
-      }]);
-      setPendingWorkflow({ topicId: matchedTopic.id, triggerMessage: messageContent, runId });
-      setIsLoading(false);
+        messageContent,
+      );
       return;
+    }
+
+    if (!currentWorkflow) {
+      const contextMatch = await matchTopicByConversationContext(messageContent);
+      if (contextMatch?.topic && !declinedWorkflowIdsRef.current.has(contextMatch.topic.id)) {
+        offerMatchedWorkflow(
+          contextMatch.topic,
+          buildWorkflowTriggerRecord({
+            trigger: 'context',
+            reason: contextMatch.reason,
+            message: messageContent,
+          }),
+          messageContent,
+        );
+        return;
+      }
     }
 
     await continueFreeform();
@@ -7422,29 +7645,109 @@ ${stepInstruction}`;
       {/* Landing Page */}
       {showLanding ? (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-10 sm:py-16">
-          <div className="text-center mb-12">
+          <div className="text-center mb-10">
             <h2 className="text-3xl sm:text-4xl font-bold text-white mb-3">Commercial Excellence Hub</h2>
             <p className="text-blue-300/70 text-lg max-w-2xl mx-auto">AI-powered tools for field and commercial excellence. Select a topic to get started.</p>
           </div>
+
+          <div className="mb-8">
+            <div className="flex flex-wrap items-end justify-between gap-3 mb-3">
+              <div>
+                <h3 className="text-sm font-bold text-white">Active modules</h3>
+                <p className="text-xs text-blue-300/55 mt-1">
+                  Drag the link handle from one card onto another to share context (schemes, data summaries, strategy files). Links are saved for this account.
+                </p>
+              </div>
+              {landingLinkNotice ? (
+                <div className="text-xs font-semibold text-cyan-200 bg-cyan-500/10 border border-cyan-400/25 rounded-lg px-3 py-1.5">{landingLinkNotice}</div>
+              ) : null}
+            </div>
+            <div ref={landingBoardRef} className="relative">
+              <svg className="absolute inset-0 w-full h-full pointer-events-none z-10 overflow-visible" aria-hidden="true">
+                {(userSettings.moduleConnections || []).map((c) => {
+                  const from = landingCardRects[c.a];
+                  const to = landingCardRects[c.b];
+                  if (!from || !to) return null;
+                  return (
+                    <g key={`${c.a}|${c.b}`}>
+                      <line x1={from.cx} y1={from.cy} x2={to.cx} y2={to.cy} stroke="rgba(34,211,238,0.55)" strokeWidth="3" strokeLinecap="round" />
+                      <circle cx={from.cx} cy={from.cy} r="4" fill="#22d3ee" />
+                      <circle cx={to.cx} cy={to.cy} r="4" fill="#22d3ee" />
+                    </g>
+                  );
+                })}
+                {landingLinkDrag && landingCardRects[landingLinkDrag.fromId] ? (
+                  <line
+                    x1={landingCardRects[landingLinkDrag.fromId].cx}
+                    y1={landingCardRects[landingLinkDrag.fromId].cy}
+                    x2={landingLinkDrag.x}
+                    y2={landingLinkDrag.y}
+                    stroke="rgba(165,243,252,0.9)"
+                    strokeWidth="2.5"
+                    strokeDasharray="6 5"
+                    strokeLinecap="round"
+                  />
+                ) : null}
+              </svg>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 relative z-20">
+                {ACTIVE_HUB_MODULES.map((mod) => {
+                  const linked = connectedModuleIds(userSettings.moduleConnections, mod.id);
+                  const dropTarget = landingLinkDrag && landingLinkDrag.fromId !== mod.id;
+                  const Icon = mod.Icon;
+                  return (
+                    <div
+                      key={mod.id}
+                      ref={(el) => { landingCardRefs.current[mod.id] = el; }}
+                      className={`relative text-left bg-slate-800/60 border rounded-2xl p-6 transition-all ${mod.ring} ${mod.shadow} ${dropTarget ? 'ring-2 ring-cyan-300/70' : ''}`}
+                    >
+                      <button
+                        type="button"
+                        title="Drag onto another module to share context"
+                        onPointerDown={(e) => startLandingLinkDrag(e, mod.id)}
+                        className="absolute top-3 right-3 z-30 p-2 rounded-lg bg-slate-900/70 border border-cyan-400/30 text-cyan-200 hover:bg-cyan-500/20 hover:border-cyan-300/60 cursor-grab active:cursor-grabbing touch-none select-none"
+                      >
+                        <Link2 className="w-4 h-4" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setShowLanding(false); setActiveTab(mod.tab); }}
+                        className="text-left w-full group"
+                      >
+                        <div className={`w-12 h-12 ${mod.iconBg} rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform`}>
+                          <Icon className="w-6 h-6 text-white" />
+                        </div>
+                        <h3 className="font-bold text-white text-base mb-1 pr-8">{mod.title}</h3>
+                        <p className="text-xs text-blue-300/60 leading-relaxed">{mod.desc}</p>
+                        <div className="mt-4 flex items-center gap-1.5">
+                          <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                          <span className="text-xs text-emerald-400">Active</span>
+                        </div>
+                      </button>
+                      {linked.length > 0 && (
+                        <div className="mt-3 flex flex-wrap gap-1.5">
+                          {linked.map((id) => (
+                            <button
+                              key={id}
+                              type="button"
+                              title={`Stop sharing context with ${MODULE_CONTEXT_LABELS[id] || id}`}
+                              onClick={() => persistModuleConnection(mod.id, id, { unlink: true })}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-cyan-500/15 text-cyan-200 border border-cyan-400/25 hover:bg-red-500/15 hover:text-red-200 hover:border-red-400/30"
+                            >
+                              Linked: {MODULE_CONTEXT_LABELS[id] || id}
+                              <X className="w-3 h-3" />
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <h3 className="text-sm font-bold text-slate-400 mb-3">Coming soon</h3>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            <button onClick={() => { setShowLanding(false); setActiveTab('chat'); }} className="text-left bg-slate-800/60 hover:bg-slate-700/60 border border-blue-400/30 hover:border-blue-400/60 rounded-2xl p-6 transition-all group hover:shadow-xl hover:shadow-blue-500/10 hover:-translate-y-0.5">
-              <div className="w-12 h-12 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><DollarSign className="w-6 h-6 text-white" /></div>
-              <h3 className="font-bold text-white text-base mb-1">Incentive Compensation</h3>
-              <p className="text-xs text-blue-300/60 leading-relaxed">Design, assess and optimise sales incentive schemes.</p>
-              <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
-            </button>
-            <button onClick={() => { setShowLanding(false); setActiveTab('territory'); }} className="text-left bg-slate-800/60 hover:bg-slate-700/60 border border-emerald-400/30 hover:border-emerald-400/60 rounded-2xl p-6 transition-all group hover:shadow-xl hover:shadow-emerald-500/10 hover:-translate-y-0.5">
-              <div className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><MapIcon className="w-6 h-6 text-white" /></div>
-              <h3 className="font-bold text-white text-base mb-1">Territory Design</h3>
-              <p className="text-xs text-blue-300/60 leading-relaxed">Assess and optimise territory structures.</p>
-              <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
-            </button>
-            <button onClick={() => { setShowLanding(false); setActiveTab('stella'); }} className="text-left bg-slate-800/60 hover:bg-slate-700/60 border border-cyan-400/30 hover:border-cyan-400/60 rounded-2xl p-6 transition-all group hover:shadow-xl hover:shadow-cyan-500/10 hover:-translate-y-0.5">
-              <div className="w-12 h-12 bg-gradient-to-br from-cyan-500 to-blue-500 rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform"><Layers className="w-6 h-6 text-white" /></div>
-              <h3 className="font-bold text-white text-base mb-1">Stella Insights</h3>
-              <p className="text-xs text-blue-300/60 leading-relaxed">Chat with your data, run analysis and generate charts.</p>
-              <div className="mt-4 flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-xs text-emerald-400">Active</span></div>
-            </button>
             {[{ icon: BarChart3, label: 'Sales Performance', desc: 'Track and benchmark rep performance.' }, { icon: Target, label: 'Targeting & Segmentation', desc: 'Build and refine HCP target lists.' }, { icon: Users, label: 'Workforce Planning', desc: 'Model headcount and deployment.' }, { icon: Calendar, label: 'Business Planning', desc: 'Align field activity with strategy.' }, { icon: Award, label: 'Customer Engagement', desc: 'Design multi-channel engagement plans.' }, { icon: TrendingUp, label: 'Market Access', desc: 'Formulary positioning and payer strategy.' }].map(({ icon: Icon, label, desc }) => (
               <div key={label} className="text-left bg-slate-800/30 border border-slate-700/40 rounded-2xl p-6 opacity-50 cursor-not-allowed">
                 <div className="w-12 h-12 bg-slate-700/50 rounded-xl flex items-center justify-center mb-4"><Icon className="w-6 h-6 text-slate-500" /></div>
@@ -8289,7 +8592,7 @@ ${stepInstruction}`;
                 {userSettingsPane === 'general' && (
                   <>
                     <p className="text-xs text-blue-300/70 mb-5">
-                      Company, industry, metrics, and terminology here apply across Incentive Comp, Territory, and Stella — not duplicated per tool. Saved per named account in Supabase Storage bucket
+                      Company, industry, metrics, and terminology here apply across Incentive Comp, Territory, and Stella — not duplicated per tool. Link modules on the home page to share that tool’s files and data summaries between them. Saved per named account in Supabase Storage bucket
                       {' '}<code className="text-cyan-300/80">intelligence</code>
                       {' '}→ <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/settings.json</code>.
                       {' '}Chat history is a sibling file <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/chats.json</code>.
@@ -8444,7 +8747,7 @@ ${stepInstruction}`;
                           </span>
                         </label>
                         <p className="text-[11px] text-blue-300/45 mb-2">
-                          Saved only on this account in settings.json. If a new fact contradicts one already remembered, the assistant will ask before updating and can mark the old fact as obsolete.
+                          Saved only on this account in settings.json. Facts are tagged by the module you were in. Another module only receives them if you link the two on the home page. If a new fact contradicts one already remembered, the assistant will ask before updating and can mark the old fact as obsolete.
                         </p>
                         {userSettings.memoryEnabled === false && (
                           <div className="text-xs text-amber-200/70 border border-amber-400/20 rounded-lg px-3 py-2 mb-2">
@@ -8464,6 +8767,7 @@ ${stepInstruction}`;
                                   </span>
                                   <span className="block text-[10px] text-blue-300/45 mt-1">
                                     {item.createdAt ? `Added ${formatMemoryStamp(item.createdAt)}` : 'Added date not recorded'}
+                                    {item.module ? ` · ${MODULE_CONTEXT_LABELS[item.module] || item.module}` : ''}
                                     {item.status === 'obsolete' && item.obsoleteAt ? ` · Obsolete ${formatMemoryStamp(item.obsoleteAt)}` : ''}
                                   </span>
                                 </span>

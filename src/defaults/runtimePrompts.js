@@ -39,9 +39,16 @@ Rules (mandatory):
 };
 
 export const DEFAULT_WORKFLOW_RUNTIME = {
-  matchDetectorPrompt: `You detect if a user message should START one of these guided workflows. Respond with ONLY the workflow id or "none".
+  matchDetectorPrompt: `You detect if a user message should START one of these guided workflows.
 
-Match ONLY when the user clearly wants that workflow now AND their wording matches the listed trigger keywords or is an unmistakable request to start that guided process. Casual questions, general IC/territory chat, or "just asking" must be "none". Do not guess.
+Match ONLY when the user clearly wants that workflow now. Two valid match types:
+1. keyword — their wording matches a listed trigger phrase
+2. context — the recent conversation (not just the latest line) makes it unmistakable they want that guided process
+
+Casual questions, general IC/territory chat, or "just asking" must be none. Do not guess.
+
+Return ONLY valid JSON — no markdown.
+{"id":"<workflow id or none>","matched":"keyword"|"context"|"none","reason":"≤20 words naming the phrase or conversation cue that matched"}
 
 Workflows:
 {{workflowList}}`,

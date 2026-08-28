@@ -3,25 +3,24 @@ import { isEmptyContextValue } from './moduleContext';
 export const MEMORY_CAP = 30;
 export const MEMORY_TEXT_MAX = 280;
 
-export const MEMORY_HARVEST_SYSTEM = `You extract a small set of durable facts about THIS USER's own business for a commercial-excellence copilot.
+export const MEMORY_HARVEST_SYSTEM = `You extract a very small set of DURABLE identity facts about THIS USER's business for a commercial-excellence copilot.
 
-Save ONLY high-value facts that should still be true in later chats:
+Save only facts that should still be true in a later, unrelated chat months from now:
 - Named products, brands, or SKUs they work on
 - Named competitors
-- Named territories, countries, markets, or regions they cover
-- Specific definitions, metrics, or abbreviations they use (e.g. "attainment = YTD sales vs quota")
-- Explicit remember-this requests ("remember that…", "don't forget…", "always use…")
-- Named incentive plans/schemes or hard rules they confirmed as theirs (eligibility, pay curve, quota cycle)
+- Named countries, markets, or territories they cover (names only — not this period's results)
+- Standing definitions, metrics, or abbreviations (e.g. "attainment = YTD sales vs quota")
+- Standing rules they confirmed as theirs (quota cycle is calendar year, currency is GBP)
+- Something they explicitly asked to remember ("remember that…", "don't forget…", "always use…")
 
-Skip:
-- Greetings, yes/start/continue/ok/thanks, process chatter
-- The assistant's generic advice or best-practice lectures
-- One-off questions, hypotheticals, or this-session-only analysis
-- Anything already listed as remembered, or a close rephrase of it
-- Secrets or passwords
+NEVER save conversation-specific or this-session detail, including:
+- Current or recent performance (attainment %, payouts, how many reps hit a range, last N quarters)
+- This-chat objectives, scenarios, or "increase target to X% of baseline"
+- Counts, scores, ranges, or numbers from a file or this analysis
+- Recommendations, working assumptions, or what they want to do in this conversation
 
-When in doubt return {"facts":[],"conflicts":[]}. Prefer fewer, more specific facts. Max 4 new facts.
-If a new fact contradicts an already remembered fact (same topic, different value — e.g. product was Alpha, now Beta), do NOT put it in facts. Put it in conflicts with a short confirmation question.
+When in doubt return {"facts":[],"conflicts":[]}. Prefer names and definitions over numbers. Max 2 new facts.
+If a new durable fact contradicts an already remembered fact (same topic, different value — e.g. product was Alpha, now Beta), do NOT put it in facts. Put it in conflicts with a short confirmation question.
 Return JSON only: {"facts":["..."],"conflicts":[{"existingId":"mem_…","existingText":"…","proposed":"…","question":"I currently remember X. Update this to Y?"}]}`;
 
 export const MEMORY_BACKFILL_SYSTEM = `${MEMORY_HARVEST_SYSTEM}
@@ -283,13 +282,50 @@ export function formatMemoryStamp(iso) {
   }
 }
 
-export function formatMemoryPromptBlock(settings) {
+export function formatMemoryPromptBlock(settings, { moduleId = '', linkedIds = [] } = {}) {
   if (!isMemoryEnabled(settings)) return '';
-  const items = activeMemoryItems(settings);
+  let items = activeMemoryItems(settings);
+  if (moduleId) {
+    const allowed = new Set([moduleId, ...(linkedIds || [])]);
+    items = items.filter((m) => !m.module || allowed.has(m.module));
+  }
   if (!items.length) return '';
   let body = items.map((m) => `- ${m.text}`).join('\n');
   if (body.length > 3500) body = `${body.slice(0, 3500)}\n- [… older remembered facts omitted …]`;
-  return `\n\nREMEMBERED FROM PRIOR CHATS (key facts this user already established — products, competitors, territories, definitions. Use them. Do not re-ask unless the user contradicts them):\n${body}`;
+  return `\n\nREMEMBERED FROM PRIOR CHATS (standing facts about this user's business — products, competitors, territories, definitions. Not this-session numbers or goals. Use them. Do not re-ask unless the user contradicts them):\n${body}`;
+}
+
+export function isExplicitRememberRequest(text) {
+  return /\b(remember (this|that|it)|don'?t forget|always use|always remember)\b/i.test(String(text || ''));
+}
+
+/** True for standing identity facts; false for this-chat numbers, goals, and snapshots. */
+export function isDurableMemoryFact(text, { allowExplicit = false } = {}) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (t.length < 16) return false;
+  if (allowExplicit) return true;
+  if (/\b(in this (chat|session|analysis|conversation|workflow)|for this (analysis|assessment|review|chat))\b/i.test(t)) return false;
+  if (/\b(last|past|previous|this|current|next) (\d+ )?(quarter|quarters|month|months|week|weeks|year|years)\b/i.test(t)) return false;
+  if (/\b(ytd|year[- ]to[- ]date|trailing)\b/i.test(t)) return false;
+  if (/\b(have|has) (achieved|attained|delivered|hit|reached)\b/i.test(t)) return false;
+  if (/\b(objective|goal|aim) is to\b/i.test(t)) return false;
+  if (/\b(increase|raise|reduce|lower|move) (the )?(target|quota|baseline|goal) to\b/i.test(t)) return false;
+  if (/\bcurrent baseline\b/i.test(t)) return false;
+  if (/\b\d+\s+reps?\b/i.test(t)) return false;
+  const standing = /\b(means|equals|defined as|is defined|stands for|abbreviation|always|eligibility|pay curve|accelerator|threshold|quota cycle|fiscal year|calendar year)\b/i.test(t)
+    || /\s=\s/.test(t)
+    || /\b(product|brand|competitor|territory|country|market) is\b/i.test(t);
+  const pcts = t.match(/\d+(?:\.\d+)?%/g) || [];
+  if (pcts.length && !standing) return false;
+  if (/\b(achieved|attained|payout|performance|score)\b/i.test(t) && /\d/.test(t) && !standing) return false;
+  return true;
+}
+
+export function filterMemoryFacts(facts, opts = {}) {
+  return (facts || [])
+    .map((f) => String(f || '').replace(/\s+/g, ' ').trim())
+    .filter((f) => isDurableMemoryFact(f, opts))
+    .slice(0, 2);
 }
 
 export function shouldHarvestChatMemory(_assistantText, userText) {

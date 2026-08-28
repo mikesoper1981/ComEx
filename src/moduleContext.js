@@ -350,7 +350,83 @@ function formatBlockForPrompt(b) {
   return `${b.label}: ${value}`;
 }
 
-export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 12000 } = {}) {
+export const MODULE_CONTEXT_LABELS = {
+  incentives: 'Incentive Compensation',
+  territory: 'Territory Design',
+  stella: 'Stella Insights',
+};
+
+export function mergeModuleConnections(raw) {
+  const seen = new Set();
+  const out = [];
+  const list = Array.isArray(raw) ? raw : [];
+  for (const item of list) {
+    const a = item?.a || item?.from || (Array.isArray(item) ? item[0] : '');
+    const b = item?.b || item?.to || (Array.isArray(item) ? item[1] : '');
+    const ids = [a, b]
+      .map((id) => String(id || '').trim())
+      .filter((id) => MODULE_CONTEXT_IDS.includes(id));
+    if (ids.length !== 2 || ids[0] === ids[1]) continue;
+    const [left, right] = ids.slice().sort();
+    const key = `${left}|${right}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ a: left, b: right });
+  }
+  return out;
+}
+
+export function connectionKey(a, b) {
+  const ids = [a, b].filter((id) => MODULE_CONTEXT_IDS.includes(id)).slice().sort();
+  if (ids.length !== 2 || ids[0] === ids[1]) return '';
+  return `${ids[0]}|${ids[1]}`;
+}
+
+export function modulesAreConnected(connections, a, b) {
+  const key = connectionKey(a, b);
+  return !!key && mergeModuleConnections(connections).some((c) => `${c.a}|${c.b}` === key);
+}
+
+export function connectedModuleIds(connections, moduleId) {
+  if (!MODULE_CONTEXT_IDS.includes(moduleId)) return [];
+  return mergeModuleConnections(connections)
+    .filter((c) => c.a === moduleId || c.b === moduleId)
+    .map((c) => (c.a === moduleId ? c.b : c.a));
+}
+
+export function toggleModuleConnection(connections, a, b) {
+  const key = connectionKey(a, b);
+  if (!key) return mergeModuleConnections(connections);
+  const next = mergeModuleConnections(connections);
+  if (next.some((c) => `${c.a}|${c.b}` === key)) {
+    return next.filter((c) => `${c.a}|${c.b}` !== key);
+  }
+  const [left, right] = key.split('|');
+  return [...next, { a: left, b: right }];
+}
+
+export function formatStellaSharePromptBlock(files, { maxChars = 3500 } = {}) {
+  const usable = (files || []).filter((f) => f && !f.processing);
+  if (!usable.length) return '';
+  const blocks = usable.map((f) => {
+    const cols = (f.columns || []).slice(0, 18).map((c) => (typeof c === 'string' ? c : c.name)).filter(Boolean).join(', ');
+    const ctx = f.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
+    const metrics = Array.isArray(ctx.key_metrics) ? ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).slice(0, 8).join('; ') : '';
+    return [
+      `FILE: ${f.name}${f.rowCount != null ? ` (${f.rowCount} rows)` : (f.tableName ? ' (table)' : ' (document)')}`,
+      !isEmptyContextValue(f.summary) ? `Summary: ${String(f.summary).replace(/\s+/g, ' ').trim().slice(0, 420)}` : '',
+      cols ? `Columns: ${cols}` : '',
+      !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
+      !isEmptyContextValue(ctx.time_period) ? `Period: ${ctx.time_period}` : '',
+      metrics ? `Key metrics: ${metrics}` : '',
+    ].filter(Boolean).join('\n');
+  });
+  let body = blocks.join('\n\n');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… Stella catalog truncated …]`;
+  return `\n\nLINKED STELLA DATA CATALOG — this user connected Stella to this module. Summaries of datasets they uploaded to Stella (not live SQL). Use as background for territories, products, coverage, and metrics. Do not invent extra tables or values:\n${body}\n`;
+}
+
+export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 12000, linkedFrom = '' } = {}) {
   const files = (settings?.moduleContext?.[moduleId]?.files || []).filter((f) => f && !f.processing);
   const blobs = files.map((f) => {
     const blocks = listModuleContextBlocks(f).map(formatBlockForPrompt).filter(Boolean);
@@ -360,8 +436,36 @@ export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 
   if (!blobs.length) return '';
   let body = blobs.join('\n\n');
   if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… module context truncated …]`;
-  return `\n\nMODULE CONTEXT (${moduleId}) — user-provided guidance for this module. Treat it as mandatory background. Do not contradict it. Do not name internal filenames to end users:\n${body}\n`;
+  const header = linkedFrom
+    ? `\n\nLINKED MODULE CONTEXT (${moduleId}) — shared because this user connected ${linkedFrom} with ${moduleId}. Treat it as mandatory background from that module. Do not contradict it. Do not name internal filenames to end users:\n`
+    : `\n\nMODULE CONTEXT (${moduleId}) — user-provided guidance for this module. Treat it as mandatory background. Do not contradict it. Do not name internal filenames to end users:\n`;
+  return `${header}${body}\n`;
 }
+
+export function formatLinkedModulesPromptBlock(settings, homeId, { stellaFiles = [], maxChars = 14000 } = {}) {
+  const home = MODULE_CONTEXT_IDS.includes(homeId) ? homeId : 'incentives';
+  const linked = connectedModuleIds(settings?.moduleConnections, home);
+  const chunks = [];
+  const homeBlock = formatModuleContextPromptBlock(settings, home, { maxChars: 8000 });
+  if (homeBlock) chunks.push(homeBlock);
+  for (const id of linked) {
+    const other = formatModuleContextPromptBlock(settings, id, { maxChars: 4500, linkedFrom: home });
+    if (other) chunks.push(other);
+    if (id === 'stella' && home !== 'stella') {
+      const goals = String(settings?.stellaBusinessContext?.keyGoals || '').trim();
+      if (goals) {
+        chunks.push(`\n\nLINKED STELLA ANALYSIS GOALS — use as background for what they want from data analysis:\n${goals}\n`);
+      }
+      const catalog = formatStellaSharePromptBlock(stellaFiles);
+      if (catalog) chunks.push(catalog);
+    }
+  }
+  if (!chunks.length) return '';
+  let body = chunks.join('');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… linked context truncated …]`;
+  return body;
+}
+
 
 export function knowledgeStemPattern(names = []) {
   const stems = (names || [])

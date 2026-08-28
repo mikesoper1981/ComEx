@@ -228,7 +228,8 @@ export function mergeWorkflowRuntime(partial) {
     if (w[key] != null) out[key] = String(w[key]);
   }
   if (!/casual questions/i.test(String(out.matchDetectorPrompt || ''))
-    || /You detect if a user message matches one of these workflows/i.test(String(out.matchDetectorPrompt || ''))) {
+    || /You detect if a user message matches one of these workflows/i.test(String(out.matchDetectorPrompt || ''))
+    || !/"reason"/i.test(String(out.matchDetectorPrompt || ''))) {
     out.matchDetectorPrompt = DEFAULT_WORKFLOW_RUNTIME.matchDetectorPrompt;
   }
   // Refresh stale factory prompts that dropped scheme images / vision extracts
