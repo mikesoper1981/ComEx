@@ -1021,6 +1021,25 @@ function isMemoryConfirmDecline(text) {
     || /^(keep|keep it|keep existing)([\s.!,'"]*)$/i.test(t);
 }
 
+function matchConflictingMemory(existingActive, { existingId = '', existingText = '', proposed = '' } = {}) {
+  const list = Array.isArray(existingActive) ? existingActive : [];
+  const proposedText = String(proposed || '').trim();
+  if (existingId) {
+    const byId = list.find((m) => m.id === existingId);
+    if (byId && (!proposedText || byId.text.toLowerCase() !== proposedText.toLowerCase())) return byId;
+  }
+  const named = String(existingText || '').trim();
+  if (named) {
+    const byNamed = list.find((m) => m.text.toLowerCase() === named.toLowerCase() || factsAreSimilar(m.text, named));
+    if (byNamed && (!proposedText || byNamed.text.toLowerCase() !== proposedText.toLowerCase())) return byNamed;
+  }
+  if (!proposedText) return null;
+  return list.find((m) => (
+    m.text.toLowerCase() !== proposedText.toLowerCase()
+    && factsShareMemoryTopic(m.text, proposedText)
+  )) || null;
+}
+
 function looksLikeMemoryCorrection(text, { force = false } = {}) {
   const t = String(text || '').trim();
   if (t.length > 280) return false;
@@ -3755,48 +3774,40 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
       const facts = [];
       const conflicts = [];
       for (const conflict of harvestedConflicts || []) {
-        if (conflict?.proposed && isDurableMemoryFact(conflict.proposed, { allowExplicit })) {
-          conflicts.push(conflict);
+        if (!conflict?.proposed || !isDurableMemoryFact(conflict.proposed, { allowExplicit })) continue;
+        const matched = matchConflictingMemory(existingActive, conflict);
+        if (matched) {
+          conflicts.push({
+            ...conflict,
+            existingId: matched.id,
+            existingText: matched.text,
+          });
+        } else {
+          facts.push(conflict.proposed);
         }
       }
       for (const fact of filterMemoryFacts(harvestedFacts, { allowExplicit })) {
-        const match = existingActive.find((m) => (
-          m.text.toLowerCase() !== String(fact).toLowerCase()
-          && factsShareMemoryTopic(m.text, fact)
-        ));
-        if (match) {
-          if (!conflicts.some((c) => (c.existingId && c.existingId === match.id) || factsAreSimilar(c.proposed, fact))) {
+        const matched = matchConflictingMemory(existingActive, { proposed: fact });
+        if (matched) {
+          if (!conflicts.some((c) => (c.existingId && c.existingId === matched.id) || factsAreSimilar(c.proposed, fact))) {
             conflicts.push({
-              existingId: match.id,
-              existingText: match.text,
+              existingId: matched.id,
+              existingText: matched.text,
               proposed: fact,
-              question: `I currently remember: "${match.text}". Should I update memory to: "${fact}"?`,
+              question: `I currently remember: "${matched.text}". Should I update memory to: "${fact}"?`,
             });
           }
-        } else {
+        } else if (!facts.some((f) => factsAreSimilar(f, fact))) {
           facts.push(fact);
         }
       }
-      const conflict = (conflicts || []).find((c) => c.proposed);
-      if (conflict && !pendingMemoryConfirmRef.current) {
-        const extraFacts = facts.filter((f) => !factsAreSimilar(f, conflict.proposed) && String(f).toLowerCase() !== String(conflict.existingText || '').toLowerCase());
-        const existing = String(conflict.existingText || '').trim();
-        const proposed = String(conflict.proposed || '').trim();
-        const question = existing
-          ? `Should I update a remembered fact?\n\n**Currently:** ${existing}\n**Update to:** ${proposed}`
-          : `Should I remember this going forward?\n\n**${proposed}**`;
-        const pending = { ...conflict, extraFacts, thread };
-        pendingMemoryConfirmRef.current = pending;
-        setPendingMemoryConfirm(pending);
-        setMemoryCustomOpen(false);
-        setMemoryCustomDraft(proposed);
-        setSuggestedPrompts([]);
-        const append = thread === 'stella' ? setStellaMessages : setMessages;
-        append((prev) => [...prev, { role: 'assistant', content: question, kind: 'memory-confirm' }]);
-        openedConflict = true;
-      } else if (!conflicts.length && facts.length) {
+      const newFacts = facts.filter((f) => {
+        const proposed = conflicts[0]?.proposed;
+        return !proposed || (!factsAreSimilar(f, proposed) && String(f).toLowerCase() !== String(conflicts[0]?.existingText || '').toLowerCase());
+      });
+      if (newFacts.length) {
         const before = memorySignature(userSettingsRef.current.memory);
-        const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts, { module: resolvePromptModule() });
+        const memory = mergeMemoryFacts(userSettingsRef.current.memory, newFacts, { module: resolvePromptModule() });
         if (memorySignature(memory) !== before) {
           const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
           setUserSettings(settings);
@@ -3807,6 +3818,21 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
             { userName: currentUser.name },
           ));
         }
+      }
+      const conflict = conflicts.find((c) => c.proposed && c.existingText);
+      if (conflict && !pendingMemoryConfirmRef.current) {
+        const existing = String(conflict.existingText || '').trim();
+        const proposed = String(conflict.proposed || '').trim();
+        const question = `Should I update a remembered fact?\n\n**Currently:** ${existing}\n**Update to:** ${proposed}`;
+        const pending = { ...conflict, extraFacts: [], thread };
+        pendingMemoryConfirmRef.current = pending;
+        setPendingMemoryConfirm(pending);
+        setMemoryCustomOpen(false);
+        setMemoryCustomDraft(proposed);
+        setSuggestedPrompts([]);
+        const append = thread === 'stella' ? setStellaMessages : setMessages;
+        append((prev) => [...prev, { role: 'assistant', content: question, kind: 'memory-confirm' }]);
+        openedConflict = true;
       }
     } catch (err) {
       console.warn('Chat memory harvest failed:', err?.message || err);
@@ -8426,9 +8452,6 @@ ${stepInstruction}`;
                           </div>
                         )}
                       </div>
-                      {index === messages.length - 1 && pendingMemoryConfirm && (message.kind === 'memory-confirm' || /remembered fact/i.test(message.content || '')) && (
-                        <div className="mt-3 max-w-[85%] text-left">{renderMemoryConfirmActions()}</div>
-                      )}
                     </div>
                   </div>
                 ))}
@@ -8803,9 +8826,6 @@ ${stepInstruction}`;
                           </div>
                           {message.role === 'assistant' && Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps)}
                         </div>
-                        {index === stellaMessages.length - 1 && pendingMemoryConfirm && (message.kind === 'memory-confirm' || /remembered fact/i.test(message.content || '')) && (
-                          <div className="mt-3 max-w-[85%] text-left">{renderMemoryConfirmActions()}</div>
-                        )}
                       </div>
                     </div>
                   ))}
