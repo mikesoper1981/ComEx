@@ -2825,6 +2825,7 @@ export default function CommercialExcellenceApp() {
   const [pendingMemoryConfirm, setPendingMemoryConfirm] = useState(null);
   const [memoryCustomOpen, setMemoryCustomOpen] = useState(false);
   const [memoryCustomDraft, setMemoryCustomDraft] = useState('');
+  const memoryCustomInputRef = useRef(null);
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
     try { return localStorage.getItem('comex-chat-history-collapsed') === '1'; } catch { return false; }
   });
@@ -3779,18 +3780,19 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
       const conflict = (conflicts || []).find((c) => c.proposed);
       if (conflict && !pendingMemoryConfirmRef.current) {
         const extraFacts = facts.filter((f) => !factsAreSimilar(f, conflict.proposed) && String(f).toLowerCase() !== String(conflict.existingText || '').toLowerCase());
-        const question = `I want to update your **remembered facts** before we continue.\n\n${
-          conflict.question
-          || `I currently remember: "${conflict.existingText}". Should I update memory to: "${conflict.proposed}"?`
-        }\n\nReply **yes** to update, **no** to keep the existing fact, or type the correct version.`;
+        const existing = String(conflict.existingText || '').trim();
+        const proposed = String(conflict.proposed || '').trim();
+        const question = existing
+          ? `Should I update a remembered fact?\n\n**Currently:** ${existing}\n**Update to:** ${proposed}`
+          : `Should I remember this going forward?\n\n**${proposed}**`;
         const pending = { ...conflict, extraFacts, thread };
         pendingMemoryConfirmRef.current = pending;
         setPendingMemoryConfirm(pending);
         setMemoryCustomOpen(false);
-        setMemoryCustomDraft(String(conflict.proposed || '').trim());
+        setMemoryCustomDraft(proposed);
         setSuggestedPrompts([]);
         const append = thread === 'stella' ? setStellaMessages : setMessages;
-        append((prev) => [...prev, { role: 'assistant', content: question }]);
+        append((prev) => [...prev, { role: 'assistant', content: question, kind: 'memory-confirm' }]);
         openedConflict = true;
       } else if (!conflicts.length && facts.length) {
         const before = memorySignature(userSettingsRef.current.memory);
@@ -7776,6 +7778,89 @@ ${stepInstruction}`;
     await continueFreeform();
   };
 
+  const openMemoryOther = () => {
+    setMemoryCustomDraft(String(pendingMemoryConfirmRef.current?.proposed || memoryCustomDraft || '').trim());
+    setMemoryCustomOpen(true);
+    window.setTimeout(() => memoryCustomInputRef.current?.focus(), 50);
+  };
+
+  const submitMemoryChoice = (event, value) => {
+    if (event?.preventDefault) event.preventDefault();
+    const thread = pendingMemoryConfirmRef.current?.thread;
+    if (thread === 'stella') {
+      setStellaInput('');
+      handleStellaChatSubmit(event, value);
+    } else {
+      setInput('');
+      handleSubmit(event, value);
+    }
+  };
+
+  const saveMemoryOther = (event) => {
+    const text = String(memoryCustomDraft || '').trim();
+    if (!text) return;
+    memoryCustomForcedRef.current = true;
+    submitMemoryChoice(event, text);
+  };
+
+  const renderMemoryConfirmActions = () => {
+    if (!pendingMemoryConfirm) return null;
+    return (
+      <div className="space-y-2">
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={(e) => submitMemoryChoice(e, 'Yes')}
+            className="px-4 py-2.5 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all"
+          >
+            Yes
+          </button>
+          <button
+            type="button"
+            onClick={(e) => submitMemoryChoice(e, 'No')}
+            className="px-4 py-2.5 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all"
+          >
+            No
+          </button>
+          <button
+            type="button"
+            onClick={openMemoryOther}
+            className={`px-4 py-2.5 font-semibold rounded-lg transition-all border ${memoryCustomOpen ? 'bg-cyan-500/25 border-cyan-300/60 text-cyan-50' : 'bg-slate-800 hover:bg-slate-700 border-cyan-400/35 text-cyan-100'}`}
+          >
+            Other
+          </button>
+        </div>
+        {memoryCustomOpen && (
+          <div className="bg-slate-900/60 border border-cyan-400/25 rounded-lg p-3 space-y-2">
+            <label className="block text-[11px] text-cyan-200/80 font-semibold">Type the fact to remember</label>
+            <textarea
+              ref={memoryCustomInputRef}
+              value={memoryCustomDraft}
+              onChange={(e) => setMemoryCustomDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  saveMemoryOther(e);
+                }
+              }}
+              rows={3}
+              placeholder="e.g. Products are Tysabri and Innovex"
+              className="w-full bg-slate-950/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-cyan-400 resize-y"
+            />
+            <button
+              type="button"
+              disabled={!String(memoryCustomDraft || '').trim()}
+              onClick={saveMemoryOther}
+              className="px-4 py-2 bg-cyan-500/25 hover:bg-cyan-500/40 border border-cyan-400/40 text-cyan-50 font-semibold rounded-lg text-sm disabled:opacity-40"
+            >
+              Save this version
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 text-white">
       {/* Header */}
@@ -8340,51 +8425,10 @@ ${stepInstruction}`;
                             <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">💬 No, keep talking</button>
                           </div>
                         )}
-                        {index === messages.length - 1 && pendingMemoryConfirm && /update your \*\*remembered facts\*\*|update memory/i.test(message.content) && (
-                          <div className="mt-4 space-y-2">
-                            <div className="flex flex-col sm:flex-row gap-2">
-                              <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, update memory</button>
-                              <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">Keep existing fact</button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setMemoryCustomDraft(String(pendingMemoryConfirm?.proposed || memoryCustomDraft || '').trim());
-                                  setMemoryCustomOpen(true);
-                                }}
-                                className="flex-1 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-cyan-400/30 text-cyan-100 font-semibold rounded-lg transition-all"
-                              >
-                                Type a different version
-                              </button>
-                            </div>
-                            {memoryCustomOpen && (
-                              <div className="bg-slate-900/50 border border-cyan-400/20 rounded-lg p-3 space-y-2">
-                                <textarea
-                                  value={memoryCustomDraft}
-                                  onChange={(e) => setMemoryCustomDraft(e.target.value)}
-                                  rows={3}
-                                  placeholder="Type the fact that should be remembered"
-                                  className="w-full bg-slate-950/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-cyan-400 resize-y"
-                                />
-                                <button
-                                  type="button"
-                                  disabled={!String(memoryCustomDraft || '').trim()}
-                                  onClick={(e) => {
-                                    e.preventDefault();
-                                    const text = String(memoryCustomDraft || '').trim();
-                                    if (!text) return;
-                                    memoryCustomForcedRef.current = true;
-                                    setInput('');
-                                    handleSubmit(e, text);
-                                  }}
-                                  className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-100 font-semibold rounded-lg text-sm disabled:opacity-40"
-                                >
-                                  Save this version
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        )}
                       </div>
+                      {index === messages.length - 1 && pendingMemoryConfirm && (message.kind === 'memory-confirm' || /remembered fact/i.test(message.content || '')) && (
+                        <div className="mt-3 max-w-[85%] text-left">{renderMemoryConfirmActions()}</div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -8500,6 +8544,13 @@ ${stepInstruction}`;
                 {clarifyingReplyHint && !isLoading && !pptxGenerating && (
                   <div className="mb-3 text-xs text-blue-300/70 bg-slate-800/40 border border-blue-400/20 rounded-lg px-3 py-2">
                     Reply with your answers by number, e.g. <span className="text-cyan-300 font-mono">1 = …</span>  <span className="text-cyan-300 font-mono">2 = …</span>
+                  </div>
+                )}
+
+                {pendingMemoryConfirm && !isLoading && !pptxGenerating && (
+                  <div className="mb-3 p-3 bg-slate-800/70 border border-cyan-400/35 rounded-xl">
+                    <div className="text-xs font-semibold text-cyan-200 mb-2">Confirm remembered fact</div>
+                    {renderMemoryConfirmActions()}
                   </div>
                 )}
 
@@ -8751,50 +8802,10 @@ ${stepInstruction}`;
                             {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : <MessageErrorBoundary>{formatMarkdown(message.content)}</MessageErrorBoundary>}
                           </div>
                           {message.role === 'assistant' && Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps)}
-                          {index === stellaMessages.length - 1 && pendingMemoryConfirm && /update your \*\*remembered facts\*\*|update memory/i.test(message.content) && (
-                            <div className="mt-4 space-y-2 text-left">
-                              <div className="flex flex-col sm:flex-row gap-2">
-                                <button type="button" onClick={(e) => { e.preventDefault(); setStellaInput(''); handleStellaChatSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, update memory</button>
-                                <button type="button" onClick={(e) => { e.preventDefault(); setStellaInput(''); handleStellaChatSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">Keep existing fact</button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setMemoryCustomDraft(String(pendingMemoryConfirm?.proposed || memoryCustomDraft || '').trim());
-                                    setMemoryCustomOpen(true);
-                                  }}
-                                  className="flex-1 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-cyan-400/30 text-cyan-100 font-semibold rounded-lg transition-all"
-                                >
-                                  Type a different version
-                                </button>
-                              </div>
-                              {memoryCustomOpen && (
-                                <div className="bg-slate-900/50 border border-cyan-400/20 rounded-lg p-3 space-y-2">
-                                  <textarea
-                                    value={memoryCustomDraft}
-                                    onChange={(e) => setMemoryCustomDraft(e.target.value)}
-                                    rows={3}
-                                    placeholder="Type the fact that should be remembered"
-                                    className="w-full bg-slate-950/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-cyan-400 resize-y"
-                                  />
-                                  <button
-                                    type="button"
-                                    disabled={!String(memoryCustomDraft || '').trim()}
-                                    onClick={(e) => {
-                                      e.preventDefault();
-                                      const text = String(memoryCustomDraft || '').trim();
-                                      if (!text) return;
-                                      memoryCustomForcedRef.current = true;
-                                      setStellaInput('');
-                                      handleStellaChatSubmit(e, text);
-                                    }}
-                                    className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-100 font-semibold rounded-lg text-sm disabled:opacity-40"
-                                  >
-                                    Save this version
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          )}
+                        </div>
+                        {index === stellaMessages.length - 1 && pendingMemoryConfirm && (message.kind === 'memory-confirm' || /remembered fact/i.test(message.content || '')) && (
+                          <div className="mt-3 max-w-[85%] text-left">{renderMemoryConfirmActions()}</div>
+                        )}
                         </div>
                       </div>
                     </div>
@@ -8816,6 +8827,12 @@ ${stepInstruction}`;
                   <div ref={messagesEndRef} />
                 </div>
 
+                {pendingMemoryConfirm && !stellaIsLoading && (
+                  <div className="mb-3 p-3 bg-slate-800/70 border border-cyan-400/35 rounded-xl">
+                    <div className="text-xs font-semibold text-cyan-200 mb-2">Confirm remembered fact</div>
+                    {renderMemoryConfirmActions()}
+                  </div>
+                )}
                 <form onSubmit={handleStellaChatSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-4">
                   <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
                     <div className="flex-1">
