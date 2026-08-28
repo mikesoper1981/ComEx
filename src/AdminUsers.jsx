@@ -15,6 +15,7 @@ import {
   liftStellaGenericIntoUserSettings,
 } from './stellaUserSettings';
 import { formatMemoryStamp, describeObsoleteReason, memoryUsage } from './chatMemory';
+import { defaultCompanyForRole } from './company';
 
 function formatLogin(iso) {
   if (!iso) return 'Never';
@@ -118,6 +119,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [role, setRole] = useState('user');
+  const [company, setCompany] = useState('PharmaCo');
   const [busy, setBusy] = useState(false);
   const [editUser, setEditUser] = useState(null);
   const [editEmail, setEditEmail] = useState('');
@@ -174,11 +176,13 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
         name,
         email,
         role,
+        company,
         loginUrl: window.location.origin,
       });
       setName('');
       setEmail('');
       setRole('user');
+      setCompany('PharmaCo');
       setNotice(
         data?.emailSent
           ? 'User created. A one-time password has been emailed; they must change it on first sign-in.'
@@ -578,7 +582,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             <Pencil className="w-6 h-6 text-cyan-400" /> Edit user
           </h2>
           <p className="text-sm text-blue-300/70 mb-5">
-            {editUser.name}{editUser.email ? ` · ${editUser.email}` : ''} — email, General (shared company/industry/terminology), and Stella analysis goals
+            {editUser.name}{editUser.email ? ` · ${editUser.email}` : ''}{editUser.company ? ` · ${editUser.company}` : ''} — email, General (shared company/industry/terminology), and Stella analysis goals
           </p>
           {error && (
             <div className="mb-4 text-sm text-red-300 flex items-center gap-2">
@@ -608,6 +612,17 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                   placeholder="name@company.com"
                   className={fieldClass}
                 />
+              </div>
+              <div>
+                <label className={labelClass}>Company</label>
+                <input
+                  value={editUser.company || ''}
+                  readOnly
+                  className={`${fieldClass} opacity-70 cursor-default`}
+                />
+                <p className="text-[11px] text-blue-300/45 mt-1">
+                  Tenant for this account’s files and Stella tables. Set when the user is created.
+                </p>
               </div>
 
               <div>
@@ -758,9 +773,9 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                       </div>
                     )}
                     {editMemory.length === 0 ? (
-                      <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet.</div>
+                      <div className={`text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2 ${editGeneral.memoryEnabled === false ? 'opacity-40' : ''}`}>Nothing remembered yet.</div>
                     ) : (
-                      <ul className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1">
+                      <ul className={`space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1 ${editGeneral.memoryEnabled === false ? 'opacity-40 grayscale' : ''}`}>
                         {editMemory.map((item) => {
                           const reason = describeObsoleteReason(item, editMemory);
                           return (
@@ -850,7 +865,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
           Create and remove accounts. New users get a one-time password by email and must choose a new one on first sign-in.
         </p>
 
-        <form onSubmit={handleCreate} className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 mb-6 grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
+        <form onSubmit={handleCreate} className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 mb-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-3 items-end">
           <div>
             <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Username</label>
             <input
@@ -860,7 +875,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
               className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
             />
           </div>
-          <div className="md:col-span-2">
+          <div className="lg:col-span-2">
             <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Email</label>
             <input
               type="email"
@@ -872,10 +887,27 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             />
           </div>
           <div>
+            <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Company</label>
+            <input
+              value={company}
+              onChange={(e) => setCompany(e.target.value)}
+              placeholder="e.g. PharmaCo"
+              className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
+            />
+          </div>
+          <div>
             <label className="block text-xs text-blue-300/70 font-semibold mb-1.5">Role</label>
             <select
               value={role}
-              onChange={(e) => setRole(e.target.value)}
+              onChange={(e) => {
+                const next = e.target.value;
+                setRole(next);
+                setCompany((current) => {
+                  const fromRole = defaultCompanyForRole(next);
+                  if (current === defaultCompanyForRole(role) || !String(current || '').trim()) return fromRole;
+                  return current;
+                });
+              }}
               className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400"
             >
               <option value="user">User</option>
@@ -884,7 +916,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
           </div>
           <button
             type="submit"
-            disabled={busy || name.trim().length < 2 || !email.includes('@')}
+            disabled={busy || name.trim().length < 2 || !email.includes('@') || company.trim().length < 2}
             className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white text-sm font-semibold rounded-lg flex items-center justify-center gap-2"
           >
             <Plus className="w-4 h-4" /> Create
@@ -905,6 +937,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             <thead>
               <tr className="text-left text-[11px] uppercase tracking-wide text-blue-300/50 border-b border-blue-400/15">
                 <th className="pb-2 pr-3 font-semibold">User</th>
+                <th className="pb-2 pr-3 font-semibold">Company</th>
                 <th className="pb-2 pr-3 font-semibold">Role</th>
                 <th className="pb-2 pr-3 font-semibold">Last login</th>
                 <th className="pb-2 pr-3 font-semibold text-right">Chats (7d)</th>
@@ -915,12 +948,12 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             <tbody>
               {status === 'loading' && (
                 <tr>
-                  <td colSpan={6} className="py-6 text-blue-300/50">Loading users…</td>
+                  <td colSpan={7} className="py-6 text-blue-300/50">Loading users…</td>
                 </tr>
               )}
               {status === 'ready' && users.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="py-6 text-blue-300/50">No users yet.</td>
+                  <td colSpan={7} className="py-6 text-blue-300/50">No users yet.</td>
                 </tr>
               )}
               {users.map((u) => (
@@ -930,6 +963,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                     <div className="text-[11px] text-blue-300/70">{u.email || 'No email'}</div>
                     <div className="text-[11px] text-blue-300/40 font-mono">{u.id}</div>
                   </td>
+                  <td className="py-3 pr-3 text-blue-100/80 whitespace-nowrap">{u.company || '—'}</td>
                   <td className="py-3 pr-3">
                     <span className={`px-2 py-0.5 rounded text-xs ${u.role === 'admin' ? 'bg-amber-500/15 text-amber-300 border border-amber-400/25' : 'bg-slate-700/50 text-blue-200 border border-blue-400/15'}`}>
                       {u.role === 'admin' ? 'Admin' : 'User'}

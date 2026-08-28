@@ -26,8 +26,8 @@ function storedLength(raw) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return 'standard';
   if (n <= 1) return 'executive';
-  if (n >= 4) return 'teaching';
-  return 'standard';
+  if (n === 2) return 'standard';
+  return 'teaching';
 }
 
 function settingsFrom(doc) {

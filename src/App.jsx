@@ -20,13 +20,18 @@ import {
   userStellaStoragePrefix,
   productIntelligenceLocalKey,
   productIntelligenceRemotePath,
+  authHeaders,
 } from './auth';
+import {
+  resolveUserCompany,
+} from './company';
 import {
   STELLA_CONNECTORS,
   mergeStellaBusinessContext,
   stellaBusinessContextIsEmpty,
   liftStellaGenericIntoUserSettings,
   stellaOrgIdForUser,
+  stellaOrgIdCandidates,
 } from './stellaUserSettings';
 import {
   MEMORY_HARVEST_SYSTEM,
@@ -330,9 +335,10 @@ function normalizeResponseLength(raw) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return DEFAULT_RESPONSE_LENGTH;
   const rounded = Math.round(n);
-  // Legacy 5-stop slider: 1 Exec, 2 Brief, 3 Standard, 4 Expanded, 5 Teaching
   if (rounded <= 1) return 1;
-  if (rounded >= 4) return 3;
+  if (rounded === 2) return 2;
+  // New 3-stop slider: 3 = Teaching. Legacy 5-stop: 4–5 = Teaching.
+  if (rounded >= 3) return 3;
   return 2;
 }
 
@@ -3207,10 +3213,11 @@ export default function CommercialExcellenceApp() {
       chatsFullLoadedRef.current = false;
       chatsFullPromiseRef.current = null;
       chatsBodiesRef.current = [];
-      const userOrg = stellaOrgIdForUser(currentUser.id);
+      const userOrg = stellaOrgIdForUser(currentUser);
+      const orgCandidates = stellaOrgIdCandidates(currentUser);
 
       const loadStellaFiles = async () => {
-      // File registry (stella_files table), scoped to this user.
+      // File registry (stella_files table), scoped to this company + user.
       try {
         if (isAdmin) {
           const { data: own } = await supabase
@@ -3229,17 +3236,40 @@ export default function CommercialExcellenceApp() {
             }
           }
         }
-        const { data, error } = await supabase
-          .from('stella_files')
-          .select('*')
-          .eq('org_id', userOrg)
-          .order('uploaded_at', { ascending: true });
-        if (!error && Array.isArray(data)) {
+        let data = [];
+        let sourceOrg = '';
+        for (const org of orgCandidates) {
+          const { data: rows, error } = await supabase
+            .from('stella_files')
+            .select('*')
+            .eq('org_id', org)
+            .order('uploaded_at', { ascending: true });
+          if (!error && Array.isArray(rows) && rows.length) {
+            data = rows;
+            sourceOrg = org;
+            break;
+          }
+        }
+        if (sourceOrg && sourceOrg !== userOrg) {
+          await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', sourceOrg);
+          data = data.map((row) => ({ ...row, org_id: userOrg }));
+        }
+        if (Array.isArray(data) && data.length) {
           const mapped = data.map(stellaMapRegistryRow);
           setStellaDataFiles(prev => {
             const existing = new Set(prev.map(f => f.dbId).filter(Boolean));
             return [...prev, ...mapped.filter(f => !existing.has(f.dbId))];
           });
+          const tables = [...new Set(mapped.map((f) => f.tableName).filter(Boolean))];
+          for (const tableName of tables) {
+            try {
+              await fetch(STELLA_QUERY_API_PATH, {
+                method: 'POST',
+                headers: authHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ action: 'move', tableName }),
+              });
+            } catch { /* company-schema SQL may not be applied yet */ }
+          }
         }
       } catch { /* stella_files table may not exist yet */ }
       };
@@ -3298,8 +3328,8 @@ export default function CommercialExcellenceApp() {
       };
 
       const loadUserJson = async () => {
-      // User settings: intelligence/users/<display name>/settings.json
-      // Chat hub list: intelligence/users/<display name>/chats-index.json (full transcripts load later)
+      // User settings: intelligence/companies/<slug>/users/<display name>/settings.json
+      // Chat hub list: intelligence/companies/<slug>/users/<display name>/chats-index.json
       try {
         try {
           localStorage.removeItem(userSettingsLocalKey(currentUser.id));
@@ -3341,7 +3371,13 @@ export default function CommercialExcellenceApp() {
         const lifted = liftStellaGenericIntoUserSettings({ ...merged, stellaBusinessContext: biz });
         merged = lifted.settings;
         biz = mergeStellaBusinessContext(merged.stellaBusinessContext);
-        if (migratedStellaBiz || lifted.changed) {
+        const tenantCompany = resolveUserCompany(currentUser);
+        let filledCompany = false;
+        if (!String(merged.companyName || '').trim() && tenantCompany) {
+          merged = { ...merged, companyName: tenantCompany };
+          filledCompany = true;
+        }
+        if (migratedStellaBiz || lifted.changed || filledCompany) {
           try {
             await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
               currentUser.id,
@@ -6327,7 +6363,7 @@ ${stepInstruction}`;
       const { data, error } = await supabase
         .from('stella_files')
         .select('*')
-        .eq('org_id', stellaOrgIdForUser(currentUser.id))
+        .eq('org_id', stellaOrgIdForUser(currentUser))
         .order('uploaded_at', { ascending: true });
       if (error || !Array.isArray(data)) return null;
       const mapped = data.map(stellaMapRegistryRow);
@@ -6353,7 +6389,7 @@ ${stepInstruction}`;
   const stellaInsertRegistry = async (record) => {
     const { data, error } = await supabase
       .from('stella_files')
-      .insert({ org_id: stellaOrgIdForUser(currentUser.id), ...record })
+      .insert({ org_id: stellaOrgIdForUser(currentUser), ...record })
       .select()
       .single();
     if (error) throw new Error(`Registry insert failed: ${error.message}`);
@@ -6366,16 +6402,24 @@ ${stepInstruction}`;
     if (error) throw new Error(`Registry update failed: ${error.message}`);
   };
 
-  // Create a dynamic stella_data_* table via RPC and load rows in batches.
+  const stellaTableApi = async (payload) => {
+    const res = await fetch(STELLA_QUERY_API_PATH, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `Stella request failed (${res.status})`);
+    return data;
+  };
+
+  // Create a dynamic stella_data_* table in this company's schema and load rows in batches.
   const stellaCreateAndLoadTable = async (tableName, columns, rows) => {
     const cols = columns.map(c => ({ name: c.name, type: c.type }));
-    const { error: createErr } = await supabase.rpc('stella_create_table', { p_table_name: tableName, p_columns: cols });
-    if (createErr) throw new Error(`Table create failed: ${createErr.message}`);
+    await stellaTableApi({ action: 'create', tableName, columns: cols });
     const BATCH = 500;
     for (let i = 0; i < rows.length; i += BATCH) {
-      const batch = rows.slice(i, i + BATCH);
-      const { error: insErr } = await supabase.rpc('stella_insert_rows', { p_table_name: tableName, p_rows: batch });
-      if (insErr) throw new Error(`Row insert failed: ${insErr.message}`);
+      await stellaTableApi({ action: 'insert', tableName, rows: rows.slice(i, i + BATCH) });
     }
   };
 
@@ -6833,7 +6877,7 @@ ${stepInstruction}`;
     } catch (e) {
       setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not remove "${f.name}" from the registry: ${e.message}` }]);
     }
-    try { if (f.tableName) await supabase.rpc('stella_drop_table', { p_table_name: f.tableName }); } catch { /* ignore */ }
+    try { if (f.tableName) await stellaTableApi({ action: 'drop', tableName: f.tableName }); } catch { /* ignore */ }
     await stellaRemoveStorage(f.storagePath);
     if (f.storagePath) await stellaRemoveStorage(stellaExtractedTextPath(f.storagePath));
     setStellaDataFiles(prev => prev.filter(x => x.id !== fileId));
@@ -7068,13 +7112,7 @@ ${stepInstruction}`;
   };
 
   const stellaRunQuery = async (sql) => {
-    const res = await fetch(STELLA_QUERY_API_PATH, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sql }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data?.error?.message || `Query failed (${res.status})`);
+    const data = await stellaTableApi({ sql });
     return Array.isArray(data.rows) ? data.rows : [];
   };
 
@@ -9094,6 +9132,7 @@ ${stepInstruction}`;
                   </div>
                   <div className="text-right text-xs text-blue-100/80">
                     <div className="font-semibold text-white">{currentUser.name}</div>
+                    <div>{resolveUserCompany(currentUser)}</div>
                     <div className="font-mono text-blue-200/70">userId: {currentUser.id}</div>
                   </div>
                 </div>
@@ -9116,10 +9155,10 @@ ${stepInstruction}`;
                 {userSettingsPane === 'general' && (
                   <>
                     <p className="text-xs text-blue-300/70 mb-5">
-                      Company, industry, metrics, and terminology here apply across Incentive Comp, Territory, and Stella — not duplicated per tool. Link modules on the home page to share that tool’s files and data summaries between them. Saved per named account in Supabase Storage bucket
-                      {' '}<code className="text-cyan-300/80">intelligence</code>
-                      {' '}→ <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/settings.json</code>.
-                      {' '}Chat history is a sibling file <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/chats.json</code>.
+                      Company, industry, metrics, and terminology here apply across Incentive Comp, Territory, and Stella — not duplicated per tool. Link modules on the home page to share that tool’s files and data summaries between them.
+                      {' '}Account company <span className="text-cyan-200 font-semibold">{resolveUserCompany(currentUser)}</span> isolates this user’s files under
+                      {' '}<code className="text-cyan-300/80">{userSettingsRemotePath(currentUser)}</code>.
+                      {' '}Chat history is <code className="text-cyan-300/80">{userChatsRemotePath(currentUser)}</code>.
                     </p>
                     {(() => {
                       const lengthLevel = getResponseLengthLevel(userSettings);
@@ -9136,6 +9175,25 @@ ${stepInstruction}`;
                               <div className="text-sm font-bold text-cyan-300">{lengthLevel.label}</div>
                               <div className="text-[10px] text-blue-300/50">{lengthLevel.value} of {RESPONSE_LENGTH_MAX}</div>
                             </div>
+                          </div>
+                          <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-full sm:w-fit mb-3">
+                            {RESPONSE_LENGTH_LEVELS.map((level) => (
+                              <button
+                                key={level.id}
+                                type="button"
+                                onClick={() => setUserSettings((prev) => ({
+                                  ...prev,
+                                  responseLength: storedResponseLength(level.id),
+                                }))}
+                                className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                                  level.value === lengthLevel.value
+                                    ? 'bg-blue-500 text-white shadow-lg'
+                                    : 'text-blue-300 hover:bg-slate-700/50'
+                                }`}
+                              >
+                                {level.label}
+                              </button>
+                            ))}
                           </div>
                           <input
                             id="response-length"
@@ -9154,13 +9212,18 @@ ${stepInstruction}`;
                             aria-valuenow={lengthLevel.value}
                             aria-valuetext={lengthLevel.label}
                           />
-                          <div className="flex justify-between mt-2">
+                          <div className="grid grid-cols-3 mt-2">
                             {RESPONSE_LENGTH_LEVELS.map((level) => (
                               <button
                                 key={level.value}
                                 type="button"
-                                onClick={() => setUserSettings((prev) => ({ ...prev, responseLength: level.id }))}
-                                className={`text-[10px] sm:text-xs font-semibold px-0.5 sm:px-1 ${level.value === lengthLevel.value ? 'text-cyan-300' : 'text-blue-300/40 hover:text-blue-200/70'}`}
+                                onClick={() => setUserSettings((prev) => ({
+                                  ...prev,
+                                  responseLength: storedResponseLength(level.id),
+                                }))}
+                                className={`text-[10px] sm:text-xs font-semibold ${
+                                  level.value === 1 ? 'text-left' : level.value === 3 ? 'text-right' : 'text-center'
+                                } ${level.value === lengthLevel.value ? 'text-cyan-300' : 'text-blue-300/40 hover:text-blue-200/70'}`}
                               >
                                 {level.label}
                               </button>
@@ -9263,13 +9326,13 @@ ${stepInstruction}`;
                           {(() => {
                             const usage = memoryUsage(userSettings.memory);
                             return (
-                              <span className="text-[10px] text-blue-300/50 whitespace-nowrap">
+                              <span className={`text-[10px] whitespace-nowrap ${userSettings.memoryEnabled === false ? 'text-blue-300/30' : 'text-blue-300/50'}`}>
                                 {usage.used} of {usage.cap} · {usage.pctLabel} full
                               </span>
                             );
                           })()}
                         </div>
-                        <div className="h-1 rounded-full bg-slate-800 overflow-hidden mb-3">
+                        <div className={`h-1 rounded-full bg-slate-800 overflow-hidden mb-3 ${userSettings.memoryEnabled === false ? 'opacity-40 grayscale' : ''}`}>
                           <div
                             className="h-full bg-cyan-400/70 rounded-full transition-all"
                             style={{ width: `${Math.min(100, memoryUsage(userSettings.memory).pct)}%` }}
@@ -9294,6 +9357,7 @@ ${stepInstruction}`;
                             Chat memory is off — existing facts are not passed as context.
                           </div>
                         )}
+                        <div className={userSettings.memoryEnabled === false ? 'opacity-40 grayscale' : ''}>
                         {(userSettings.memory || []).length === 0 ? (
                           <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet. Key facts from conversations appear here automatically.</div>
                         ) : (
@@ -9335,6 +9399,7 @@ ${stepInstruction}`;
                             })}
                           </ul>
                         )}
+                        </div>
                       </div>
                     </div>
                   </>

@@ -8,6 +8,9 @@
     },
     "api/users.js": {
       "maxDuration": 30
+    },
+    "api/stella-query.js": {
+      "maxDuration": 30
     }
   }
 }

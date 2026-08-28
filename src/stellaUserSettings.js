@@ -1,3 +1,5 @@
+import { companySlug, resolveUserCompany } from './company';
+
 /** Per-user Stella Insights settings (business context + connections). */
 
 export const DEFAULT_STELLA_BUSINESS_CONTEXT = {
@@ -60,8 +62,21 @@ export function liftStellaGenericIntoUserSettings(settings) {
   return { settings: s, changed };
 }
 
-/** Scope key for stella_files.org_id — one registry partition per account. */
-export function stellaOrgIdForUser(userId) {
-  const id = String(userId || '').trim();
+/** Scope key for stella_files.org_id — company + user, never shared across tenants. */
+export function stellaOrgIdForUser(userOrId) {
+  if (userOrId && typeof userOrId === 'object') {
+    const id = String(userOrId.id || '').trim();
+    const slug = companySlug(resolveUserCompany(userOrId));
+    return id ? `company:${slug}:user:${id}` : `company:${slug}`;
+  }
+  const id = String(userOrId || '').trim();
   return id ? `user:${id}` : 'default';
+}
+
+export function stellaOrgIdCandidates(user) {
+  const id = String(user?.id || '').trim();
+  return [...new Set([
+    stellaOrgIdForUser(user),
+    id ? `user:${id}` : '',
+  ].filter(Boolean))];
 }

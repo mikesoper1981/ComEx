@@ -29,6 +29,7 @@ Set these in your local `.env` and in your Vercel project settings:
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |
 | `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.js`, `api/user-settings.js`, `api/users.js`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used for Stella Insights, user JSON, and the account registry (`intelligence/accounts.json`) with hashed passwords. |
+| `DATABASE_URL` or `SUPABASE_DB_PASSWORD` | Server (`api/stella-db.js`) | Optional. Lets the app create company Postgres schemas when you add a company. `DATABASE_URL` is the URI from Supabase → Settings → Database. `SUPABASE_DB_PASSWORD` is the database password (used with `SUPABASE_URL`). Not needed if the Vercel Supabase integration already set `POSTGRES_URL`. |
 
 ## Gmail email
 
@@ -43,10 +44,12 @@ Do not use your normal Gmail password. Hotmail SMTP will not work.
 
 ## Stella Insights setup
 
-Run `supabase/stella_setup.sql` once in the Supabase SQL editor. It creates the
-`stella_files` registry table, the read-only `stella_run_select` executor, the
-dynamic-table helper functions (`stella_create_table`, `stella_insert_rows`,
-`stella_drop_table`), and the `stella-data` storage bucket.
+Company Postgres schemas (`c_pharmaco`, `c_comex`, …) and Stella helper
+functions are created by the app when you add a company in Users. There is
+nothing to run in the SQL editor.
+
+If schemas are not appearing, set `DATABASE_URL` or `SUPABASE_DB_PASSWORD`
+(Supabase → Settings → Database) in Vercel so the server can create them.
 
 Currently, two official plugins are available:
 

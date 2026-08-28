@@ -3,6 +3,11 @@
  * and never stored in the client bundle.
  */
 
+import {
+  companySlug,
+  resolveUserCompany,
+} from './company';
+
 export const SESSION_UNLOCKED_KEY = 'comex_app_unlocked';
 export const SESSION_USER_KEY = 'comex_current_user';
 export const SESSION_TOKEN_KEY = 'comex_auth_token';
@@ -18,16 +23,19 @@ export const HARDCODED_USERS = [
     id: envStr('VITE_APP_USER_ID', 'default'),
     name: envStr('VITE_APP_USER_NAME', 'Admin'),
     role: 'admin',
+    company: 'ComEx',
   },
   {
     id: envStr('VITE_APP_USER2_ID', 'consultant'),
     name: envStr('VITE_APP_USER2_NAME', 'Standard User'),
     role: 'user',
+    company: 'PharmaCo',
   },
   {
     id: envStr('VITE_APP_USER3_ID', 'oscar'),
     name: envStr('VITE_APP_USER3_NAME', 'Oscar'),
     role: 'user',
+    company: 'PharmaCo',
   },
 ];
 
@@ -37,6 +45,7 @@ export function getHardcodedUser() {
     id: String(u.id || 'default'),
     name: String(u.name || 'Admin'),
     role: u.role === 'admin' ? 'admin' : 'user',
+    company: String(u.company || (u.role === 'admin' ? 'ComEx' : 'PharmaCo')),
   };
 }
 
@@ -52,10 +61,15 @@ export function isAdminUser(user) {
 
 function sanitizeUser(user) {
   const listed = findHardcodedUser(user?.id);
+  const role = user?.role === 'admin' || listed?.role === 'admin' ? 'admin' : 'user';
   return {
     id: String(user?.id || listed?.id || 'default'),
     name: String(user?.name || listed?.name || user?.id || 'User'),
-    role: user?.role === 'admin' || listed?.role === 'admin' ? 'admin' : 'user',
+    role,
+    company: resolveUserCompany({
+      company: user?.company || listed?.company,
+      role,
+    }),
   };
 }
 
@@ -122,30 +136,47 @@ export function userStorageFolder(userOrName) {
   }
 }
 
+/** companies/{slug}/users/{display name} — tenant isolation for settings, chats, Stella files. */
+export function userTenantPrefix(userOrName) {
+  const folder = userStorageFolder(userOrName);
+  const company = companySlug(
+    userOrName && typeof userOrName === 'object'
+      ? resolveUserCompany(userOrName)
+      : '',
+  );
+  return `companies/${company}/users/${folder}`;
+}
+
+function uniquePaths(paths) {
+  return [...new Set((paths || []).map((p) => String(p || '').replace(/\/+/g, '/')).filter(Boolean))];
+}
+
 export function userSettingsRemotePath(userOrName) {
-  return `users/${userStorageFolder(userOrName)}/settings.json`;
+  return `${userTenantPrefix(userOrName)}/settings.json`;
 }
 
 /** Chat transcripts — sibling of settings.json, not mixed into user preferences. */
 export function userChatsRemotePath(userOrName) {
-  return `users/${userStorageFolder(userOrName)}/chats.json`;
+  return `${userTenantPrefix(userOrName)}/chats.json`;
 }
 
 /** Slim hub list (titles/dates only) — sibling of chats.json. */
 export function userChatsIndexRemotePath(userOrName) {
-  return `users/${userStorageFolder(userOrName)}/chats-index.json`;
+  return `${userTenantPrefix(userOrName)}/chats-index.json`;
 }
 
 export function chatsIndexLocalKey(userId) {
   return `comex-chats-index:${userId}`;
 }
 
-/** Named path first, then older users/<id>/settings.json for migration. */
+/** Named tenant path first, then older users/<name>/ and users/<id>/ for migration. */
 export function userSettingsRemotePathCandidates(user) {
   const named = userSettingsRemotePath(user);
+  const folder = userStorageFolder(user);
   const id = String(user?.id || '').trim();
   const byId = id ? `users/${id}/settings.json` : '';
-  return byId && byId !== named ? [named, byId] : [named];
+  const legacy = `users/${folder}/settings.json`;
+  return uniquePaths([named, legacy, byId]);
 }
 
 /** Shared Admin / product intelligence (agents, workflows, prompts). Not per-user. */
@@ -158,7 +189,7 @@ export function productIntelligenceRemotePath() {
 }
 
 export function userPptxTemplateRemotePath(userOrName) {
-  return `users/${userStorageFolder(userOrName)}/pptx-template.pptx`;
+  return `${userTenantPrefix(userOrName)}/pptx-template.pptx`;
 }
 
 /** Per-user IC proposal uploads (Assess Proposal). */
@@ -168,12 +199,12 @@ export function userProposalRemotePath(userOrName, fileName) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120) || 'proposal';
-  return `users/${userStorageFolder(userOrName)}/proposals/${Date.now()}_${safe}`;
+  return `${userTenantPrefix(userOrName)}/proposals/${Date.now()}_${safe}`;
 }
 
 /** Folder for this user's Stella file uploads (CSV/PDF/etc.). */
 export function userStellaStoragePrefix(userOrName) {
-  return `users/${userStorageFolder(userOrName)}/stella/`;
+  return `${userTenantPrefix(userOrName)}/stella/`;
 }
 
 /** Per-user module context originals (strategy decks, territory Excel, etc.). */
@@ -184,5 +215,5 @@ export function userModuleContextRemotePath(userOrName, moduleId, fileName) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 120) || 'file';
-  return `users/${userStorageFolder(userOrName)}/context/${mod}/${Date.now()}_${safe}`;
+  return `${userTenantPrefix(userOrName)}/context/${mod}/${Date.now()}_${safe}`;
 }

@@ -3,7 +3,7 @@
  *
  * GET  /api/users?action=list
  * POST /api/users { action: 'login', login, password }
- * POST /api/users { action: 'create', name, email, password, role, loginUrl }
+ * POST /api/users { action: 'create', name, email, company, role, loginUrl }
  * POST /api/users { action: 'set-password', userId, password }
  * POST /api/users { action: 'delete', userId }
  * POST /api/users { action: 'reset-password', login, loginUrl }
@@ -29,6 +29,7 @@ const {
   recordLogin,
   loginHistoryForUser,
 } = require('./accounts-store');
+const { ensureCompanyPgSchema } = require('./company');
 const { appLoginUrl, welcomeEmail, resetEmail, sendEmail } = require('./mail');
 
 const OTP_TTL_MS = 24 * 60 * 60 * 1000;
@@ -140,6 +141,7 @@ module.exports = async function handler(req, res) {
       }
       recordLogin(user);
       await saveAccounts(accounts);
+      ensureCompanyPgSchema(user.company).catch(() => {});
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
         user: publicUser(user),
@@ -195,6 +197,7 @@ module.exports = async function handler(req, res) {
       user.otpExpiresAt = null;
       recordLogin(user);
       await saveAccounts(accounts);
+      ensureCompanyPgSchema(user.company).catch(() => {});
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
         user: publicUser(user),
@@ -210,11 +213,16 @@ module.exports = async function handler(req, res) {
       const name = String(body.name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
       const email = normalizeEmail(body.email);
       const role = body.role === 'admin' ? 'admin' : 'user';
+      const company = String(body.company || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+        || (role === 'admin' ? 'ComEx' : 'PharmaCo');
       if (name.length < 2) {
         return res.status(400).json({ error: { message: 'Name must be at least 2 characters' } });
       }
       if (!isEmail(email)) {
         return res.status(400).json({ error: { message: 'A valid email is required' } });
+      }
+      if (company.length < 2) {
+        return res.status(400).json({ error: { message: 'Company is required' } });
       }
       const accounts = await loadAccounts();
       let id = slugId(name);
@@ -238,6 +246,7 @@ module.exports = async function handler(req, res) {
         name,
         email,
         role,
+        company,
         passwordHash: hashPassword(password),
         createdAt: new Date().toISOString(),
         lastLoginAt: null,
@@ -247,6 +256,10 @@ module.exports = async function handler(req, res) {
       };
       accounts.users.push(created);
       await saveAccounts(accounts);
+      const schemaCreated = await ensureCompanyPgSchema(company);
+      if (!schemaCreated) {
+        console.warn('Company schema was not created for', company);
+      }
       let emailSent = false;
       let emailError = '';
       try {

@@ -1,15 +1,8 @@
--- =====================================================================
--- Stella Insights — Supabase setup (reference copy)
--- The app installs this automatically. Do not run it by hand.
--- =====================================================================
+/** Applied automatically by the app. Not run by hand. */
 
+module.exports = `
 create extension if not exists pgcrypto;
 
--- ---------------------------------------------------------------------
--- Registry of every file Stella knows about (tabular datasets + docs).
--- org_id is 'company:<slug>:user:<userId>' so files never cross tenants.
--- Legacy rows used 'user:<userId>' or 'default' and are migrated on load.
--- ---------------------------------------------------------------------
 create table if not exists public.stella_files (
   id           uuid primary key default gen_random_uuid(),
   org_id       text default 'default',
@@ -30,10 +23,6 @@ drop policy if exists "stella_files allow all" on public.stella_files;
 create policy "stella_files allow all" on public.stella_files
   for all using (true) with check (true);
 
--- ---------------------------------------------------------------------
--- Company schemas (c_pharmaco, c_comex, …) are created by the app via
--- stella_ensure_schema — never by running extra SQL per company.
--- ---------------------------------------------------------------------
 create or replace function public.stella_ensure_schema(p_schema text)
 returns void
 language plpgsql
@@ -48,6 +37,11 @@ begin
     raise exception 'Invalid company schema: %', p_schema;
   end if;
   execute format('create schema if not exists %I', p_schema);
+  begin
+    execute format('grant usage on schema %I to anon, authenticated, service_role', p_schema);
+  exception when others then
+    null;
+  end;
 end;
 $$;
 
@@ -176,16 +170,4 @@ grant execute on function public.stella_insert_rows(text, jsonb, text) to anon, 
 grant execute on function public.stella_drop_table(text, text) to anon, authenticated, service_role;
 grant execute on function public.stella_run_select(text, text) to anon, authenticated, service_role;
 grant execute on function public.stella_move_table(text, text) to anon, authenticated, service_role;
-
--- ---------------------------------------------------------------------
--- Storage bucket for PDF / text source files (stella/ prefix).
--- If you prefer to reuse an existing bucket, the app falls back to the
--- `intelligence` bucket with a `stella/` prefix automatically.
--- ---------------------------------------------------------------------
-insert into storage.buckets (id, name, public)
-values ('stella-data', 'stella-data', false)
-on conflict (id) do nothing;
-
-drop policy if exists "stella-data allow all" on storage.objects;
-create policy "stella-data allow all" on storage.objects
-  for all using (bucket_id = 'stella-data') with check (bucket_id = 'stella-data');
+`;

@@ -3,7 +3,13 @@
  * Passwords are scrypt hashes in intelligence/accounts.json (service-role only).
  */
 
-const crypto = require('crypto');
+const {
+  resolveUserCompany,
+  companySlug,
+  companyPgSchema,
+  userObjectPrefix,
+  ensureCompanyPgSchema,
+} = require('./company');
 
 const ACCOUNTS_PATH = 'accounts.json';
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -104,6 +110,7 @@ function publicUser(user) {
     name: String(user.name || user.id),
     email: String(user.email || ''),
     role: user.role === 'admin' ? 'admin' : 'user',
+    company: resolveUserCompany(user),
     createdAt: user.createdAt || null,
     lastLoginAt: user.lastLoginAt || null,
     mustChangePassword: !!user.mustChangePassword,
@@ -159,6 +166,7 @@ function seedUsersFromEnv() {
       id: u.id,
       name: u.name,
       role: u.role,
+      company: resolveUserCompany(u),
       email: normalizeEmail(u.email),
       passwordHash: hashPassword(u.password),
       createdAt: now,
@@ -325,12 +333,11 @@ async function loadAccounts() {
   accountsInFlight = (async () => {
     const doc = await downloadObject(ACCOUNTS_PATH);
     if (doc && Array.isArray(doc.users) && doc.users.length) {
-      const data = {
-        updatedAt: doc.updatedAt || new Date().toISOString(),
-        users: doc.users.map((u) => ({
+      const users = doc.users.map((u) => ({
           id: String(u.id || ''),
           name: String(u.name || u.id || 'User'),
           role: u.role === 'admin' ? 'admin' : 'user',
+          company: resolveUserCompany(u),
           email: normalizeEmail(u.email),
           passwordHash: String(u.passwordHash || ''),
           createdAt: u.createdAt || null,
@@ -338,9 +345,21 @@ async function loadAccounts() {
           mustChangePassword: !!u.mustChangePassword,
           otpExpiresAt: u.otpExpiresAt || null,
           loginHistory: Array.isArray(u.loginHistory) ? u.loginHistory : [],
-        })).filter((u) => u.id),
+        })).filter((u) => u.id);
+      const missingCompany = (doc.users || []).some((u) => !String(u.company || '').trim());
+      const data = {
+        updatedAt: doc.updatedAt || new Date().toISOString(),
+        users,
       };
       accountsCache = { at: Date.now(), data };
+      if (missingCompany) {
+        await uploadObject(ACCOUNTS_PATH, {
+          ...data,
+          updatedAt: new Date().toISOString(),
+        });
+        const companies = [...new Set(users.map((u) => u.company).filter(Boolean))];
+        Promise.all(companies.map((c) => ensureCompanyPgSchema(c))).catch(() => {});
+      }
       return data;
     }
     const seeded = {
@@ -367,6 +386,7 @@ async function saveAccounts(doc) {
       id: String(u.id),
       name: String(u.name || u.id),
       role: u.role === 'admin' ? 'admin' : 'user',
+      company: resolveUserCompany(u),
       email: normalizeEmail(u.email),
       passwordHash: String(u.passwordHash || ''),
       createdAt: u.createdAt || new Date().toISOString(),
@@ -407,6 +427,13 @@ function issueToken(user, extra = {}) {
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
   return { token: `${body}.${sig}`, expiresAt: payload.exp };
+}
+
+async function sessionUserFromRequest(req) {
+  const payload = verifyToken(req?.headers?.authorization || req?.headers?.Authorization);
+  if (!payload?.id || payload.purpose === 'change-password') return null;
+  const accounts = await loadAccounts();
+  return findAccount(accounts, payload.id);
 }
 
 function verifyToken(raw) {
@@ -643,9 +670,16 @@ function buildLoginHistory(user, chatsDoc) {
 async function loginHistoryForUser(user) {
   let doc = null;
   try {
-    doc = await downloadObject(`users/${storageFolder(user)}/chats.json`);
+    doc = await downloadObject(`${userObjectPrefix(user)}/chats.json`);
   } catch {
     doc = null;
+  }
+  if (!doc) {
+    try {
+      doc = await downloadObject(`users/${storageFolder(user)}/chats.json`);
+    } catch {
+      doc = null;
+    }
   }
   return buildLoginHistory(user, doc);
 }
@@ -678,7 +712,8 @@ function usageFromChatsDocument(doc) {
 async function usageForUser(user) {
   const folder = storageFolder(user);
   try {
-    const doc = await downloadObject(`users/${folder}/chats.json`);
+    const doc = await downloadObject(`${userObjectPrefix(user)}/chats.json`)
+      || await downloadObject(`users/${folder}/chats.json`);
     return usageFromChatsDocument(doc);
   } catch {
     return { messagesLast7Days: 0, conversationsLast7Days: 0 };
@@ -687,7 +722,8 @@ async function usageForUser(user) {
 
 async function deleteUserFolder(user) {
   const named = storageFolder(user);
-  const prefixes = [`users/${named}`];
+  const tenant = userObjectPrefix(user);
+  const prefixes = [tenant, `users/${named}`];
   const id = String(user?.id || '').trim();
   if (id && id !== named) prefixes.push(`users/${id}`);
 
@@ -742,31 +778,42 @@ async function deleteUserStellaData(user) {
   const { supabaseUrl, serviceKey } = supabaseConfig();
   const userId = String(user?.id || '').trim();
   if (!supabaseUrl || !serviceKey || !userId) return;
-  const orgId = `user:${userId}`;
+  const orgIds = [...new Set([
+    `company:${companySlug(resolveUserCompany(user))}:user:${userId}`,
+    `user:${userId}`,
+  ])];
   const headers = restHeaders(serviceKey);
-  const listUrl = `${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}&select=id,table_name,storage_path`;
-  const listRes = await fetch(listUrl, { headers }).catch(() => null);
-  const files = listRes && listRes.ok ? await listRes.json().catch(() => []) : [];
+  const schema = companyPgSchema(resolveUserCompany(user));
   const storagePaths = [];
-  for (const file of Array.isArray(files) ? files : []) {
-    if (file?.table_name) {
-      await fetch(`${supabaseUrl}/rest/v1/rpc/stella_drop_table`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ p_table_name: file.table_name }),
-      }).catch(() => null);
+  for (const orgId of orgIds) {
+    const listUrl = `${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}&select=id,table_name,storage_path`;
+    const listRes = await fetch(listUrl, { headers }).catch(() => null);
+    const files = listRes && listRes.ok ? await listRes.json().catch(() => []) : [];
+    for (const file of Array.isArray(files) ? files : []) {
+      if (file?.table_name) {
+        await fetch(`${supabaseUrl}/rest/v1/rpc/stella_drop_table`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ p_table_name: file.table_name, p_schema: schema }),
+        }).catch(() => null);
+        await fetch(`${supabaseUrl}/rest/v1/rpc/stella_drop_table`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ p_table_name: file.table_name }),
+        }).catch(() => null);
+      }
+      if (file?.storage_path) {
+        storagePaths.push(String(file.storage_path));
+        storagePaths.push(`${file.storage_path}.extracted.txt`);
+      }
     }
-    if (file?.storage_path) {
-      storagePaths.push(String(file.storage_path));
-      storagePaths.push(`${file.storage_path}.extracted.txt`);
-    }
+    await fetch(`${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}`, {
+      method: 'DELETE',
+      headers,
+    }).catch(() => null);
   }
-  await fetch(`${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}`, {
-    method: 'DELETE',
-    headers,
-  }).catch(() => null);
-  const folder = `users/${storageFolder(user)}/stella`;
-  storagePaths.push(folder);
+  storagePaths.push(`${userObjectPrefix(user)}/stella`);
+  storagePaths.push(`users/${storageFolder(user)}/stella`);
   await removeFromBucket('intelligence', storagePaths);
   await removeFromBucket('stella-data', storagePaths);
 }
@@ -787,6 +834,7 @@ module.exports = {
   findAccount,
   issueToken,
   verifyToken,
+  sessionUserFromRequest,
   usageForUser,
   deleteUserFolder,
   deleteUserStellaData,

@@ -1,6 +1,7 @@
 /**
- * Read/write intelligence/users/<display name>/{settings|chats}.json using the
- * service-role key so Storage RLS cannot drop Standard User saves.
+ * Read/write intelligence/companies/<slug>/users/<display name>/{settings|chats}.json
+ * using the service-role key so Storage RLS cannot drop Standard User saves.
+ * Legacy intelligence/users/<name>/ paths are still read for migration.
  *
  * GET  /api/user-settings?userId=&userName=&file=settings.json|chats.json|chats-index.json
  * POST /api/user-settings { userId, userName, file, document }
@@ -10,6 +11,7 @@
  */
 
 const { loadAccounts, findAccount, storageFolder, isMissingStorageObject } = require('./accounts-store');
+const { userObjectPrefix } = require('./company');
 
 function allowedUserFile(raw) {
   const name = String(raw || 'settings.json').trim().toLowerCase();
@@ -78,7 +80,18 @@ async function uploadStorageJson(supabaseUrl, serviceKey, writePath, document) {
 }
 
 function objectPath(user, file) {
-  return `users/${storageFolder(user)}/${allowedUserFile(file)}`;
+  return `${userObjectPrefix(user)}/${allowedUserFile(file)}`;
+}
+
+function objectPathCandidates(user, file) {
+  const name = allowedUserFile(file);
+  const folder = storageFolder(user);
+  const id = String(user?.id || '').trim();
+  return [...new Set([
+    `${userObjectPrefix(user)}/${name}`,
+    `users/${folder}/${name}`,
+    id && id !== folder ? `users/${id}/${name}` : '',
+  ].filter(Boolean))];
 }
 
 function encodeObjectPath(path) {
@@ -151,30 +164,37 @@ module.exports = async function handler(req, res) {
     if (!user) {
       return res.status(400).json({ error: { message: 'Unknown user' } });
     }
-    const folderUser = { id: user.id, name: String(userName || user.name) };
+    const folderUser = {
+      id: user.id,
+      name: String(userName || user.name),
+      company: user.company,
+      role: user.role,
+    };
     const writePath = objectPath(folderUser, file);
     if (req.method === 'GET') {
-      const { upstream, text, parsed } = await downloadStorageJson(supabaseUrl, serviceKey, writePath);
-      if (parsed && typeof parsed === 'object' && upstream.ok) {
-        return res.status(200).json({ path: writePath, document: parsed });
-      }
-      if (file === 'chats-index.json' && isMissingStorageObject(upstream.status, parsed, text)) {
-        const chatsPath = objectPath(folderUser, 'chats.json');
-        const chats = await downloadStorageJson(supabaseUrl, serviceKey, chatsPath);
-        if (chats.parsed && typeof chats.parsed === 'object' && chats.upstream.ok) {
-          const index = chatsIndexFromDocument(chats.parsed);
-          if (index) {
-            uploadStorageJson(supabaseUrl, serviceKey, writePath, index).catch(() => {});
-            return res.status(200).json({ path: writePath, document: index, derived: true });
-          }
+      const candidates = objectPathCandidates(folderUser, file);
+      let found = null;
+      for (const candidate of candidates) {
+        const hit = await downloadStorageJson(supabaseUrl, serviceKey, candidate);
+        if (hit.parsed && typeof hit.parsed === 'object' && hit.upstream.ok) {
+          found = { path: candidate, parsed: hit.parsed };
+          break;
         }
       }
-      if (isMissingStorageObject(upstream.status, parsed, text)) {
-        return res.status(404).json({ error: { message: `${file} not found` }, path: writePath });
+      if (found) {
+        return res.status(200).json({ path: found.path, document: found.parsed });
       }
-      if (!upstream.ok) {
-        const message = parsed?.message || parsed?.error || text || 'Download failed';
-        return res.status(upstream.status).json({ error: { message } });
+      if (file === 'chats-index.json') {
+        for (const chatsPath of objectPathCandidates(folderUser, 'chats.json')) {
+          const chats = await downloadStorageJson(supabaseUrl, serviceKey, chatsPath);
+          if (chats.parsed && typeof chats.parsed === 'object' && chats.upstream.ok) {
+            const index = chatsIndexFromDocument(chats.parsed);
+            if (index) {
+              uploadStorageJson(supabaseUrl, serviceKey, writePath, index).catch(() => {});
+              return res.status(200).json({ path: writePath, document: index, derived: true });
+            }
+          }
+        }
       }
       return res.status(404).json({ error: { message: `${file} not found` }, path: writePath });
     }
