@@ -14,6 +14,7 @@ import {
   pickStellaBusinessContext,
   liftStellaGenericIntoUserSettings,
 } from './stellaUserSettings';
+import { formatMemoryStamp } from './chatMemory';
 
 function formatLogin(iso) {
   if (!iso) return 'Never';
@@ -716,9 +717,15 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                       <ul className="space-y-2">
                         {editMemory.map((item) => (
                           <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-70' : 'border-blue-400/15'}`}>
-                            <span className={`flex-1 text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
-                              {item.text}
-                              {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                            <span className="flex-1 min-w-0">
+                              <span className={`block text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
+                                {item.text}
+                                {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                              </span>
+                              <span className="block text-[10px] text-blue-300/45 mt-1">
+                                {item.createdAt ? `Added ${formatMemoryStamp(item.createdAt)}` : 'Added date not recorded'}
+                                {item.status === 'obsolete' && item.obsoleteAt ? ` · Obsolete ${formatMemoryStamp(item.obsoleteAt)}` : ''}
+                              </span>
                             </span>
                             <button
                               type="button"

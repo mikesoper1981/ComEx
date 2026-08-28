@@ -45,6 +45,7 @@ import {
   applyMemoryConfirmation,
   factsAreSimilar,
   activeMemoryItems,
+  formatMemoryStamp,
 } from './chatMemory';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -114,10 +115,12 @@ function looksLikeIntelligenceRef(text, extraNames = []) {
 
 function isSensibleSuggestion(text, extraNames = []) {
   const p = String(text || '').replace(/\s+/g, ' ').trim();
-  if (p.length < 8 || p.length > 160) return false;
+  if (p.length < 16 || p.length > 160) return false;
   if (looksLikeIntelligenceRef(p, extraNames)) return false;
   if (/^\s*[1-9]\s*[=:).\-]/.test(p)) return false;
-  if (/\?/.test(p)) return true;
+  if (/^(yes|no|y|n|ok|okay|option\s*[a-d1-9])\b/i.test(p)) return false;
+  if (looksLikeInfoRequest(p)) return false;
+  if (/\?/.test(p) && looksLikeInfoRequest(p)) return false;
   if (/^(i|we|let'?s|please|help|tell|give|make|build|explain|summarize|summarise|check|recommend|propose|create|generate|list|outline|walk|rewrite|tighten|model|simulate|flag|identify|approve|export|assess|review|design|compare|add|change|update|draft|show|run|continue|move|apply|calculate|estimate|how|what|why|could|would|should|can)\b/i.test(p)) return true;
   return p.split(/\s+/).length >= 4;
 }
@@ -944,11 +947,31 @@ function isWorkflowDecline(text) {
 }
 
 function isMemoryConfirmAccept(text) {
-  return /^(y|yes|yeah|yep|sure|ok|okay|update|replace)([\s.!,'"]|$)/i.test(String(text || '').trim());
+  const t = String(text || '').trim();
+  return /^(y|yes|yeah|yep|sure|ok|okay)([\s.!,'"]*)$/i.test(t)
+    || /^(yes[, ]+)?(update|replace)(\s+(it|memory|the fact))?([\s.!,'"]*)$/i.test(t);
 }
 
 function isMemoryConfirmDecline(text) {
-  return /^(n|no|nope|nah|keep|keep it)([\s.!,'"]|$)/i.test(String(text || '').trim());
+  const t = String(text || '').trim();
+  return /^(n|no|nope|nah)([\s.!,'"]*)$/i.test(t)
+    || /^(keep|keep it|keep existing)([\s.!,'"]*)$/i.test(t);
+}
+
+function looksLikeMemoryCorrection(text) {
+  const t = String(text || '').trim();
+  if (t.length < 16 || t.length > 280) return false;
+  if (/\?/.test(t)) return false;
+  if (/^\d+(\s*[=.].*)?$/.test(t)) return false;
+  if (looksLikeInfoRequest(t)) return false;
+  if (/^(compare|explain|show|draft|continue|apply|summarise|summarize|walk|list|outline|how |what |why |could |would |should |can |please |let'?s )\b/i.test(t)) return false;
+  return true;
+}
+
+function isClosedChoicePrompt(text) {
+  const source = String(text || '');
+  const tail = source.length > 1400 ? source.slice(-1400) : source;
+  return /\b(reply with|choose|select|pick one|which of the following|option [123]|press [123]|tap [123])\b/i.test(tail);
 }
 
 function isAskingForNumberedReplies(text) {
@@ -986,6 +1009,261 @@ function buildUserSettingsPromptBlock(settings) {
   const lengthBlock = formatResponseLengthPrompt(s);
   const identity = `${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}`;
   return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, constraints, and response length in every response; do not contradict them):\n${identity ? `${identity}\n\n` : ''}${lengthBlock}\n`;
+}
+
+function stellaNormalizeIntakeQuestions(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : (typeof raw === 'string' && raw.trim() ? [raw] : []);
+  return list
+    .map((q) => {
+      if (q && typeof q === 'object') {
+        return String(q.question || q.text || q.q || '').replace(/\s+/g, ' ').trim();
+      }
+      return String(q || '').replace(/\s+/g, ' ').trim();
+    })
+    .filter((q) => q.length >= 8)
+    .slice(0, 5);
+}
+
+function stellaDefaultIntakeQuestions({ isTabular, columns = [] } = {}) {
+  const names = (columns || [])
+    .map((c) => (typeof c === 'string' ? c : (c.name || c.original || '')))
+    .map((n) => String(n || '').trim())
+    .filter(Boolean);
+  const colHint = names.slice(0, 6).join(', ');
+  if (isTabular) {
+    return [
+      'What does this dataset represent for your business (actuals, forecast, calls, etc.)?',
+      'What time period does it cover, and is that calendar, fiscal, or something else?',
+      colHint
+        ? `For the key numeric fields (${colHint}), what do they mean and in what units or currency?`
+        : 'What do the key numeric columns mean, and in what units or currency?',
+      'Any filters, exclusions, or definitions I should apply when analysing this?',
+    ];
+  }
+  return [
+    'What is this document, and how should Stella use it in analysis?',
+    'What time period or version does it refer to?',
+    'Which metrics or definitions in it should I treat as authoritative?',
+    'Any caveats, or sections I should ignore?',
+  ];
+}
+
+function pickStellaIntakeQuestions(onboarding, fallbacks) {
+  const raw = onboarding && typeof onboarding === 'object' ? onboarding : {};
+  const fromModel = stellaNormalizeIntakeQuestions(
+    raw.suggestedQuestions != null ? raw.suggestedQuestions : raw.questions
+  );
+  return fromModel.length >= 2 ? fromModel : fallbacks;
+}
+
+function stellaNormJoinToken(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function stellaColumnJoinMeta(col) {
+  const name = String(col?.name || '').trim();
+  const original = String(col?.original || '').trim();
+  return { name, original, type: col?.type || '' };
+}
+
+const STELLA_MEASURE_JOIN_TOKENS = /^(value|amount|revenue|rev|sales|qty|quantity|count|actual|target|attainment|percent|pct|score|rate|volume|units|calls|cost|price|margin|total|sum)$/;
+const STELLA_JOIN_FAMILIES = [
+  { id: 'territory', tokens: ['territory', 'territories', 'terr', 'geo', 'region', 'area', 'brick', 'postcode', 'zipcode', 'zip', 'alignment'] },
+  { id: 'product', tokens: ['product', 'products', 'brand', 'sku', 'molecule', 'item'] },
+  { id: 'customer', tokens: ['customer', 'account', 'hcp', 'npi', 'prescriber', 'client'] },
+  { id: 'rep', tokens: ['rep', 'reps', 'salesperson', 'ae', 'kam', 'employee'] },
+];
+
+function stellaJoinFamily(col) {
+  const blobs = [col.name, col.original].map(stellaNormJoinToken).filter(Boolean);
+  if (blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b))) return null;
+  for (const fam of STELLA_JOIN_FAMILIES) {
+    for (const t of fam.tokens) {
+      const nt = stellaNormJoinToken(t);
+      if (nt.length < 3) continue;
+      if (blobs.some((b) => b === nt || b.includes(nt))) return fam.id;
+    }
+  }
+  return null;
+}
+
+function stellaIdStem(col) {
+  const t = stellaNormJoinToken(col.name || col.original);
+  if (!t) return '';
+  return t.replace(/(uuid|code|key|id)$/g, '');
+}
+
+function stellaGuessJoinCandidates(thisFile, otherFiles) {
+  const thisCols = (thisFile?.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
+  const ranked = [];
+  for (const other of (otherFiles || []).filter((f) => f && f.id !== thisFile?.id && f.tableName)) {
+    const otherCols = (other.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
+    for (const a of thisCols) {
+      for (const b of otherCols) {
+        const aN = stellaNormJoinToken(a.name);
+        const bN = stellaNormJoinToken(b.name);
+        const aO = stellaNormJoinToken(a.original);
+        const bO = stellaNormJoinToken(b.original);
+        let score = 0;
+        let reason = '';
+        if (aN && aN === bN) { score = 100; reason = 'same column name'; }
+        else if (aO && bO && aO === bO) { score = 90; reason = 'same source header'; }
+        else {
+          const fa = stellaJoinFamily(a);
+          const fb = stellaJoinFamily(b);
+          if (fa && fa === fb) { score = 55; reason = `shared ${fa} key`; }
+          else {
+            const sa = stellaIdStem(a);
+            const sb = stellaIdStem(b);
+            const aId = /id$/.test(aN) || aN === 'id' || /id$/.test(aO);
+            const bId = /id$/.test(bN) || bN === 'id' || /id$/.test(bO);
+            if (aId && bId && sa && sa === sb && sa.length >= 3) {
+              score = 80;
+              reason = 'shared ID';
+            } else if (aN === 'id' && bN === 'id') {
+              score = 60;
+              reason = 'shared ID';
+            }
+          }
+        }
+        if (score < 55) continue;
+        ranked.push({
+          related_file: other.name,
+          related_table: other.tableName,
+          related_id: other.id,
+          this_field: a.name,
+          related_field: b.name,
+          this_header: a.original || a.name,
+          related_header: b.original || b.name,
+          reason,
+          score,
+        });
+      }
+    }
+  }
+  ranked.sort((x, y) => y.score - x.score);
+  const seen = new Set();
+  const out = [];
+  for (const row of ranked) {
+    const key = `${row.related_id}|${row.this_field}|${row.related_field}`;
+    const pairKey = `${row.related_id}`;
+    const alreadyForOther = out.filter((r) => r.related_id === row.related_id).length;
+    if (seen.has(key) || alreadyForOther >= 2) continue;
+    seen.add(key);
+    seen.add(pairKey);
+    out.push(row);
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function stellaJoinQuestion(candidates, otherFiles) {
+  const others = (otherFiles || []).filter((f) => f?.tableName);
+  if (!others.length) return '';
+  if (candidates.length) {
+    const lines = candidates.map((c) => (
+      `- **${c.related_file}**: this \`${c.this_field}\`${c.this_header && c.this_header !== c.this_field ? ` (“${c.this_header}”)` : ''} ↔ their \`${c.related_field}\`${c.related_header && c.related_header !== c.related_field ? ` (“${c.related_header}”)` : ''} (${c.reason})`
+    ));
+    return `It looks like this file can be joined to other uploaded data:\n${lines.join('\n')}\nCan you confirm those links (or tell me the correct keys — e.g. territory, product, ID)? If they should not be joined, say so.`;
+  }
+  const names = others.map((f) => `**${f.name}**`).join(', ');
+  return `Does this file share an ID, territory, product, or other key with ${names} so Stella can join them in queries? If yes, which fields match? If not, say they are unrelated.`;
+}
+
+function stellaLooksLikeJoinDecline(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  return /\b(unrelated|do not join|don't join|no (common|shared|link|join|connection)|not (linked|related|joined|connected)|separate files|no connection)\b/i.test(t);
+}
+
+function stellaLooksLikeJoinAccept(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (stellaLooksLikeJoinDecline(t)) return false;
+  if (/^(y|yes|yeah|yep|correct|that's right|thats right|right|ok|okay)[\s.!]*$/i.test(t)) return true;
+  return /\b(join (them|on|by)|they (do )?join|same (key|id|territory|product)|linked by|yes[, ]+(they |it )?(join|link))\b/i.test(t);
+}
+
+function stellaIntakeAskedJoin(messages) {
+  return (messages || []).some((m) => (
+    m?.role === 'assistant'
+    && /\b(join|joined|share an id, territory|correct keys|should not be joined)\b/i.test(String(m.content || ''))
+  ));
+}
+
+function stellaResolveJoinField(file, hint) {
+  const cols = (file?.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
+  const h = stellaNormJoinToken(hint);
+  if (!h) return '';
+  const exact = cols.find((c) => stellaNormJoinToken(c.name) === h || stellaNormJoinToken(c.original) === h);
+  if (exact) return exact.name;
+  const contains = cols.find((c) => {
+    const n = stellaNormJoinToken(c.name);
+    const o = stellaNormJoinToken(c.original);
+    return (n && (n.includes(h) || h.includes(n))) || (o && (o.includes(h) || h.includes(o)));
+  });
+  return contains ? contains.name : String(hint || '').trim();
+}
+
+function stellaDedupeRelationships(list) {
+  const seen = new Set();
+  const out = [];
+  for (const r of list || []) {
+    if (!r) continue;
+    const key = `${String(r.related_table || r.related_file || '').toLowerCase()}|${r.this_field}|${r.related_field}`;
+    if (!r.related_file && !r.related_table) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+function stellaNormalizeStoredRelationships(raw, thisFile, otherFiles) {
+  const others = otherFiles || [];
+  return stellaDedupeRelationships((Array.isArray(raw) ? raw : []).map((r) => {
+    if (!r || typeof r !== 'object') return null;
+    const relatedName = String(r.related_file || '').trim();
+    const relatedTable = String(r.related_table || '').trim();
+    const other = others.find((f) => (
+      (relatedTable && f.tableName === relatedTable)
+      || (relatedName && String(f.name || '').toLowerCase() === relatedName.toLowerCase())
+    ));
+    const thisField = stellaResolveJoinField(thisFile, r.this_field);
+    const relatedField = other ? stellaResolveJoinField(other, r.related_field) : String(r.related_field || '').trim();
+    if (!thisField || !relatedField) return null;
+    return {
+      related_file: other?.name || relatedName,
+      related_table: other?.tableName || relatedTable,
+      this_field: thisField,
+      related_field: relatedField,
+      note: String(r.note || '').trim(),
+    };
+  }).filter(Boolean));
+}
+
+function stellaFormatConfirmedJoins(files) {
+  const lines = [];
+  const seen = new Set();
+  for (const f of files || []) {
+    const rels = f?.capturedContext?.relationships;
+    if (!Array.isArray(rels) || !f.tableName) continue;
+    for (const r of rels) {
+      if (!r?.this_field || !r?.related_field) continue;
+      const left = `${f.tableName}.${r.this_field}`;
+      const rightTable = r.related_table || r.related_file;
+      if (!rightTable) continue;
+      const right = `${rightTable}.${r.related_field}`;
+      const pair = [left, right].sort().join(' = ');
+      if (seen.has(pair)) continue;
+      seen.add(pair);
+      const label = r.related_file ? ` (${f.name} ↔ ${r.related_file})` : '';
+      lines.push(`- ${left} = ${right}${label}${r.note ? ` — ${r.note}` : ''}`);
+    }
+  }
+  return lines.join('\n');
 }
 
 // Short, URL/identifier-safe random id (used for stella_data_<id> tables).
@@ -3255,7 +3533,7 @@ export default function CommercialExcellenceApp() {
       return;
     }
     const lastAssistant = [...conversationHistory].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator' || m.role === 'agent');
-    if (hasNumberedClarifyingQuestions(lastAssistant?.content) || /Would you like me to start this workflow/i.test(lastAssistant?.content || '')) {
+    if (hasNumberedClarifyingQuestions(lastAssistant?.content) || /Would you like me to start this workflow|remembered facts|update memory/i.test(lastAssistant?.content || '')) {
       setSuggestedPrompts([]);
       return;
     }
@@ -3289,7 +3567,7 @@ ${lastUserText || '(none)'}
 Assistant's latest reply:
 ${lastAsstText || '(none)'}
 
-Return ${n} clickable follow-ups that continue this thread without asking the user to supply missing information. Each must mention a concrete detail from the messages above.`,
+Return ${n} clickable follow-ups. Each must be a complete next message the user would type (a sentence), not a numbered option, not yes/no, and not a request for missing information. Each must mention a concrete detail from the messages above.`,
         }],
         max_tokens: 400,
       });
@@ -3398,7 +3676,7 @@ Return ${n} clickable follow-ups that continue this thread without asking the us
           facts.push(fact);
         }
       }
-      if (facts.length) {
+      if (!conflicts.length && facts.length) {
         const before = memorySignature(userSettingsRef.current.memory);
         const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts, { module: resolvePromptModule() });
         if (memorySignature(memory) !== before) {
@@ -3420,6 +3698,7 @@ Return ${n} clickable follow-ups that continue this thread without asking the us
         }\n\nReply **yes** to update memory, **no** to keep the existing fact, or type the correct version.`;
         pendingMemoryConfirmRef.current = conflict;
         setPendingMemoryConfirm(conflict);
+        setSuggestedPrompts([]);
         setMessages((prev) => [...prev, { role: 'assistant', content: question }]);
       }
     } catch (err) {
@@ -5762,13 +6041,21 @@ ${stepInstruction}`;
   });
 
   const stellaBuildContentSummary = async ({ name, type, textSample, columns = [], profile = '' }) => {
-    const system = withUserSettings(getStellaPrompts().contentSummary);
+    const system = withUserSettings(getStellaPrompts().contentSummary, { moduleContext: false });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
-    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}`;
-    const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1000);
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions MUST be 3–5 meaning/intent questions (what it represents, time period, units/definitions, caveats). Never return an empty array. Do not ask about row counts, distinct values, or column names already listed.`;
+    const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1400);
     const parsed = extractJsonObject(raw);
-    return parsed && typeof parsed === 'object' ? parsed : { summary: 'Uploaded dataset.', columns: [], suggestedQuestions: [] };
+    if (!(parsed && typeof parsed === 'object')) {
+      return { summary: 'Uploaded dataset.', columns: [], suggestedQuestions: [] };
+    }
+    return {
+      ...parsed,
+      suggestedQuestions: stellaNormalizeIntakeQuestions(
+        parsed.suggestedQuestions != null ? parsed.suggestedQuestions : parsed.questions
+      ),
+    };
   };
 
   // Runs one intake turn for the given (up-to-date) file object.
@@ -5778,13 +6065,25 @@ ${stepInstruction}`;
 
     // Other tabular datasets this file could relate to (for AI-suggested joins).
     const otherTabular = (stellaDataFiles || []).filter(x => x.id !== f.id && x.tableName);
+    const candidates = !isDoc ? stellaGuessJoinCandidates(f, otherTabular) : [];
     const otherFilesBlob = otherTabular.length
-      ? otherTabular.map(x => `- "${x.name}" (table ${x.tableName}) columns: ${(x.columns || []).map(c => c.name).join(', ') || '(unknown)'}`).join('\n')
+      ? otherTabular.map(x => {
+        const cols = (x.columns || []).map(c => (
+          c.original && c.original !== c.name ? `${c.name} (header "${c.original}")` : (c.name || '')
+        )).filter(Boolean).join(', ');
+        return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
+      }).join('\n')
       : '(no other datasets uploaded yet)';
+    const candidateBlob = candidates.length
+      ? `\n\nLIKELY JOINS (from shared IDs / territory / product / similar keys — confirm with the user, do not assume):\n${candidates.map(c => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
+      : '';
     const relationshipGuidance = (!isDoc && otherTabular.length)
-      ? `\n\nRELATIONSHIPS: Other datasets already exist (listed below). Based on the column names, if this dataset looks like it could be linked to any of them, propose the likely link in PLAIN ENGLISH and ask the user to confirm it makes sense — never ask them for technical join syntax. Example: "It looks like this sales file links to your Targets file by territory — is that right?". Capture any confirmed links in context_qa.relationships.\n\nOTHER DATASETS:\n${otherFilesBlob}`
+      ? `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Propose likely links in PLAIN ENGLISH (territory, product, shared ID) — never ask for SQL. If the user confirms, store exact SQL column names in context_qa.relationships. If they say the files are unrelated, store an empty array.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}`
       : '';
 
+    const colsBlob = Array.isArray(f.columns) && f.columns.length
+      ? f.columns.map(c => `- ${c.name}${c.original && c.original !== c.name ? ` (header "${c.original}")` : ''}${c.type ? ` [${c.type}]` : ''}${c.description ? `: ${c.description}` : ''}`).join('\n')
+      : '(no columns — this is a document)';
     const system = withUserSettings(fillTemplate(getStellaPrompts().intake, {
       kind: isDoc ? 'document' : 'dataset',
       kindSubject: isDoc ? 'document contains / represents' : 'data represents',
@@ -5792,11 +6091,7 @@ ${stepInstruction}`;
       dataProfile: (!isDoc && f.dataProfile) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${f.dataProfile}` : '',
       relationshipGuidance,
     }));
-
-    const colsBlob = Array.isArray(f.columns) && f.columns.length
-      ? f.columns.map(c => `- ${c.name}${c.type ? ` [${c.type}]` : ''}${c.description ? `: ${c.description}` : ''}`).join('\n')
-      : '(no columns — this is a document)';
-    const contextBlob = `FILE: "${f.name}" (type: ${f.fileType || f.type})\nSUMMARY: ${f.summary || ''}\nCOLUMNS:\n${colsBlob}`;
+    const contextBlob = `FILE: "${f.name}" (type: ${f.fileType || f.type})${f.tableName ? `\nSQL TABLE: ${f.tableName}` : ''}\nSUMMARY: ${f.summary || ''}\nCOLUMNS (use these exact names in relationships.this_field):\n${colsBlob}`;
     const convo = [
       { role: 'user', content: `You are onboarding: "${f.name}".\n\n${contextBlob}` },
       ...((f.intakeMessages || []).map(m => ({ role: toAnthropicRole(m.role), content: m.content }))),
@@ -5805,25 +6100,78 @@ ${stepInstruction}`;
     let parsed = null;
     let raw = '';
     try {
-      raw = await callAnthropic(system, convo, 900);
+      raw = await callAnthropic(system, convo, 1400);
       parsed = extractJsonObject(raw);
     } catch { /* fall through to fallback handling */ }
 
-    // Robust fallback: if we couldn't parse JSON, treat the raw text as the next question.
-    const complete = !!(parsed && parsed.complete);
-    const assistantMessage =
+    const lastUserText = [...(f.intakeMessages || [])].reverse().find(m => m.role === 'user')?.content || '';
+    const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
+    let rels = stellaNormalizeStoredRelationships(parsed?.context_qa?.relationships, f, otherTabular);
+    if (!rels.length && !declinedJoin && candidates.length && stellaLooksLikeJoinAccept(lastUserText)) {
+      rels = stellaNormalizeStoredRelationships(candidates, f, otherTabular);
+    }
+    const priorRels = stellaNormalizeStoredRelationships(f.capturedContext?.relationships, f, otherTabular);
+    if (priorRels.length) rels = stellaDedupeRelationships([...priorRels, ...rels]);
+
+    const joinAskCount = (f.intakeMessages || []).filter(m => (
+      m?.role === 'assistant' && /\b(join|joined|share an id, territory|correct keys|should not be joined)\b/i.test(String(m.content || ''))
+    )).length;
+    let complete = !!(parsed && parsed.complete);
+    let forceJoinQuestion = false;
+    if (!isDoc && otherTabular.length && !rels.length && !declinedJoin && joinAskCount < 2) {
+      if (complete || !stellaIntakeAskedJoin(f.intakeMessages)) {
+        complete = false;
+        forceJoinQuestion = true;
+      }
+    }
+
+    let assistantMessage =
       (parsed && parsed.message) ||
       (complete ? 'Thanks — I have enough context to interpret this now.' : (String(raw).trim() || 'Could you tell me what this represents, the time period it covers, and the key metrics involved?'));
+    if (forceJoinQuestion) {
+      assistantMessage = stellaJoinQuestion(candidates, otherTabular) || assistantMessage;
+    }
+    if (complete && rels.length && !/\bstored join/i.test(assistantMessage)) {
+      const joinLines = rels.map(r => `- ${f.tableName}.${r.this_field} = ${r.related_table || r.related_file}.${r.related_field}${r.related_file ? ` (${r.related_file})` : ''}`);
+      assistantMessage = `${assistantMessage}\n\nStored joins for queries:\n${joinLines.join('\n')}`;
+    }
 
     const nextIntakeMessages = [...(f.intakeMessages || []), { role: 'assistant', content: assistantMessage }];
 
     if (complete) {
-      const ctx = normalizeContextQa(parsed.context_qa, nextIntakeMessages);
+      const ctx = {
+        ...normalizeContextQa(parsed?.context_qa, nextIntakeMessages),
+        relationships: declinedJoin ? [] : rels,
+      };
       stellaPatchLocal(f.id, { intakeMessages: nextIntakeMessages, capturedContext: ctx, intakeComplete: true });
       try {
         await stellaUpdateRegistry(f.dbId, { context_qa: ctx });
       } catch (e) {
         setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not save captured context: ${e.message}` }]);
+      }
+      if (rels.length) {
+        for (const r of rels) {
+          const other = otherTabular.find(x => (
+            (r.related_table && x.tableName === r.related_table)
+            || (r.related_file && String(x.name || '').toLowerCase() === String(r.related_file).toLowerCase())
+          ));
+          if (!other) continue;
+          const reverse = {
+            related_file: f.name,
+            related_table: f.tableName || '',
+            this_field: r.related_field,
+            related_field: r.this_field,
+            note: r.note || '',
+          };
+          const existing = Array.isArray(other.capturedContext?.relationships) ? other.capturedContext.relationships : [];
+          const nextRels = stellaDedupeRelationships([...existing, reverse]);
+          if (nextRels.length === existing.length) continue;
+          const nextCtx = { ...(other.capturedContext || {}), relationships: nextRels };
+          stellaPatchLocal(other.id, { capturedContext: nextCtx });
+          try {
+            if (other.dbId) await stellaUpdateRegistry(other.dbId, { context_qa: nextCtx });
+          } catch { /* keep local mirror even if registry update fails */ }
+        }
       }
     } else {
       stellaPatchLocal(f.id, { intakeMessages: nextIntakeMessages });
@@ -5955,10 +6303,23 @@ ${stepInstruction}`;
       });
       const dbId = dbRow?.id || tempId;
 
-      // Opening intake message (asks 3-5 questions to seed the conversation).
-      const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+      // Opening intake message — always include real questions (model or fallback).
+      const questions = pickStellaIntakeQuestions(
+        onboarding,
+        stellaDefaultIntakeQuestions({ isTabular, columns: mergedColumns }),
+      );
+      const otherTabular = (stellaDataFiles || []).filter((x) => x.id !== tempId && x.tableName);
+      if (isTabular && otherTabular.length) {
+        const joinQ = stellaJoinQuestion(
+          stellaGuessJoinCandidates({ id: tempId, columns: mergedColumns }, otherTabular),
+          otherTabular,
+        );
+        const alreadyJoin = questions.some((q) => /\b(join|related|shared (id|key)|territory, product)\b/i.test(q));
+        if (joinQ && !alreadyJoin) questions.push(joinQ);
+      }
       const colLine = mergedColumns.length ? `\n\n**Columns:** ${mergedColumns.map(c => c.name).join(', ')}` : '';
-      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nTo interpret this correctly I need a little context. Let's start:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them all together or one at a time.`;
+      const qBlock = questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nTo interpret this correctly I need a little context:\n\n${qBlock}\n\nYou can answer them all together or one at a time.`;
 
       const finalFile = {
         id: dbId, dbId,
@@ -6212,8 +6573,11 @@ ${stepInstruction}`;
     }).join('\n\n');
 
     const tableList = tabular.length ? tabular.map(t => t.tableName).join(', ') : '(none)';
+    const joinMap = stellaFormatConfirmedJoins(files);
     const sqlInstr = tabular.length
-      ? `\nTABULAR DATA (query with tools):\n- Query tables using the \`run_sql\` tool (single SELECT only). Available tables: ${tableList}.\n- Use \`inspect_table\` to preview a table's real values/formats before writing analytical queries.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n- To combine datasets, JOIN across tables using the confirmed relationships above (or a sensible key if none is confirmed — state the assumption).\n`
+      ? `\nTABULAR DATA (query with tools):\n- Query tables using the \`run_sql\` tool (single SELECT only). Available tables: ${tableList}.\n- Use \`inspect_table\` to preview a table's real values/formats before writing analytical queries.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n${joinMap
+        ? `- CONFIRMED JOINS (use these exact table.column names when combining datasets):\n${joinMap.split('\n').map((l) => `  ${l}`).join('\n')}\n`
+        : '- No joins are confirmed yet. Only JOIN if a shared key is obvious, and state the assumption.\n'}`
       : '';
     const docList = docs.length ? docs.map(d => `"${d.name}"`).join(', ') : '(none)';
     const docInstr = docs.length
@@ -6472,6 +6836,7 @@ ${stepInstruction}`;
 
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
+    if (pendingMemoryConfirm) return null;
     if (pptxClarifyPending) return getPptxClarify().options;
     if (currentWorkflow?.awaitingAgentReply) return null;
     if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
@@ -6479,8 +6844,10 @@ ${stepInstruction}`;
     const last = [...list].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
     if (!last?.content) return null;
     if (hasNumberedClarifyingQuestions(last.content)) return null;
+    if (/remembered facts|update memory/i.test(last.content)) return null;
+    if (!isClosedChoicePrompt(last.content)) return null;
     return extractChoiceOptions(last.content);
-  }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision]);
+  }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision, pendingMemoryConfirm]);
 
   const clarifyingReplyHint = useMemo(() => {
     if (isLoading || pptxGenerating) return false;
@@ -6752,10 +7119,10 @@ ${stepInstruction}`;
     };
 
     if (pendingMemoryConfirmRef.current && !currentWorkflow) {
-      setInput('');
-      setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
       const pending = pendingMemoryConfirmRef.current;
       if (isMemoryConfirmAccept(messageContent)) {
+        setInput('');
+        setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
         const next = applyMemoryConfirmation(userSettingsRef.current.memory, { ...pending, accept: true }, { module: resolvePromptModule() });
         pendingMemoryConfirmRef.current = null;
         setPendingMemoryConfirm(null);
@@ -6765,23 +7132,32 @@ ${stepInstruction}`;
         return;
       }
       if (isMemoryConfirmDecline(messageContent)) {
+        setInput('');
+        setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
         pendingMemoryConfirmRef.current = null;
         setPendingMemoryConfirm(null);
         setMessages((prev) => [...prev, { role: 'assistant', content: 'Kept the existing remembered fact. Thanks for confirming.' }]);
         setIsLoading(false);
         return;
       }
-      const next = applyMemoryConfirmation(
-        userSettingsRef.current.memory,
-        { ...pending, proposed: messageContent.trim(), accept: true },
-        { module: resolvePromptModule() },
-      );
+      if (looksLikeMemoryCorrection(messageContent)) {
+        setInput('');
+        setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+        const next = applyMemoryConfirmation(
+          userSettingsRef.current.memory,
+          { ...pending, proposed: messageContent.trim(), accept: true },
+          { module: resolvePromptModule() },
+        );
+        pendingMemoryConfirmRef.current = null;
+        setPendingMemoryConfirm(null);
+        await persistConfirmedMemory(next);
+        setMessages((prev) => [...prev, { role: 'assistant', content: `Updated memory to: ${messageContent.trim()}` }]);
+        setIsLoading(false);
+        return;
+      }
+      // Suggested prompts / other chat — do not change memory; continue the discussion.
       pendingMemoryConfirmRef.current = null;
       setPendingMemoryConfirm(null);
-      await persistConfirmedMemory(next);
-      setMessages((prev) => [...prev, { role: 'assistant', content: `Updated memory to: ${messageContent.trim()}` }]);
-      setIsLoading(false);
-      return;
     }
 
     setInput('');
@@ -6815,10 +7191,6 @@ ${stepInstruction}`;
     setPptxOffers(null);
     setMessages(prev => [...prev, { role: 'user', content: messageContent }]);
     setIsLoading(true);
-    if (shouldHarvestChatMemory('', messageContent)) {
-      const priorAsk = [...(messagesRef.current || [])].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
-      void harvestChatMemory(priorAsk?.content, messageContent, recentChatTurnsForMemory());
-    }
 
     // Uploaded IC proposal → always Analyze Existing IC workflow (never PPT export).
     if (isFileAnalysis && !currentWorkflow) {
@@ -6890,12 +7262,17 @@ ${stepInstruction}`;
         });
         const data = await response.json();
         const assistantMessage = anthropicAssistantText(data);
-        setMessages(prev => {
-          const updated = [...prev, { role: 'assistant', content: assistantMessage }];
-          setTimeout(() => generateSuggestions(updated), 500);
-          return updated;
-        });
+        const withReply = [...(messagesRef.current || []), { role: 'assistant', content: assistantMessage }];
+        setMessages(prev => [...prev, { role: 'assistant', content: assistantMessage }]);
         setUploadedFile(null);
+        if (shouldHarvestChatMemory(assistantMessage, messageContent)) {
+          await harvestChatMemory(assistantMessage, messageContent, recentChatTurnsForMemory(withReply));
+        }
+        if (!pendingMemoryConfirmRef.current) {
+          setTimeout(() => generateSuggestions(withReply), 400);
+        } else {
+          setSuggestedPrompts([]);
+        }
       } catch (error) {
         setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error: Unable to process request. Please try again.' }]);
       } finally {
@@ -8080,9 +8457,15 @@ ${stepInstruction}`;
                           <ul className="space-y-2">
                             {(userSettings.memory || []).map((item) => (
                               <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-70' : 'border-blue-400/15'}`}>
-                                <span className={`flex-1 text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
-                                  {item.text}
-                                  {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                                <span className="flex-1 min-w-0">
+                                  <span className={`block text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
+                                    {item.text}
+                                    {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                                  </span>
+                                  <span className="block text-[10px] text-blue-300/45 mt-1">
+                                    {item.createdAt ? `Added ${formatMemoryStamp(item.createdAt)}` : 'Added date not recorded'}
+                                    {item.status === 'obsolete' && item.obsoleteAt ? ` · Obsolete ${formatMemoryStamp(item.obsoleteAt)}` : ''}
+                                  </span>
                                 </span>
                                 <button
                                   type="button"

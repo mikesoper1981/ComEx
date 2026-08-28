@@ -152,7 +152,7 @@ export function applyMemoryConfirmation(existing, { existingId, existingText, pr
   const oldId = matchIdx >= 0 ? base[matchIdx].id : '';
   let next = base;
   if (matchIdx >= 0) {
-    next = base.map((m, i) => (i === matchIdx ? { ...m, status: 'obsolete', updatedAt: now } : m));
+    next = base.map((m, i) => (i === matchIdx ? { ...m, status: 'obsolete', obsoleteAt: now, updatedAt: now } : m));
   }
   const merged = mergeMemoryFacts(next, [proposed], { module });
   if (!oldId) return merged;
@@ -191,7 +191,9 @@ export function normalizeMemoryItems(raw) {
       module: ['incentives', 'territory', 'stella'].includes(item?.module) ? item.module : '',
       status: item?.status === 'obsolete' ? 'obsolete' : 'active',
       supersededBy: item?.supersededBy ? String(item.supersededBy) : '',
-      updatedAt: item?.updatedAt || new Date().toISOString(),
+      createdAt: String(item?.createdAt || item?.addedAt || item?.updatedAt || ''),
+      obsoleteAt: item?.status === 'obsolete' ? String(item?.obsoleteAt || item?.updatedAt || '') : '',
+      updatedAt: String(item?.updatedAt || item?.createdAt || item?.obsoleteAt || ''),
     });
     if (out.length >= MEMORY_CAP) break;
   }
@@ -251,6 +253,8 @@ export function mergeMemoryFacts(existing, incoming, { module = '' } = {}) {
       text,
       module,
       status: 'active',
+      createdAt: now,
+      obsoleteAt: '',
       updatedAt: now,
     });
   }
@@ -259,6 +263,24 @@ export function mergeMemoryFacts(existing, incoming, { module = '' } = {}) {
 
 export function isMemoryEnabled(settings) {
   return settings?.memoryEnabled !== false;
+}
+
+export function formatMemoryStamp(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleString('en-GB', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'Europe/London',
+    });
+  } catch {
+    return '';
+  }
 }
 
 export function formatMemoryPromptBlock(settings) {

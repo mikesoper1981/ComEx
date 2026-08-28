@@ -255,11 +255,20 @@ export function mergeWorkflowRuntime(partial) {
 
 export function mergeStellaPrompts(partial) {
   const s = partial && typeof partial === 'object' ? partial : {};
-  return {
+  const out = {
     contentSummary: s.contentSummary != null ? String(s.contentSummary) : DEFAULT_STELLA_PROMPTS.contentSummary,
     intake: s.intake != null ? String(s.intake) : DEFAULT_STELLA_PROMPTS.intake,
     analyst: s.analyst != null ? String(s.analyst) : DEFAULT_STELLA_PROMPTS.analyst,
   };
+  if (/You are a data onboarding assistant/i.test(out.contentSummary)
+      && !/Never return an empty array/i.test(out.contentSummary)) {
+    out.contentSummary = DEFAULT_STELLA_PROMPTS.contentSummary;
+  }
+  if (/You are the Stella Insights data intake agent/i.test(out.intake)
+      && !/MUST ask whether\/how this file joins/i.test(out.intake)) {
+    out.intake = DEFAULT_STELLA_PROMPTS.intake;
+  }
+  return out;
 }
 
 /** Deep-merge intelligence fields from a loaded settings object. */
