@@ -11,6 +11,8 @@ import {
   userSettingsLocalKey,
   userSettingsRemotePath,
   userChatsRemotePath,
+  userChatsIndexRemotePath,
+  chatsIndexLocalKey,
   userSettingsRemotePathCandidates,
   userStorageFolder,
   userPptxTemplateRemotePath,
@@ -47,6 +49,8 @@ import {
   factsShareMemoryTopic,
   activeMemoryItems,
   formatMemoryStamp,
+  describeObsoleteReason,
+  memoryUsage,
   filterMemoryFacts,
   isDurableMemoryFact,
   isExplicitRememberRequest,
@@ -466,8 +470,30 @@ function buildUserChatsDocument(userId, { chats = [], activeChatId = null, userN
   return doc;
 }
 
+/** Titles and dates only — what the hub page needs to render Recent chats. */
+function buildUserChatsIndexDocument(userId, { chats = [], activeChatId = null, userName = '' } = {}) {
+  const doc = {
+    userId,
+    updatedAt: new Date().toISOString(),
+    activeChatId: activeChatId || null,
+    chats: (chats || []).slice(0, MAX_STORED_CHATS).map((c) => ({
+      id: c.id,
+      title: c.title || deriveChatTitle(c.messages),
+      createdAt: c.createdAt || createdAtFromChatId(c.id) || null,
+      updatedAt: c.updatedAt || null,
+      module: c.module || inferChatModule(c),
+      hasWorkflow: !!(c.currentWorkflow || c.hasWorkflow),
+      hasUserContent: c.hasUserContent === true || chatHasUserContent(c.messages),
+    })).filter((c) => c.id && c.hasUserContent),
+  };
+  if (userName) doc.userName = userName;
+  return doc;
+}
+
 function userJsonRemotePath(user, file) {
-  return file === 'chats.json' ? userChatsRemotePath(user) : userSettingsRemotePath(user);
+  if (file === 'chats.json') return userChatsRemotePath(user);
+  if (file === 'chats-index.json') return userChatsIndexRemotePath(user);
+  return userSettingsRemotePath(user);
 }
 
 async function uploadUserJsonDirect(user, doc, file = 'settings.json') {
@@ -600,7 +626,14 @@ function queueUserSettingsUpload(user, docOrBuilder) {
 }
 
 function queueUserChatsUpload(user, docOrBuilder) {
-  return queueUserJsonUpload(user, 'chats.json', docOrBuilder);
+  const buildChats = () => (typeof docOrBuilder === 'function' ? docOrBuilder() : docOrBuilder);
+  queueUserJsonUpload(user, 'chats-index.json', () => {
+    const doc = buildChats() || {};
+    const index = buildUserChatsIndexDocument(doc.userId, doc);
+    writeCachedChatIndex(user?.id, index);
+    return index;
+  });
+  return queueUserJsonUpload(user, 'chats.json', buildChats);
 }
 
 function buildProductIntelligenceDocument(intel) {
@@ -681,9 +714,16 @@ function upsertChatInPlace(list, snap) {
   return arr.slice(0, MAX_STORED_CHATS);
 }
 
+function chatIsListed(c) {
+  if (!c?.id) return false;
+  if (c.hasUserContent === false) return false;
+  if (c.hasUserContent === true) return true;
+  return chatHasUserContent(c.messages);
+}
+
 function recentChats(list) {
   return (list || [])
-    .filter((c) => chatHasUserContent(c.messages))
+    .filter(chatIsListed)
     .slice()
     .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
     .slice(0, MAX_VISIBLE_CHATS);
@@ -817,6 +857,62 @@ function extractChatsFromDocument(parsed) {
   const chats = normalizeStoredChats(parsed.chats || parsed.settings?.chats);
   const activeChatId = parsed.activeChatId || parsed.settings?.activeChatId || null;
   return { chats, activeChatId };
+}
+
+function normalizeChatIndexEntries(raw) {
+  const chats = Array.isArray(raw?.chats) ? raw.chats : (Array.isArray(raw) ? raw : []);
+  return chats.filter((c) => c && c.id).slice(0, MAX_STORED_CHATS).map((c) => ({
+    id: c.id,
+    title: c.title || deriveChatTitle(c.messages) || 'Chat',
+    createdAt: c.createdAt || createdAtFromChatId(c.id) || '',
+    updatedAt: c.updatedAt || '',
+    module: c.module || inferChatModule(c),
+    hasWorkflow: !!(c.hasWorkflow || c.currentWorkflow),
+    hasUserContent: c.hasUserContent !== false,
+    currentWorkflow: c.currentWorkflow || null,
+    messages: Array.isArray(c.messages) ? c.messages : [],
+    messagesLoaded: Array.isArray(c.messages) && c.messages.length > 0,
+  }));
+}
+
+function extractChatIndexFromDocument(parsed) {
+  if (!parsed || typeof parsed !== 'object') return { chats: [], activeChatId: null };
+  if (Array.isArray(parsed.chats) && parsed.chats.some((c) => Array.isArray(c?.messages) && c.messages.length)) {
+    const full = extractChatsFromDocument(parsed);
+    return {
+      chats: normalizeChatIndexEntries(buildUserChatsIndexDocument(parsed.userId, full)),
+      activeChatId: full.activeChatId,
+    };
+  }
+  return {
+    chats: normalizeChatIndexEntries(parsed),
+    activeChatId: parsed.activeChatId || null,
+  };
+}
+
+function writeCachedChatIndex(userId, index) {
+  try {
+    const chats = normalizeChatIndexEntries(index);
+    if (!chats.length) return;
+    localStorage.setItem(chatsIndexLocalKey(userId), JSON.stringify({
+      updatedAt: index?.updatedAt || new Date().toISOString(),
+      activeChatId: index?.activeChatId || null,
+      chats,
+    }));
+  } catch { /* quota / private mode */ }
+}
+
+function readCachedChatIndex(userId) {
+  try {
+    const parsed = safeJsonParse(localStorage.getItem(chatsIndexLocalKey(userId)));
+    if (!parsed || typeof parsed !== 'object') return { chats: [], activeChatId: null };
+    return {
+      chats: normalizeChatIndexEntries(parsed),
+      activeChatId: parsed.activeChatId || null,
+    };
+  } catch {
+    return { chats: [], activeChatId: null };
+  }
 }
 
 function consultationWelcome() {
@@ -2773,8 +2869,10 @@ export default function CommercialExcellenceApp() {
   const isAdmin = isAdminUser(currentUser);
   const [activeTab, setActiveTab] = useState('chat');
   const [showLanding, setShowLanding] = useState(true);
-  const [chatSessions, setChatSessions] = useState([]);
-  const [activeChatId, setActiveChatId] = useState(null);
+  const [chatSessions, setChatSessions] = useState(() => readCachedChatIndex(currentUser.id).chats);
+  const [activeChatId, setActiveChatId] = useState(() => readCachedChatIndex(currentUser.id).activeChatId || null);
+  const [chatIndexLoading, setChatIndexLoading] = useState(() => !readCachedChatIndex(currentUser.id).chats.length);
+  const [openingChatId, setOpeningChatId] = useState(null);
   const [messages, setMessages] = useState(() => [consultationWelcome()]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -2831,6 +2929,9 @@ export default function CommercialExcellenceApp() {
   const userSettingsRef = useRef(userSettings);
   const persistChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
+  const chatsBodiesRef = useRef([]);
+  const chatsFullLoadedRef = useRef(false);
+  const chatsFullPromiseRef = useRef(null);
   const userSettingsReadyRef = useRef(false);
   const harvestMemoryBusyRef = useRef(false);
   const harvestMemoryPendingRef = useRef(null);
@@ -3010,12 +3111,105 @@ export default function CommercialExcellenceApp() {
     loadIntelligenceFiles();
   }, []);
 
+  const applyChatIndex = (indexChats, remoteActive) => {
+    skipChatPersistRef.current = true;
+    const chats = Array.isArray(indexChats) ? indexChats : [];
+    chatSessionsRef.current = chats;
+    setChatSessions(chats);
+    writeCachedChatIndex(currentUser.id, { chats, activeChatId: remoteActive });
+    if (chats.length) {
+      const pick = chats.find((c) => c.id === remoteActive) || chats[0];
+      setActiveChatId(pick.id);
+      activeChatIdRef.current = pick.id;
+    } else {
+      setActiveChatId(null);
+      activeChatIdRef.current = null;
+    }
+    setChatIndexLoading(false);
+    setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+  };
+
+  const ensureFullChatsLoaded = () => {
+    if (chatsFullLoadedRef.current) return Promise.resolve(chatsBodiesRef.current);
+    if (chatsFullPromiseRef.current) return chatsFullPromiseRef.current;
+    chatsFullPromiseRef.current = (async () => {
+      const chatsParsed = await downloadUserJsonDocument(currentUser, 'chats.json');
+      let remoteChats = [];
+      let remoteActive = activeChatIdRef.current;
+      if (chatsParsed && typeof chatsParsed === 'object') {
+        ({ chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(chatsParsed));
+      }
+      const liveId = activeChatIdRef.current;
+      const live = (chatSessionsRef.current || []).find((c) => (
+        c.id === liveId && Array.isArray(c.messages) && chatHasUserContent(c.messages)
+      ));
+      const merged = remoteChats.map((c) => {
+        if (live && c.id === live.id && (live.messages?.length || 0) >= (c.messages?.length || 0)) {
+          return { ...c, ...live };
+        }
+        return c;
+      });
+      if (live && !merged.some((c) => c.id === live.id)) merged.unshift(live);
+      chatsBodiesRef.current = merged;
+      chatsFullLoadedRef.current = true;
+      skipChatPersistRef.current = true;
+      chatSessionsRef.current = merged;
+      setChatSessions(merged);
+      writeCachedChatIndex(currentUser.id, { chats: merged, activeChatId: remoteActive || liveId });
+      setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+      return merged;
+    })().catch((err) => {
+      chatsFullPromiseRef.current = null;
+      throw err;
+    });
+    return chatsFullPromiseRef.current;
+  };
+
+  const runMemoryBackfillIfNeeded = async () => {
+    if (memoryBackfillDoneRef.current) return;
+    if (!memoryBackfillNeeded(userSettingsRef.current.memory, chatsBodiesRef.current, userSettingsRef.current)) {
+      memoryBackfillDoneRef.current = true;
+      return;
+    }
+    memoryBackfillDoneRef.current = true;
+    try {
+      const blob = compactChatsForMemory(chatsBodiesRef.current);
+      const raw = await callAnthropic(
+        MEMORY_BACKFILL_SYSTEM,
+        [{ role: 'user', content: buildBackfillExchange(blob, userSettingsRef.current.memory) }],
+        800,
+      );
+      const facts = filterMemoryFacts(parseMemoryFacts(raw));
+      if (facts.length) {
+        const before = memorySignature(userSettingsRef.current.memory);
+        const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts);
+        if (memorySignature(memory) !== before) {
+          const nextSettings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
+          setUserSettings(nextSettings);
+          userSettingsRef.current = nextSettings;
+          await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+            currentUser.id,
+            mergeUserSettingsFields(userSettingsRef.current),
+            { userName: currentUser.name },
+          ));
+        }
+      }
+    } catch (err) {
+      console.warn('Chat memory backfill failed:', err?.message || err);
+    }
+  };
+
   // ── SUPABASE: Load Stella registry + product intel + user settings on startup ──
   useEffect(() => {
     const loadStella = async () => {
       userSettingsReadyRef.current = false;
       memoryBackfillDoneRef.current = false;
+      chatsFullLoadedRef.current = false;
+      chatsFullPromiseRef.current = null;
+      chatsBodiesRef.current = [];
       const userOrg = stellaOrgIdForUser(currentUser.id);
+
+      const loadStellaFiles = async () => {
       // File registry (stella_files table), scoped to this user.
       try {
         if (isAdmin) {
@@ -3048,7 +3242,9 @@ export default function CommercialExcellenceApp() {
           });
         }
       } catch { /* stella_files table may not exist yet */ }
+      };
 
+      const loadProductIntel = async () => {
       // Shared product intelligence (admin-owned). Fall back to admin user JSON once, then factory defaults.
       try {
         let intelParsed = null;
@@ -3099,9 +3295,11 @@ export default function CommercialExcellenceApp() {
           }
         }
       } catch { /* product intel falls back to factory defaults */ }
+      };
 
+      const loadUserJson = async () => {
       // User settings: intelligence/users/<display name>/settings.json
-      // Chat history:  intelligence/users/<display name>/chats.json
+      // Chat hub list: intelligence/users/<display name>/chats-index.json (full transcripts load later)
       try {
         try {
           localStorage.removeItem(userSettingsLocalKey(currentUser.id));
@@ -3110,9 +3308,9 @@ export default function CommercialExcellenceApp() {
             .filter((k) => k.startsWith('comex-user-settings'))
             .forEach((k) => localStorage.removeItem(k));
         } catch { /* ignore */ }
-        const [parsed, chatsParsed] = await Promise.all([
+        const [parsed, indexParsed] = await Promise.all([
           downloadUserJsonDocument(currentUser, 'settings.json'),
-          downloadUserJsonDocument(currentUser, 'chats.json'),
+          downloadUserJsonDocument(currentUser, 'chats-index.json'),
         ]);
         let merged = mergeUserSettingsFields(userSettingsRef.current);
         if (parsed && typeof parsed === 'object') {
@@ -3155,39 +3353,30 @@ export default function CommercialExcellenceApp() {
         setUserSettings(merged);
         userSettingsRef.current = merged;
         setStellaBusinessContext(biz);
-        let remoteChats = [];
+        let indexChats = [];
         let remoteActive = null;
         let migratedChats = false;
-        if (chatsParsed && typeof chatsParsed === 'object') {
-          ({ chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(chatsParsed));
+        if (indexParsed && typeof indexParsed === 'object') {
+          ({ chats: indexChats, activeChatId: remoteActive } = extractChatIndexFromDocument(indexParsed));
+          applyChatIndex(indexChats, remoteActive);
         } else {
-          const fromSettings = extractChatsFromDocument(parsed);
-          remoteChats = fromSettings.chats;
+          const fromSettings = extractChatIndexFromDocument(parsed);
+          indexChats = fromSettings.chats;
           remoteActive = fromSettings.activeChatId;
-          migratedChats = remoteChats.length > 0;
+          migratedChats = indexChats.length > 0;
+          if (migratedChats) applyChatIndex(indexChats, remoteActive);
+          else {
+            try {
+              await ensureFullChatsLoaded();
+              setChatIndexLoading(false);
+            } catch {
+              setChatIndexLoading(false);
+            }
+          }
         }
-        skipChatPersistRef.current = true;
-        setChatSessions(remoteChats);
-        chatSessionsRef.current = remoteChats;
-        if (remoteChats.length) {
-          const pick = remoteChats.find((c) => c.id === remoteActive) || remoteChats[0];
-          setActiveChatId(pick.id);
-          activeChatIdRef.current = pick.id;
-          if (pick.messages?.length) setMessages(pick.messages);
-          setCurrentWorkflow(pick.currentWorkflow || null);
-          setPendingWorkflow(pick.pendingWorkflow || null);
-          setUploadedFile(pick.uploadedFile || null);
-        } else {
-          setActiveChatId(null);
-          activeChatIdRef.current = null;
-          setMessages([consultationWelcome()]);
-          setCurrentWorkflow(null);
-          setPendingWorkflow(null);
-          setUploadedFile(null);
-        }
-        setTimeout(() => { skipChatPersistRef.current = false; }, 0);
         if (migratedChats) {
           try {
+            await ensureFullChatsLoaded();
             await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
               currentUser.id,
               {
@@ -3205,43 +3394,23 @@ export default function CommercialExcellenceApp() {
             }
           } catch { /* one-time split is best-effort */ }
         }
-        if (!memoryBackfillDoneRef.current && memoryBackfillNeeded(userSettingsRef.current.memory, chatSessionsRef.current, userSettingsRef.current)) {
-          memoryBackfillDoneRef.current = true;
-          try {
-            const blob = compactChatsForMemory(chatSessionsRef.current);
-            const raw = await callAnthropic(
-              MEMORY_BACKFILL_SYSTEM,
-              [{ role: 'user', content: buildBackfillExchange(blob, userSettingsRef.current.memory) }],
-              800,
-            );
-            const facts = filterMemoryFacts(parseMemoryFacts(raw));
-            if (facts.length) {
-              const before = memorySignature(userSettingsRef.current.memory);
-              const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts);
-              if (memorySignature(memory) !== before) {
-                const nextSettings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
-                setUserSettings(nextSettings);
-                userSettingsRef.current = nextSettings;
-                await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
-                  currentUser.id,
-                  mergeUserSettingsFields(userSettingsRef.current),
-                  { userName: currentUser.name },
-                ));
-              }
-            }
-          } catch (err) {
-            console.warn('Chat memory backfill failed:', err?.message || err);
-          }
-        } else {
-          memoryBackfillDoneRef.current = true;
-        }
       } catch (err) {
+        setChatIndexLoading(false);
         setUserSettingsCloudError(err?.message || 'Could not load settings.json');
       }
+      };
+
+      const userJsonDone = loadUserJson();
+      const restDone = Promise.all([loadStellaFiles(), loadProductIntel()]);
+      await userJsonDone;
       userSettingsReadyRef.current = true;
       const pendingHarvest = harvestMemoryPendingRef.current;
       harvestMemoryPendingRef.current = null;
       if (pendingHarvest) void harvestChatMemory(pendingHarvest.assistantText, pendingHarvest.userText, pendingHarvest.recentTurns);
+      void ensureFullChatsLoaded()
+        .then(() => runMemoryBackfillIfNeeded())
+        .catch((err) => console.warn('Chat transcripts load failed:', err?.message || err));
+      await restDone;
     };
     loadStella();
   }, [currentUser.id]);
@@ -3273,6 +3442,11 @@ export default function CommercialExcellenceApp() {
     if (!chatHasUserContent(messages) && !currentWorkflow) return;
     if (persistChatsTimerRef.current) clearTimeout(persistChatsTimerRef.current);
     persistChatsTimerRef.current = setTimeout(async () => {
+      try {
+        await ensureFullChatsLoaded();
+      } catch {
+        return;
+      }
       const id = activeChatIdRef.current || newChatId();
       if (!activeChatIdRef.current) {
         activeChatIdRef.current = id;
@@ -3294,12 +3468,13 @@ export default function CommercialExcellenceApp() {
       });
       const next = upsertChatInPlace(chatSessionsRef.current, snap);
       chatSessionsRef.current = next;
+      chatsBodiesRef.current = next;
       setChatSessions(next);
       try {
         await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
           {
-            chats: chatSessionsRef.current,
+            chats: mergeChatListForPersist(chatSessionsRef.current),
             activeChatId: activeChatIdRef.current,
             userName: currentUser.name,
           },
@@ -3865,11 +4040,17 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     const extra = (pending.extraFacts || []).filter(Boolean);
     let next = userSettingsRef.current.memory;
     if (action === 'accept') {
-      next = applyMemoryConfirmation(next, { ...pending, accept: true }, { module: resolvePromptModule() });
-    } else if (action === 'custom') {
+      const proposed = String(pending.proposed || '').trim();
       next = applyMemoryConfirmation(
         next,
-        { ...pending, proposed: String(customText || '').trim(), accept: true },
+        { ...pending, accept: true, reason: proposed ? `Replaced by “${proposed}”` : '' },
+        { module: resolvePromptModule() },
+      );
+    } else if (action === 'custom') {
+      const custom = String(customText || '').trim();
+      next = applyMemoryConfirmation(
+        next,
+        { ...pending, proposed: custom, accept: true, reason: custom ? `User confirmed: “${custom}”` : '' },
         { module: resolvePromptModule() },
       );
     }
@@ -4000,6 +4181,9 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     userSettingsRef.current = settings;
     setUserSettingsSaveStatus('saving');
     try {
+      try {
+        await ensureFullChatsLoaded();
+      } catch { /* still save settings */ }
       if (liveChats !== chatSessionsRef.current) {
         chatSessionsRef.current = liveChats;
         setChatSessions(liveChats);
@@ -4007,7 +4191,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       void queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
         currentUser.id,
         {
-          chats: chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats,
+          chats: mergeChatListForPersist(chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats),
           activeChatId: activeChatIdRef.current || liveSnap.id,
           userName: currentUser.name,
         },
@@ -4120,13 +4304,27 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     window.addEventListener('pointerup', onUp);
   };
 
+  const mergeChatListForPersist = (list) => {
+    const fullById = new Map((chatsBodiesRef.current || []).map((c) => [c.id, c]));
+    return (list || []).map((c) => {
+      if (!c?.id) return c;
+      if (Array.isArray(c.messages) && c.messages.length) return c;
+      return fullById.get(c.id) || c;
+    });
+  };
+
   const persistChatList = async (list, activeId) => {
     if (!userSettingsReadyRef.current) return;
     try {
+      try {
+        await ensureFullChatsLoaded();
+      } catch {
+        return;
+      }
       await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
         currentUser.id,
         {
-          chats: list,
+          chats: mergeChatListForPersist(list),
           activeChatId: activeId,
           userName: currentUser.name,
         },
@@ -4203,19 +4401,30 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     setMobileChatHistoryOpen(false);
   };
 
-  const continueChat = (chatId) => {
-    if (chatId === activeChatIdRef.current) {
-      const current = (chatSessionsRef.current || []).find((c) => c.id === chatId);
+  const continueChat = async (chatId) => {
+    const current = (chatSessionsRef.current || []).find((c) => c.id === chatId);
+    const bodiesReady = chatsFullLoadedRef.current && Array.isArray(current?.messages) && (
+      current.messages.length > 0 || current.messagesLoaded
+    );
+    if (chatId === activeChatIdRef.current && bodiesReady) {
       setShowLanding(false);
       setActiveTab(chatModuleMeta(current).tab);
       setMobileChatHistoryOpen(false);
       return;
     }
     flushActiveChat({ preserveUpdatedAt: true });
-    const found = (chatSessionsRef.current || []).find((c) => c.id === chatId);
-    if (!found) return;
-    resetLiveChat(found.id, found);
-    setMobileChatHistoryOpen(false);
+    setOpeningChatId(chatId);
+    try {
+      await ensureFullChatsLoaded();
+      const found = (chatSessionsRef.current || []).find((c) => c.id === chatId);
+      if (!found) return;
+      resetLiveChat(found.id, found);
+    } catch (err) {
+      console.warn('Could not open chat:', err?.message || err);
+    } finally {
+      setOpeningChatId(null);
+      setMobileChatHistoryOpen(false);
+    }
   };
 
   const deleteChat = (chatId, event) => {
@@ -8065,33 +8274,34 @@ ${stepInstruction}`;
             ))}
           </div>
 
+          {chatIndexLoading && recentChats(chatSessions).length === 0 && (
+            <div className="mt-10 text-sm text-blue-300/55">Loading recent chats…</div>
+          )}
           {recentChats(chatSessions).length > 0 && (
             <div className="mt-10">
-              <div className="flex items-center gap-2 mb-1">
+              <div className="flex items-center gap-2 mb-4">
                 <History className="w-5 h-5 text-cyan-300" />
                 <h3 className="text-lg font-semibold text-white">Recent chats</h3>
               </div>
-              <p className="text-[11px] text-blue-300/45 mb-4">
-                From <code className="text-cyan-300/70">intelligence/{userChatsRemotePath(currentUser)}</code> only.
-              </p>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
                 {recentChats(chatSessions).map((chat) => {
                   const mod = chatModuleMeta(chat);
+                  const opening = openingChatId === chat.id;
                   return (
                   <div
                     key={chat.id}
                     className="text-left bg-slate-800/50 hover:bg-slate-700/55 border border-blue-400/20 hover:border-blue-400/45 rounded-xl p-4 transition-all group"
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <button type="button" onClick={() => continueChat(chat.id)} className="min-w-0 text-left flex-1">
+                      <button type="button" onClick={() => continueChat(chat.id)} disabled={!!openingChatId} className="min-w-0 text-left flex-1 disabled:opacity-70">
                         <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/90 mb-1">{mod.label}</div>
                         <div className="text-sm font-semibold text-white truncate">{chat.title || 'Chat'}</div>
                         <div className="text-[11px] text-blue-300/60 mt-1">
                           {formatChatTime(chat.updatedAt)}
-                          {chat.currentWorkflow ? ' · Workflow in progress' : ''}
+                          {(chat.currentWorkflow || chat.hasWorkflow) ? ' · Workflow in progress' : ''}
                           {chat.id === activeChatId ? ' · Current' : ''}
                         </div>
-                        <div className="mt-3 text-xs text-cyan-300/80 font-semibold">Continue →</div>
+                        <div className="mt-3 text-xs text-cyan-300/80 font-semibold">{opening ? 'Opening…' : 'Continue →'}</div>
                       </button>
                       <button
                         type="button"
@@ -8173,7 +8383,7 @@ ${stepInstruction}`;
                               <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
                               <div className="text-[10px] text-blue-300/55 mt-0.5">
                                 {formatChatTime(chat.updatedAt)}
-                                {chat.currentWorkflow ? ' · in progress' : ''}
+                                {chat.currentWorkflow || chat.hasWorkflow ? ' · in progress' : ''}
                               </div>
                             </button>
                             <button
@@ -8247,7 +8457,7 @@ ${stepInstruction}`;
                         <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
                         <div className="text-[10px] text-blue-300/55 mt-0.5">
                           {formatChatTime(chat.updatedAt)}
-                          {chat.currentWorkflow ? ' · in progress' : ''}
+                          {chat.currentWorkflow || chat.hasWorkflow ? ' · in progress' : ''}
                         </div>
                       </button>
                       <button
@@ -9048,7 +9258,23 @@ ${stepInstruction}`;
                         />
                       </div>
                       <div className="md:col-span-2">
-                        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Remembered from chats</label>
+                        <div className="flex items-baseline justify-between gap-3 mb-2">
+                          <label className="block text-xs text-blue-300/70 font-semibold">Remembered from chats</label>
+                          {(() => {
+                            const usage = memoryUsage(userSettings.memory);
+                            return (
+                              <span className="text-[10px] text-blue-300/50 whitespace-nowrap">
+                                {usage.used} of {usage.cap} · {usage.pctLabel} full
+                              </span>
+                            );
+                          })()}
+                        </div>
+                        <div className="h-1 rounded-full bg-slate-800 overflow-hidden mb-3">
+                          <div
+                            className="h-full bg-cyan-400/70 rounded-full transition-all"
+                            style={{ width: `${Math.min(100, memoryUsage(userSettings.memory).pct)}%` }}
+                          />
+                        </div>
                         <label className="flex items-start gap-2 mb-3 cursor-pointer">
                           <input
                             type="checkbox"
@@ -9071,19 +9297,28 @@ ${stepInstruction}`;
                         {(userSettings.memory || []).length === 0 ? (
                           <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet. Key facts from conversations appear here automatically.</div>
                         ) : (
-                          <ul className="space-y-2">
-                            {(userSettings.memory || []).map((item) => (
-                              <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-70' : 'border-blue-400/15'}`}>
+                          <ul className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1">
+                            {(userSettings.memory || []).map((item) => {
+                              const reason = describeObsoleteReason(item, userSettings.memory);
+                              return (
+                              <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-80' : 'border-blue-400/15'}`}>
                                 <span className="flex-1 min-w-0">
-                                  <span className={`block text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
-                                    {item.text}
-                                    {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                                  <span className="block text-xs leading-relaxed text-slate-200">
+                                    {item.status === 'obsolete' ? (
+                                      <>
+                                        <span className="text-slate-400 line-through">{item.text}</span>
+                                        <span className="ml-2 text-[10px] text-amber-300/80 uppercase tracking-wide font-semibold">obsolete</span>
+                                      </>
+                                    ) : item.text}
                                   </span>
                                   <span className="block text-[10px] text-blue-300/45 mt-1">
                                     {item.createdAt ? `Added ${formatMemoryStamp(item.createdAt)}` : 'Added date not recorded'}
                                     {item.module ? ` · ${MODULE_CONTEXT_LABELS[item.module] || item.module}` : ''}
                                     {item.status === 'obsolete' && item.obsoleteAt ? ` · Obsolete ${formatMemoryStamp(item.obsoleteAt)}` : ''}
                                   </span>
+                                  {item.status === 'obsolete' && reason ? (
+                                    <span className="block text-[10px] text-amber-200/75 mt-0.5">{reason}</span>
+                                  ) : null}
                                 </span>
                                 <button
                                   type="button"
@@ -9096,7 +9331,8 @@ ${stepInstruction}`;
                                   <X className="w-3.5 h-3.5" />
                                 </button>
                               </li>
-                            ))}
+                              );
+                            })}
                           </ul>
                         )}
                       </div>

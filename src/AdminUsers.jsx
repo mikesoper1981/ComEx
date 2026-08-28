@@ -14,7 +14,7 @@ import {
   pickStellaBusinessContext,
   liftStellaGenericIntoUserSettings,
 } from './stellaUserSettings';
-import { formatMemoryStamp } from './chatMemory';
+import { formatMemoryStamp, describeObsoleteReason, memoryUsage } from './chatMemory';
 
 function formatLogin(iso) {
   if (!iso) return 'Never';
@@ -721,7 +721,23 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                     />
                   </div>
                   <div className="md:col-span-2">
-                    <label className={labelClass}>Remembered from chats</label>
+                    <div className="flex items-baseline justify-between gap-3 mb-2">
+                      <label className={labelClass}>Remembered from chats</label>
+                      {(() => {
+                        const usage = memoryUsage(editMemory);
+                        return (
+                          <span className="text-[10px] text-blue-300/50 whitespace-nowrap">
+                            {usage.used} of {usage.cap} · {usage.pctLabel} full
+                          </span>
+                        );
+                      })()}
+                    </div>
+                    <div className="h-1 rounded-full bg-slate-800 overflow-hidden mb-3">
+                      <div
+                        className="h-full bg-cyan-400/70 rounded-full"
+                        style={{ width: `${Math.min(100, memoryUsage(editMemory).pct)}%` }}
+                      />
+                    </div>
                     <label className="flex items-start gap-2 mb-3 cursor-pointer">
                       <input
                         type="checkbox"
@@ -744,18 +760,27 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                     {editMemory.length === 0 ? (
                       <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet.</div>
                     ) : (
-                      <ul className="space-y-2">
-                        {editMemory.map((item) => (
-                          <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-70' : 'border-blue-400/15'}`}>
+                      <ul className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1">
+                        {editMemory.map((item) => {
+                          const reason = describeObsoleteReason(item, editMemory);
+                          return (
+                          <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-80' : 'border-blue-400/15'}`}>
                             <span className="flex-1 min-w-0">
-                              <span className={`block text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
-                                {item.text}
-                                {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                              <span className="block text-xs leading-relaxed text-slate-200">
+                                {item.status === 'obsolete' ? (
+                                  <>
+                                    <span className="text-slate-400 line-through">{item.text}</span>
+                                    <span className="ml-2 text-[10px] text-amber-300/80 uppercase tracking-wide font-semibold">obsolete</span>
+                                  </>
+                                ) : item.text}
                               </span>
                               <span className="block text-[10px] text-blue-300/45 mt-1">
                                 {item.createdAt ? `Added ${formatMemoryStamp(item.createdAt)}` : 'Added date not recorded'}
                                 {item.status === 'obsolete' && item.obsoleteAt ? ` · Obsolete ${formatMemoryStamp(item.obsoleteAt)}` : ''}
                               </span>
+                              {item.status === 'obsolete' && reason ? (
+                                <span className="block text-[10px] text-amber-200/75 mt-0.5">{reason}</span>
+                              ) : null}
                             </span>
                             <button
                               type="button"
@@ -767,7 +792,8 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                               <X className="w-3.5 h-3.5" />
                             </button>
                           </li>
-                        ))}
+                          );
+                        })}
                       </ul>
                     )}
                   </div>

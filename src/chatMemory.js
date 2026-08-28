@@ -1,6 +1,6 @@
 import { isEmptyContextValue } from './moduleContext';
 
-export const MEMORY_CAP = 30;
+export const MEMORY_CAP = 500;
 export const MEMORY_TEXT_MAX = 280;
 
 export const MEMORY_HARVEST_SYSTEM = `You extract a very small set of DURABLE identity facts about THIS USER's business for a commercial-excellence copilot.
@@ -141,22 +141,61 @@ export function activeMemoryItems(settings) {
   return normalizeMemoryItems(settings?.memory).filter((m) => m.status !== 'obsolete');
 }
 
-export function applyMemoryConfirmation(existing, { existingId, existingText, proposed, accept }, { module = '' } = {}) {
+function clipReason(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+}
+
+export function describeObsoleteReason(item, allItems = []) {
+  const stored = clipReason(item?.obsoleteReason);
+  if (stored) return stored;
+  const id = String(item?.supersededBy || '');
+  if (!id) return '';
+  const replacement = (allItems || []).find((m) => m && m.id === id);
+  return replacement?.text ? `Replaced by “${replacement.text}”` : '';
+}
+
+export function memoryUsage(items) {
+  const used = normalizeMemoryItems(items).length;
+  const raw = MEMORY_CAP ? (used / MEMORY_CAP) * 100 : 0;
+  const pctLabel = used <= 0 ? '0%' : (raw < 1 ? `${Math.max(0.1, Math.round(raw * 10) / 10)}%` : `${Math.round(raw)}%`);
+  return { used, cap: MEMORY_CAP, pct: Math.min(100, raw), pctLabel };
+}
+
+function trimMemoryToCap(items, cap = MEMORY_CAP) {
+  if (!Array.isArray(items) || items.length <= cap) return items || [];
+  const active = items.filter((m) => m.status !== 'obsolete');
+  const obsolete = items.filter((m) => m.status === 'obsolete').slice().sort((a, b) => (
+    String(b.obsoleteAt || b.updatedAt || '').localeCompare(String(a.obsoleteAt || a.updatedAt || ''))
+  ));
+  if (active.length >= cap) return active.slice(0, cap);
+  return [...active, ...obsolete.slice(0, cap - active.length)];
+}
+
+export function applyMemoryConfirmation(existing, { existingId, existingText, proposed, accept, reason } = {}, { module = '' } = {}) {
   const base = normalizeMemoryItems(existing);
   const now = new Date().toISOString();
   if (!accept) return base;
+  const replacement = String(proposed || '').trim();
   const matchIdx = base.findIndex((m) =>
     (existingId && m.id === existingId) || (existingText && factsAreSimilar(m.text, existingText)),
   );
   const oldId = matchIdx >= 0 ? base[matchIdx].id : '';
+  const obsoleteReason = clipReason(reason)
+    || (replacement ? `Replaced by “${replacement}”` : 'User confirmed this is no longer current');
   let next = base;
   if (matchIdx >= 0) {
-    next = base.map((m, i) => (i === matchIdx ? { ...m, status: 'obsolete', obsoleteAt: now, updatedAt: now } : m));
+    next = base.map((m, i) => (i === matchIdx ? {
+      ...m,
+      status: 'obsolete',
+      obsoleteAt: now,
+      updatedAt: now,
+      obsoleteReason,
+    } : m));
   }
   const merged = mergeMemoryFacts(next, [proposed], { module });
   if (!oldId) return merged;
   const added = merged.find((m) => m.status === 'active' && factsAreSimilar(m.text, proposed));
-  return merged.map((m) => (m.id === oldId ? { ...m, supersededBy: added?.id || '' } : m));
+  return merged.map((m) => (m.id === oldId ? { ...m, supersededBy: added?.id || '', obsoleteReason } : m));
 }
 
 export function parseMemoryFacts(raw) {
@@ -190,13 +229,13 @@ export function normalizeMemoryItems(raw) {
       module: ['incentives', 'territory', 'stella'].includes(item?.module) ? item.module : '',
       status: item?.status === 'obsolete' ? 'obsolete' : 'active',
       supersededBy: item?.supersededBy ? String(item.supersededBy) : '',
+      obsoleteReason: clipReason(item?.obsoleteReason),
       createdAt: String(item?.createdAt || item?.addedAt || item?.updatedAt || ''),
       obsoleteAt: item?.status === 'obsolete' ? String(item?.obsoleteAt || item?.updatedAt || '') : '',
       updatedAt: String(item?.updatedAt || item?.createdAt || item?.obsoleteAt || ''),
     });
-    if (out.length >= MEMORY_CAP) break;
   }
-  return out;
+  return trimMemoryToCap(out);
 }
 
 const FACT_STOPWORDS = new Set([
@@ -270,7 +309,7 @@ export function mergeMemoryFacts(existing, incoming, { module = '' } = {}) {
       updatedAt: now,
     });
   }
-  return normalizeMemoryItems(base).slice(0, MEMORY_CAP);
+  return normalizeMemoryItems(base);
 }
 
 export function isMemoryEnabled(settings) {

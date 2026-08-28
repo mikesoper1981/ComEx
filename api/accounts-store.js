@@ -698,6 +698,7 @@ async function deleteUserFolder(user) {
     paths.push(
       `${prefix}/settings.json`,
       `${prefix}/chats.json`,
+      `${prefix}/chats-index.json`,
       `${prefix}/pptx-template.pptx`,
     );
     paths.push(...await listObjectsRecursive(prefix));

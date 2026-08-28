@@ -131,6 +131,15 @@ export function userChatsRemotePath(userOrName) {
   return `users/${userStorageFolder(userOrName)}/chats.json`;
 }
 
+/** Slim hub list (titles/dates only) — sibling of chats.json. */
+export function userChatsIndexRemotePath(userOrName) {
+  return `users/${userStorageFolder(userOrName)}/chats-index.json`;
+}
+
+export function chatsIndexLocalKey(userId) {
+  return `comex-chats-index:${userId}`;
+}
+
 /** Named path first, then older users/<id>/settings.json for migration. */
 export function userSettingsRemotePathCandidates(user) {
   const named = userSettingsRemotePath(user);
