@@ -20,10 +20,10 @@ import {
   productIntelligenceRemotePath,
 } from './auth';
 import {
-  DEFAULT_STELLA_BUSINESS_CONTEXT,
   STELLA_CONNECTORS,
   mergeStellaBusinessContext,
   stellaBusinessContextIsEmpty,
+  liftStellaGenericIntoUserSettings,
   stellaOrgIdForUser,
 } from './stellaUserSettings';
 import {
@@ -34,12 +34,17 @@ import {
   formatMemoryPromptBlock,
   shouldHarvestChatMemory,
   parseMemoryFacts,
+  parseMemoryHarvest,
+  parseJsonArray,
   compactChatsForMemory,
   memoryBackfillNeeded,
   buildHarvestExchange,
   buildBackfillExchange,
   isMemoryEnabled,
   memorySignature,
+  applyMemoryConfirmation,
+  factsAreSimilar,
+  activeMemoryItems,
 } from './chatMemory';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -686,7 +691,7 @@ function sanitizeMessageForStorage(m, { stampNow = false } = {}) {
   return out;
 }
 
-function serializeChatSnapshot({ id, title, updatedAt, createdAt, messages, currentWorkflow, pendingWorkflow, uploadedFile, module }) {
+function serializeChatSnapshot({ id, title, updatedAt, createdAt, messages, currentWorkflow, pendingWorkflow, uploadedFile, module, workflowRuns }) {
   const cid = id || newChatId();
   const now = new Date().toISOString();
   const list = messages || [];
@@ -723,6 +728,7 @@ function serializeChatSnapshot({ id, title, updatedAt, createdAt, messages, curr
         }
       : null,
     pendingWorkflow: pendingWorkflow || null,
+    workflowRuns: Array.isArray(workflowRuns) ? workflowRuns.slice(-20) : [],
     uploadedFile: uploadedFile
       ? (() => {
           const extractedText = String(uploadedFile.extractedText || '').slice(0, 40000);
@@ -899,8 +905,64 @@ function extractChoiceOptions(text) {
 /** True when the assistant asked numbered clarifying questions the user must answer themselves. */
 function hasNumberedClarifyingQuestions(text) {
   if (!text) return false;
-  const numberedQs = [...String(text).matchAll(/(?:^|\n)\s*(?:\*\*)?([1-9])(?:\*\*)?\s*[.:)\]]\s+.+\?/gm)];
+  const source = String(text);
+  const tail = source.length > 1400 ? source.slice(-1400) : source;
+  const numberedQs = [...tail.matchAll(/(?:^|\n)\s*(?:\*\*)?([1-9])(?:\*\*)?\s*[.:)\]]\s+.+\?/gm)];
   return numberedQs.length >= 1;
+}
+
+function pendingWorkflowId(pending) {
+  if (!pending) return '';
+  if (typeof pending === 'string') return pending;
+  return String(pending.topicId || pending.id || '');
+}
+
+function matchTopicByTriggers(topics, message) {
+  const msg = String(message || '').toLowerCase();
+  if (msg.length < 8) return null;
+  for (const topic of topics || []) {
+    if (topic.status !== 'active') continue;
+    const kws = Array.isArray(topic.triggerKeywords) ? topic.triggerKeywords : [];
+    if (kws.some((kw) => {
+      const k = String(kw || '').toLowerCase().trim();
+      return k.length >= 4 && msg.includes(k);
+    })) return topic;
+  }
+  return null;
+}
+
+function isWorkflowAccept(text) {
+  const t = String(text || '').trim();
+  return /^(y|yes|yeah|yep|sure|ok|okay|start)([\s.!,'"]|$)/i.test(t)
+    || /\b(start (the )?workflow|yes,? start)\b/i.test(t);
+}
+
+function isWorkflowDecline(text) {
+  const t = String(text || '').trim();
+  return /^(n|no|nope|nah|cancel)([\s.!,'"]|$)/i.test(t)
+    || /\b(just chat|don'?t (want|start)|not now|no thanks|no workflow)\b/i.test(t);
+}
+
+function isMemoryConfirmAccept(text) {
+  return /^(y|yes|yeah|yep|sure|ok|okay|update|replace)([\s.!,'"]|$)/i.test(String(text || '').trim());
+}
+
+function isMemoryConfirmDecline(text) {
+  return /^(n|no|nope|nah|keep|keep it)([\s.!,'"]|$)/i.test(String(text || '').trim());
+}
+
+function isAskingForNumberedReplies(text) {
+  if (!hasNumberedClarifyingQuestions(text)) return false;
+  const source = String(text || '');
+  const tail = source.length > 1400 ? source.slice(-1400) : source;
+  return /\b(reply|respond|answer with|please (answer|reply)|i (still )?need|clarifying|1\s*=)\b/i.test(tail);
+}
+
+function looksLikeInfoRequest(text) {
+  const t = String(text || '').trim();
+  if (!t) return true;
+  return /^(what is your|what's your|which of your|how many|how much|please (provide|share|upload|tell|send)|can you (tell me|share|provide|upload)|could you (tell me|share|provide)|do you have|what('s| is) the (current|actual)|i need (the|your))\b/i.test(t)
+    || /\b(please (provide|share|upload)|tell me (your|the missing)|what('s| is) missing)\b/i.test(t);
 }
 
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
@@ -2356,7 +2418,7 @@ export default function CommercialExcellenceApp() {
   const [currentWorkflow, setCurrentWorkflow] = useState(null);
   const [pendingWorkflow, setPendingWorkflow] = useState(null);
   const [uploadedFile, setUploadedFile] = useState(null);
-  const [stellaSettingsTab, setStellaSettingsTab] = useState('business'); // business | connections
+  const [stellaSettingsTab, setStellaSettingsTab] = useState('connections'); // connections | goals
   const [stellaConnectionsTab, setStellaConnectionsTab] = useState('files'); // files | connector id
   const [stellaMessages, setStellaMessages] = useState(() => [{
     role: 'assistant',
@@ -2405,6 +2467,9 @@ export default function CommercialExcellenceApp() {
   const harvestMemoryBusyRef = useRef(false);
   const harvestMemoryPendingRef = useRef(null);
   const memoryBackfillDoneRef = useRef(false);
+  const pendingMemoryConfirmRef = useRef(null);
+  const declinedWorkflowIdsRef = useRef(new Set());
+  const [pendingMemoryConfirm, setPendingMemoryConfirm] = useState(null);
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
     try { return localStorage.getItem('comex-chat-history-collapsed') === '1'; } catch { return false; }
   });
@@ -2682,6 +2747,7 @@ export default function CommercialExcellenceApp() {
           };
         }
         let biz = mergeStellaBusinessContext(merged.stellaBusinessContext);
+        let migratedStellaBiz = false;
         if (stellaBusinessContextIsEmpty(biz)) {
           for (const candidate of STELLA_STORAGE_CANDIDATES) {
             try {
@@ -2691,17 +2757,23 @@ export default function CommercialExcellenceApp() {
               if (parsedBiz && typeof parsedBiz === 'object' && !stellaBusinessContextIsEmpty(parsedBiz)) {
                 biz = mergeStellaBusinessContext(parsedBiz);
                 merged = { ...merged, stellaBusinessContext: biz };
-                try {
-                  await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
-                    currentUser.id,
-                    mergeUserSettingsFields(merged),
-                    { userName: currentUser.name },
-                  ));
-                } catch { /* one-time migrate is best-effort */ }
+                migratedStellaBiz = true;
                 break;
               }
             } catch { /* try next candidate */ }
           }
+        }
+        const lifted = liftStellaGenericIntoUserSettings({ ...merged, stellaBusinessContext: biz });
+        merged = lifted.settings;
+        biz = mergeStellaBusinessContext(merged.stellaBusinessContext);
+        if (migratedStellaBiz || lifted.changed) {
+          try {
+            await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+              currentUser.id,
+              mergeUserSettingsFields(merged),
+              { userName: currentUser.name },
+            ));
+          } catch { /* one-time migrate is best-effort */ }
         }
         setUserSettings(merged);
         userSettingsRef.current = merged;
@@ -2841,6 +2913,7 @@ export default function CommercialExcellenceApp() {
         module: existing?.module,
         createdAt: existing?.createdAt,
         updatedAt: sameThread ? existing.updatedAt : undefined,
+        workflowRuns: existing?.workflowRuns,
       });
       const next = upsertChatInPlace(chatSessionsRef.current, snap);
       chatSessionsRef.current = next;
@@ -2859,14 +2932,63 @@ export default function CommercialExcellenceApp() {
     return () => clearTimeout(persistChatsTimerRef.current);
   }, [messages, currentWorkflow, pendingWorkflow, uploadedFile]);
 
+  const patchWorkflowRun = (patch) => {
+    const id = activeChatIdRef.current;
+    if (!id || !patch) return;
+    const existing = (chatSessionsRef.current || []).find((c) => c.id === id);
+    const runs = Array.isArray(existing?.workflowRuns) ? [...existing.workflowRuns] : [];
+    const now = new Date().toISOString();
+    const matchIdx = runs.findIndex((r) =>
+      (patch.id && r.id === patch.id)
+      || (patch.topicId && r.topicId === patch.topicId && (r.status === 'offered' || r.status === 'running')),
+    );
+    if (matchIdx >= 0) {
+      runs[matchIdx] = {
+        ...runs[matchIdx],
+        ...patch,
+        at: runs[matchIdx].at || now,
+        completedAt: ['completed', 'declined', 'cancelled'].includes(patch.status) ? (patch.completedAt || now) : runs[matchIdx].completedAt,
+      };
+    } else {
+      runs.unshift({
+        id: patch.id || `wf_${Date.now().toString(36)}`,
+        topicId: patch.topicId || '',
+        topicName: patch.topicName || patch.topicId || 'Workflow',
+        status: patch.status || 'offered',
+        trigger: patch.trigger || '',
+        triggerText: String(patch.triggerText || '').slice(0, 280),
+        at: patch.at || now,
+        completedAt: patch.completedAt || null,
+        chatId: id,
+        chatTitle: existing?.title || '',
+      });
+    }
+    const snap = serializeChatSnapshot({
+      id,
+      title: existing?.title,
+      messages: messagesRef.current,
+      currentWorkflow: currentWorkflowRef.current,
+      pendingWorkflow: pendingWorkflowRef.current,
+      uploadedFile: uploadedFileRef.current,
+      module: existing?.module,
+      createdAt: existing?.createdAt,
+      workflowRuns: runs.slice(0, 20),
+    });
+    const next = upsertChatInPlace(chatSessionsRef.current, snap);
+    chatSessionsRef.current = next;
+    setChatSessions(next);
+  };
+
   const handleCancelWorkflow = (e) => {
     if (e) { e.preventDefault(); e.stopPropagation(); }
     const confirmed = window.confirm('Cancel this workflow and return to normal chat?');
     if (confirmed) {
+      const topicId = currentWorkflowRef.current?.topicId;
+      patchWorkflowRun({ topicId, status: 'cancelled' });
       setCurrentWorkflow(null);
       setPendingWorkflow(null);
       setIsLoading(false);
-      setMessages(prev => [...prev, { role: 'system', content: '❌ Workflow cancelled. Returning to normal chat mode.' }]);
+      setMessages(prev => [...prev, { role: 'system', content: '❌ Workflow cancelled. Returning to normal chat mode. We can keep talking about what you were working on.' }]);
     }
   };
 
@@ -3128,12 +3250,12 @@ export default function CommercialExcellenceApp() {
   const generateSuggestions = async (conversationHistory) => {
     if (!suggestionsEnabled || conversationHistory.length === 0) { setSuggestedPrompts([]); return; }
     // Never invent answers while an agent is waiting on clarifying questions
-    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser || pendingProposalIntake) {
+    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser || pendingProposalIntake || pendingMemoryConfirmRef.current) {
       setSuggestedPrompts([]);
       return;
     }
     const lastAssistant = [...conversationHistory].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator' || m.role === 'agent');
-    if (hasNumberedClarifyingQuestions(lastAssistant?.content)) {
+    if (hasNumberedClarifyingQuestions(lastAssistant?.content) || /Would you like me to start this workflow/i.test(lastAssistant?.content || '')) {
       setSuggestedPrompts([]);
       return;
     }
@@ -3167,18 +3289,19 @@ ${lastUserText || '(none)'}
 Assistant's latest reply:
 ${lastAsstText || '(none)'}
 
-Return ${n} clickable follow-ups that continue this thread. Each must mention a concrete detail from the messages above.`,
+Return ${n} clickable follow-ups that continue this thread without asking the user to supply missing information. Each must mention a concrete detail from the messages above.`,
         }],
         max_tokens: 400,
       });
       const data = await response.json();
       const text = anthropicAssistantText(data)?.trim();
       if (text) {
-        const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+        let parsed = null;
+        try { parsed = JSON.parse(text.replace(/```json|```/g, '').trim()); } catch { parsed = parseJsonArray(text); }
         if (Array.isArray(parsed)) {
           const cleaned = parsed
             .map((p) => stripKnowledgeCitations(String(p || ''), knowledgeNames).replace(/\s+/g, ' ').trim())
-            .filter((p) => isSensibleSuggestion(p, knowledgeNames) && isConversationGrounded(p, convoTokens));
+            .filter((p) => isSensibleSuggestion(p, knowledgeNames) && isConversationGrounded(p, convoTokens) && !looksLikeInfoRequest(p));
           setSuggestedPrompts(cleaned.slice(0, n));
         }
       }
@@ -3235,6 +3358,7 @@ Return ${n} clickable follow-ups that continue this thread. Each must mention a 
 
   const harvestChatMemory = async (assistantText, userText, recentTurns = []) => {
     if (!isMemoryEnabled(userSettingsRef.current)) return;
+    if (pendingMemoryConfirmRef.current) return;
     if (!shouldHarvestChatMemory(assistantText, userText)) return;
     if (!userSettingsReadyRef.current || harvestMemoryBusyRef.current) {
       harvestMemoryPendingRef.current = { assistantText, userText, recentTurns };
@@ -3253,9 +3377,27 @@ Return ${n} clickable follow-ups that continue this thread. Each must mention a 
             existingMemory: userSettingsRef.current.memory,
           }),
         }],
-        400,
+        500,
       );
-      const facts = parseMemoryFacts(raw);
+      const { facts: harvestedFacts, conflicts: harvestedConflicts } = parseMemoryHarvest(raw);
+      const existingActive = activeMemoryItems({ memory: userSettingsRef.current.memory });
+      const facts = [];
+      const conflicts = [...(harvestedConflicts || [])];
+      for (const fact of harvestedFacts) {
+        const match = existingActive.find((m) => factsAreSimilar(m.text, fact) && m.text.toLowerCase() !== String(fact).toLowerCase());
+        if (match) {
+          if (!conflicts.some((c) => (c.existingId && c.existingId === match.id) || factsAreSimilar(c.proposed, fact))) {
+            conflicts.push({
+              existingId: match.id,
+              existingText: match.text,
+              proposed: fact,
+              question: `I currently remember: "${match.text}". Should I update memory to: "${fact}"?`,
+            });
+          }
+        } else {
+          facts.push(fact);
+        }
+      }
       if (facts.length) {
         const before = memorySignature(userSettingsRef.current.memory);
         const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts, { module: resolvePromptModule() });
@@ -3269,6 +3411,16 @@ Return ${n} clickable follow-ups that continue this thread. Each must mention a 
             { userName: currentUser.name },
           ));
         }
+      }
+      const conflict = (conflicts || []).find((c) => c.proposed);
+      if (conflict && !pendingMemoryConfirmRef.current) {
+        const question = `I want to update your **remembered facts** before we continue.\n\n${
+          conflict.question
+          || `I currently remember: "${conflict.existingText}". Should I update memory to: "${conflict.proposed}"?`
+        }\n\nReply **yes** to update memory, **no** to keep the existing fact, or type the correct version.`;
+        pendingMemoryConfirmRef.current = conflict;
+        setPendingMemoryConfirm(conflict);
+        setMessages((prev) => [...prev, { role: 'assistant', content: question }]);
       }
     } catch (err) {
       console.warn('Chat memory harvest failed:', err?.message || err);
@@ -3380,14 +3532,16 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       ...userSettingsRef.current,
       ...incoming,
     });
+    const liveExisting = (chatSessionsRef.current || []).find((c) => c.id === (activeChatIdRef.current));
     const liveSnap = serializeChatSnapshot({
       id: activeChatIdRef.current || newChatId(),
       messages: messagesRef.current,
       currentWorkflow: currentWorkflowRef.current,
       pendingWorkflow: pendingWorkflowRef.current,
       uploadedFile: uploadedFileRef.current,
-      module: (chatSessionsRef.current || []).find((c) => c.id === (activeChatIdRef.current))?.module,
-      createdAt: (chatSessionsRef.current || []).find((c) => c.id === (activeChatIdRef.current))?.createdAt,
+      module: liveExisting?.module,
+      createdAt: liveExisting?.createdAt,
+      workflowRuns: liveExisting?.workflowRuns,
     });
     const liveChats = chatHasUserContent(liveSnap.messages)
       ? upsertChatInPlace(chatSessionsRef.current, liveSnap)
@@ -3463,6 +3617,7 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
       module: existing?.module,
       createdAt: existing?.createdAt,
       updatedAt: preserveUpdatedAt ? existing?.updatedAt : undefined,
+      workflowRuns: existing?.workflowRuns,
     });
     const next = chatHasUserContent(snap.messages)
       ? upsertChatInPlace(chatSessionsRef.current, snap)
@@ -3491,6 +3646,13 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
     setIsLoading(false);
     setShowLanding(false);
     setActiveTab('chat');
+    pendingMemoryConfirmRef.current = null;
+    setPendingMemoryConfirm(null);
+    const declined = new Set();
+    for (const run of snapshot?.workflowRuns || []) {
+      if (run?.status === 'declined' && run.topicId) declined.add(run.topicId);
+    }
+    declinedWorkflowIdsRef.current = declined;
     setTimeout(() => { skipChatPersistRef.current = false; }, 0);
   };
 
@@ -3819,7 +3981,7 @@ ${introInstr}`);
     await runWorkflowStep(topic, currentStep, userMessage, workflowContext, focusedContext);
   };
 
-  const launchWorkflowDirect = async (topicId, userMessage, focusedContext = null) => {
+  const launchWorkflowDirect = async (topicId, userMessage, focusedContext = null, source = 'direct') => {
     const topic = topics.find(t => t.id === topicId);
     if (!topic) {
       setMessages((prev) => [...prev, {
@@ -3833,6 +3995,13 @@ ${introInstr}`);
     setPptxOffers(null);
     setCurrentWorkflow({ topicId: topic.id, currentStep: 0, context: [], waitingForUser: false, focusedContext });
     setPendingWorkflow(null);
+    patchWorkflowRun({
+      topicId: topic.id,
+      topicName: topic.name,
+      status: 'running',
+      trigger: source || 'direct',
+      triggerText: String(userMessage || '').slice(0, 280),
+    });
     logActivity('workflow', `Direct launch: ${topic.name}`);
     try {
       await executeOrchestrator(topic, userMessage, 0, focusedContext);
@@ -4070,6 +4239,7 @@ ${introInstr}`);
       return updated;
     });
     setMessages(prev => [...prev, { role: 'system', content: `✅ **Workflow complete** — ${topic.workflow.length} steps finished.` }]);
+    patchWorkflowRun({ topicId: topic.id, topicName: topic.name, status: 'completed' });
     setCurrentWorkflow(null);
     setIsLoading(false);
   };
@@ -5566,7 +5736,7 @@ ${stepInstruction}`;
   };
 
   const stellaSaveBusinessContext = async (next) => {
-    const ctx = mergeStellaBusinessContext(next);
+    const ctx = mergeStellaBusinessContext({ keyGoals: mergeStellaBusinessContext(next).keyGoals });
     setStellaBusinessContext(ctx);
     setStellaBizSaveStatus('saving');
     try {
@@ -5954,35 +6124,19 @@ ${stepInstruction}`;
 
   const renderStellaBusinessPanel = () => (
     <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
-      <h3 className="text-lg font-bold text-white mb-2">Business Context</h3>
-      <p className="text-xs text-blue-300/60 mb-6">Saved for your account and injected into every Stella chat. Other users have their own copy.</p>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div>
-          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
-          <input value={stellaBusinessContext.companyName} onChange={(e) => patchStellaBusinessField('companyName', e.target.value)} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
-        </div>
-        <div>
-          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Industry</label>
-          <input value={stellaBusinessContext.industry} onChange={(e) => patchStellaBusinessField('industry', e.target.value)} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400" />
-        </div>
-        <div className="md:col-span-2">
-          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key goals</label>
-          <textarea value={stellaBusinessContext.keyGoals} onChange={(e) => patchStellaBusinessField('keyGoals', e.target.value)} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
-        </div>
-        <div className="md:col-span-2">
-          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key metrics</label>
-          <textarea value={stellaBusinessContext.keyMetrics} onChange={(e) => patchStellaBusinessField('keyMetrics', e.target.value)} rows={3} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
-        </div>
-        <div className="md:col-span-2">
-          <label className="block text-xs text-blue-300/70 font-semibold mb-2">Terminology / definitions</label>
-          <textarea value={stellaBusinessContext.terminology} onChange={(e) => patchStellaBusinessField('terminology', e.target.value)} rows={4} className="w-full bg-slate-900/50 text-white border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
-        </div>
+      <h3 className="text-lg font-bold text-white mb-2">Analysis goals</h3>
+      <p className="text-xs text-blue-300/60 mb-6">
+        Company name, industry, metrics, and terminology are in <span className="text-cyan-300 font-semibold">General</span> and apply across the hub. Use this field only for what Stella should focus on when analysing your data.
+      </p>
+      <div>
+        <label className="block text-xs text-blue-300/70 font-semibold mb-2">Key goals for Stella</label>
+        <textarea value={stellaBusinessContext.keyGoals} onChange={(e) => patchStellaBusinessField('keyGoals', e.target.value)} rows={4} placeholder="e.g. Spot underperforming territories, explain mix vs price, flag data quality issues" className="w-full bg-slate-900/50 text-white placeholder-blue-300/30 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-y" />
       </div>
       <div className="flex items-center gap-3 mt-6">
         <button onClick={() => stellaSaveBusinessContext(stellaBusinessContext)} disabled={stellaBizSaveStatus === 'saving'} className="px-5 py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 text-white font-semibold rounded-lg transition-all flex items-center gap-2">
           <Save className="w-4 h-4" /> {stellaBizSaveStatus === 'saving' ? 'Saving…' : 'Save'}
         </button>
-        <button onClick={() => stellaSaveBusinessContext(DEFAULT_STELLA_BUSINESS_CONTEXT)} className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30">
+        <button onClick={() => stellaSaveBusinessContext({ ...stellaBusinessContext, keyGoals: '' })} className="px-5 py-2.5 bg-slate-700/60 hover:bg-slate-600/60 text-slate-200 font-semibold rounded-lg transition-all border border-slate-500/30">
           Reset
         </button>
         {stellaBizSaveStatus === 'saved' && (
@@ -6038,7 +6192,10 @@ ${stepInstruction}`;
   const buildStellaSystemPrompt = (filesArg) => {
     const files = Array.isArray(filesArg) ? filesArg : (stellaDataFiles || []);
     const biz = stellaBusinessContext || {};
-    const bizText = `BUSINESS CONTEXT:\n- Company: ${biz.companyName || '(not set)'}\n- Industry: ${biz.industry || '(not set)'}\n- Key goals: ${biz.keyGoals || '(not set)'}\n- Key metrics: ${biz.keyMetrics || '(not set)'}\n- Terminology/definitions: ${biz.terminology || '(not set)'}\n`;
+    const goals = String(biz.keyGoals || '').trim();
+    const bizText = goals
+      ? `STELLA ANALYSIS GOALS:\n${goals}\n\nCompany, industry, metrics, and terminology come from this user's General settings — do not re-ask them.\n`
+      : 'STELLA ANALYSIS GOALS: (not set — use General user settings for company, industry, metrics, and terminology.)\n';
 
     const tabular = files.filter(f => f.tableName);
     const docs = files.filter(f => !f.tableName);
@@ -6327,12 +6484,13 @@ ${stepInstruction}`;
 
   const clarifyingReplyHint = useMemo(() => {
     if (isLoading || pptxGenerating) return false;
-    if (currentWorkflow?.awaitingAgentReply) return true;
-    if (currentWorkflow || pendingWorkflow || orchestratorDecision || pptxClarifyPending) return false;
+    if (pendingWorkflow || orchestratorDecision || pptxClarifyPending || pendingMemoryConfirm) return false;
     const list = Array.isArray(messages) ? messages : [];
     const last = [...list].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
-    return hasNumberedClarifyingQuestions(last?.content);
-  }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision]);
+    if (currentWorkflow?.awaitingAgentReply) return hasNumberedClarifyingQuestions(last?.content);
+    if (currentWorkflow) return false;
+    return isAskingForNumberedReplies(last?.content);
+  }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision, pendingMemoryConfirm]);
 
   const offerFromClassification = (classified) => {
     if (!classified) return null;
@@ -6582,6 +6740,50 @@ ${stepInstruction}`;
       return;
     }
 
+    const persistConfirmedMemory = async (nextMemory) => {
+      const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory: nextMemory });
+      setUserSettings(settings);
+      userSettingsRef.current = settings;
+      await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+        currentUser.id,
+        mergeUserSettingsFields(userSettingsRef.current),
+        { userName: currentUser.name },
+      ));
+    };
+
+    if (pendingMemoryConfirmRef.current && !currentWorkflow) {
+      setInput('');
+      setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+      const pending = pendingMemoryConfirmRef.current;
+      if (isMemoryConfirmAccept(messageContent)) {
+        const next = applyMemoryConfirmation(userSettingsRef.current.memory, { ...pending, accept: true }, { module: resolvePromptModule() });
+        pendingMemoryConfirmRef.current = null;
+        setPendingMemoryConfirm(null);
+        await persistConfirmedMemory(next);
+        setMessages((prev) => [...prev, { role: 'assistant', content: 'Updated. I’ll use the new fact going forward and keep the old one marked as superseded.' }]);
+        setIsLoading(false);
+        return;
+      }
+      if (isMemoryConfirmDecline(messageContent)) {
+        pendingMemoryConfirmRef.current = null;
+        setPendingMemoryConfirm(null);
+        setMessages((prev) => [...prev, { role: 'assistant', content: 'Kept the existing remembered fact. Thanks for confirming.' }]);
+        setIsLoading(false);
+        return;
+      }
+      const next = applyMemoryConfirmation(
+        userSettingsRef.current.memory,
+        { ...pending, proposed: messageContent.trim(), accept: true },
+        { module: resolvePromptModule() },
+      );
+      pendingMemoryConfirmRef.current = null;
+      setPendingMemoryConfirm(null);
+      await persistConfirmedMemory(next);
+      setMessages((prev) => [...prev, { role: 'assistant', content: `Updated memory to: ${messageContent.trim()}` }]);
+      setIsLoading(false);
+      return;
+    }
+
     setInput('');
     // Capture before clearing — needed to route Continue / typed replies correctly
     const pendingDecision = orchestratorDecision;
@@ -6628,7 +6830,7 @@ ${stepInstruction}`;
           : messageContent;
         setPendingWorkflow(null);
         setPptxClarifyPending(false);
-        await launchWorkflowDirect('analyze_ic', workflowMessage);
+        await launchWorkflowDirect('analyze_ic', workflowMessage, null, 'file');
         return;
       }
     }
@@ -6656,7 +6858,85 @@ ${stepInstruction}`;
       }
     }
 
-    // PPT export vs IC assessment — classified via settings pptxContext.messageClassify (not hardcoded regex).
+    const continueFreeform = async (extraInstruction = '') => {
+      try {
+        const fileContext = isFileAnalysis && uploadedFile ? `\n\nCONTEXT: The user has just uploaded a file named "${uploadedFile.name}" for assessment.` : '';
+        const kbRaw = knowledgeBase || buildKnowledgeBaseFromDocuments(documents);
+        const kb = isAdmin
+          ? kbRaw
+          : (documents || [])
+            .filter((d) => d.status === 'active' && d.content)
+            .map((d, i) => `## Best-practice guidance ${i + 1}\n${d.content}`)
+            .join('\n\n');
+        const systemPrompt = withUserSettings(customSystemPrompt
+          .replace(
+            'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
+            kb
+              ? (isAdmin
+                ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
+                : `KNOWLEDGE BASE (best-practice guidance — never name source files):\n${kb}`)
+              : 'KNOWLEDGE BASE:\nNo knowledge files are loaded yet. Answer from conversation context and user settings only.'
+          )
+          + fileContext
+          + (extraInstruction ? `\n\n${extraInstruction}` : ''));
+
+        const response = await anthropicMessagesPost({
+          system: systemPrompt,
+          messages: [
+            ...messages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
+            { role: 'user', content: messageContent }
+          ],
+          max_tokens: scaleUserFacingMaxTokens(4000, userSettings),
+        });
+        const data = await response.json();
+        const assistantMessage = anthropicAssistantText(data);
+        setMessages(prev => {
+          const updated = [...prev, { role: 'assistant', content: assistantMessage }];
+          setTimeout(() => generateSuggestions(updated), 500);
+          return updated;
+        });
+        setUploadedFile(null);
+      } catch (error) {
+        setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error: Unable to process request. Please try again.' }]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    const pendingId = pendingWorkflowId(pendingWorkflow);
+    if (pendingId && !currentWorkflow) {
+      const topic = topics.find((t) => t.id === pendingId);
+      const triggerMessage = (typeof pendingWorkflow === 'object' && pendingWorkflow?.triggerMessage) || '';
+      if (topic && isWorkflowAccept(messageContent)) {
+        setPptxOffers(null);
+        setCurrentWorkflow({ topicId: topic.id, currentStep: 0, context: [], waitingForUser: false });
+        setPendingWorkflow(null);
+        patchWorkflowRun({
+          id: typeof pendingWorkflow === 'object' ? pendingWorkflow.runId : null,
+          topicId: topic.id,
+          topicName: topic.name,
+          status: 'running',
+          trigger: 'offer-accepted',
+          triggerText: triggerMessage || messageContent,
+        });
+        await executeOrchestrator(topic, triggerMessage || messageContent, 0);
+        return;
+      }
+      declinedWorkflowIdsRef.current.add(pendingId);
+      patchWorkflowRun({
+        id: typeof pendingWorkflow === 'object' ? pendingWorkflow.runId : null,
+        topicId: pendingId,
+        topicName: topic?.name,
+        status: 'declined',
+      });
+      setPendingWorkflow(null);
+      await continueFreeform(
+        'The user declined (or continued past) a guided workflow offer. Answer their current message in the existing conversation. Do not restart from scratch, do not greet as if this is a new chat, and do not re-offer that workflow unless they explicitly ask to start it.',
+      );
+      return;
+    }
+
+    // PPT export only — never auto-launch an assessment/workflow from the classifier.
     if (!isFileAnalysis) {
       const routed = await classifyUserMessageIntent(messageContent);
       if (routed.kind === 'export') {
@@ -6669,31 +6949,20 @@ ${stepInstruction}`;
         askPptxClarification();
         return;
       }
-      if (routed.kind === 'assessment' && !currentWorkflow) {
-        const analyzeTopic = topics.find((t) => t.id === 'analyze_ic');
-        if (analyzeTopic) {
-          setPendingWorkflow(null);
-          await launchWorkflowDirect('analyze_ic', messageContent);
-          return;
-        }
-      }
     }
 
-    const msg = messageContent.toLowerCase();
-    let matchedTopic = topics.find(topic => topic.status === 'active' && topic.triggerKeywords.some(kw => msg.includes(kw.toLowerCase())));
-
-    if (!matchedTopic && topics.length > 0) {
-      try {
-        const workflowList = topics.filter(t => t.status === 'active').map(t => `id: "${t.id}"\n  name: ${t.name}\n  keywords: ${t.triggerKeywords.join(', ')}`).join('\n\n');
-        const detectRes = await anthropicMessagesPost({ system: fillTemplate(getWorkflowRuntime().matchDetectorPrompt, { workflowList }), messages: [{ role: 'user', content: messageContent }], max_tokens: 50 });
-        const detectData = await detectRes.json();
-        const detectedId = anthropicAssistantText(detectData)?.trim().toLowerCase();
-        if (detectedId && detectedId !== 'none') matchedTopic = topics.find(t => t.id === detectedId);
-      } catch (error) { /* fallback to normal chat */ }
-    }
-
-    if (matchedTopic && !currentWorkflow) {
+    const matchedTopic = matchTopicByTriggers(topics, messageContent);
+    if (matchedTopic && !currentWorkflow && !declinedWorkflowIdsRef.current.has(matchedTopic.id)) {
       const workflowSummary = matchedTopic.workflow.map((s, i) => `**Step ${i + 1}:** ${s.name}\n   _${s.goal}_`).join('\n\n');
+      const runId = `wf_${Date.now().toString(36)}`;
+      patchWorkflowRun({
+        id: runId,
+        topicId: matchedTopic.id,
+        topicName: matchedTopic.name,
+        status: 'offered',
+        trigger: 'keyword',
+        triggerText: messageContent,
+      });
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: fillTemplate(getWorkflowRuntime().offerTemplate, {
@@ -6702,70 +6971,12 @@ ${stepInstruction}`;
           workflowSummary,
         }),
       }]);
-      setPendingWorkflow(matchedTopic.id);
+      setPendingWorkflow({ topicId: matchedTopic.id, triggerMessage: messageContent, runId });
       setIsLoading(false);
       return;
     }
 
-    if (pendingWorkflow && (msg.includes('yes') || msg.includes('start'))) {
-      const topic = topics.find(t => t.id === pendingWorkflow);
-      if (topic) {
-        setPptxOffers(null);
-        setCurrentWorkflow({ topicId: topic.id, currentStep: 0, context: [], waitingForUser: false });
-        setPendingWorkflow(null);
-        await executeOrchestrator(topic, messageContent, 0);
-        return;
-      }
-    }
-
-    if (pendingWorkflow && (msg.includes('no') || msg.includes('cancel'))) {
-      setPendingWorkflow(null);
-      setMessages(prev => [...prev, { role: 'assistant', content: 'No problem! How else can I help you?' }]);
-      setIsLoading(false);
-      return;
-    }
-
-    try {
-      const fileContext = isFileAnalysis && uploadedFile ? `\n\nCONTEXT: The user has just uploaded a file named "${uploadedFile.name}" for assessment.` : '';
-      const kbRaw = knowledgeBase || buildKnowledgeBaseFromDocuments(documents);
-      const kb = isAdmin
-        ? kbRaw
-        : (documents || [])
-          .filter((d) => d.status === 'active' && d.content)
-          .map((d, i) => `## Best-practice guidance ${i + 1}\n${d.content}`)
-          .join('\n\n');
-      const systemPrompt = withUserSettings(customSystemPrompt
-        .replace(
-          'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
-          kb
-            ? (isAdmin
-              ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
-              : `KNOWLEDGE BASE (best-practice guidance — never name source files):\n${kb}`)
-            : 'KNOWLEDGE BASE:\nNo knowledge files are loaded yet. Answer from conversation context and user settings only.'
-        )
-        + fileContext);
-
-      const response = await anthropicMessagesPost({
-        system: systemPrompt,
-        messages: [
-          ...messages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
-          { role: 'user', content: messageContent }
-        ],
-        max_tokens: scaleUserFacingMaxTokens(4000, userSettings),
-      });
-      const data = await response.json();
-      const assistantMessage = anthropicAssistantText(data);
-      setMessages(prev => {
-        const updated = [...prev, { role: 'assistant', content: assistantMessage }];
-        setTimeout(() => generateSuggestions(updated), 500);
-        return updated;
-      });
-      setUploadedFile(null);
-    } catch (error) {
-      setMessages(prev => [...prev, { role: 'assistant', content: '⚠️ Error: Unable to process request. Please try again.' }]);
-    } finally {
-      setIsLoading(false);
-    }
+    await continueFreeform();
   };
 
   return (
@@ -7246,10 +7457,16 @@ ${stepInstruction}`;
                             </button>
                           </div>
                         )}
-                        {index === messages.length - 1 && pendingWorkflow && message.content.includes('Would you like me to start this workflow') && (
+                        {index === messages.length - 1 && pendingWorkflow && /Would you like me to start this workflow|Reply \*\*"Yes"\*\* to use the guided workflow/i.test(message.content) && (
                           <div className="flex gap-2 mt-4">
                             <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, Start Workflow</button>
-                            <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">💬 No, Just Chat</button>
+                            <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">💬 No, keep talking</button>
+                          </div>
+                        )}
+                        {index === messages.length - 1 && pendingMemoryConfirm && /update your \*\*remembered facts\*\*|update memory/i.test(message.content) && (
+                          <div className="flex gap-2 mt-4">
+                            <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, update memory</button>
+                            <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">Keep existing fact</button>
                           </div>
                         )}
                       </div>
@@ -7389,7 +7606,7 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !currentWorkflow && !pendingImageReview && !pendingProposalIntake && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
+                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !pendingMemoryConfirm && !currentWorkflow && !pendingImageReview && !pendingProposalIntake && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
                   <div className="mb-3">
                     <div className="text-xs text-blue-300/70 mb-2 flex items-center gap-2"><span>💡 Suggested next steps:</span></div>
                     <div className="flex flex-wrap gap-2">
@@ -7695,7 +7912,7 @@ ${stepInstruction}`;
                 {userSettingsPane === 'general' && (
                   <>
                     <p className="text-xs text-blue-300/70 mb-5">
-                      These apply across the hub. Saved per named account in Supabase Storage bucket
+                      Company, industry, metrics, and terminology here apply across Incentive Comp, Territory, and Stella — not duplicated per tool. Saved per named account in Supabase Storage bucket
                       {' '}<code className="text-cyan-300/80">intelligence</code>
                       {' '}→ <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/settings.json</code>.
                       {' '}Chat history is a sibling file <code className="text-cyan-300/80">users/{userStorageFolder(currentUser)}/chats.json</code>.
@@ -7850,7 +8067,7 @@ ${stepInstruction}`;
                           </span>
                         </label>
                         <p className="text-[11px] text-blue-300/45 mb-2">
-                          Saved only on this account in settings.json. Review and delete any fact. Similar facts are not stored twice.
+                          Saved only on this account in settings.json. If a new fact contradicts one already remembered, the assistant will ask before updating and can mark the old fact as obsolete.
                         </p>
                         {userSettings.memoryEnabled === false && (
                           <div className="text-xs text-amber-200/70 border border-amber-400/20 rounded-lg px-3 py-2 mb-2">
@@ -7862,8 +8079,11 @@ ${stepInstruction}`;
                         ) : (
                           <ul className="space-y-2">
                             {(userSettings.memory || []).map((item) => (
-                              <li key={item.id} className="flex items-start gap-2 bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
-                                <span className="flex-1 text-xs text-slate-200 leading-relaxed">{item.text}</span>
+                              <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-70' : 'border-blue-400/15'}`}>
+                                <span className={`flex-1 text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
+                                  {item.text}
+                                  {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                                </span>
                                 <button
                                   type="button"
                                   onClick={() => saveUserSettings({
@@ -7990,10 +8210,10 @@ ${stepInstruction}`;
                 {userSettingsPane === 'stella' && (
                   <>
                     <p className="text-xs text-blue-300/70 mb-4">
-                      Business context, files, and connections are saved for your account only.
+                      Files and connectors for this account. Company, industry, metrics, and terminology are under <span className="text-cyan-300 font-semibold">General</span>.
                     </p>
                     <div className="flex gap-1 bg-slate-900/50 rounded-lg p-1 w-fit mb-5">
-                      {[['business', 'Business Context'], ['connections', 'Connections']].map(([id, label]) => (
+                      {[['connections', 'Connections'], ['goals', 'Analysis goals']].map(([id, label]) => (
                         <button
                           key={id}
                           type="button"
@@ -8004,11 +8224,11 @@ ${stepInstruction}`;
                         </button>
                       ))}
                     </div>
-                    {stellaSettingsTab === 'business' && (
+                    {stellaSettingsTab === 'goals' && (
                       <>
                         {renderStellaBusinessPanel()}
                         <p className="text-xs text-blue-300/70 mt-6 mb-2">
-                          Optional background notes (strategy, definitions) used as guidance in Stella. Dataset files live under Connections → Files.
+                          Optional background notes used as guidance in Stella. Dataset files live under Connections → Files.
                         </p>
                         {renderModuleContextPanel('stella')}
                       </>

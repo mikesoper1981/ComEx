@@ -178,9 +178,13 @@ export function mergeTopics(partial) {
 
 export function mergeWelcomeMessages(partial) {
   const w = partial && typeof partial === 'object' ? partial : {};
+  let stella = w.stella != null ? String(w.stella) : DEFAULT_WELCOME_MESSAGES.stella;
+  if (/define your \*\*Business Context\*\*/i.test(stella)) {
+    stella = DEFAULT_WELCOME_MESSAGES.stella;
+  }
   return {
     consultation: w.consultation != null ? String(w.consultation) : DEFAULT_WELCOME_MESSAGES.consultation,
-    stella: w.stella != null ? String(w.stella) : DEFAULT_WELCOME_MESSAGES.stella,
+    stella,
   };
 }
 
@@ -193,7 +197,8 @@ export function mergeSuggestions(partial) {
     || systemPrompt.includes('No hardcoded generic IC trivia')
     || systemPrompt.includes('How would a 110% accelerator')
     || !/concrete detail/i.test(systemPrompt)
-    || !/NEVER name knowledge files/i.test(systemPrompt)) {
+    || !/NEVER name knowledge files/i.test(systemPrompt)
+    || !/Do NOT ask the user to supply missing/i.test(systemPrompt)) {
     systemPrompt = DEFAULT_SUGGESTIONS.systemPrompt;
     userPromptTemplate = DEFAULT_SUGGESTIONS.userPromptTemplate;
   }
@@ -221,6 +226,10 @@ export function mergeWorkflowRuntime(partial) {
   const out = { ...DEFAULT_WORKFLOW_RUNTIME };
   for (const key of Object.keys(DEFAULT_WORKFLOW_RUNTIME)) {
     if (w[key] != null) out[key] = String(w[key]);
+  }
+  if (!/casual questions/i.test(String(out.matchDetectorPrompt || ''))
+    || /You detect if a user message matches one of these workflows/i.test(String(out.matchDetectorPrompt || ''))) {
+    out.matchDetectorPrompt = DEFAULT_WORKFLOW_RUNTIME.matchDetectorPrompt;
   }
   // Refresh stale factory prompts that dropped scheme images / vision extracts
   const classify = String(out.proposalImageClassifyPrompt || '');

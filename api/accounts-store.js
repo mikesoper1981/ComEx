@@ -466,6 +466,107 @@ function usageForCalendarDay(doc, dayKey) {
   return { chats: questions, conversations };
 }
 
+function clipWorkflowText(text, max = 240) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function normalizeWorkflowRun(raw, fallbackAt) {
+  if (!raw || typeof raw !== 'object') return null;
+  const status = String(raw.status || 'offered').toLowerCase();
+  const allowed = ['offered', 'running', 'completed', 'declined', 'cancelled'];
+  return {
+    id: String(raw.id || ''),
+    topicId: String(raw.topicId || ''),
+    topicName: String(raw.topicName || raw.topicId || 'Workflow'),
+    status: allowed.includes(status) ? status : 'offered',
+    trigger: String(raw.trigger || ''),
+    triggerText: clipWorkflowText(raw.triggerText, 280),
+    at: raw.at || fallbackAt || null,
+    completedAt: raw.completedAt || null,
+    chatId: String(raw.chatId || ''),
+    chatTitle: String(raw.chatTitle || ''),
+  };
+}
+
+function inferWorkflowRunsFromChat(chat) {
+  const fallbackAt = chat?.updatedAt || chat?.createdAt || null;
+  const stored = (Array.isArray(chat?.workflowRuns) ? chat.workflowRuns : [])
+    .map((r) => normalizeWorkflowRun(r, fallbackAt))
+    .filter(Boolean);
+  if (stored.length) {
+    return stored.map((r) => ({
+      ...r,
+      chatId: r.chatId || chat.id || '',
+      chatTitle: r.chatTitle || chat.title || '',
+    }));
+  }
+  const msgs = Array.isArray(chat?.messages) ? chat.messages : [];
+  const runs = [];
+  msgs.forEach((m, i) => {
+    const text = String(m?.content || '');
+    const t = messageTime(m, chat, i);
+    const at = Number.isFinite(t) ? new Date(t).toISOString() : fallbackAt;
+    if (m?.role === 'assistant' && /Would you like me to start this workflow/i.test(text)) {
+      const prevUser = [...msgs.slice(0, i)].reverse().find((x) => x?.role === 'user');
+      const titleMatch = text.match(/\*\*([^*]{3,80})\*\*/);
+      runs.push({
+        id: `inf_${chat?.id || 'chat'}_${i}`,
+        topicId: '',
+        topicName: titleMatch ? titleMatch[1] : 'Workflow',
+        status: 'offered',
+        trigger: 'keyword',
+        triggerText: clipWorkflowText(prevUser?.content, 280),
+        at,
+        completedAt: null,
+        chatId: chat?.id || '',
+        chatTitle: chat?.title || '',
+      });
+      return;
+    }
+    const last = runs[runs.length - 1];
+    if (!last) return;
+    if (m?.role === 'system' && /Workflow complete/i.test(text)) {
+      last.status = 'completed';
+      last.completedAt = at;
+    } else if (m?.role === 'system' && /Workflow cancelled/i.test(text)) {
+      last.status = 'cancelled';
+      last.completedAt = at;
+    } else if (m?.role === 'assistant' && /No problem! How else can I help/i.test(text)) {
+      if (last.status === 'offered') last.status = 'declined';
+    } else if (m?.role === 'user' && last.status === 'offered') {
+      const reply = String(m?.content || '').trim();
+      if (/^(n|no|nope|nah)([\s.!,'"]|$)/i.test(reply) || /\b(just chat|don'?t (want|start)|not now|no thanks|no workflow)\b/i.test(reply)) {
+        last.status = 'declined';
+        last.completedAt = at;
+      }
+    } else if (m?.role === 'system' && /Direct launch|Step 1\//i.test(text) && last.status === 'offered') {
+      last.status = 'running';
+    }
+  });
+  if (chat?.currentWorkflow && runs.length) {
+    const last = runs[runs.length - 1];
+    if (last.status === 'offered' || last.status === 'running') last.status = 'running';
+  }
+  return runs;
+}
+
+function workflowUsageForCalendarDay(doc, dayKey) {
+  const chats = Array.isArray(doc?.chats) ? doc.chats : [];
+  const runs = [];
+  for (const chat of chats) {
+    for (const run of inferWorkflowRunsFromChat(chat)) {
+      const t = Date.parse(run.at || run.completedAt || '');
+      if (!Number.isFinite(t) || dayKeyLondon(t) !== dayKey) continue;
+      runs.push(run);
+    }
+  }
+  const byStatus = { offered: 0, running: 0, completed: 0, declined: 0, cancelled: 0 };
+  for (const r of runs) {
+    if (byStatus[r.status] != null) byStatus[r.status] += 1;
+  }
+  return { workflows: runs.length, byStatus, runs };
+}
+
 function normalizeLoginHistory(raw, lastLoginAt) {
   const list = (Array.isArray(raw) ? raw : [])
     .map((e) => {
@@ -503,11 +604,15 @@ function buildLoginHistory(user, chatsDoc) {
     .slice(0, 10)
     .map((row) => {
       const usage = usageForCalendarDay(chatsDoc, row.dayKey);
+      const workflows = workflowUsageForCalendarDay(chatsDoc, row.dayKey);
       return {
         at: row.at,
         dayKey: row.dayKey,
         chats: usage.chats,
         conversations: usage.conversations,
+        workflows: workflows.workflows,
+        workflowByStatus: workflows.byStatus,
+        workflowRuns: workflows.runs,
       };
     });
 }

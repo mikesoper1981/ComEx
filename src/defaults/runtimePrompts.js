@@ -2,7 +2,7 @@
 
 export const DEFAULT_WELCOME_MESSAGES = {
   consultation: "Hello! I'm your Commercial Excellence AI assistant. I can help you design motivating sales incentive schemes, assess existing proposals, and provide best practice guidance. What would you like to work on today?",
-  stella: 'Welcome to **Stella Insights**. Upload files in **User Settings → Stella Insights → Connections → Files**, define your **Business Context**, then ask me questions here — I can analyse trends and generate charts.',
+  stella: 'Welcome to **Stella Insights**. Company, industry, and terminology live in **User Settings → General**. Upload files in **User Settings → Stella Insights → Connections → Files**, then ask me questions here — I can analyse trends and generate charts.',
 };
 
 export const DEFAULT_PPTX_CLARIFY = {
@@ -28,18 +28,23 @@ Each suggestion is sent verbatim as the user's next message.
 
 Rules (mandatory):
 - Ground EVERY suggestion in THIS conversation. Reuse concrete details already discussed (products, roles, weights, thresholds, geographies, findings, decisions).
-- Each item must read as a natural question or instruction the user would type next about that thread.
-- If a topic was not mentioned in the conversation, do not suggest it — even if it is common IC / territory practice.
-- You MAY use best-practice knowledge only to shape a question about what is already on the table.
+- Write what the user would type next to CONTINUE or deepen the discussion — a next analysis, comparison, or "apply this to X".
+- Do NOT ask the user to supply missing facts, numbers, files, or definitions. Do not request information.
+- If a topic was not mentioned in the conversation, do not suggest it.
 - NEVER name knowledge files, document titles, citation numbers, or a References section.
 - If the assistant just asked numbered clarifying questions (1. 2. 3. …), return an EMPTY JSON array [].
 - No duplicates. About 8–16 words each.
 - Respond ONLY with a JSON array of strings, length {{n}} (or []).`,
-  userPromptTemplate: `Conversation to continue (the only allowed topic):\n{{recent}}\n\nReturn {{n}} follow-up questions or user instructions that continue THIS discussion. Each must mention a concrete detail from the thread. If the assistant asked numbered clarifying questions, return []. Never mention knowledge-file names.`,
+  userPromptTemplate: `Conversation to continue (the only allowed topic):\n{{recent}}\n\nReturn {{n}} next-step prompts the user can click to continue THIS discussion. Each must mention a concrete detail from the thread. Do not ask the user for missing information. If the assistant asked numbered clarifying questions, return [].`,
 };
 
 export const DEFAULT_WORKFLOW_RUNTIME = {
-  matchDetectorPrompt: `You detect if a user message matches one of these workflows. Respond with ONLY the workflow id or "none".\n\nWorkflows:\n{{workflowList}}`,
+  matchDetectorPrompt: `You detect if a user message should START one of these guided workflows. Respond with ONLY the workflow id or "none".
+
+Match ONLY when the user clearly wants that workflow now AND their wording matches the listed trigger keywords or is an unmistakable request to start that guided process. Casual questions, general IC/territory chat, or "just asking" must be "none". Do not guess.
+
+Workflows:
+{{workflowList}}`,
   offerTemplate: `I can help you with **{{description}}**.\n\nI have a structured **{{stepCount}}-step workflow**:\n\n{{workflowSummary}}\n\nWould you like me to start this workflow?\n\nReply **"Yes"** to use the guided workflow, or **"No"** to continue chatting normally.`,
   agentTaskWrapper: `YOUR CURRENT TASK:
 Step {{stepNumber}}: {{stepName}}

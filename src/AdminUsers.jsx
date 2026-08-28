@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { AlertTriangle, ArrowLeft, History, Mail, Pencil, Plus, Trash2, Users, X } from 'lucide-react';
 import { authHeaders } from './auth';
 import {
@@ -12,6 +12,7 @@ import {
   DEFAULT_STELLA_BUSINESS_CONTEXT,
   mergeStellaBusinessContext,
   pickStellaBusinessContext,
+  liftStellaGenericIntoUserSettings,
 } from './stellaUserSettings';
 
 function formatLogin(iso) {
@@ -57,6 +58,44 @@ function formatTime(iso) {
   }
 }
 
+function workflowStatusLabel(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'completed') return 'Completed';
+  if (s === 'declined') return 'Declined';
+  if (s === 'cancelled') return 'Cancelled';
+  if (s === 'running') return 'In progress';
+  if (s === 'offered') return 'Offered';
+  return status || 'Unknown';
+}
+
+function workflowStatusClass(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'completed') return 'text-emerald-300 bg-emerald-500/15 border-emerald-400/25';
+  if (s === 'declined') return 'text-amber-200 bg-amber-500/15 border-amber-400/25';
+  if (s === 'cancelled') return 'text-slate-300 bg-slate-500/20 border-slate-400/25';
+  if (s === 'running') return 'text-cyan-200 bg-cyan-500/15 border-cyan-400/25';
+  return 'text-blue-200 bg-blue-500/15 border-blue-400/25';
+}
+
+function workflowTriggerLabel(trigger) {
+  const t = String(trigger || '').toLowerCase();
+  if (t === 'keyword') return 'Keyword / phrase';
+  if (t === 'file') return 'File upload';
+  if (t === 'direct') return 'Started from UI';
+  if (t === 'offer-accepted') return 'Accepted offer';
+  return trigger || 'Trigger';
+}
+
+function summarizeWorkflowStatus(byStatus) {
+  const parts = [];
+  const order = ['completed', 'declined', 'cancelled', 'running', 'offered'];
+  for (const key of order) {
+    const n = Number(byStatus?.[key] || 0);
+    if (n) parts.push(`${n} ${workflowStatusLabel(key).toLowerCase()}`);
+  }
+  return parts.join(' · ') || 'none';
+}
+
 export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
   const [users, setUsers] = useState([]);
   const [status, setStatus] = useState('loading');
@@ -76,6 +115,8 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
   const [historyUser, setHistoryUser] = useState(null);
   const [historyDays, setHistoryDays] = useState([]);
   const [historyStatus, setHistoryStatus] = useState('idle');
+  const [expandedHistoryDay, setExpandedHistoryDay] = useState(null);
+  const [historyRunDetail, setHistoryRunDetail] = useState(null);
   const [pendingDelete, setPendingDelete] = useState(null);
 
   const load = async () => {
@@ -180,9 +221,14 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
         throw new Error(message);
       }
       const doc = data?.document && typeof data.document === 'object' ? data.document : data;
+      const lifted = liftStellaGenericIntoUserSettings({
+        ...pickGeneralSettings(doc),
+        memory: pickMemoryItems(doc),
+        stellaBusinessContext: pickStellaBusinessContext(doc),
+      });
       setEditDoc(doc);
-      setEditGeneral(pickGeneralSettings(doc));
-      setEditStellaBiz(pickStellaBusinessContext(doc));
+      setEditGeneral(pickGeneralSettings({ settings: lifted.settings }));
+      setEditStellaBiz(mergeStellaBusinessContext(lifted.settings.stellaBusinessContext));
       setEditMemory(pickMemoryItems(doc));
       setEditStatus('ready');
     } catch (err) {
@@ -235,13 +281,13 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
         });
       }
       const document = mergeGeneralIntoDocument(editDoc, editGeneral, editUser, editMemory, {
-        stellaBusinessContext: mergeStellaBusinessContext(editStellaBiz),
+        stellaBusinessContext: mergeStellaBusinessContext({ keyGoals: editStellaBiz.keyGoals }),
       });
       await persistUserSettings(editUser, document);
       onGeneralSettingsSaved?.(editUser.id, {
         ...editGeneral,
         memory: editMemory,
-        stellaBusinessContext: mergeStellaBusinessContext(editStellaBiz),
+        stellaBusinessContext: mergeStellaBusinessContext({ keyGoals: editStellaBiz.keyGoals }),
       });
       const savedName = editUser.name;
       closeEdit();
@@ -319,6 +365,8 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
     setHistoryUser(user);
     setHistoryDays([]);
     setHistoryStatus('loading');
+    setExpandedHistoryDay(null);
+    setHistoryRunDetail(null);
     setError('');
     try {
       const q = new URLSearchParams({ action: 'login-history', userId: user.id, userName: user.name });
@@ -339,7 +387,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
         <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
           <button
             type="button"
-            onClick={() => { setHistoryUser(null); setHistoryDays([]); setHistoryStatus('idle'); setError(''); }}
+            onClick={() => { setHistoryUser(null); setHistoryDays([]); setHistoryStatus('idle'); setExpandedHistoryDay(null); setHistoryRunDetail(null); setError(''); }}
             className="mb-4 px-3 py-1.5 bg-slate-700/50 hover:bg-slate-600/50 border border-blue-400/20 rounded-lg text-xs text-blue-200 font-semibold inline-flex items-center gap-1.5"
           >
             <ArrowLeft className="w-3.5 h-3.5" /> Back to users
@@ -348,7 +396,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             <History className="w-6 h-6 text-cyan-400" /> Login history
           </h2>
           <p className="text-sm text-blue-300/70 mb-5">
-            {historyUser.name}{historyUser.email ? ` · ${historyUser.email}` : ''} — last 10 login days
+            {historyUser.name}{historyUser.email ? ` · ${historyUser.email}` : ''} — last 10 login days, with chat volume and workflow triggers
           </p>
           {error && (
             <div className="mb-4 text-sm text-red-300 flex items-center gap-2">
@@ -362,28 +410,118 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                   <th className="pb-2 pr-3 font-semibold">Day</th>
                   <th className="pb-2 pr-3 font-semibold">Time</th>
                   <th className="pb-2 pr-3 font-semibold text-right">Unique chats</th>
-                  <th className="pb-2 font-semibold text-right">Conversations</th>
+                  <th className="pb-2 pr-3 font-semibold text-right">Conversations</th>
+                  <th className="pb-2 font-semibold text-right">Workflows</th>
                 </tr>
               </thead>
               <tbody>
                 {historyStatus === 'loading' && (
                   <tr>
-                    <td colSpan={4} className="py-6 text-blue-300/50">Loading history…</td>
+                    <td colSpan={5} className="py-6 text-blue-300/50">Loading history…</td>
                   </tr>
                 )}
                 {historyStatus === 'ready' && historyDays.length === 0 && (
                   <tr>
-                    <td colSpan={4} className="py-6 text-blue-300/50">No logins recorded yet.</td>
+                    <td colSpan={5} className="py-6 text-blue-300/50">No logins recorded yet.</td>
                   </tr>
                 )}
-                {historyDays.map((row) => (
-                  <tr key={row.at} className="border-b border-blue-400/10">
-                    <td className="py-3 pr-3 font-semibold text-white whitespace-nowrap">{formatDay(row.at)}</td>
-                    <td className="py-3 pr-3 text-blue-100/80">{formatTime(row.at)}</td>
-                    <td className="py-3 pr-3 text-right font-semibold text-white">{row.chats ?? 0}</td>
-                    <td className="py-3 text-right font-semibold text-white">{row.conversations ?? 0}</td>
-                  </tr>
-                ))}
+                {historyDays.map((row) => {
+                  const dayKey = row.dayKey || row.at;
+                  const expanded = expandedHistoryDay === dayKey;
+                  const runs = Array.isArray(row.workflowRuns) ? row.workflowRuns : [];
+                  return (
+                    <Fragment key={dayKey}>
+                      <tr className="border-b border-blue-400/10">
+                        <td className="py-3 pr-3 font-semibold text-white whitespace-nowrap">{formatDay(row.at)}</td>
+                        <td className="py-3 pr-3 text-blue-100/80">{formatTime(row.at)}</td>
+                        <td className="py-3 pr-3 text-right font-semibold text-white">{row.chats ?? 0}</td>
+                        <td className="py-3 pr-3 text-right font-semibold text-white">{row.conversations ?? 0}</td>
+                        <td className="py-3 text-right">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setExpandedHistoryDay(expanded ? null : dayKey);
+                              setHistoryRunDetail(null);
+                            }}
+                            className="inline-flex flex-col items-end gap-0.5 text-right hover:opacity-90"
+                          >
+                            <span className="font-semibold text-white underline decoration-cyan-400/40 underline-offset-2">
+                              {row.workflows ?? 0}
+                            </span>
+                            <span className="text-[10px] text-blue-300/55 font-normal normal-case tracking-normal">
+                              {summarizeWorkflowStatus(row.workflowByStatus)}
+                            </span>
+                          </button>
+                        </td>
+                      </tr>
+                      {expanded && (
+                        <tr className="border-b border-blue-400/10">
+                          <td colSpan={5} className="pb-4 pt-1">
+                            <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-3 space-y-2">
+                              <div className="text-[11px] uppercase tracking-wide text-blue-300/50 font-semibold">Workflow activity</div>
+                              {runs.length === 0 ? (
+                                <p className="text-xs text-blue-300/50">No workflow offers or runs recorded for this day.</p>
+                              ) : (
+                                <ul className="space-y-1.5">
+                                  {runs.map((run, idx) => (
+                                    <li key={run.id || `${dayKey}-${idx}`}>
+                                      <button
+                                        type="button"
+                                        onClick={() => setHistoryRunDetail(run)}
+                                        className="w-full text-left px-3 py-2 rounded-lg bg-slate-800/50 hover:bg-slate-800/80 border border-blue-400/10 hover:border-cyan-400/30 transition-all"
+                                      >
+                                        <div className="flex flex-wrap items-center gap-2">
+                                          <span className="text-sm font-semibold text-white">{run.topicName || 'Workflow'}</span>
+                                          <span className={`text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded border ${workflowStatusClass(run.status)}`}>
+                                            {workflowStatusLabel(run.status)}
+                                          </span>
+                                          <span className="text-[11px] text-blue-300/55">{formatTime(run.at)}</span>
+                                        </div>
+                                        <div className="text-xs text-blue-200/70 mt-1 line-clamp-2">
+                                          {run.triggerText || 'No trigger text stored'}
+                                        </div>
+                                      </button>
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                              {historyRunDetail && (
+                                <div className="mt-3 px-3 py-3 rounded-lg bg-slate-800/70 border border-cyan-400/20 text-sm space-y-2">
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div className="font-semibold text-white">{historyRunDetail.topicName || 'Workflow'}</div>
+                                    <button
+                                      type="button"
+                                      onClick={() => setHistoryRunDetail(null)}
+                                      className="text-blue-300/50 hover:text-white"
+                                      aria-label="Close workflow detail"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                  <div className="flex flex-wrap gap-2 text-xs">
+                                    <span className={`px-1.5 py-0.5 rounded border ${workflowStatusClass(historyRunDetail.status)}`}>
+                                      {workflowStatusLabel(historyRunDetail.status)}
+                                    </span>
+                                    <span className="text-blue-300/70">{workflowTriggerLabel(historyRunDetail.trigger)}</span>
+                                  </div>
+                                  <div>
+                                    <div className="text-[11px] uppercase tracking-wide text-blue-300/50 mb-1">What triggered it</div>
+                                    <p className="text-blue-100/90 whitespace-pre-wrap">{historyRunDetail.triggerText || 'Not recorded'}</p>
+                                  </div>
+                                  <div className="text-xs text-blue-300/60">
+                                    Chat: {historyRunDetail.chatTitle || historyRunDetail.chatId || 'Unknown'}
+                                    {historyRunDetail.at ? ` · ${formatDay(historyRunDetail.at)} ${formatTime(historyRunDetail.at)}` : ''}
+                                    {historyRunDetail.completedAt ? ` · ended ${formatTime(historyRunDetail.completedAt)}` : ''}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -409,7 +547,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             <Pencil className="w-6 h-6 text-cyan-400" /> Edit user
           </h2>
           <p className="text-sm text-blue-300/70 mb-5">
-            {editUser.name}{editUser.email ? ` · ${editUser.email}` : ''} — email, General, and Stella Insights settings for this account
+            {editUser.name}{editUser.email ? ` · ${editUser.email}` : ''} — email, General (shared company/industry/terminology), and Stella analysis goals
           </p>
           {error && (
             <div className="mb-4 text-sm text-red-300 flex items-center gap-2">
@@ -444,7 +582,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
               <div>
                 <h3 className="text-sm font-bold text-white mb-1">General settings</h3>
                 <p className="text-xs text-blue-300/60 mb-4">
-                  Same fields as User Settings → General. Saved for {editUser.name}; they take effect the next time that user loads the hub.
+                  Same fields as User Settings → General, including company, industry, metrics, and terminology used by Stella. Saved for {editUser.name}; they take effect the next time that user loads the hub.
                 </p>
                 <div className="mb-6 bg-slate-900/40 border border-blue-400/20 rounded-xl p-4">
                   <label className="block text-sm font-semibold text-white mb-1">Response length</label>
@@ -577,8 +715,11 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                     ) : (
                       <ul className="space-y-2">
                         {editMemory.map((item) => (
-                          <li key={item.id} className="flex items-start gap-2 bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
-                            <span className="flex-1 text-xs text-slate-200 leading-relaxed">{item.text}</span>
+                          <li key={item.id} className={`flex items-start gap-2 bg-slate-900/40 border rounded-lg px-3 py-2 ${item.status === 'obsolete' ? 'border-slate-500/20 opacity-70' : 'border-blue-400/15'}`}>
+                            <span className={`flex-1 text-xs leading-relaxed ${item.status === 'obsolete' ? 'text-slate-400 line-through' : 'text-slate-200'}`}>
+                              {item.text}
+                              {item.status === 'obsolete' ? <span className="ml-2 no-underline text-[10px] text-amber-300/70 uppercase tracking-wide">obsolete</span> : null}
+                            </span>
                             <button
                               type="button"
                               disabled={busy}
@@ -599,52 +740,17 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
               <div>
                 <h3 className="text-sm font-bold text-white mb-1">Stella Insights</h3>
                 <p className="text-xs text-blue-300/60 mb-4">
-                  Business context for this account. Dataset files and connectors are uploaded from that user&apos;s User Settings → Stella Insights → Connections.
+                  Company, industry, metrics, and terminology are in General above. This is only what Stella should focus on when analysing this user&apos;s data. Dataset files and connectors are uploaded from that user&apos;s User Settings → Stella Insights → Connections.
                 </p>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className={labelClass}>Company name</label>
-                    <input
-                      value={editStellaBiz.companyName}
-                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, companyName: e.target.value }))}
-                      className={fieldClass}
-                    />
-                  </div>
-                  <div>
-                    <label className={labelClass}>Industry</label>
-                    <input
-                      value={editStellaBiz.industry}
-                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, industry: e.target.value }))}
-                      className={fieldClass}
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className={labelClass}>Key goals</label>
-                    <textarea
-                      value={editStellaBiz.keyGoals}
-                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, keyGoals: e.target.value }))}
-                      rows={3}
-                      className={`${fieldClass} resize-y`}
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className={labelClass}>Key metrics</label>
-                    <textarea
-                      value={editStellaBiz.keyMetrics}
-                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, keyMetrics: e.target.value }))}
-                      rows={3}
-                      className={`${fieldClass} resize-y`}
-                    />
-                  </div>
-                  <div className="md:col-span-2">
-                    <label className={labelClass}>Terminology / definitions</label>
-                    <textarea
-                      value={editStellaBiz.terminology}
-                      onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, terminology: e.target.value }))}
-                      rows={4}
-                      className={`${fieldClass} resize-y`}
-                    />
-                  </div>
+                <div>
+                  <label className={labelClass}>Key goals for Stella</label>
+                  <textarea
+                    value={editStellaBiz.keyGoals}
+                    onChange={(e) => setEditStellaBiz((prev) => ({ ...prev, keyGoals: e.target.value }))}
+                    rows={4}
+                    placeholder="e.g. Spot underperforming territories, explain mix vs price"
+                    className={`${fieldClass} resize-y`}
+                  />
                 </div>
               </div>
 

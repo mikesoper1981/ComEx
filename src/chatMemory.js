@@ -20,8 +20,9 @@ Skip:
 - Anything already listed as remembered, or a close rephrase of it
 - Secrets or passwords
 
-When in doubt return {"facts":[]}. Prefer fewer, more specific facts. Max 4. Each fact one short standalone sentence.
-Return JSON only: {"facts":["..."]}.`;
+When in doubt return {"facts":[],"conflicts":[]}. Prefer fewer, more specific facts. Max 4 new facts.
+If a new fact contradicts an already remembered fact (same topic, different value — e.g. product was Alpha, now Beta), do NOT put it in facts. Put it in conflicts with a short confirmation question.
+Return JSON only: {"facts":["..."],"conflicts":[{"existingId":"mem_…","existingText":"…","proposed":"…","question":"I currently remember X. Update this to Y?"}]}`;
 
 export const MEMORY_BACKFILL_SYSTEM = `${MEMORY_HARVEST_SYSTEM}
 
@@ -107,6 +108,58 @@ function extractJsonArray(text) {
   return null;
 }
 
+export function parseMemoryHarvest(raw) {
+  const parsed = extractJsonObject(String(raw || ''));
+  const facts = parseMemoryFacts(raw);
+  const conflicts = [];
+  const list = parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.conflicts)
+    ? parsed.conflicts
+    : [];
+  for (const item of list) {
+    const proposed = factText(item?.proposed || item?.text);
+    const existingText = factText(item?.existingText || item?.existing);
+    if (proposed.length < 12) continue;
+    conflicts.push({
+      existingId: String(item?.existingId || ''),
+      existingText,
+      proposed,
+      question: String(item?.question || '').replace(/\s+/g, ' ').trim()
+        || `I currently remember: "${existingText || 'an earlier fact'}". Should I update this to: "${proposed}"?`,
+    });
+  }
+  return { facts, conflicts };
+}
+
+export function parseJsonArray(raw) {
+  const arr = extractJsonArray(String(raw || ''));
+  if (Array.isArray(arr)) return arr;
+  const parsed = extractJsonObject(String(raw || ''));
+  if (Array.isArray(parsed)) return parsed;
+  return [];
+}
+
+export function activeMemoryItems(settings) {
+  return normalizeMemoryItems(settings?.memory).filter((m) => m.status !== 'obsolete');
+}
+
+export function applyMemoryConfirmation(existing, { existingId, existingText, proposed, accept }, { module = '' } = {}) {
+  const base = normalizeMemoryItems(existing);
+  const now = new Date().toISOString();
+  if (!accept) return base;
+  const matchIdx = base.findIndex((m) =>
+    (existingId && m.id === existingId) || (existingText && factsAreSimilar(m.text, existingText)),
+  );
+  const oldId = matchIdx >= 0 ? base[matchIdx].id : '';
+  let next = base;
+  if (matchIdx >= 0) {
+    next = base.map((m, i) => (i === matchIdx ? { ...m, status: 'obsolete', updatedAt: now } : m));
+  }
+  const merged = mergeMemoryFacts(next, [proposed], { module });
+  if (!oldId) return merged;
+  const added = merged.find((m) => m.status === 'active' && factsAreSimilar(m.text, proposed));
+  return merged.map((m) => (m.id === oldId ? { ...m, supersededBy: added?.id || '' } : m));
+}
+
 export function parseMemoryFacts(raw) {
   const parsed = extractJsonObject(String(raw || ''));
   if (Array.isArray(parsed)) return parsed.map(factText).filter(Boolean);
@@ -136,6 +189,8 @@ export function normalizeMemoryItems(raw) {
       id: String(item?.id || `mem_${out.length + 1}`),
       text,
       module: ['incentives', 'territory', 'stella'].includes(item?.module) ? item.module : '',
+      status: item?.status === 'obsolete' ? 'obsolete' : 'active',
+      supersededBy: item?.supersededBy ? String(item.supersededBy) : '',
       updatedAt: item?.updatedAt || new Date().toISOString(),
     });
     if (out.length >= MEMORY_CAP) break;
@@ -189,11 +244,13 @@ export function mergeMemoryFacts(existing, incoming, { module = '' } = {}) {
   for (const raw of incoming || []) {
     const text = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, MEMORY_TEXT_MAX);
     if (text.length < 12 || isEmptyContextValue(text)) continue;
-    if (base.some((m) => factsAreSimilar(m.text, text))) continue;
+    const active = base.filter((m) => m.status !== 'obsolete');
+    if (active.some((m) => factsAreSimilar(m.text, text))) continue;
     base.unshift({
       id: `mem_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
       text,
       module,
+      status: 'active',
       updatedAt: now,
     });
   }
@@ -206,7 +263,7 @@ export function isMemoryEnabled(settings) {
 
 export function formatMemoryPromptBlock(settings) {
   if (!isMemoryEnabled(settings)) return '';
-  const items = normalizeMemoryItems(settings?.memory);
+  const items = activeMemoryItems(settings);
   if (!items.length) return '';
   let body = items.map((m) => `- ${m.text}`).join('\n');
   if (body.length > 3500) body = `${body.slice(0, 3500)}\n- [… older remembered facts omitted …]`;
@@ -271,9 +328,9 @@ export function memoryBackfillNeeded(memory, chats, settings) {
 }
 
 function formatKnownMemory(existingMemory) {
-  const items = normalizeMemoryItems(existingMemory);
+  const items = normalizeMemoryItems(existingMemory).filter((m) => m.status !== 'obsolete');
   if (!items.length) return '';
-  return `\n\nAlready remembered for this user (do not repeat similar facts):\n${items.map((m) => `- ${m.text}`).join('\n')}`;
+  return `\n\nAlready remembered for this user (id + fact — do not repeat similar facts; use conflicts if a new fact contradicts one of these):\n${items.map((m) => `- [${m.id}] ${m.text}`).join('\n')}`;
 }
 
 export function buildHarvestExchange({ assistantText = '', userText = '', recentTurns = [], existingMemory = [] } = {}) {
