@@ -8806,7 +8806,6 @@ ${stepInstruction}`;
                         {index === stellaMessages.length - 1 && pendingMemoryConfirm && (message.kind === 'memory-confirm' || /remembered fact/i.test(message.content || '')) && (
                           <div className="mt-3 max-w-[85%] text-left">{renderMemoryConfirmActions()}</div>
                         )}
-                        </div>
                       </div>
                     </div>
                   ))}
