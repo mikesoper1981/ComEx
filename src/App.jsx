@@ -44,6 +44,7 @@ import {
   memorySignature,
   applyMemoryConfirmation,
   factsAreSimilar,
+  factsShareMemoryTopic,
   activeMemoryItems,
   formatMemoryStamp,
   filterMemoryFacts,
@@ -1020,9 +1021,11 @@ function isMemoryConfirmDecline(text) {
     || /^(keep|keep it|keep existing)([\s.!,'"]*)$/i.test(t);
 }
 
-function looksLikeMemoryCorrection(text) {
+function looksLikeMemoryCorrection(text, { force = false } = {}) {
   const t = String(text || '').trim();
-  if (t.length < 16 || t.length > 280) return false;
+  if (t.length > 280) return false;
+  if (force) return t.length >= 8;
+  if (t.length < 16) return false;
   if (/\?/.test(t)) return false;
   if (/^\d+(\s*[=.].*)?$/.test(t)) return false;
   if (looksLikeInfoRequest(t)) return false;
@@ -2814,8 +2817,14 @@ export default function CommercialExcellenceApp() {
   const harvestMemoryPendingRef = useRef(null);
   const memoryBackfillDoneRef = useRef(false);
   const pendingMemoryConfirmRef = useRef(null);
+  const memoryResumeRef = useRef(null);
+  const memoryCustomForcedRef = useRef(false);
+  const skipMemoryHarvestRef = useRef(false);
+  const stellaResumeRef = useRef(null);
   const declinedWorkflowIdsRef = useRef(new Set());
   const [pendingMemoryConfirm, setPendingMemoryConfirm] = useState(null);
+  const [memoryCustomOpen, setMemoryCustomOpen] = useState(false);
+  const [memoryCustomDraft, setMemoryCustomDraft] = useState('');
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(() => {
     try { return localStorage.getItem('comex-chat-history-collapsed') === '1'; } catch { return false; }
   });
@@ -3709,15 +3718,22 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     return anthropicAssistantText(data);
   };
 
-  const harvestChatMemory = async (assistantText, userText, recentTurns = []) => {
-    if (!isMemoryEnabled(userSettingsRef.current)) return;
-    if (pendingMemoryConfirmRef.current) return;
-    if (!shouldHarvestChatMemory(assistantText, userText)) return;
+  const harvestChatMemory = async (assistantText, userText, recentTurns = [], { thread = 'chat' } = {}) => {
+    if (!isMemoryEnabled(userSettingsRef.current)) return { conflict: false };
+    if (pendingMemoryConfirmRef.current) return { conflict: true };
+    if (!shouldHarvestChatMemory(assistantText, userText)) return { conflict: false };
+    let spins = 0;
+    while (harvestMemoryBusyRef.current && spins < 80) {
+      await new Promise((r) => setTimeout(r, 50));
+      spins += 1;
+      if (pendingMemoryConfirmRef.current) return { conflict: true };
+    }
     if (!userSettingsReadyRef.current || harvestMemoryBusyRef.current) {
-      harvestMemoryPendingRef.current = { assistantText, userText, recentTurns };
-      return;
+      harvestMemoryPendingRef.current = { assistantText, userText, recentTurns, thread };
+      return { conflict: false };
     }
     harvestMemoryBusyRef.current = true;
+    let openedConflict = false;
     try {
       const raw = await callAnthropic(
         MEMORY_HARVEST_SYSTEM,
@@ -3743,7 +3759,10 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
         }
       }
       for (const fact of filterMemoryFacts(harvestedFacts, { allowExplicit })) {
-        const match = existingActive.find((m) => factsAreSimilar(m.text, fact) && m.text.toLowerCase() !== String(fact).toLowerCase());
+        const match = existingActive.find((m) => (
+          m.text.toLowerCase() !== String(fact).toLowerCase()
+          && factsShareMemoryTopic(m.text, fact)
+        ));
         if (match) {
           if (!conflicts.some((c) => (c.existingId && c.existingId === match.id) || factsAreSimilar(c.proposed, fact))) {
             conflicts.push({
@@ -3757,7 +3776,23 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
           facts.push(fact);
         }
       }
-      if (!conflicts.length && facts.length) {
+      const conflict = (conflicts || []).find((c) => c.proposed);
+      if (conflict && !pendingMemoryConfirmRef.current) {
+        const extraFacts = facts.filter((f) => !factsAreSimilar(f, conflict.proposed) && String(f).toLowerCase() !== String(conflict.existingText || '').toLowerCase());
+        const question = `I want to update your **remembered facts** before we continue.\n\n${
+          conflict.question
+          || `I currently remember: "${conflict.existingText}". Should I update memory to: "${conflict.proposed}"?`
+        }\n\nReply **yes** to update, **no** to keep the existing fact, or type the correct version.`;
+        const pending = { ...conflict, extraFacts, thread };
+        pendingMemoryConfirmRef.current = pending;
+        setPendingMemoryConfirm(pending);
+        setMemoryCustomOpen(false);
+        setMemoryCustomDraft(String(conflict.proposed || '').trim());
+        setSuggestedPrompts([]);
+        const append = thread === 'stella' ? setStellaMessages : setMessages;
+        append((prev) => [...prev, { role: 'assistant', content: question }]);
+        openedConflict = true;
+      } else if (!conflicts.length && facts.length) {
         const before = memorySignature(userSettingsRef.current.memory);
         const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts, { module: resolvePromptModule() });
         if (memorySignature(memory) !== before) {
@@ -3771,26 +3806,49 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
           ));
         }
       }
-      const conflict = (conflicts || []).find((c) => c.proposed);
-      if (conflict && !pendingMemoryConfirmRef.current) {
-        const question = `I want to update your **remembered facts** before we continue.\n\n${
-          conflict.question
-          || `I currently remember: "${conflict.existingText}". Should I update memory to: "${conflict.proposed}"?`
-        }\n\nReply **yes** to update memory, **no** to keep the existing fact, or type the correct version.`;
-        pendingMemoryConfirmRef.current = conflict;
-        setPendingMemoryConfirm(conflict);
-        setSuggestedPrompts([]);
-        setMessages((prev) => [...prev, { role: 'assistant', content: question }]);
-      }
     } catch (err) {
       console.warn('Chat memory harvest failed:', err?.message || err);
     }
     harvestMemoryBusyRef.current = false;
     const pending = harvestMemoryPendingRef.current;
     harvestMemoryPendingRef.current = null;
-    if (pending && (pending.userText !== userText || pending.assistantText !== assistantText)) {
-      void harvestChatMemory(pending.assistantText, pending.userText, pending.recentTurns);
+    if (pending && (pending.userText !== userText || pending.assistantText !== assistantText) && !pendingMemoryConfirmRef.current) {
+      void harvestChatMemory(pending.assistantText, pending.userText, pending.recentTurns, { thread: pending.thread || 'chat' });
     }
+    return { conflict: openedConflict || !!pendingMemoryConfirmRef.current };
+  };
+
+  const persistConfirmedMemory = async (nextMemory) => {
+    const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory: nextMemory });
+    setUserSettings(settings);
+    userSettingsRef.current = settings;
+    await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+      currentUser.id,
+      mergeUserSettingsFields(userSettingsRef.current),
+      { userName: currentUser.name },
+    ));
+  };
+
+  const applyPendingMemoryDecision = async (action, customText = '') => {
+    const pending = pendingMemoryConfirmRef.current;
+    if (!pending) return;
+    const extra = (pending.extraFacts || []).filter(Boolean);
+    let next = userSettingsRef.current.memory;
+    if (action === 'accept') {
+      next = applyMemoryConfirmation(next, { ...pending, accept: true }, { module: resolvePromptModule() });
+    } else if (action === 'custom') {
+      next = applyMemoryConfirmation(
+        next,
+        { ...pending, proposed: String(customText || '').trim(), accept: true },
+        { module: resolvePromptModule() },
+      );
+    }
+    if (extra.length) next = mergeMemoryFacts(next, extra, { module: resolvePromptModule() });
+    await persistConfirmedMemory(next);
+    pendingMemoryConfirmRef.current = null;
+    setPendingMemoryConfirm(null);
+    setMemoryCustomOpen(false);
+    memoryCustomForcedRef.current = false;
   };
 
   const recentChatTurnsForMemory = (list) => (
@@ -3821,14 +3879,16 @@ Do not cite sources. Never name knowledge files, intelligence documents, or file
       prompt = prompt.replace(/ALWAYS include the source of the data points in your response text/gi, 'Do not name the source of data points');
       prompt = prompt.replace(/loaded from intelligence files/gi, 'best-practice guidance');
     }
+    const settings = userSettingsRef.current || userSettings;
     const moduleBlock = moduleContext
-      ? formatLinkedModulesPromptBlock(userSettings, resolvePromptModule(), { stellaFiles: stellaDataFiles })
+      ? formatLinkedModulesPromptBlock(settings, resolvePromptModule(), { stellaFiles: stellaDataFiles })
       : '';
-    const base = `${prompt}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule() })}${moduleBlock}`;
+    const base = `${prompt}${buildUserSettingsPromptBlock(settings, { moduleId: resolvePromptModule() })}${moduleBlock}`;
     if (isAdmin) return base;
     return `${base}
 
-END-USER MODE: Never cite or name knowledge files, intelligence documents, or source filenames. Do not use [1]/[2] markers or a References section. Apply best-practice knowledge in your reasoning without mentioning where it came from.`;
+END-USER MODE: Never cite or name knowledge files, intelligence documents, or source filenames. Do not use [1]/[2] markers or a References section. Apply best-practice knowledge in your reasoning without mentioning where it came from.
+MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. Do not write "Memory updated". The app confirms memory changes separately.`;
   };
 
   const getIntel = () => mergeProductIntelligence({
@@ -4091,6 +4151,12 @@ END-USER MODE: Never cite or name knowledge files, intelligence documents, or so
     setActiveTab('chat');
     pendingMemoryConfirmRef.current = null;
     setPendingMemoryConfirm(null);
+    setMemoryCustomOpen(false);
+    setMemoryCustomDraft('');
+    memoryResumeRef.current = null;
+    memoryCustomForcedRef.current = false;
+    skipMemoryHarvestRef.current = false;
+    stellaResumeRef.current = null;
     const declined = new Set();
     for (const run of snapshot?.workflowRuns || []) {
       if (run?.status === 'declined' && run.topicId) declined.add(run.topicId);
@@ -6900,13 +6966,90 @@ ${stepInstruction}`;
     );
   };
 
-  const handleStellaChatSubmit = async (e) => {
+  const handleStellaChatSubmit = async (e, overrideInput = null) => {
     if (e) e.preventDefault();
-    const messageContent = stellaInput.trim();
+    let messageContent = (overrideInput != null ? String(overrideInput) : stellaInput).trim();
     if (!messageContent || stellaIsLoading) return;
+
+    let skipPost = false;
+    let skipHarvest = false;
+    const resume = stellaResumeRef.current;
+
+    if (pendingMemoryConfirmRef.current) {
+      const forcedCustom = memoryCustomForcedRef.current;
+      memoryCustomForcedRef.current = false;
+      if (isMemoryConfirmAccept(messageContent)) {
+        setStellaInput('');
+        setStellaMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+        await applyPendingMemoryDecision('accept');
+        if (resume?.messageContent) {
+          stellaResumeRef.current = null;
+          skipPost = true;
+          skipHarvest = true;
+          messageContent = resume.messageContent;
+        } else {
+          setStellaMessages((prev) => [...prev, { role: 'assistant', content: 'Updated. I’ll use the new fact going forward.' }]);
+          return;
+        }
+      } else if (isMemoryConfirmDecline(messageContent)) {
+        setStellaInput('');
+        setStellaMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+        await applyPendingMemoryDecision('decline');
+        if (resume?.messageContent) {
+          stellaResumeRef.current = null;
+          skipPost = true;
+          skipHarvest = true;
+          messageContent = resume.messageContent;
+        } else {
+          setStellaMessages((prev) => [...prev, { role: 'assistant', content: 'Kept the existing remembered fact. Thanks for confirming.' }]);
+          return;
+        }
+      } else if (forcedCustom || looksLikeMemoryCorrection(messageContent, { force: forcedCustom })) {
+        setStellaInput('');
+        setStellaMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+        await applyPendingMemoryDecision('custom', messageContent.trim());
+        if (resume?.messageContent) {
+          stellaResumeRef.current = null;
+          skipPost = true;
+          skipHarvest = true;
+          messageContent = resume.messageContent;
+        } else {
+          setStellaMessages((prev) => [...prev, { role: 'assistant', content: `Updated memory to: ${messageContent.trim()}` }]);
+          return;
+        }
+      } else {
+        setStellaInput('');
+        setStellaMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+        setStellaMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: 'Please confirm the memory change first — **Yes**, **Keep existing**, or type the correct version.',
+        }]);
+        return;
+      }
+    }
+
     setStellaIsLoading(true);
-    setStellaMessages(prev => [...prev, { role: 'user', content: messageContent }]);
-    setStellaInput('');
+    if (!skipPost) {
+      setStellaMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+      setStellaInput('');
+    }
+
+    if (!skipHarvest && shouldHarvestChatMemory('', messageContent)) {
+      const priorAsk = [...stellaMessages].reverse().find((m) => m.role === 'assistant');
+      const harvested = await harvestChatMemory(
+        priorAsk?.content,
+        messageContent,
+        recentChatTurnsForMemory([...(stellaMessages || []), { role: 'user', content: messageContent }]),
+        { thread: 'stella' },
+      );
+      if (harvested?.conflict || pendingMemoryConfirmRef.current) {
+        stellaResumeRef.current = { messageContent };
+        setStellaIsLoading(false);
+        return;
+      }
+      skipHarvest = true;
+    }
+
     try {
       // Always build the prompt from the freshest registry.
       const registry = await stellaReloadRegistry();
@@ -6985,8 +7128,10 @@ ${stepInstruction}`;
 
       const cleaned = stellaStripSqlBlocks(finalText) || finalText || 'I couldn\'t find enough to answer that from the available data.';
       setStellaMessages(prev => [...prev, { role: 'assistant', content: cleaned, steps }]);
-      const priorAsk = [...stellaMessages].reverse().find((m) => m.role === 'assistant');
-      void harvestChatMemory(priorAsk?.content, messageContent, recentChatTurnsForMemory(stellaMessages));
+      if (!skipHarvest && shouldHarvestChatMemory(cleaned, messageContent)) {
+        const priorAsk = [...stellaMessages].reverse().find((m) => m.role === 'assistant');
+        void harvestChatMemory(priorAsk?.content, messageContent, recentChatTurnsForMemory(stellaMessages), { thread: 'stella' });
+      }
     } catch (error) {
       setStellaMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: Unable to process request.\n\n${error?.message || 'Unknown error'}` }]);
     } finally {
@@ -7290,7 +7435,7 @@ ${stepInstruction}`;
 
   const handleSubmit = async (e, overrideInput = null, isFileAnalysis = false) => {
     if (e) e.preventDefault();
-    const messageContent = overrideInput || input.trim();
+    let messageContent = overrideInput || input.trim();
     if (!messageContent || isLoading) return;
 
     if (pendingImageReview?.unsure?.length && !currentWorkflow) {
@@ -7327,57 +7472,84 @@ ${stepInstruction}`;
       return;
     }
 
-    const persistConfirmedMemory = async (nextMemory) => {
-      const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory: nextMemory });
-      setUserSettings(settings);
-      userSettingsRef.current = settings;
-      await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
-        currentUser.id,
-        mergeUserSettingsFields(userSettingsRef.current),
-        { userName: currentUser.name },
-      ));
-    };
+    let skipPostUserMessage = false;
+    let skipMemoryHarvest = skipMemoryHarvestRef.current;
+    skipMemoryHarvestRef.current = false;
+    const resumeAfterConfirm = memoryResumeRef.current;
 
     if (pendingMemoryConfirmRef.current && !currentWorkflow) {
-      const pending = pendingMemoryConfirmRef.current;
+      const forcedCustom = memoryCustomForcedRef.current;
+      memoryCustomForcedRef.current = false;
       if (isMemoryConfirmAccept(messageContent)) {
         setInput('');
-        setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
-        const next = applyMemoryConfirmation(userSettingsRef.current.memory, { ...pending, accept: true }, { module: resolvePromptModule() });
-        pendingMemoryConfirmRef.current = null;
-        setPendingMemoryConfirm(null);
-        await persistConfirmedMemory(next);
-        setMessages((prev) => [...prev, { role: 'assistant', content: 'Updated. I’ll use the new fact going forward and keep the old one marked as superseded.' }]);
-        setIsLoading(false);
-        return;
-      }
-      if (isMemoryConfirmDecline(messageContent)) {
+        setMessages((prev) => {
+          const next = [...prev, { role: 'user', content: messageContent }];
+          messagesRef.current = next;
+          return next;
+        });
+        await applyPendingMemoryDecision('accept');
+        if (resumeAfterConfirm?.messageContent) {
+          memoryResumeRef.current = null;
+          skipPostUserMessage = true;
+          skipMemoryHarvest = true;
+          messageContent = resumeAfterConfirm.messageContent;
+          isFileAnalysis = !!resumeAfterConfirm.isFileAnalysis;
+        } else {
+          setMessages((prev) => [...prev, { role: 'assistant', content: 'Updated. I’ll use the new fact going forward.' }]);
+          setIsLoading(false);
+          return;
+        }
+      } else if (isMemoryConfirmDecline(messageContent)) {
         setInput('');
-        setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
-        pendingMemoryConfirmRef.current = null;
-        setPendingMemoryConfirm(null);
-        setMessages((prev) => [...prev, { role: 'assistant', content: 'Kept the existing remembered fact. Thanks for confirming.' }]);
-        setIsLoading(false);
-        return;
-      }
-      if (looksLikeMemoryCorrection(messageContent)) {
+        setMessages((prev) => {
+          const next = [...prev, { role: 'user', content: messageContent }];
+          messagesRef.current = next;
+          return next;
+        });
+        await applyPendingMemoryDecision('decline');
+        if (resumeAfterConfirm?.messageContent) {
+          memoryResumeRef.current = null;
+          skipPostUserMessage = true;
+          skipMemoryHarvest = true;
+          messageContent = resumeAfterConfirm.messageContent;
+          isFileAnalysis = !!resumeAfterConfirm.isFileAnalysis;
+        } else {
+          setMessages((prev) => [...prev, { role: 'assistant', content: 'Kept the existing remembered fact. Thanks for confirming.' }]);
+          setIsLoading(false);
+          return;
+        }
+      } else if (forcedCustom || looksLikeMemoryCorrection(messageContent, { force: forcedCustom })) {
         setInput('');
-        setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
-        const next = applyMemoryConfirmation(
-          userSettingsRef.current.memory,
-          { ...pending, proposed: messageContent.trim(), accept: true },
-          { module: resolvePromptModule() },
-        );
-        pendingMemoryConfirmRef.current = null;
-        setPendingMemoryConfirm(null);
-        await persistConfirmedMemory(next);
-        setMessages((prev) => [...prev, { role: 'assistant', content: `Updated memory to: ${messageContent.trim()}` }]);
+        setMessages((prev) => {
+          const next = [...prev, { role: 'user', content: messageContent }];
+          messagesRef.current = next;
+          return next;
+        });
+        await applyPendingMemoryDecision('custom', messageContent.trim());
+        if (resumeAfterConfirm?.messageContent) {
+          memoryResumeRef.current = null;
+          skipPostUserMessage = true;
+          skipMemoryHarvest = true;
+          messageContent = resumeAfterConfirm.messageContent;
+        } else {
+          setMessages((prev) => [...prev, { role: 'assistant', content: `Updated memory to: ${messageContent.trim()}` }]);
+          setIsLoading(false);
+          return;
+        }
+      } else {
+        setInput('');
+        setMessages((prev) => {
+          const next = [...prev, { role: 'user', content: messageContent }];
+          messagesRef.current = next;
+          return next;
+        });
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: 'Please confirm the memory change first — **Yes**, **Keep existing**, or type the correct version.',
+        }]);
         setIsLoading(false);
         return;
       }
-      // Suggested prompts / other chat — do not change memory; continue the discussion.
-      pendingMemoryConfirmRef.current = null;
-      setPendingMemoryConfirm(null);
     }
 
     setInput('');
@@ -7409,8 +7581,30 @@ ${stepInstruction}`;
     }
 
     setPptxOffers(null);
-    setMessages(prev => [...prev, { role: 'user', content: messageContent }]);
+    if (!skipPostUserMessage) {
+      setMessages((prev) => {
+        const next = [...prev, { role: 'user', content: messageContent }];
+        messagesRef.current = next;
+        return next;
+      });
+    }
     setIsLoading(true);
+
+    if (!skipMemoryHarvest && !currentWorkflow && shouldHarvestChatMemory('', messageContent)) {
+      const priorAsk = [...(messagesRef.current || [])].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
+      const harvested = await harvestChatMemory(
+        priorAsk?.content,
+        messageContent,
+        recentChatTurnsForMemory(messagesRef.current),
+        { thread: 'chat' },
+      );
+      if (harvested?.conflict || pendingMemoryConfirmRef.current) {
+        memoryResumeRef.current = { messageContent, isFileAnalysis };
+        setIsLoading(false);
+        return;
+      }
+      skipMemoryHarvest = true;
+    }
 
     // Uploaded IC proposal → always Analyze Existing IC workflow (never PPT export).
     if (isFileAnalysis && !currentWorkflow) {
@@ -7472,21 +7666,24 @@ ${stepInstruction}`;
           + fileContext
           + (extraInstruction ? `\n\n${extraInstruction}` : ''));
 
+        const history = (messagesRef.current || []).filter((m) => m.role !== 'system').map((m) => ({ role: toAnthropicRole(m.role), content: m.content }));
+        const alreadyLatest = history.length && history[history.length - 1]?.role === 'user'
+          && String(history[history.length - 1]?.content || '') === messageContent;
         const response = await anthropicMessagesPost({
           system: systemPrompt,
           messages: [
-            ...messages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
-            { role: 'user', content: messageContent }
+            ...history,
+            ...(alreadyLatest ? [] : [{ role: 'user', content: messageContent }]),
           ],
-          max_tokens: scaleUserFacingMaxTokens(4000, userSettings),
+          max_tokens: scaleUserFacingMaxTokens(4000, userSettingsRef.current || userSettings),
         });
         const data = await response.json();
         const assistantMessage = anthropicAssistantText(data);
         const withReply = [...(messagesRef.current || []), { role: 'assistant', content: assistantMessage }];
         setMessages(prev => [...prev, { role: 'assistant', content: assistantMessage }]);
         setUploadedFile(null);
-        if (shouldHarvestChatMemory(assistantMessage, messageContent)) {
-          await harvestChatMemory(assistantMessage, messageContent, recentChatTurnsForMemory(withReply));
+        if (!skipMemoryHarvest && shouldHarvestChatMemory(assistantMessage, messageContent)) {
+          await harvestChatMemory(assistantMessage, messageContent, recentChatTurnsForMemory(withReply), { thread: 'chat' });
         }
         if (!pendingMemoryConfirmRef.current) {
           setTimeout(() => generateSuggestions(withReply), 400);
@@ -8144,9 +8341,47 @@ ${stepInstruction}`;
                           </div>
                         )}
                         {index === messages.length - 1 && pendingMemoryConfirm && /update your \*\*remembered facts\*\*|update memory/i.test(message.content) && (
-                          <div className="flex gap-2 mt-4">
-                            <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, update memory</button>
-                            <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">Keep existing fact</button>
+                          <div className="mt-4 space-y-2">
+                            <div className="flex flex-col sm:flex-row gap-2">
+                              <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, update memory</button>
+                              <button onClick={(e) => { e.preventDefault(); setInput(''); handleSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">Keep existing fact</button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setMemoryCustomDraft(String(pendingMemoryConfirm?.proposed || memoryCustomDraft || '').trim());
+                                  setMemoryCustomOpen(true);
+                                }}
+                                className="flex-1 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-cyan-400/30 text-cyan-100 font-semibold rounded-lg transition-all"
+                              >
+                                Type a different version
+                              </button>
+                            </div>
+                            {memoryCustomOpen && (
+                              <div className="bg-slate-900/50 border border-cyan-400/20 rounded-lg p-3 space-y-2">
+                                <textarea
+                                  value={memoryCustomDraft}
+                                  onChange={(e) => setMemoryCustomDraft(e.target.value)}
+                                  rows={3}
+                                  placeholder="Type the fact that should be remembered"
+                                  className="w-full bg-slate-950/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-cyan-400 resize-y"
+                                />
+                                <button
+                                  type="button"
+                                  disabled={!String(memoryCustomDraft || '').trim()}
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    const text = String(memoryCustomDraft || '').trim();
+                                    if (!text) return;
+                                    memoryCustomForcedRef.current = true;
+                                    setInput('');
+                                    handleSubmit(e, text);
+                                  }}
+                                  className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-100 font-semibold rounded-lg text-sm disabled:opacity-40"
+                                >
+                                  Save this version
+                                </button>
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
@@ -8516,6 +8751,50 @@ ${stepInstruction}`;
                             {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : <MessageErrorBoundary>{formatMarkdown(message.content)}</MessageErrorBoundary>}
                           </div>
                           {message.role === 'assistant' && Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps)}
+                          {index === stellaMessages.length - 1 && pendingMemoryConfirm && /update your \*\*remembered facts\*\*|update memory/i.test(message.content) && (
+                            <div className="mt-4 space-y-2 text-left">
+                              <div className="flex flex-col sm:flex-row gap-2">
+                                <button type="button" onClick={(e) => { e.preventDefault(); setStellaInput(''); handleStellaChatSubmit(e, 'Yes'); }} className="flex-1 px-4 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold rounded-lg transition-all">✅ Yes, update memory</button>
+                                <button type="button" onClick={(e) => { e.preventDefault(); setStellaInput(''); handleStellaChatSubmit(e, 'No'); }} className="flex-1 px-4 py-2 bg-slate-600 hover:bg-slate-500 text-white font-semibold rounded-lg transition-all">Keep existing fact</button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setMemoryCustomDraft(String(pendingMemoryConfirm?.proposed || memoryCustomDraft || '').trim());
+                                    setMemoryCustomOpen(true);
+                                  }}
+                                  className="flex-1 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-cyan-400/30 text-cyan-100 font-semibold rounded-lg transition-all"
+                                >
+                                  Type a different version
+                                </button>
+                              </div>
+                              {memoryCustomOpen && (
+                                <div className="bg-slate-900/50 border border-cyan-400/20 rounded-lg p-3 space-y-2">
+                                  <textarea
+                                    value={memoryCustomDraft}
+                                    onChange={(e) => setMemoryCustomDraft(e.target.value)}
+                                    rows={3}
+                                    placeholder="Type the fact that should be remembered"
+                                    className="w-full bg-slate-950/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-cyan-400 resize-y"
+                                  />
+                                  <button
+                                    type="button"
+                                    disabled={!String(memoryCustomDraft || '').trim()}
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      const text = String(memoryCustomDraft || '').trim();
+                                      if (!text) return;
+                                      memoryCustomForcedRef.current = true;
+                                      setStellaInput('');
+                                      handleStellaChatSubmit(e, text);
+                                    }}
+                                    className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-100 font-semibold rounded-lg text-sm disabled:opacity-40"
+                                  >
+                                    Save this version
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>

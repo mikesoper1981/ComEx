@@ -235,6 +235,19 @@ export function factsAreSimilar(a, b) {
   return jaccard >= 0.55 || coverage >= 0.8;
 }
 
+export function factsShareMemoryTopic(a, b) {
+  if (factsAreSimilar(a, b)) return true;
+  const topic = (t) => {
+    const s = String(t || '').toLowerCase();
+    if (/\b(products?|brands?|skus?|portfolio)\b/.test(s)) return 'product';
+    if (/\bcompetitors?\b/.test(s)) return 'competitor';
+    if (/\b(territor(?:y|ies)|countries|markets?)\b/.test(s)) return 'geo';
+    return '';
+  };
+  const ta = topic(a);
+  return !!(ta && ta === topic(b));
+}
+
 export function memorySignature(items) {
   return normalizeMemoryItems(items).map((m) => m.text.toLowerCase()).sort().join('\n');
 }
@@ -292,7 +305,7 @@ export function formatMemoryPromptBlock(settings, { moduleId = '', linkedIds = [
   if (!items.length) return '';
   let body = items.map((m) => `- ${m.text}`).join('\n');
   if (body.length > 3500) body = `${body.slice(0, 3500)}\n- [… older remembered facts omitted …]`;
-  return `\n\nREMEMBERED FROM PRIOR CHATS (standing facts about this user's business — products, competitors, territories, definitions. Not this-session numbers or goals. Use them. Do not re-ask unless the user contradicts them):\n${body}`;
+  return `\n\nREMEMBERED FROM PRIOR CHATS (standing facts about this user's business — products, competitors, territories, definitions. Not this-session numbers or goals. Use them. Do not re-ask unless the user contradicts them):\n${body}\n\nNEVER say you updated, saved, locked in, or remembered a fact. NEVER write "Memory updated". The app confirms memory changes in a separate step — wait for that; keep helping with the user's question only after they confirm.`;
 }
 
 export function isExplicitRememberRequest(text) {
