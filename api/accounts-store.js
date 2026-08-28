@@ -3,6 +3,7 @@
  * Passwords are scrypt hashes in intelligence/accounts.json (service-role only).
  */
 
+const crypto = require('crypto');
 const {
   resolveUserCompany,
   companySlug,
