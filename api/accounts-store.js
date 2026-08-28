@@ -313,33 +313,51 @@ async function removeObjects(paths) {
   }
 }
 
+let accountsInFlight = null;
+let accountsCache = { at: 0, data: null };
+const ACCOUNTS_CACHE_MS = 4000;
+
 async function loadAccounts() {
-  const doc = await downloadObject(ACCOUNTS_PATH);
-  if (doc && Array.isArray(doc.users) && doc.users.length) {
-    return {
-      updatedAt: doc.updatedAt || new Date().toISOString(),
-      users: doc.users.map((u) => ({
-        id: String(u.id || ''),
-        name: String(u.name || u.id || 'User'),
-        role: u.role === 'admin' ? 'admin' : 'user',
-        email: normalizeEmail(u.email),
-        passwordHash: String(u.passwordHash || ''),
-        createdAt: u.createdAt || null,
-        lastLoginAt: u.lastLoginAt || null,
-        mustChangePassword: !!u.mustChangePassword,
-        otpExpiresAt: u.otpExpiresAt || null,
-        loginHistory: Array.isArray(u.loginHistory) ? u.loginHistory : [],
-      })).filter((u) => u.id),
+  if (accountsCache.data && Date.now() - accountsCache.at < ACCOUNTS_CACHE_MS) {
+    return accountsCache.data;
+  }
+  if (accountsInFlight) return accountsInFlight;
+  accountsInFlight = (async () => {
+    const doc = await downloadObject(ACCOUNTS_PATH);
+    if (doc && Array.isArray(doc.users) && doc.users.length) {
+      const data = {
+        updatedAt: doc.updatedAt || new Date().toISOString(),
+        users: doc.users.map((u) => ({
+          id: String(u.id || ''),
+          name: String(u.name || u.id || 'User'),
+          role: u.role === 'admin' ? 'admin' : 'user',
+          email: normalizeEmail(u.email),
+          passwordHash: String(u.passwordHash || ''),
+          createdAt: u.createdAt || null,
+          lastLoginAt: u.lastLoginAt || null,
+          mustChangePassword: !!u.mustChangePassword,
+          otpExpiresAt: u.otpExpiresAt || null,
+          loginHistory: Array.isArray(u.loginHistory) ? u.loginHistory : [],
+        })).filter((u) => u.id),
+      };
+      accountsCache = { at: Date.now(), data };
+      return data;
+    }
+    const seeded = {
+      updatedAt: new Date().toISOString(),
+      users: seedUsersFromEnv(),
     };
+    if (seeded.users.length) {
+      await uploadObject(ACCOUNTS_PATH, seeded);
+    }
+    accountsCache = { at: Date.now(), data: seeded };
+    return seeded;
+  })();
+  try {
+    return await accountsInFlight;
+  } finally {
+    accountsInFlight = null;
   }
-  const seeded = {
-    updatedAt: new Date().toISOString(),
-    users: seedUsersFromEnv(),
-  };
-  if (seeded.users.length) {
-    await uploadObject(ACCOUNTS_PATH, seeded);
-  }
-  return seeded;
 }
 
 async function saveAccounts(doc) {
@@ -359,6 +377,7 @@ async function saveAccounts(doc) {
     })),
   };
   await uploadObject(ACCOUNTS_PATH, next);
+  accountsCache = { at: Date.now(), data: next };
   return next;
 }
 

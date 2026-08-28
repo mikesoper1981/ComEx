@@ -110,7 +110,7 @@ module.exports = async function handler(req, res) {
       return res.status(404).json({ error: { message: `${file} not found` }, path: writePath });
     }
 
-    const body = JSON.stringify(document, null, 2);
+    const body = JSON.stringify(document);
     const url = `${supabaseUrl}/storage/v1/object/intelligence/${encodeObjectPath(writePath)}`;
     const headers = storageHeaders(serviceKey, {
       'Content-Type': 'application/json',

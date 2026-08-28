@@ -472,7 +472,7 @@ function userJsonRemotePath(user, file) {
 
 async function uploadUserJsonDirect(user, doc, file = 'settings.json') {
   const path = userJsonRemotePath(user, file);
-  const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify(doc)], { type: 'application/json' });
   const opts = { upsert: true, contentType: 'application/json', cacheControl: '0' };
   const { error } = await supabase.storage.from('intelligence').upload(path, blob, opts);
   if (!error) return;
@@ -3110,8 +3110,10 @@ export default function CommercialExcellenceApp() {
             .filter((k) => k.startsWith('comex-user-settings'))
             .forEach((k) => localStorage.removeItem(k));
         } catch { /* ignore */ }
-        const parsed = await downloadUserJsonDocument(currentUser, 'settings.json');
-        const chatsParsed = await downloadUserJsonDocument(currentUser, 'chats.json');
+        const [parsed, chatsParsed] = await Promise.all([
+          downloadUserJsonDocument(currentUser, 'settings.json'),
+          downloadUserJsonDocument(currentUser, 'chats.json'),
+        ]);
         let merged = mergeUserSettingsFields(userSettingsRef.current);
         if (parsed && typeof parsed === 'object') {
           const remoteSettings = normalizeLoadedUserSettings(parsed);
@@ -4158,7 +4160,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     return { list: next, activeId: id, snap };
   };
 
-  const resetLiveChat = (id, snapshot = null) => {
+  const resetLiveChat = (id, snapshot = null, { tab } = {}) => {
     skipChatPersistRef.current = true;
     setActiveChatId(id);
     activeChatIdRef.current = id;
@@ -4176,7 +4178,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     setPptxClarifyPending(false);
     setIsLoading(false);
     setShowLanding(false);
-    setActiveTab('chat');
+    setActiveTab(tab || (snapshot ? chatModuleMeta(snapshot).tab : 'chat'));
     pendingMemoryConfirmRef.current = null;
     setPendingMemoryConfirm(null);
     setMemoryCustomOpen(false);
@@ -4209,13 +4211,10 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       setMobileChatHistoryOpen(false);
       return;
     }
-    const { list } = flushActiveChat({ preserveUpdatedAt: true });
-    const found = list.find((c) => c.id === chatId) || (chatSessionsRef.current || []).find((c) => c.id === chatId);
+    flushActiveChat({ preserveUpdatedAt: true });
+    const found = (chatSessionsRef.current || []).find((c) => c.id === chatId);
     if (!found) return;
     resetLiveChat(found.id, found);
-    persistChatList(list, found.id);
-    const tab = chatModuleMeta(found).tab;
-    setActiveTab(tab);
     setMobileChatHistoryOpen(false);
   };
 
