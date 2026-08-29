@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
+import { createPortal } from 'react-dom';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2 } from 'lucide-react';
 import { supabase } from './supabase';
 import {
@@ -1267,19 +1268,17 @@ function stellaDefaultIntakeQuestions({ isTabular, columns = [] } = {}) {
   const colHint = names.slice(0, 6).join(', ');
   if (isTabular) {
     return [
-      'What does this dataset represent for your business (actuals, forecast, calls, etc.)?',
-      'What time period does it cover, and is that calendar, fiscal, or something else?',
       colHint
-        ? `For the key numeric fields (${colHint}), what do they mean and in what units or currency?`
-        : 'What do the key numeric columns mean, and in what units or currency?',
-      'Any filters, exclusions, or definitions I should apply when analysing this?',
+        ? `What is one row in this file (for example one account, one month, one call)? Columns include ${colHint}.`
+        : 'What is one row in this file — one account, one month, one event, or something else?',
+      colHint
+        ? `Are any of these columns codes or IDs whose values I should treat as keys: ${colHint}?`
+        : 'Which columns are identifiers that could join to other files?',
     ];
   }
   return [
-    'What is this document, and how should Stella use it in analysis?',
-    'What time period or version does it refer to?',
-    'Which metrics or definitions in it should I treat as authoritative?',
-    'Any caveats, or sections I should ignore?',
+    'What is this document (list of records, definitions, or something else)?',
+    'Which sections or tables in it describe the data structure Stella should use?',
   ];
 }
 
@@ -1288,7 +1287,7 @@ function pickStellaIntakeQuestions(onboarding, fallbacks) {
   const fromModel = stellaNormalizeIntakeQuestions(
     raw.suggestedQuestions != null ? raw.suggestedQuestions : raw.questions
   );
-  return fromModel.length >= 2 ? fromModel : fallbacks;
+  return fromModel.length >= 1 ? fromModel : fallbacks;
 }
 
 function stellaNormJoinToken(s) {
@@ -1440,6 +1439,61 @@ function stellaResolveJoinField(file, hint) {
   return contains ? contains.name : String(hint || '').trim();
 }
 
+function stellaFileColumnNames(file) {
+  return (file?.columns || []).map((c) => {
+    if (typeof c === 'string') return c.trim();
+    return String(c?.name || c?.original || '').trim();
+  }).filter(Boolean);
+}
+
+function stellaRelMatches(rel, otherFile, thisField, relatedField) {
+  if (!rel || !otherFile) return false;
+  const table = String(rel.related_table || '').toLowerCase();
+  const name = String(rel.related_file || '').toLowerCase();
+  const otherTable = String(otherFile.tableName || '').toLowerCase();
+  const otherName = String(otherFile.name || '').toLowerCase();
+  const otherHit = (table && otherTable && table === otherTable)
+    || (name && otherName && name === otherName);
+  if (!otherHit) return false;
+  return String(rel.this_field || '').toLowerCase() === String(thisField || '').toLowerCase()
+    && String(rel.related_field || '').toLowerCase() === String(relatedField || '').toLowerCase();
+}
+
+function stellaMutateRelationships(ctx, otherFile, thisField, relatedField, type) {
+  const base = (ctx && typeof ctx === 'object') ? { ...ctx } : {};
+  let rels = Array.isArray(base.relationships) ? [...base.relationships] : [];
+  if (type === 'remove') {
+    rels = rels.filter((r) => !stellaRelMatches(r, otherFile, thisField, relatedField));
+  } else {
+    rels = stellaDedupeRelationships([
+      ...rels,
+      {
+        related_file: otherFile.name || '',
+        related_table: otherFile.tableName || '',
+        this_field: thisField,
+        related_field: relatedField,
+        note: 'Linked on the connection map',
+      },
+    ]);
+  }
+  return { ...base, relationships: rels };
+}
+
+function stellaCapturedContextIsEmpty(ctx) {
+  if (!ctx || typeof ctx !== 'object') return true;
+  const maps = Array.isArray(ctx.name_maps) ? ctx.name_maps : [];
+  const rels = Array.isArray(ctx.relationships) ? ctx.relationships : [];
+  const qa = Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : [];
+  const metrics = Array.isArray(ctx.key_metrics) ? ctx.key_metrics : [];
+  return !String(ctx.what_it_represents || '').trim()
+    && !String(ctx.time_period || '').trim()
+    && !String(ctx.interpretation_notes || '').trim()
+    && !metrics.some((m) => String(m || '').trim())
+    && !maps.length
+    && !rels.length
+    && !qa.some((p) => p && (p.question || p.answer));
+}
+
 function stellaDedupeRelationships(list) {
   const seen = new Set();
   const out = [];
@@ -1519,6 +1573,7 @@ function stellaBuildFileLinkGraph(files) {
     name: f.name || 'File',
     tableName: f.tableName || '',
     intakeComplete: !!(f.intakeComplete || f.capturedContext),
+    columns: stellaFileColumnNames(f),
     joinCount: 0,
     partners: new Set(),
   }));
@@ -1627,6 +1682,13 @@ function stellaJoinFieldsForNode(nodeId, edges) {
   return fields;
 }
 
+function stellaFieldsForNode(node, edges) {
+  const joinFields = stellaJoinFieldsForNode(node.id, edges);
+  const seen = new Set(joinFields.map((f) => f.toLowerCase()));
+  const rest = (node.columns || []).filter((c) => !seen.has(String(c).toLowerCase()));
+  return [...joinFields, ...rest];
+}
+
 function stellaCardSize(expanded, fieldCount) {
   if (!expanded) return { w: STELLA_CARD_W, h: STELLA_HEADER_H };
   const rows = Math.max(fieldCount, 1);
@@ -1642,14 +1704,17 @@ function stellaFieldAnchor(node, fieldName, side) {
   };
 }
 
-function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
+function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }) {
   const graph = useMemo(() => stellaBuildFileLinkGraph(files || []), [files]);
   const nodeIds = graph.nodes.map((n) => n.id).join('|');
   const [large, setLarge] = useState(false);
   const [expanded, setExpanded] = useState(() => new Set());
   const [pos, setPos] = useState({});
+  const [joinLine, setJoinLine] = useState(null);
+  const [hoverJoin, setHoverJoin] = useState('');
   const svgRef = useRef(null);
   const dragRef = useRef(null);
+  const joinDragRef = useRef(null);
 
   useEffect(() => {
     setPos((prev) => {
@@ -1665,13 +1730,18 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
 
   useEffect(() => {
     if (!large) return undefined;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
     const onKey = (e) => { if (e.key === 'Escape') setLarge(false); };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener('keydown', onKey);
+    };
   }, [large]);
 
   const width = large ? 1400 : 900;
-  const height = large ? 820 : (graph.nodes.length <= 2 ? 280 : graph.nodes.length <= 4 ? 360 : 420);
+  const height = large ? 820 : (graph.nodes.length <= 2 ? 320 : graph.nodes.length <= 4 ? 400 : 460);
   const pairBuckets = new Map();
   for (const e of graph.edges) {
     const key = [e.from, e.to].sort().join('|');
@@ -1684,7 +1754,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
 
   const laid = graph.nodes.map((n) => {
     const p = pos[n.id] || { x: 0.5, y: 0.5 };
-    const fields = stellaJoinFieldsForNode(n.id, graph.edges);
+    const fields = stellaFieldsForNode(n, graph.edges);
     const isOpen = expanded.has(n.id);
     const size = stellaCardSize(isOpen, fields.length);
     return {
@@ -1699,7 +1769,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
   });
   const posMap = new Map(laid.map((n) => [n.id, n]));
 
-  const clientToFrac = (clientX, clientY) => {
+  const clientToSvg = (clientX, clientY) => {
     const svg = svgRef.current;
     if (!svg) return null;
     const pt = svg.createSVGPoint();
@@ -1708,10 +1778,40 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
     const ctm = svg.getScreenCTM();
     if (!ctm) return null;
     const loc = pt.matrixTransform(ctm.inverse());
+    return { x: loc.x, y: loc.y };
+  };
+
+  const clientToFrac = (clientX, clientY) => {
+    const loc = clientToSvg(clientX, clientY);
+    if (!loc) return null;
     return {
       x: Math.min(0.96, Math.max(0.04, loc.x / width)),
       y: Math.min(0.96, Math.max(0.04, loc.y / height)),
     };
+  };
+
+  const fieldAtSvg = (x, y) => {
+    for (const n of laid) {
+      if (!n.expanded || !n.fields.length) continue;
+      const left = n.x - n.w / 2;
+      const top = n.y - n.h / 2;
+      for (let i = 0; i < n.fields.length; i += 1) {
+        const fy = top + STELLA_HEADER_H + 10 + i * STELLA_ROW_H;
+        if (x >= left && x <= left + n.w && y >= fy && y <= fy + STELLA_ROW_H) {
+          return { id: n.id, field: n.fields[i] };
+        }
+      }
+    }
+    return null;
+  };
+
+  const nodeAtSvg = (x, y) => {
+    for (const n of laid) {
+      const left = n.x - n.w / 2;
+      const top = n.y - n.h / 2;
+      if (x >= left && x <= left + n.w && y >= top && y <= top + n.h) return n;
+    }
+    return null;
   };
 
   const toggleExpand = (id) => {
@@ -1731,7 +1831,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
   };
 
   const onPointerDown = (ev, id) => {
-    if (ev.button !== 0) return;
+    if (ev.button !== 0 || joinDragRef.current) return;
     ev.preventDefault();
     ev.stopPropagation();
     const frac = clientToFrac(ev.clientX, ev.clientY);
@@ -1747,7 +1847,28 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
     ev.currentTarget.setPointerCapture?.(ev.pointerId);
   };
 
+  const beginFieldJoin = (ev, nodeId, field) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    try { ev.currentTarget.setPointerCapture?.(ev.pointerId); } catch { /* ignore */ }
+    const loc = clientToSvg(ev.clientX, ev.clientY);
+    const node = posMap.get(nodeId);
+    joinDragRef.current = { fromId: nodeId, field };
+    setJoinLine({
+      x1: node ? stellaFieldAnchor(node, field, 'right').x : loc?.x || 0,
+      y1: node ? stellaFieldAnchor(node, field, 'right').y : loc?.y || 0,
+      x2: loc?.x || 0,
+      y2: loc?.y || 0,
+    });
+  };
+
   const onPointerMove = (ev) => {
+    if (joinDragRef.current) {
+      const loc = clientToSvg(ev.clientX, ev.clientY);
+      if (loc) setJoinLine((prev) => (prev ? { ...prev, x2: loc.x, y2: loc.y } : prev));
+      return;
+    }
     const drag = dragRef.current;
     if (!drag) return;
     const dist = Math.hypot(ev.clientX - drag.startClientX, ev.clientY - drag.startClientY);
@@ -1760,12 +1881,51 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
     setPos((prev) => ({ ...prev, [drag.id]: { x: nx, y: ny } }));
   };
 
+  const finishJoinDrag = (ev) => {
+    const drag = joinDragRef.current;
+    joinDragRef.current = null;
+    setJoinLine(null);
+    if (!drag) return;
+    const loc = clientToSvg(ev.clientX, ev.clientY);
+    if (!loc) return;
+    const hit = fieldAtSvg(loc.x, loc.y);
+    if (hit && hit.id !== drag.fromId) {
+      setExpanded((prev) => new Set([...prev, drag.fromId, hit.id]));
+      onJoinChange?.({
+        type: 'add',
+        fromId: drag.fromId,
+        toId: hit.id,
+        thisField: drag.field,
+        relatedField: hit.field,
+      });
+      return;
+    }
+    const node = nodeAtSvg(loc.x, loc.y);
+    if (node && node.id !== drag.fromId && !node.expanded) {
+      setExpanded((prev) => new Set([...prev, drag.fromId, node.id]));
+    }
+  };
+
   const onPointerUp = (ev, id) => {
+    if (joinDragRef.current) {
+      finishJoinDrag(ev);
+      return;
+    }
     const drag = dragRef.current;
     const moved = !!(drag && drag.moved);
     dragRef.current = null;
     try { ev.currentTarget.releasePointerCapture?.(ev.pointerId); } catch { /* ignore */ }
     if (!moved) toggleExpand(id);
+  };
+
+  const removeJoin = (edge) => {
+    onJoinChange?.({
+      type: 'remove',
+      fromId: edge.from,
+      toId: edge.to,
+      thisField: edge.thisField,
+      relatedField: edge.relatedField,
+    });
   };
 
   const toolbar = (
@@ -1785,11 +1945,14 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
       <svg
         ref={isLarge === large ? svgRef : undefined}
         viewBox={`0 0 ${width} ${height}`}
-        className={isLarge ? 'w-full h-full' : 'w-full h-auto max-h-[420px]'}
+        className={isLarge ? 'w-full h-full' : 'w-full h-auto max-h-[460px]'}
         role="img"
         aria-label="File connection map"
         onPointerMove={onPointerMove}
-        onPointerUp={() => { dragRef.current = null; }}
+        onPointerUp={(ev) => {
+          if (joinDragRef.current) finishJoinDrag(ev);
+          else dragRef.current = null;
+        }}
       >
         {Array.from(pairBuckets.values()).map((bucket) => {
           const e0 = bucket[0];
@@ -1799,37 +1962,63 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
           const pairKey = `${[e0.from, e0.to].sort().join('|')}${isLarge ? '-lg' : ''}`;
           const bothOpen = a.expanded && b.expanded;
           const aRight = a.x <= b.x;
-          const stroke = (activeId === a.id || activeId === b.id) ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.55)';
-          if (!bothOpen) {
-            const curve = stellaJoinCurvePath(a, b, 0, 1);
-            return (
-              <g key={pairKey}>
-                <path d={curve.d} fill="none" stroke={stroke} strokeWidth={1.7} />
-              </g>
-            );
-          }
+          const baseStroke = (activeId === a.id || activeId === b.id) ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.55)';
           return (
             <g key={pairKey}>
               {bucket.map((k, i) => {
-                const fromPt = stellaFieldAnchor(a, k.thisField, aRight ? 'right' : 'left');
-                const toPt = stellaFieldAnchor(b, k.relatedField, aRight ? 'left' : 'right');
+                const fromPt = bothOpen ? stellaFieldAnchor(a, k.thisField, aRight ? 'right' : 'left') : a;
+                const toPt = bothOpen ? stellaFieldAnchor(b, k.relatedField, aRight ? 'left' : 'right') : b;
                 const curve = stellaJoinCurvePath(fromPt, toPt, i, bucket.length);
+                const joinKey = `${k.from}|${k.to}|${k.thisField}|${k.relatedField}`;
+                const hot = hoverJoin === joinKey;
+                const stroke = hot ? 'rgb(248, 113, 113)' : baseStroke;
                 return (
                   <g key={`${k.thisField}-${k.relatedField}`}>
-                    <path d={curve.d} fill="none" stroke={stroke} strokeWidth={1.8} />
-                    <circle cx={fromPt.x} cy={fromPt.y} r={3.2} fill={stroke} />
-                    <circle cx={toPt.x} cy={toPt.y} r={3.2} fill={stroke} />
+                    <path
+                      d={curve.d}
+                      fill="none"
+                      stroke="transparent"
+                      strokeWidth={14}
+                      className="cursor-pointer"
+                      onPointerEnter={() => setHoverJoin(joinKey)}
+                      onPointerLeave={() => setHoverJoin((prev) => (prev === joinKey ? '' : prev))}
+                      onClick={(ev) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        removeJoin(k);
+                      }}
+                    >
+                      <title>Click to remove {k.thisField} ↔ {k.relatedField}</title>
+                    </path>
+                    <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.6 : 1.8} className="pointer-events-none" />
+                    {bothOpen ? (
+                      <>
+                        <circle cx={fromPt.x} cy={fromPt.y} r={3.2} fill={stroke} className="pointer-events-none" />
+                        <circle cx={toPt.x} cy={toPt.y} r={3.2} fill={stroke} className="pointer-events-none" />
+                      </>
+                    ) : null}
                   </g>
                 );
               })}
             </g>
           );
         })}
+        {joinLine ? (
+          <path
+            d={`M ${joinLine.x1} ${joinLine.y1} L ${joinLine.x2} ${joinLine.y2}`}
+            fill="none"
+            stroke="rgb(34, 211, 238)"
+            strokeWidth={1.8}
+            strokeDasharray="6 4"
+            className="pointer-events-none"
+          />
+        ) : null}
         {laid.map((n) => {
           const selected = activeId === n.id;
           const linked = n.joinCount > 0;
           const x = n.x - n.w / 2;
           const y = n.y - n.h / 2;
+          const joinSet = new Set(stellaJoinFieldsForNode(n.id, graph.edges).map((f) => f.toLowerCase()));
           return (
             <g
               key={`${n.id}${isLarge ? '-lg' : ''}`}
@@ -1859,25 +2048,39 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
                 className={linked ? 'fill-emerald-300' : 'fill-slate-400'}
                 style={{ fontSize: 9 }}
               >
-                {!n.intakeComplete ? 'Intake pending' : linked ? (n.expanded ? `${n.fields.length} key${n.fields.length === 1 ? '' : 's'}` : 'Connected · click to expand') : 'Not joined'}
+                {!n.intakeComplete
+                  ? 'Intake pending'
+                  : n.expanded
+                    ? `${n.fields.length} column${n.fields.length === 1 ? '' : 's'} · drag a field to join`
+                    : (linked ? 'Connected · click to expand' : 'Not joined · click to expand')}
               </text>
               {n.expanded && (
                 n.fields.length
-                  ? n.fields.map((field, i) => (
-                    <text
-                      key={field}
-                      x={n.x}
-                      y={y + STELLA_HEADER_H + 10 + i * STELLA_ROW_H + 14}
-                      textAnchor="middle"
-                      className="fill-cyan-100"
-                      style={{ fontSize: 10, fontFamily: 'ui-monospace, monospace' }}
-                    >
-                      {field.length > 24 ? `${field.slice(0, 22)}…` : field}
-                    </text>
-                  ))
+                  ? n.fields.map((field, i) => {
+                    const joined = joinSet.has(field.toLowerCase());
+                    const fy = y + STELLA_HEADER_H + 10 + i * STELLA_ROW_H;
+                    return (
+                      <g
+                        key={field}
+                        className="cursor-crosshair"
+                        onPointerDown={(ev) => beginFieldJoin(ev, n.id, field)}
+                      >
+                        <rect x={x + 6} y={fy} width={n.w - 12} height={STELLA_ROW_H - 1} rx={4} fill={joined ? 'rgba(8, 145, 178, 0.25)' : 'transparent'} />
+                        <text
+                          x={n.x}
+                          y={fy + 14}
+                          textAnchor="middle"
+                          className={joined ? 'fill-cyan-100' : 'fill-slate-300'}
+                          style={{ fontSize: 10, fontFamily: 'ui-monospace, monospace' }}
+                        >
+                          {field.length > 24 ? `${field.slice(0, 22)}…` : field}
+                        </text>
+                      </g>
+                    );
+                  })
                   : (
                     <text x={n.x} y={y + STELLA_HEADER_H + 22} textAnchor="middle" className="fill-slate-500" style={{ fontSize: 10 }}>
-                      No join keys
+                      No columns to join
                     </text>
                   )
               )}
@@ -1887,6 +2090,31 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
       </svg>
     </div>
   );
+
+  const overlay = large ? createPortal(
+    <div
+      className="fixed inset-0 z-[200] bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4 sm:p-8"
+      style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
+      onClick={() => setLarge(false)}
+    >
+      <div
+        className="w-full max-w-[1400px] h-[min(92vh,920px)] bg-slate-900 border border-cyan-400/25 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
+          <div className="text-sm font-bold text-white flex items-center gap-2">
+            <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
+            <span className="text-xs font-normal text-blue-300/60">Click a join to remove · drag a field onto another to add</span>
+          </div>
+          {toolbar}
+        </div>
+        <div className="flex-1 min-h-0 p-4 overflow-hidden">
+          {drawCanvas(true)}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  ) : null;
 
   return (
     <>
@@ -1899,8 +2127,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
             </div>
             <p className="text-xs text-blue-300/60 mt-1">
               {pairCount
-                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Click a table to see keys; drag to rearrange.`
-                : 'No confirmed connections yet. Expand for the map.'}
+                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Click a join to remove it; drag a field to add one.`
+                : 'No connections yet. Expand, then drag a field onto another file to link them.'}
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -1913,45 +2141,18 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
         </summary>
 
         <p className="text-xs text-blue-300/60 mt-3 mb-3">
-          Click a table to list join fields and draw key-to-key lines. Drag tables to tidy the layout.
+          Click a table to list columns. Drag a field onto a field in another table to create a join. Click a join line to remove it. Changes are saved to that file&apos;s captured context.
         </p>
         {drawCanvas(false)}
         {isolated.length > 0 && (
           <p className="text-xs text-blue-300/55 mt-3">
             {isolated.map((n) => n.name).join(', ')}
             {isolated.length === 1 ? ' has' : ' have'} no confirmed connection
-            {pending.length ? ' — finish intake to capture links, or confirm they should stay separate.' : '.'}
-          </p>
-        )}
-        {graph.nodes.length > 1 && graph.edges.length === 0 && isolated.length === graph.nodes.length && (
-          <p className="text-xs text-blue-300/55 mt-2">
-            Stella only draws a connection when you confirm it in intake. Unrelated files are expected to stay apart.
+            {pending.length ? ' — finish intake, or drag fields here to link them.' : '.'}
           </p>
         )}
       </details>
-
-      {large && (
-        <div
-          className="fixed inset-0 z-[80] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-8"
-          onClick={() => setLarge(false)}
-        >
-          <div
-            className="w-full max-w-[1400px] h-[min(90vh,900px)] bg-slate-900 border border-cyan-400/25 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
-              <div className="text-sm font-bold text-white flex items-center gap-2">
-                <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
-                <span className="text-xs font-normal text-blue-300/60">Drag tables · click to expand keys</span>
-              </div>
-              {toolbar}
-            </div>
-            <div className="flex-1 min-h-0 p-4 overflow-hidden">
-              {drawCanvas(true)}
-            </div>
-          </div>
-        </div>
-      )}
+      {overlay}
     </>
   );
 }
@@ -3091,7 +3292,7 @@ function stellaContextText(value) {
   return s ? s : '';
 }
 
-function StellaCapturedContextView({ ctx }) {
+function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
   if (!ctx || typeof ctx !== 'object') {
     return <p className="text-xs text-emerald-200/70">No interpretive notes stored yet.</p>;
   }
@@ -3108,34 +3309,81 @@ function StellaCapturedContextView({ ctx }) {
     return <p className="text-xs text-emerald-200/70">No interpretive notes stored yet.</p>;
   }
 
-  const Section = ({ title, children }) => (
+  const editable = typeof onPatch === 'function';
+  const Remove = ({ onClick, label }) => (
+    editable ? (
+      <button
+        type="button"
+        onClick={onClick}
+        className="p-0.5 rounded text-red-400/80 hover:text-red-300 hover:bg-red-500/15 shrink-0"
+        title={label || 'Remove this'}
+      >
+        <X className="w-3.5 h-3.5" />
+      </button>
+    ) : null
+  );
+
+  const Section = ({ title, onRemove, children }) => (
     <div>
-      <div className="text-[10px] font-bold uppercase tracking-wide text-emerald-400/80 mb-1">{title}</div>
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="text-[10px] font-bold uppercase tracking-wide text-emerald-400/80">{title}</div>
+        {onRemove ? <Remove onClick={onRemove} label={`Remove ${title.toLowerCase()}`} /> : null}
+      </div>
       <div className="text-xs text-emerald-50/95 leading-relaxed">{children}</div>
     </div>
   );
 
   return (
     <div className="px-4 pb-4 space-y-3">
-      {represents ? <Section title="What this file is">{represents}</Section> : null}
-      {period ? <Section title="Time period">{period}</Section> : null}
+      {editable ? (
+        <div className="flex items-center justify-between gap-2 pb-1">
+          <p className="text-[11px] text-emerald-200/60">Remove anything that is wrong. Stella will stop using it.</p>
+          <button
+            type="button"
+            onClick={() => onPatch(null)}
+            className="text-[11px] font-semibold text-red-300 hover:text-red-200"
+          >
+            Remove all
+          </button>
+        </div>
+      ) : null}
+      {represents ? (
+        <Section title="What this file is" onRemove={() => onPatch({ ...ctx, what_it_represents: '' })}>
+          {represents}
+        </Section>
+      ) : null}
+      {period ? (
+        <Section title="Time period" onRemove={() => onPatch({ ...ctx, time_period: '' })}>
+          {period}
+        </Section>
+      ) : null}
       {metricList.length ? (
-        <Section title="Key metrics">
+        <Section title="Columns / contents" onRemove={() => onPatch({ ...ctx, key_metrics: [] })}>
           <ul className="list-disc pl-4 space-y-0.5">
             {metricList.map((m) => <li key={m}>{m}</li>)}
           </ul>
         </Section>
       ) : null}
-      {notes ? <Section title="How to read it">{notes}</Section> : null}
+      {notes ? (
+        <Section title="How to read it" onRemove={() => onPatch({ ...ctx, interpretation_notes: '' })}>
+          {notes}
+        </Section>
+      ) : null}
       {maps.length ? (
         <Section title="Same product, different names">
           <ul className="space-y-1">
             {maps.map((m, i) => (
-              <li key={`${m.from}-${m.to}-${i}`}>
-                <span className="text-cyan-200 font-semibold">{m.from}</span>
-                <span className="text-emerald-300/50"> is </span>
-                <span className="text-cyan-200 font-semibold">{m.to}</span>
-                {m.note ? <span className="text-emerald-200/60"> — {m.note}</span> : null}
+              <li key={`${m.from}-${m.to}-${i}`} className="flex items-start justify-between gap-2">
+                <div>
+                  <span className="text-cyan-200 font-semibold">{m.from}</span>
+                  <span className="text-emerald-300/50"> is </span>
+                  <span className="text-cyan-200 font-semibold">{m.to}</span>
+                  {m.note ? <span className="text-emerald-200/60"> — {m.note}</span> : null}
+                </div>
+                <Remove
+                  onClick={() => onPatch({ ...ctx, name_maps: maps.filter((_, idx) => idx !== i) })}
+                  label="Remove this name map"
+                />
               </li>
             ))}
           </ul>
@@ -3150,10 +3398,19 @@ function StellaCapturedContextView({ ctx }) {
                 ? `${r.this_field} matches ${r.related_field}`
                 : '';
               return (
-                <li key={`${target}-${r.this_field}-${i}`}>
-                  <span className="text-cyan-200 font-semibold">{target}</span>
-                  {join ? <span className="text-emerald-200/80"> — {join}</span> : null}
-                  {r.note ? <div className="text-emerald-200/60 mt-0.5">{r.note}</div> : null}
+                <li key={`${target}-${r.this_field}-${i}`} className="flex items-start justify-between gap-2">
+                  <div>
+                    <span className="text-cyan-200 font-semibold">{target}</span>
+                    {join ? <span className="text-emerald-200/80"> — {join}</span> : null}
+                    {r.note ? <div className="text-emerald-200/60 mt-0.5">{r.note}</div> : null}
+                  </div>
+                  <Remove
+                    onClick={() => (onRemoveJoin ? onRemoveJoin(r) : onPatch({
+                      ...ctx,
+                      relationships: rels.filter((_, idx) => idx !== i),
+                    }))}
+                    label="Remove this join"
+                  />
                 </li>
               );
             })}
@@ -3164,9 +3421,15 @@ function StellaCapturedContextView({ ctx }) {
         <Section title="Intake answers">
           <ol className="space-y-2">
             {qa.map((p, i) => (
-              <li key={i} className="bg-slate-950/35 border border-emerald-400/15 rounded-lg px-3 py-2">
-                {p.question ? <div className="text-emerald-200/70 mb-1">{p.question}</div> : null}
-                {p.answer ? <div className="text-emerald-50">{p.answer}</div> : null}
+              <li key={i} className="bg-slate-950/35 border border-emerald-400/15 rounded-lg px-3 py-2 flex items-start justify-between gap-2">
+                <div>
+                  {p.question ? <div className="text-emerald-200/70 mb-1">{p.question}</div> : null}
+                  {p.answer ? <div className="text-emerald-50">{p.answer}</div> : null}
+                </div>
+                <Remove
+                  onClick={() => onPatch({ ...ctx, qa_pairs: qa.filter((_, idx) => idx !== i) })}
+                  label="Remove this answer"
+                />
               </li>
             ))}
           </ol>
@@ -7459,6 +7722,36 @@ ${stepInstruction}`;
     return nextCtx;
   };
 
+  const persistStellaFileContext = async (fileRec, nextCtx) => {
+    const ctx = stellaCapturedContextIsEmpty(nextCtx) ? null : nextCtx;
+    stellaPatchLocal(fileRec.id, { capturedContext: ctx, intakeComplete: !!ctx });
+    try {
+      if (fileRec.dbId) await stellaUpdateRegistry(fileRec.dbId, { context_qa: ctx });
+    } catch (e) {
+      setStellaMessages((prev) => [...prev, { role: 'system', content: `⚠️ Could not save context: ${e.message}` }]);
+    }
+  };
+
+  const handleStellaJoinChange = async ({ type, fromId, toId, thisField, relatedField }) => {
+    const files = stellaDataFilesRef.current || [];
+    const from = files.find((f) => f.id === fromId);
+    const to = files.find((f) => f.id === toId);
+    if (!from || !to || from.id === to.id) return;
+    const tf = String(thisField || '').trim();
+    const rf = String(relatedField || '').trim();
+    if (!tf || !rf) return;
+    const fromCtx = stellaMutateRelationships(from.capturedContext, to, tf, rf, type);
+    const toCtx = stellaMutateRelationships(to.capturedContext, from, rf, tf, type);
+    stellaPatchLocal(from.id, { capturedContext: fromCtx, intakeComplete: true });
+    stellaPatchLocal(to.id, { capturedContext: toCtx, intakeComplete: true });
+    try {
+      if (from.dbId) await stellaUpdateRegistry(from.dbId, { context_qa: fromCtx });
+      if (to.dbId) await stellaUpdateRegistry(to.dbId, { context_qa: toCtx });
+    } catch (e) {
+      setStellaMessages((prev) => [...prev, { role: 'system', content: `⚠️ Could not save join: ${e.message}` }]);
+    }
+  };
+
   const stellaSaveBusinessContext = async (next) => {
     const ctx = mergeStellaBusinessContext({ keyGoals: mergeStellaBusinessContext(next).keyGoals });
     setStellaBusinessContext(ctx);
@@ -7489,7 +7782,7 @@ ${stepInstruction}`;
     const system = withUserSettings(getStellaPrompts().contentSummary, { moduleContext: false, applyResponseLength: false });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
-    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions MUST be 3–5 meaning/intent questions (what it represents, time period, units/definitions, caveats). Never return an empty array. Do not ask about row counts, distinct values, or column names already listed.`;
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions must be structure-only (grain, ambiguous columns, join keys). Do not ask about metrics, KPIs, or interpretation. Skip questions already answered by the extract.`;
     const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1400);
     const parsed = extractJsonObject(raw);
     if (!(parsed && typeof parsed === 'object')) {
@@ -7521,7 +7814,7 @@ ${stepInstruction}`;
     const system = withUserSettings(fillTemplate(getStellaPrompts().intake, {
       kind: isDoc ? 'document' : 'dataset',
       kindSubject: isDoc ? 'document contains / represents' : 'data represents',
-      relationshipBullet: (!isDoc && otherTabular.length) ? '\n- whether/how it relates to other uploaded datasets (list every matching key in plain English for the user to confirm)' : '',
+      relationshipBullet: (!isDoc && otherTabular.length) ? '\n- joins: whether/how it shares keys with other uploaded datasets (list every matching column in plain English)' : '',
       dataProfile: (!isDoc && f.dataProfile) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${f.dataProfile}` : '',
       relationshipGuidance,
     }));
@@ -7845,6 +8138,7 @@ ${stepInstruction}`;
         files={files}
         activeId={activeStellaDataId}
         onSelectFile={setActiveStellaDataId}
+        onJoinChange={handleStellaJoinChange}
       />
     );
   };
@@ -7917,7 +8211,7 @@ ${stepInstruction}`;
       <div className="w-full lg:w-3/5">
         <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5">
           <div className="text-sm font-bold text-white mb-1">Intake assistant</div>
-          <div className="text-xs text-blue-300/60 mb-4">Answer a few questions so Stella can interpret your dataset correctly.</div>
+          <div className="text-xs text-blue-300/60 mb-4">Answer questions about this file&apos;s structure — columns, what they contain, and how it joins to other files. Not metrics or analysis.</div>
 
           {(() => {
             const f = stellaDataFiles.find(x => x.id === activeStellaDataId);
@@ -7962,7 +8256,32 @@ ${stepInstruction}`;
                     <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">
                       <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
                     </summary>
-                    <StellaCapturedContextView ctx={f.capturedContext} />
+                    <StellaCapturedContextView
+                      ctx={f.capturedContext}
+                      onPatch={(next) => persistStellaFileContext(f, next)}
+                      onRemoveJoin={(rel) => {
+                        const other = (stellaDataFilesRef.current || []).find((x) => (
+                          x.id !== f.id && (
+                            (rel.related_table && x.tableName === rel.related_table)
+                            || (rel.related_file && String(x.name || '').toLowerCase() === String(rel.related_file || '').toLowerCase())
+                          )
+                        ));
+                        if (!other) {
+                          persistStellaFileContext(f, {
+                            ...f.capturedContext,
+                            relationships: (f.capturedContext?.relationships || []).filter((r) => r !== rel),
+                          });
+                          return;
+                        }
+                        handleStellaJoinChange({
+                          type: 'remove',
+                          fromId: f.id,
+                          toId: other.id,
+                          thisField: rel.this_field,
+                          relatedField: rel.related_field,
+                        });
+                      }}
+                    />
                   </details>
                 )}
               </div>
