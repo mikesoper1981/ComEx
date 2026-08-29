@@ -1827,6 +1827,7 @@ function stellaJoinActionLabel(action) {
 function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, onRequestRemoveJoin, onUndoJoin, joinUndo, joinConfirmOpen }) {
   const graph = useMemo(() => stellaBuildFileLinkGraph(files || []), [files]);
   const fileById = useMemo(() => new Map((files || []).map((f) => [f.id, f])), [files]);
+  const nodeIds = graph.nodes.map((n) => n.id).join('|');
   const [large, setLarge] = useState(false);
   const [expanded, setExpanded] = useState(() => new Set());
   const [pos, setPos] = useState({});
