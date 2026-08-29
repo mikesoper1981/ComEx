@@ -1302,6 +1302,7 @@ function stellaColumnJoinMeta(col) {
 }
 
 const STELLA_MEASURE_JOIN_TOKENS = /^(value|amount|revenue|rev|sales|qty|quantity|count|actual|target|attainment|percent|pct|score|rate|volume|units|calls|cost|price|margin|total|sum)$/;
+const STELLA_DATE_JOIN_TOKENS = /^(date|dt|day|month|quarter|qtr|year|yr|week|wk|period|time)$/;
 const STELLA_JOIN_FAMILIES = [
   { id: 'territory', tokens: ['territory', 'territories', 'terr', 'geo', 'region', 'area', 'brick', 'postcode', 'zipcode', 'zip', 'alignment'] },
   { id: 'product', tokens: ['product', 'products', 'brand', 'sku', 'molecule', 'item'] },
@@ -1310,8 +1311,9 @@ const STELLA_JOIN_FAMILIES = [
 ];
 
 function stellaJoinFamily(col) {
-  const blobs = [col.name, col.original].map(stellaNormJoinToken).filter(Boolean);
+  const blobs = [col?.name, col?.original].map(stellaNormJoinToken).filter(Boolean);
   if (blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b))) return null;
+  if (blobs.some((b) => STELLA_DATE_JOIN_TOKENS.test(b))) return 'date';
   for (const fam of STELLA_JOIN_FAMILIES) {
     for (const t of fam.tokens) {
       const nt = stellaNormJoinToken(t);
@@ -1346,8 +1348,10 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
         else {
           const fa = stellaJoinFamily(a);
           const fb = stellaJoinFamily(b);
-          if (fa && fa === fb) { score = 55; reason = `shared ${fa} key`; }
-          else {
+          if (fa && fa === fb) {
+            score = 70;
+            reason = `shared ${fa} key`;
+          } else {
             const sa = stellaIdStem(a);
             const sb = stellaIdStem(b);
             const aId = /id$/.test(aN) || aN === 'id' || /id$/.test(aO);
@@ -1380,14 +1384,10 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
   const seen = new Set();
   const out = [];
   for (const row of ranked) {
-    const key = `${row.related_id}|${row.this_field}|${row.related_field}`;
-    const pairKey = `${row.related_id}`;
-    const alreadyForOther = out.filter((r) => r.related_id === row.related_id).length;
-    if (seen.has(key) || alreadyForOther >= 2) continue;
+    const key = `${row.related_id}|${String(row.this_field || '').toLowerCase()}|${String(row.related_field || '').toLowerCase()}`;
+    if (seen.has(key)) continue;
     seen.add(key);
-    seen.add(pairKey);
     out.push(row);
-    if (out.length >= 6) break;
   }
   return out;
 }
@@ -1399,7 +1399,7 @@ function stellaJoinQuestion(candidates, otherFiles) {
     const lines = candidates.map((c) => (
       `- **${c.related_file}**: this \`${c.this_field}\`${c.this_header && c.this_header !== c.this_field ? ` (“${c.this_header}”)` : ''} ↔ their \`${c.related_field}\`${c.related_header && c.related_header !== c.related_field ? ` (“${c.related_header}”)` : ''} (${c.reason})`
     ));
-    return `It looks like this file can be joined to other uploaded data:\n${lines.join('\n')}\nCan you confirm those links (or tell me the correct keys — e.g. territory, product, ID)? If they should not be joined, say so.`;
+    return `It looks like this file can be joined to other uploaded data on every key below:\n${lines.join('\n')}\nConfirm those links, add any I missed, or say they should not be joined.`;
   }
   const names = others.map((f) => `**${f.name}**`).join(', ');
   return `Does this file share an ID, territory, product, or other key with ${names} so Stella can join them in queries? If yes, which fields match? If not, say they are unrelated.`;
@@ -1520,6 +1520,7 @@ function stellaBuildFileLinkGraph(files) {
     tableName: f.tableName || '',
     intakeComplete: !!(f.intakeComplete || f.capturedContext),
     joinCount: 0,
+    partners: new Set(),
   }));
   const byTable = new Map();
   const byName = new Map();
@@ -1560,11 +1561,19 @@ function stellaBuildFileLinkGraph(files) {
       });
       const a = nodeById.get(f.id);
       const b = nodeById.get(otherId);
-      if (a) a.joinCount += 1;
-      if (b) b.joinCount += 1;
+      if (a) a.partners.add(otherId);
+      if (b) b.partners.add(f.id);
     }
   }
+  for (const n of nodes) n.joinCount = n.partners.size;
   return { nodes, edges };
+}
+
+function stellaPairJoinLabel(edges) {
+  const names = [...new Set((edges || []).map((e) => e.thisField).filter(Boolean))];
+  if (!names.length) return 'join';
+  if (names.length <= 4) return names.join(' · ');
+  return `${names.length} keys`;
 }
 
 function stellaFileGraphLayout(nodes, width, height) {
@@ -2738,6 +2747,12 @@ function stellaFilesApiDown(res) {
   return !res || res.status === 404 || res.status === 502 || res.status === 503;
 }
 
+function stellaSchemaStatusFromPayload(payload) {
+  const name = typeof payload?.schema === 'string' ? payload.schema.trim() : '';
+  if (!name) return null;
+  return { name, ready: payload.schemaReady !== false };
+}
+
 async function stellaListFilesViaSupabase(user, { isAdmin } = {}) {
   const userOrg = stellaOrgIdForUser(user);
   const orgCandidates = stellaOrgIdCandidates(user);
@@ -3187,6 +3202,7 @@ export default function CommercialExcellenceApp() {
   const [stellaInput, setStellaInput] = useState('');
   const [stellaIsLoading, setStellaIsLoading] = useState(false);
   const [stellaDataFiles, setStellaDataFiles] = useState([]); // { id, name, type, size, uploadedAt, storageBucket, storagePath, metaPath, summary, capturedContext, intakeMessages }
+  const [stellaTenantSchema, setStellaTenantSchema] = useState(null); // { name, ready }
   const [activeStellaDataId, setActiveStellaDataId] = useState(null);
   const [stellaIntakeInput, setStellaIntakeInput] = useState('');
   const [stellaBusinessContext, setStellaBusinessContext] = useState(() => mergeStellaBusinessContext({}));
@@ -3523,6 +3539,8 @@ export default function CommercialExcellenceApp() {
           });
           if (res.ok) {
             const payload = await res.json().catch(() => ({}));
+            const schemaStatus = stellaSchemaStatusFromPayload(payload);
+            if (schemaStatus) setStellaTenantSchema(schemaStatus);
             data = Array.isArray(payload.files) ? payload.files : [];
           } else if (stellaFilesApiDown(res)) {
             data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
@@ -6725,6 +6743,8 @@ ${stepInstruction}`;
         });
         if (res.ok) {
           const payload = await res.json().catch(() => ({}));
+          const schemaStatus = stellaSchemaStatusFromPayload(payload);
+          if (schemaStatus) setStellaTenantSchema(schemaStatus);
           if (Array.isArray(payload.files)) data = payload.files;
         } else if (stellaFilesApiDown(res)) {
           data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
@@ -6821,13 +6841,13 @@ ${stepInstruction}`;
       return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
     }).join('\n');
     const candidateBlob = candidates.length
-      ? `\n\nLIKELY JOINS (from shared IDs / territory / product / similar keys — confirm with the user, do not assume):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
+      ? `\n\nMATCHING JOIN KEYS (include every one that makes sense — dates, territory, product, rep, IDs — not a subset):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
       : '';
     const knownJoins = stellaFormatConfirmedJoins(otherTabular);
     const knownBlob = knownJoins
-      ? `\n\nALREADY CONFIRMED JOINS among previously loaded files (do not re-ask these; propose how THIS file connects):\n${knownJoins}`
+      ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Propose likely links in PLAIN ENGLISH (territory, product, shared ID) — never ask for SQL. If the user confirms, store exact SQL column names in context_qa.relationships. If they say the files are unrelated, store an empty array.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. List EVERY matching key in plain English (territory, date/month/quarter, product, rep, shared ID) — never pick only the "best" ones, never ask for SQL. Store all of those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -7037,7 +7057,7 @@ ${stepInstruction}`;
     const system = withUserSettings(fillTemplate(getStellaPrompts().intake, {
       kind: isDoc ? 'document' : 'dataset',
       kindSubject: isDoc ? 'document contains / represents' : 'data represents',
-      relationshipBullet: (!isDoc && otherTabular.length) ? '\n- whether/how it relates to other uploaded datasets (propose the link in plain English for the user to confirm)' : '',
+      relationshipBullet: (!isDoc && otherTabular.length) ? '\n- whether/how it relates to other uploaded datasets (list every matching key in plain English for the user to confirm)' : '',
       dataProfile: (!isDoc && f.dataProfile) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${f.dataProfile}` : '',
       relationshipGuidance,
     }));
@@ -7057,11 +7077,14 @@ ${stepInstruction}`;
     const lastUserText = [...(f.intakeMessages || [])].reverse().find(m => m.role === 'user')?.content || '';
     const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
     let rels = stellaNormalizeStoredRelationships(parsed?.context_qa?.relationships, f, otherTabular);
-    if (!rels.length && !declinedJoin && candidates.length && stellaLooksLikeJoinAccept(lastUserText)) {
-      rels = stellaNormalizeStoredRelationships(candidates, f, otherTabular);
+    if (!declinedJoin && candidates.length) {
+      rels = stellaDedupeRelationships([
+        ...rels,
+        ...stellaNormalizeStoredRelationships(candidates, f, otherTabular),
+      ]);
     }
     const priorRels = stellaNormalizeStoredRelationships(f.capturedContext?.relationships, f, otherTabular);
-    if (priorRels.length) rels = stellaDedupeRelationships([...priorRels, ...rels]);
+    if (priorRels.length && !declinedJoin) rels = stellaDedupeRelationships([...priorRels, ...rels]);
 
     const joinAskCount = (f.intakeMessages || []).filter(m => (
       m?.role === 'assistant' && /\b(join|joined|share an id, territory|correct keys|should not be joined)\b/i.test(String(m.content || ''))
@@ -7367,62 +7390,71 @@ ${stepInstruction}`;
     const isolated = graph.nodes.filter((n) => n.joinCount === 0);
     const pending = graph.nodes.filter((n) => !n.intakeComplete);
 
+    const pairCount = pairBuckets.size;
+
     return (
-      <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
-        <div className="flex items-start justify-between gap-3 mb-3">
+      <details className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4 group">
+        <summary className="cursor-pointer list-none flex items-start justify-between gap-3 [&::-webkit-details-marker]:hidden">
           <div>
             <div className="text-sm font-bold text-white flex items-center gap-2">
+              <ChevronRight className="w-4 h-4 text-cyan-300 transition-transform group-open:rotate-90" />
               <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
             </div>
             <p className="text-xs text-blue-300/60 mt-1">
-              Joins Stella stored from intake. One pair of files can have several links (different keys). Files with no confirmed join stay unconnected.
+              {pairCount
+                ? `${pairCount} connection${pairCount === 1 ? '' : 's'} between files. Expand to see keys.`
+                : 'No confirmed connections yet. Expand for the map.'}
             </p>
           </div>
           <div className="text-right shrink-0 text-[10px] text-blue-300/50">
-            <div>{graph.edges.length} join{graph.edges.length === 1 ? '' : 's'}</div>
+            <div>{pairCount} connection{pairCount === 1 ? '' : 's'}</div>
             <div>{isolated.length} unconnected</div>
           </div>
-        </div>
+        </summary>
+
+        <p className="text-xs text-blue-300/60 mt-3 mb-3">
+          One connection per pair of files. Every matching key (date, territory, product, and so on) is listed — not a preferred subset.
+        </p>
 
         <div className="bg-slate-950/40 border border-blue-400/15 rounded-xl overflow-hidden">
           <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto max-h-[320px]" role="img" aria-label="File connection map">
-            {Array.from(pairBuckets.values()).flatMap((bucket) => (
-              bucket.map((e, i) => {
-                const a = pos.get(e.from);
-                const b = pos.get(e.to);
-                if (!a || !b) return null;
-                const curve = stellaJoinCurvePath(a, b, i, bucket.length);
-                const active = activeStellaDataId === e.from || activeStellaDataId === e.to;
-                return (
-                  <g key={`${e.from}-${e.to}-${e.thisField}-${e.relatedField}`}>
-                    <path
-                      d={curve.d}
-                      fill="none"
-                      stroke={active ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.45)'}
-                      strokeWidth={active ? 2.4 : 1.6}
-                    />
-                    <rect
-                      x={curve.lx - 62}
-                      y={curve.ly - 10}
-                      width={124}
-                      height={20}
-                      rx={6}
-                      fill="rgba(15, 23, 42, 0.92)"
-                      stroke="rgba(34, 211, 238, 0.25)"
-                    />
-                    <text
-                      x={curve.lx}
-                      y={curve.ly + 4}
-                      textAnchor="middle"
-                      className="fill-cyan-200"
-                      style={{ fontSize: 10, fontWeight: 600 }}
-                    >
-                      {e.label.length > 28 ? `${e.label.slice(0, 26)}…` : e.label}
-                    </text>
-                  </g>
-                );
-              })
-            ))}
+            {Array.from(pairBuckets.values()).map((bucket) => {
+              const e = bucket[0];
+              const a = pos.get(e.from);
+              const b = pos.get(e.to);
+              if (!a || !b) return null;
+              const curve = stellaJoinCurvePath(a, b, 0, 1);
+              const active = activeStellaDataId === e.from || activeStellaDataId === e.to;
+              const label = stellaPairJoinLabel(bucket);
+              return (
+                <g key={[e.from, e.to].sort().join('|')}>
+                  <path
+                    d={curve.d}
+                    fill="none"
+                    stroke={active ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.45)'}
+                    strokeWidth={active ? 2.4 : 1.6}
+                  />
+                  <rect
+                    x={curve.lx - 62}
+                    y={curve.ly - 10}
+                    width={124}
+                    height={20}
+                    rx={6}
+                    fill="rgba(15, 23, 42, 0.92)"
+                    stroke="rgba(34, 211, 238, 0.25)"
+                  />
+                  <text
+                    x={curve.lx}
+                    y={curve.ly + 4}
+                    textAnchor="middle"
+                    className="fill-cyan-200"
+                    style={{ fontSize: 10, fontWeight: 600 }}
+                  >
+                    {label.length > 28 ? `${label.slice(0, 26)}…` : label}
+                  </text>
+                </g>
+              );
+            })}
             {laid.map((n) => {
               const selected = activeStellaDataId === n.id;
               const linked = n.joinCount > 0;
@@ -7434,9 +7466,9 @@ ${stepInstruction}`;
                   tabIndex={0}
                   aria-label={`Select ${n.name}`}
                   onClick={() => setActiveStellaDataId(n.id)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
+                  onKeyDown={(ev) => {
+                    if (ev.key === 'Enter' || ev.key === ' ') {
+                      ev.preventDefault();
                       setActiveStellaDataId(n.id);
                     }
                   }}
@@ -7471,7 +7503,7 @@ ${stepInstruction}`;
                     {!n.intakeComplete
                       ? 'Intake pending'
                       : linked
-                        ? `${n.joinCount} join${n.joinCount === 1 ? '' : 's'}`
+                        ? 'Connected'
                         : 'Not joined'}
                   </text>
                 </g>
@@ -7481,29 +7513,43 @@ ${stepInstruction}`;
         </div>
 
         {graph.edges.length > 0 && (
-          <div className="mt-3 space-y-1.5">
-            {graph.edges.map((e) => (
-              <button
-                key={`${e.from}-${e.to}-${e.thisField}-${e.relatedField}`}
-                type="button"
-                onClick={() => setActiveStellaDataId(e.from)}
-                className="w-full text-left text-xs bg-slate-900/40 border border-blue-400/15 hover:border-cyan-400/40 rounded-lg px-3 py-2 text-blue-100/90"
-              >
-                <span className="text-cyan-200 font-semibold">{e.fromName}</span>
-                <span className="text-blue-400/70">.{e.thisField}</span>
-                <span className="text-blue-300/50"> = </span>
-                <span className="text-cyan-200 font-semibold">{e.toName}</span>
-                <span className="text-blue-400/70">.{e.relatedField}</span>
-                {e.note ? <span className="block text-blue-300/55 mt-0.5">{e.note}</span> : null}
-              </button>
-            ))}
+          <div className="mt-3 space-y-2">
+            {Array.from(pairBuckets.values()).map((bucket) => {
+              const e = bucket[0];
+              return (
+                <div
+                  key={[e.from, e.to].sort().join('|')}
+                  className="text-xs bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2 text-blue-100/90"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setActiveStellaDataId(e.from)}
+                    className="text-left w-full"
+                  >
+                    <span className="text-cyan-200 font-semibold">{e.fromName}</span>
+                    <span className="text-blue-300/50"> ↔ </span>
+                    <span className="text-cyan-200 font-semibold">{e.toName}</span>
+                  </button>
+                  <ul className="mt-1.5 space-y-0.5 text-blue-300/80">
+                    {bucket.map((k) => (
+                      <li key={`${k.thisField}-${k.relatedField}`}>
+                        <span className="text-blue-400/70">{k.thisField}</span>
+                        <span className="text-blue-300/50"> = </span>
+                        <span className="text-blue-400/70">{k.relatedField}</span>
+                        {k.note ? <span className="text-blue-300/55"> — {k.note}</span> : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              );
+            })}
           </div>
         )}
 
         {isolated.length > 0 && (
           <p className="text-xs text-blue-300/55 mt-3">
             {isolated.map((n) => n.name).join(', ')}
-            {isolated.length === 1 ? ' has' : ' have'} no confirmed join
+            {isolated.length === 1 ? ' has' : ' have'} no confirmed connection
             {pending.length ? ' — finish intake to capture links, or confirm they should stay separate.' : '.'}
           </p>
         )}
@@ -7512,7 +7558,7 @@ ${stepInstruction}`;
             Stella only draws a connection when you confirm it in intake. Unrelated files are expected to stay apart.
           </p>
         )}
-      </div>
+      </details>
     );
   };
 
@@ -7530,6 +7576,13 @@ ${stepInstruction}`;
             <div>
               <div className="text-sm font-bold text-white">Files</div>
               <div className="text-xs text-blue-300/60 mt-1">Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions. Files are stored for your account only.</div>
+              {stellaTenantSchema?.name ? (
+                <div className={`text-[11px] mt-1.5 ${stellaTenantSchema.ready ? 'text-blue-300/50' : 'text-amber-300/85'}`}>
+                  {stellaTenantSchema.ready
+                    ? `Company schema ${stellaTenantSchema.name} — pick that schema in the Table Editor, not public.`
+                    : `Schema ${stellaTenantSchema.name} is not on the database yet. Deleting files will not create it.`}
+                </div>
+              ) : null}
             </div>
             <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
               <Upload className="w-4 h-4" /> Upload
@@ -7560,7 +7613,7 @@ ${stepInstruction}`;
                   )}
                   {f.capturedContext && !f.processing && (joinCountById.get(f.id) || 0) > 0 && (
                     <span className="px-2 py-1 bg-cyan-500/15 text-cyan-200 text-xs rounded border border-cyan-400/25">
-                      {joinCountById.get(f.id)} join{joinCountById.get(f.id) === 1 ? '' : 's'}
+                      Connected
                     </span>
                   )}
                   {f.capturedContext && !f.processing && !(joinCountById.get(f.id) || 0) && (

@@ -123,7 +123,7 @@ module.exports = async function handler(req, res) {
   const slug = companySlug(resolveUserCompany(user));
   const userOrg = orgIdForUser(user);
   const schema = companyPgSchema(resolveUserCompany(user));
-  await ensureCompanyPgSchema(schema);
+  const schemaReady = await ensureCompanyPgSchema(schema);
 
   const action = String(req.method === 'GET' ? 'list' : (parseBody(req).body?.action || 'list')).trim().toLowerCase();
   const parsed = req.method === 'GET' ? { body: {} } : parseBody(req);
@@ -166,7 +166,7 @@ module.exports = async function handler(req, res) {
         );
         rows = rows.map((row) => ({ ...row, org_id: userOrg, company_slug: slug }));
       }
-      return res.status(200).json({ files: rows, schema, company: slug });
+      return res.status(200).json({ files: rows, schema, company: slug, schemaReady: !!schemaReady });
     }
 
     if (req.method !== 'POST') {

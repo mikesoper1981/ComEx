@@ -80,8 +80,13 @@ async function supabaseRpc(fn, args) {
       },
       body: JSON.stringify(args || {}),
     });
+    const text = await res.text().catch(() => '');
+    if (!res.ok) {
+      console.warn('Stella RPC failed', fn, res.status, String(text || '').slice(0, 300));
+    }
     return { ok: res.ok, status: res.status };
-  } catch {
+  } catch (err) {
+    console.warn('Stella RPC error', fn, err?.message || err);
     return { ok: false, status: 0 };
   }
 }

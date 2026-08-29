@@ -19,12 +19,22 @@ begin
   end if;
   execute format('create schema if not exists %I', p_schema);
   begin
-    execute format('revoke all on schema %I from public, anon, authenticated', p_schema);
+    execute format('grant usage, create on schema %I to postgres, service_role', p_schema);
   exception when others then
     null;
   end;
   begin
-    execute format('grant usage on schema %I to service_role', p_schema);
+    execute format('grant usage, create on schema %I to supabase_admin', p_schema);
+  exception when others then
+    null;
+  end;
+  begin
+    execute format('grant usage, create on schema %I to dashboard_user', p_schema);
+  exception when others then
+    null;
+  end;
+  begin
+    execute format('revoke all on schema %I from public, anon, authenticated', p_schema);
   exception when others then
     null;
   end;

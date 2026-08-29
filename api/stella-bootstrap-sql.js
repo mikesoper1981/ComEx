@@ -97,12 +97,22 @@ begin
   execute format('create schema if not exists %I', p_schema);
   execute format('comment on schema %I is %L', p_schema, 'ComEx company tenant');
   begin
-    execute format('revoke all on schema %I from public, anon, authenticated', p_schema);
+    execute format('grant usage, create on schema %I to postgres, service_role', p_schema);
   exception when others then
     null;
   end;
   begin
-    execute format('grant usage on schema %I to service_role', p_schema);
+    execute format('grant usage, create on schema %I to supabase_admin', p_schema);
+  exception when others then
+    null;
+  end;
+  begin
+    execute format('grant usage, create on schema %I to dashboard_user', p_schema);
+  exception when others then
+    null;
+  end;
+  begin
+    execute format('revoke all on schema %I from public, anon, authenticated', p_schema);
   exception when others then
     null;
   end;
@@ -264,6 +274,28 @@ begin
       coalesce(company_slug, '') <> ''
       and company_slug = public.stella_request_company()
     );
+
+  for r in
+    select nspname as schema_name
+    from pg_namespace
+    where nspname ~ '^c_[a-z0-9_]+$'
+  loop
+    begin
+      execute format('grant usage, create on schema %I to postgres, service_role', r.schema_name);
+    exception when others then
+      null;
+    end;
+    begin
+      execute format('grant usage, create on schema %I to supabase_admin', r.schema_name);
+    exception when others then
+      null;
+    end;
+    begin
+      execute format('grant usage, create on schema %I to dashboard_user', r.schema_name);
+    exception when others then
+      null;
+    end;
+  end loop;
 
   for r in
     select n.nspname as schema_name, c.relname as table_name
