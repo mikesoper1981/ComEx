@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ChevronRight,
   DollarSign,
@@ -61,12 +61,27 @@ const ACCOUNT_FIELDS = [
   ['customContext', 'Additional context'],
 ];
 
-const CANVAS = { w: 1100, h: 720, cx: 550, cy: 355, moduleR: 228, leafR: 124 };
+const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 245, leafR: 138 };
 
 function clip(text, max = 140) {
   const t = String(text || '').replace(/\s+/g, ' ').trim();
   if (!t) return '';
   return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+function isPptxLike(file) {
+  const name = String(file?.name || '').toLowerCase();
+  const type = String(file?.kind || file?.fileType || file?.type || '').toLowerCase();
+  return /\.pptx?$/.test(name) || /ppt|presentation/.test(type);
+}
+
+function contextFileKindLabel(file) {
+  if (isPptxLike(file)) return 'PowerPoint / strategy';
+  const name = String(file?.name || '').toLowerCase();
+  const type = String(file?.kind || file?.fileType || '').toLowerCase();
+  if (/\.pdf$/.test(name) || type.includes('pdf')) return 'PDF';
+  if (/\.(xlsx?|csv)$/.test(name) || /excel|spreadsheet|csv/.test(type)) return 'Spreadsheet';
+  return file?.fileType || 'Context file';
 }
 
 function filledAccountFields(settings) {
@@ -78,16 +93,16 @@ function filledAccountFields(settings) {
 function contextFileSummary(file) {
   const blocks = listModuleContextBlocks(file) || [];
   const highlights = blocks
-    .slice(0, 4)
     .map((b) => {
-      if (b.qa) return clip(b.answer || b.question, 90);
-      return clip(b.value, 90);
+      if (b.qa) return clip(b.answer || b.question, 160);
+      return clip(b.value, 160);
     })
     .filter(Boolean);
   return {
     id: file.id,
     name: file.name || 'File',
     kind: file.fileType || 'file',
+    kindLabel: contextFileKindLabel(file),
     intakeComplete: !!file.intakeComplete,
     processing: !!file.processing,
     highlights,
@@ -100,18 +115,30 @@ function stellaFileSummary(file) {
   const maps = Array.isArray(ctx.name_maps) ? ctx.name_maps.filter((m) => m?.from && m?.to) : [];
   const qa = Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs.filter((p) => p && (p.question || p.answer)) : [];
   const rels = Array.isArray(ctx.relationships) ? ctx.relationships.filter((r) => r && (r.this_field || r.related_file || r.related_table)) : [];
+  const pptx = isPptxLike(file);
+  const highlights = [
+    clip(file?.summary, 160),
+    clip(ctx.what_it_represents, 160),
+    clip(ctx.interpretation_notes, 160),
+    clip(file?.extractedText || file?.structuredExtract || file?.visionExtract, 160),
+    ...(Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).map((m) => clip(m, 120)),
+    ...qa.map((p) => clip(p.answer || p.question, 160)),
+  ].filter(Boolean);
   return {
     id: file.id,
     name: file.name || 'File',
     tableName: file.tableName || '',
     rowCount: file.rowCount,
     intakeComplete: !!(file.intakeComplete || file.capturedContext),
-    represents: clip(ctx.what_it_represents, 120),
+    represents: clip(ctx.what_it_represents, 160),
     period: clip(ctx.time_period, 80),
-    metrics: (Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).map((m) => String(m || '').trim()).filter(Boolean).slice(0, 4),
-    maps: maps.slice(0, 4).map((m) => `${m.from} → ${m.to}`),
+    metrics: (Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).map((m) => String(m || '').trim()).filter(Boolean),
+    maps: maps.map((m) => `${m.from} → ${m.to}`),
     qaCount: qa.length,
     joinCount: rels.length,
+    isPptx: pptx,
+    kindLabel: pptx ? 'PowerPoint / strategy' : (file.tableName ? 'Data table' : 'Document'),
+    highlights,
   };
 }
 
@@ -211,10 +238,10 @@ function layoutStar(model) {
     kind: 'hub',
     x: cx,
     y: cy,
-    w: 176,
-    h: 86,
-    title: 'Account',
-    subtitle: `${model.accountFields.length} setting${model.accountFields.length === 1 ? '' : 's'} · ${model.generalMemory.length} fact${model.generalMemory.length === 1 ? '' : 's'}`,
+    w: 248,
+    h: 104,
+    title: model.hubTitle || 'You',
+    subtitle: model.hubSubtitle || `${model.accountFields.length} setting${model.accountFields.length === 1 ? '' : 's'} · ${model.generalMemory.length} fact${model.generalMemory.length === 1 ? '' : 's'}`,
   }));
 
   const hubSatellites = [];
@@ -268,7 +295,7 @@ function layoutStar(model) {
       leaves.push({
         id: `${mod.id}-pptx`,
         kind: 'leaf',
-        title: 'PPT template',
+        title: 'PPT export template',
         subtitle: clip(mod.pptx.fileName || 'Custom', 22),
         w: 128,
         h: 44,
@@ -284,48 +311,28 @@ function layoutStar(model) {
         h: 44,
       });
     }
-    mod.files.slice(0, 4).forEach((f) => {
+    mod.files.forEach((f) => {
       leaves.push({
         id: `ctx-${f.id}`,
-        kind: 'file',
+        kind: f.kindLabel?.startsWith('PowerPoint') ? 'pptx' : 'file',
         fileId: f.id,
-        title: clip(f.name, 20),
-        subtitle: 'Context file',
-        w: 128,
-        h: 44,
+        title: clip(f.name, 22),
+        subtitle: f.kindLabel || 'Context file',
+        w: 136,
+        h: 48,
       });
     });
-    if (mod.files.length > 4) {
-      leaves.push({
-        id: `${mod.id}-more-ctx`,
-        kind: 'leaf',
-        title: `+${mod.files.length - 4} more files`,
-        subtitle: 'Context',
-        w: 128,
-        h: 44,
-      });
-    }
-    mod.stellaFiles.slice(0, 5).forEach((f) => {
+    mod.stellaFiles.forEach((f) => {
       leaves.push({
         id: `data-${f.id}`,
-        kind: 'data',
+        kind: f.isPptx ? 'pptx' : 'data',
         fileId: f.id,
         title: clip(f.name, 20),
-        subtitle: f.tableName ? 'Data table' : 'Document',
+        subtitle: f.kindLabel || (f.tableName ? 'Data table' : 'Document'),
         w: 128,
         h: 44,
       });
     });
-    if (mod.stellaFiles.length > 5) {
-      leaves.push({
-        id: `${mod.id}-more-data`,
-        kind: 'leaf',
-        title: `+${mod.stellaFiles.length - 5} more`,
-        subtitle: 'Data files',
-        w: 128,
-        h: 44,
-      });
-    }
     if (mod.memory.length) {
       leaves.push({
         id: `${mod.id}-mem`,
@@ -347,9 +354,10 @@ function layoutStar(model) {
       });
     }
 
-    const spread = Math.min(1.15, 0.28 * Math.max(leaves.length, 1));
+    const spread = Math.min(1.45, 0.26 * Math.max(leaves.length, 1));
+    const dist = leafR + Math.min(36, Math.max(0, leaves.length - 4) * 6);
     fanAngles(mod.angle, leaves.length, spread).forEach((ang, i) => {
-      const lp = polar(p.x, p.y, leafR, ang);
+      const lp = polar(p.x, p.y, dist, ang);
       const leaf = clampNode({ ...leaves[i], x: lp.x, y: lp.y, moduleId: mod.id });
       nodes.push(leaf);
       edges.push({ from: mod.id, to: leaf.id, kind: 'leaf' });
@@ -375,7 +383,7 @@ function layoutStar(model) {
 function usedWhenChatting(model, moduleId) {
   const mod = model.modules.find((m) => m.id === moduleId);
   if (!mod) return [];
-  const parts = ['Account settings (company, role, definitions)'];
+  const parts = [`${model.hubTitle}${model.hubSubtitle ? ` · ${model.hubSubtitle}` : ''} (company, role, definitions)`];
   if (model.generalMemory.length) parts.push(`${model.generalMemory.length} general remembered fact${model.generalMemory.length === 1 ? '' : 's'}`);
   if (mod.memory.length) parts.push(`${mod.memory.length} ${mod.short} remembered fact${mod.memory.length === 1 ? '' : 's'}`);
   if (mod.files.length) parts.push(`${mod.files.length} context file${mod.files.length === 1 ? '' : 's'} in this module`);
@@ -395,9 +403,21 @@ function usedWhenChatting(model, moduleId) {
   return parts;
 }
 
-export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenPane }) {
+export default function ContextMap({
+  userSettings,
+  stellaDataFiles = [],
+  userName = '',
+  companyName = '',
+  layout = null,
+  onLayoutChange,
+  onOpenPane,
+}) {
   const [selected, setSelected] = useState('account');
   const [openFileId, setOpenFileId] = useState('');
+  const [livePos, setLivePos] = useState({});
+  const dragRef = useRef(null);
+  const skipClickRef = useRef(false);
+  const canvasRef = useRef(null);
 
   const model = useMemo(() => {
     const connections = Array.isArray(userSettings?.moduleConnections) ? userSettings.moduleConnections : [];
@@ -405,6 +425,8 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
     const generalMemory = memoryFor(userSettings, '');
     const stellaFiles = (stellaDataFiles || []).filter((f) => f && !f.processing);
     const joins = stellaJoinEdges(stellaFiles);
+    const name = String(userName || '').trim() || 'You';
+    const company = String(companyName || '').trim();
     const modules = MODULES.map((mod) => {
       const files = (userSettings?.moduleContext?.[mod.id]?.files || []).filter((f) => f && !f.processing);
       const linked = connectedModuleIds(connections, mod.id);
@@ -419,12 +441,122 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
         joins: mod.id === 'stella' ? joins : [],
       };
     });
-    return { connections, accountFields, generalMemory, modules };
-  }, [userSettings, stellaDataFiles]);
+    return {
+      connections,
+      accountFields,
+      generalMemory,
+      modules,
+      hubTitle: name,
+      hubSubtitle: company || 'No company set',
+    };
+  }, [userSettings, stellaDataFiles, userName, companyName]);
 
-  const graph = useMemo(() => layoutStar(model), [model]);
+  const graph = useMemo(() => {
+    const laid = layoutStar(model);
+    const saved = layout?.nodes && typeof layout.nodes === 'object' ? layout.nodes : {};
+    const nodes = laid.nodes.map((n) => {
+      const s = saved[n.id];
+      const live = livePos[n.id];
+      let next = { ...n };
+      if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
+        next.x = s.x * CANVAS.w;
+        next.y = s.y * CANVAS.h;
+        if (s.w) next.w = Math.max(88, s.w * CANVAS.w);
+        if (s.h) next.h = Math.max(40, s.h * CANVAS.h);
+      }
+      if (live) next = { ...next, ...live };
+      return clampNode(next);
+    });
+    return { nodes, edges: laid.edges };
+  }, [model, layout, livePos]);
+
   const byId = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n])), [graph]);
   const hub = byId.get('account') || { x: CANVAS.cx, y: CANVAS.cy };
+
+  const persistLayout = (nodes) => {
+    if (!onLayoutChange) return;
+    const next = { nodes: {} };
+    for (const n of nodes) {
+      next.nodes[n.id] = {
+        x: n.x / CANVAS.w,
+        y: n.y / CANVAS.h,
+        w: n.w / CANVAS.w,
+        h: n.h / CANVAS.h,
+      };
+    }
+    onLayoutChange(next);
+  };
+
+  const clientToCanvas = (clientX, clientY) => {
+    const el = canvasRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    return {
+      x: ((clientX - r.left) / r.width) * CANVAS.w,
+      y: ((clientY - r.top) / r.height) * CANVAS.h,
+    };
+  };
+
+  const onNodePointerDown = (ev, node, mode = 'move') => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const loc = clientToCanvas(ev.clientX, ev.clientY);
+    dragRef.current = {
+      id: node.id,
+      mode,
+      moved: false,
+      startClientX: ev.clientX,
+      startClientY: ev.clientY,
+      origin: { x: node.x, y: node.y, w: node.w, h: node.h },
+      grab: loc,
+    };
+    try { ev.currentTarget.setPointerCapture?.(ev.pointerId); } catch { /* ignore */ }
+    selectNode(node);
+  };
+
+  useEffect(() => {
+    const onMove = (ev) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      const dist = Math.hypot(ev.clientX - drag.startClientX, ev.clientY - drag.startClientY);
+      if (dist > 4) drag.moved = true;
+      const loc = clientToCanvas(ev.clientX, ev.clientY);
+      if (!loc || !drag.grab) return;
+      if (drag.mode === 'resize') {
+        const w = Math.max(88, drag.origin.w + (loc.x - drag.grab.x));
+        const h = Math.max(40, drag.origin.h + (loc.y - drag.grab.y));
+        setLivePos((prev) => ({ ...prev, [drag.id]: { ...(prev[drag.id] || {}), w, h } }));
+        return;
+      }
+      const x = drag.origin.x + (loc.x - drag.grab.x);
+      const y = drag.origin.y + (loc.y - drag.grab.y);
+      setLivePos((prev) => ({ ...prev, [drag.id]: { ...(prev[drag.id] || {}), x, y } }));
+    };
+    const onUp = () => {
+      const drag = dragRef.current;
+      dragRef.current = null;
+      if (!drag?.moved) return;
+      skipClickRef.current = true;
+      setLivePos((current) => {
+        const merged = graph.nodes.map((n) => (current[n.id] ? clampNode({ ...n, ...current[n.id] }) : n));
+        persistLayout(merged);
+        return {};
+      });
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, [graph.nodes]);
+
+  const resetLayout = () => {
+    setLivePos({});
+    onLayoutChange?.({ nodes: {} });
+  };
 
   const selectedModule = model.modules.find((m) => m.id === selected) || null;
   const selectedIsAccount = selected === 'account' || selected === 'account-settings' || selected === 'account-memory';
@@ -449,13 +581,13 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
           <Network className="w-4 h-4 text-cyan-400" /> Context map
         </h3>
         <p className="text-xs text-blue-300/70 leading-relaxed">
-          Star schema of this account: the centre is always available to every tool. Modules sit around it with their
-          own files and memory. A cyan link between modules means they share context; otherwise they stay separate.
+          Star schema of captured context for this login. Drag any card to rearrange, and pull the corner to resize.
+          PowerPoint strategy decks sit on the module they were uploaded to. Cyan links mean modules share context.
         </p>
       </div>
 
       <div className="bg-slate-950/50 border border-blue-400/20 rounded-xl overflow-hidden">
-        <div className="relative w-full" style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}>
+        <div ref={canvasRef} className="relative w-full" style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}>
           <svg
             viewBox={`0 0 ${CANVAS.w} ${CANVAS.h}`}
             className="absolute inset-0 w-full h-full"
@@ -523,14 +655,23 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
               <button
                 key={node.id}
                 type="button"
-                onClick={() => selectNode(node)}
-                className={`absolute -translate-x-1/2 -translate-y-1/2 text-left rounded-xl border shadow-lg transition-all ${
+                onPointerDown={(ev) => onNodePointerDown(ev, node, 'move')}
+                onClick={() => {
+                  if (skipClickRef.current) {
+                    skipClickRef.current = false;
+                    return;
+                  }
+                  selectNode(node);
+                }}
+                className={`absolute -translate-x-1/2 -translate-y-1/2 text-left rounded-xl border shadow-lg transition-shadow cursor-grab active:cursor-grabbing touch-none ${
                   node.kind === 'hub'
                     ? 'bg-violet-600/90 border-violet-200/40 text-white'
                     : node.kind === 'module'
                       ? 'bg-slate-900/95 border-white/20 text-white'
                       : node.kind === 'data'
                         ? 'bg-slate-900/90 border-cyan-400/35 text-slate-100'
+                        : node.kind === 'pptx'
+                          ? 'bg-slate-900/90 border-amber-400/40 text-slate-100'
                         : node.kind === 'memory'
                           ? 'bg-slate-900/90 border-violet-400/35 text-slate-100'
                           : node.kind === 'empty'
@@ -548,7 +689,7 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
                   <span className={`mt-0.5 flex-shrink-0 rounded-md p-1 ${
                     node.kind === 'hub' ? 'bg-white/15' : (mod?.iconBg || 'bg-slate-700/80')
                   }`}>
-                    {node.kind === 'file' || node.kind === 'data' ? (
+                    {node.kind === 'file' || node.kind === 'data' || node.kind === 'pptx' ? (
                       <FileText className="w-3 h-3 text-white" />
                     ) : node.kind === 'memory' ? (
                       <Network className="w-3 h-3 text-white" />
@@ -563,15 +704,22 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
                     ) : null}
                   </span>
                 </span>
+                <span
+                  role="presentation"
+                  onPointerDown={(ev) => onNodePointerDown(ev, node, 'resize')}
+                  className="absolute right-0.5 bottom-0.5 w-3 h-3 cursor-se-resize rounded-sm border-r-2 border-b-2 border-white/50 hover:border-white"
+                  title="Resize"
+                />
               </button>
             );
           })}
         </div>
         <div className="flex flex-wrap gap-x-4 gap-y-1 px-4 py-2.5 border-t border-blue-400/15 text-[10px] text-blue-200/70 bg-slate-900/40">
-          <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always available from account</span>
+          <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always available from this login</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-cyan-400 rounded" /> Modules sharing context</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Stored file join</span>
-          <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-slate-400" /> Belongs to that module</span>
+          <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
+          <button type="button" onClick={resetLayout} className="ml-auto text-[10px] font-semibold text-cyan-200 hover:text-white">Reset layout</button>
         </div>
       </div>
 
@@ -580,8 +728,8 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
           <div className="space-y-4">
             <div className="flex items-start justify-between gap-3 flex-wrap">
               <div>
-                <div className="text-sm font-bold text-white">Account — the centre of the schema</div>
-                <p className="text-[11px] text-blue-300/55 mt-1">Used in every module. No linking required.</p>
+                <div className="text-sm font-bold text-white">{model.hubTitle}{model.hubSubtitle ? ` · ${model.hubSubtitle}` : ''}</div>
+                <p className="text-[11px] text-blue-300/55 mt-1">The centre of the schema — used in every module. No linking required.</p>
               </div>
               <button
                 type="button"
@@ -607,7 +755,7 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
               <div className="text-xs font-semibold text-blue-200 mb-2">Remembered from chats (not tied to a module)</div>
               {model.generalMemory.length ? (
                 <ul className="space-y-1.5">
-                  {model.generalMemory.slice(0, 8).map((m) => (
+                  {model.generalMemory.map((m) => (
                     <li key={m.id} className="text-xs text-slate-200 bg-slate-900/40 border border-blue-400/10 rounded-lg px-3 py-2">{m.text}</li>
                   ))}
                 </ul>
@@ -666,7 +814,7 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
 
             {selectedModule.stellaFiles.length > 0 && (
               <div>
-                <div className="text-xs font-semibold text-blue-200 mb-2">Data files (intake stays on the file)</div>
+                <div className="text-xs font-semibold text-blue-200 mb-2">Data & strategy files (intake stays on the file)</div>
                 <div className="space-y-2">
                   {selectedModule.stellaFiles.map((f) => {
                     const open = openFileId === f.id;
@@ -678,9 +826,10 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
                           className="w-full text-left px-3 py-2 flex items-start justify-between gap-2"
                         >
                           <span className="min-w-0">
-                            <span className="block text-xs font-semibold text-white truncate">{f.name}</span>
+                            <span className={`block text-xs font-semibold truncate ${f.isPptx ? 'text-amber-100' : 'text-white'}`}>{f.name}</span>
                             <span className="block text-[10px] text-blue-300/50 mt-0.5">
-                              {f.tableName ? `Table ${f.tableName}` : 'Document'}
+                              {f.kindLabel || (f.tableName ? `Table ${f.tableName}` : 'Document')}
+                              {f.tableName && !f.isPptx ? ` · ${f.tableName}` : ''}
                               {f.rowCount != null ? ` · ${f.rowCount} rows` : ''}
                               {f.intakeComplete ? ' · Intake captured' : ' · Intake incomplete'}
                             </span>
@@ -694,7 +843,10 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
                             {f.metrics.length ? <div><span className="text-blue-300/60">Metrics: </span>{f.metrics.join(', ')}</div> : null}
                             {f.maps.length ? <div><span className="text-blue-300/60">Name maps: </span>{f.maps.join('; ')}</div> : null}
                             {f.qaCount ? <div>{f.qaCount} intake answer{f.qaCount === 1 ? '' : 's'} stored on this file</div> : null}
-                            {!f.represents && !f.period && !f.metrics.length && !f.maps.length && !f.qaCount && (
+                            {f.highlights.filter((h) => h !== f.represents).map((h, i) => (
+                              <div key={`${f.id}-h-${i}`}>• {h}</div>
+                            ))}
+                            {!f.represents && !f.period && !f.metrics.length && !f.maps.length && !f.qaCount && !f.highlights.length && (
                               <div className="text-blue-300/45">No interpretive notes yet — finish intake on Connections.</div>
                             )}
                           </div>
@@ -735,10 +887,10 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
                         >
                           <span className="min-w-0">
                             <span className="block text-xs font-semibold text-white truncate flex items-center gap-1.5">
-                              <FileText className="w-3.5 h-3.5 text-cyan-400 flex-shrink-0" /> {f.name}
+                              <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${f.kindLabel?.startsWith('PowerPoint') ? 'text-amber-300' : 'text-cyan-400'}`} /> {f.name}
                             </span>
                             <span className="block text-[10px] text-blue-300/50 mt-0.5">
-                              {f.kind} · {f.blockCount ? `${f.blockCount} captured field${f.blockCount === 1 ? '' : 's'}` : 'No extracted fields yet'}
+                              {f.kind} · {f.kindLabel || 'Context'} · {f.blockCount ? `${f.blockCount} captured field${f.blockCount === 1 ? '' : 's'}` : 'No extracted fields yet'}
                             </span>
                           </span>
                           <ChevronRight className={`w-4 h-4 text-blue-300/50 flex-shrink-0 mt-0.5 transition-transform ${open ? 'rotate-90' : ''}`} />
@@ -761,7 +913,7 @@ export default function ContextMap({ userSettings, stellaDataFiles = [], onOpenP
               <div className="text-xs font-semibold text-blue-200 mb-2">Chat memory tagged to this module</div>
               {selectedModule.memory.length ? (
                 <ul className="space-y-1.5">
-                  {selectedModule.memory.slice(0, 8).map((m) => (
+                  {selectedModule.memory.map((m) => (
                     <li key={m.id} className="text-xs text-slate-200 bg-slate-900/40 border border-blue-400/10 rounded-lg px-3 py-2">{m.text}</li>
                   ))}
                 </ul>

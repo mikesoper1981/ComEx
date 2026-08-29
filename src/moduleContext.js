@@ -419,6 +419,9 @@ export function formatStellaSharePromptBlock(files, { maxChars = 3500 } = {}) {
       !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
       !isEmptyContextValue(ctx.time_period) ? `Period: ${ctx.time_period}` : '',
       metrics ? `Key metrics: ${metrics}` : '',
+      (!f.tableName && !isEmptyContextValue(f.extractedText))
+        ? `Extract: ${String(f.extractedText).replace(/\s+/g, ' ').trim().slice(0, 500)}`
+        : '',
     ].filter(Boolean).join('\n');
   });
   let body = blocks.join('\n\n');

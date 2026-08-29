@@ -433,6 +433,7 @@ const DEFAULT_USER_SETTINGS = {
   pptxTemplate: null,
   stellaBusinessContext: mergeStellaBusinessContext({}),
   stellaConnections: {},
+  contextMapLayout: { nodes: {} },
 };
 
 function mergeProductIntelligence(raw = {}) {
@@ -475,6 +476,9 @@ function mergeUserSettingsFields(raw = {}) {
     stellaConnections: (src.stellaConnections && typeof src.stellaConnections === 'object')
       ? src.stellaConnections
       : {},
+    contextMapLayout: (src.contextMapLayout && typeof src.contextMapLayout === 'object')
+      ? { nodes: src.contextMapLayout.nodes && typeof src.contextMapLayout.nodes === 'object' ? src.contextMapLayout.nodes : {} }
+      : { nodes: {} },
   };
 }
 
@@ -776,6 +780,14 @@ function recentChats(list) {
     .slice(0, MAX_VISIBLE_CHATS);
 }
 
+function sidebarChats(list) {
+  return (list || [])
+    .filter(chatIsListed)
+    .slice()
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+    .slice(0, MAX_STORED_CHATS);
+}
+
 function newChatId() {
   return `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -820,6 +832,15 @@ function sanitizeMessageForStorage(m, { stampNow = false } = {}) {
       reason: img.reason,
       sourceFormat: img.sourceFormat || null,
       bytes: img.bytes || 0,
+    }));
+  }
+  if (m.kind) out.kind = m.kind;
+  if (Array.isArray(m.steps) && m.steps.length) {
+    out.steps = m.steps.slice(0, 16).map((s) => ({
+      type: s.type || '',
+      label: s.label || '',
+      detail: String(s.detail || '').slice(0, 800),
+      resultCount: s.resultCount,
     }));
   }
   return out;
@@ -968,6 +989,15 @@ function consultationWelcome() {
     return { role: 'assistant', content: text || 'How can I help?' };
   } catch {
     return { role: 'assistant', content: 'How can I help?' };
+  }
+}
+
+function stellaWelcome() {
+  try {
+    const text = readLocalProductIntelligence()?.welcomeMessages?.stella;
+    return { role: 'assistant', content: text || 'Ask a question about your uploaded datasets.' };
+  } catch {
+    return { role: 'assistant', content: 'Ask a question about your uploaded datasets.' };
   }
 }
 
@@ -4392,10 +4422,7 @@ export default function CommercialExcellenceApp() {
   const [uploadedFile, setUploadedFile] = useState(null);
   const [stellaSettingsTab, setStellaSettingsTab] = useState('connections'); // connections | goals
   const [stellaConnectionsTab, setStellaConnectionsTab] = useState('files'); // files | connector id
-  const [stellaMessages, setStellaMessages] = useState(() => [{
-    role: 'assistant',
-    content: readLocalProductIntelligence()?.welcomeMessages?.stella || 'Ask a question about your uploaded datasets.',
-  }]);
+  const [stellaMessages, setStellaMessages] = useState(() => [stellaWelcome()]);
   const [stellaInput, setStellaInput] = useState('');
   const [stellaIsLoading, setStellaIsLoading] = useState(false);
   const [stellaDataFiles, setStellaDataFiles] = useState([]); // { id, name, type, size, uploadedAt, storageBucket, storagePath, metaPath, summary, capturedContext, intakeMessages }
@@ -4448,6 +4475,8 @@ export default function CommercialExcellenceApp() {
   const chatSessionsRef = useRef(chatSessions);
   const activeChatIdRef = useRef(activeChatId);
   const messagesRef = useRef(messages);
+  const stellaMessagesRef = useRef(stellaMessages);
+  const activeTabRef = useRef('chat');
   const currentWorkflowRef = useRef(currentWorkflow);
   const pendingWorkflowRef = useRef(pendingWorkflow);
   const uploadedFileRef = useRef(uploadedFile);
@@ -4455,6 +4484,7 @@ export default function CommercialExcellenceApp() {
   const stellaDataFilesRef = useRef(stellaDataFiles);
   const stellaHydrateColumnProfilesRef = useRef(async () => {});
   const persistChatsTimerRef = useRef(null);
+  const persistStellaChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
   const chatsBodiesRef = useRef([]);
   const chatsFullLoadedRef = useRef(false);
@@ -4968,10 +4998,12 @@ export default function CommercialExcellenceApp() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, stellaMessages, activeTab]);
 
   useEffect(() => {
     messagesRef.current = messages;
+    stellaMessagesRef.current = stellaMessages;
+    activeTabRef.current = activeTab;
     currentWorkflowRef.current = currentWorkflow;
     pendingWorkflowRef.current = pendingWorkflow;
     uploadedFileRef.current = uploadedFile;
@@ -4991,6 +5023,7 @@ export default function CommercialExcellenceApp() {
   useEffect(() => {
     if (!userSettingsReadyRef.current) return;
     if (skipChatPersistRef.current) return;
+    if (activeTabRef.current === 'stella') return;
     if (!chatHasUserContent(messages) && !currentWorkflow) return;
     if (persistChatsTimerRef.current) clearTimeout(persistChatsTimerRef.current);
     persistChatsTimerRef.current = setTimeout(async () => {
@@ -5000,12 +5033,16 @@ export default function CommercialExcellenceApp() {
         return;
       }
       if (!chatsFullLoadedRef.current) return;
-      const id = activeChatIdRef.current || newChatId();
-      if (!activeChatIdRef.current) {
+      let id = activeChatIdRef.current || newChatId();
+      let existing = (chatSessionsRef.current || []).find((c) => c.id === id);
+      if (existing && (existing.module || inferChatModule(existing)) === 'stella') {
+        id = newChatId();
+        existing = undefined;
+      }
+      if (activeChatIdRef.current !== id) {
         activeChatIdRef.current = id;
         setActiveChatId(id);
       }
-      const existing = (chatSessionsRef.current || []).find((c) => c.id === id);
       const sameThread = existing && (existing.messages || []).length === (messagesRef.current || []).length
         && String(existing.messages?.[existing.messages.length - 1]?.content || '') === String(messagesRef.current?.[messagesRef.current.length - 1]?.content || '');
       const snap = serializeChatSnapshot({
@@ -5039,6 +5076,63 @@ export default function CommercialExcellenceApp() {
     }, 1200);
     return () => clearTimeout(persistChatsTimerRef.current);
   }, [messages, currentWorkflow, pendingWorkflow, uploadedFile]);
+
+  useEffect(() => {
+    if (!userSettingsReadyRef.current) return;
+    if (skipChatPersistRef.current) return;
+    if (activeTabRef.current !== 'stella') return;
+    if (!chatHasUserContent(stellaMessages)) return;
+    if (persistStellaChatsTimerRef.current) clearTimeout(persistStellaChatsTimerRef.current);
+    persistStellaChatsTimerRef.current = setTimeout(async () => {
+      try {
+        await ensureFullChatsLoaded();
+      } catch {
+        return;
+      }
+      if (!chatsFullLoadedRef.current) return;
+      let id = activeChatIdRef.current || newChatId();
+      let existing = (chatSessionsRef.current || []).find((c) => c.id === id);
+      if (existing && (existing.module || inferChatModule(existing)) !== 'stella') {
+        id = newChatId();
+        existing = undefined;
+      }
+      if (activeChatIdRef.current !== id) {
+        activeChatIdRef.current = id;
+        setActiveChatId(id);
+      }
+      const sameThread = existing && (existing.messages || []).length === (stellaMessagesRef.current || []).length
+        && String(existing.messages?.[existing.messages.length - 1]?.content || '') === String(stellaMessagesRef.current?.[stellaMessagesRef.current.length - 1]?.content || '');
+      const snap = serializeChatSnapshot({
+        id,
+        messages: stellaMessagesRef.current,
+        currentWorkflow: null,
+        pendingWorkflow: null,
+        uploadedFile: null,
+        module: 'stella',
+        createdAt: existing?.createdAt,
+        updatedAt: sameThread ? existing.updatedAt : undefined,
+        workflowRuns: existing?.workflowRuns,
+      });
+      const next = upsertChatInPlace(chatSessionsRef.current, snap);
+      chatSessionsRef.current = next;
+      chatsBodiesRef.current = next;
+      setChatSessions(next);
+      const toSave = mergeChatListForPersist(next);
+      const listed = (next || []).filter(chatIsListed);
+      if (listed.some((c) => !toSave.some((s) => s.id === c.id))) return;
+      try {
+        await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
+          currentUser.id,
+          {
+            chats: toSave,
+            activeChatId: activeChatIdRef.current,
+            userName: currentUser.name,
+          },
+        ));
+      } catch { /* next save retries */ }
+    }, 1200);
+    return () => clearTimeout(persistStellaChatsTimerRef.current);
+  }, [stellaMessages]);
 
   const patchWorkflowRun = (patch) => {
     const id = activeChatIdRef.current;
@@ -5553,7 +5647,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
       });
       if (newFacts.length) {
         const before = memorySignature(userSettingsRef.current.memory);
-        const memory = mergeMemoryFacts(userSettingsRef.current.memory, newFacts, { module: resolvePromptModule() });
+        const memory = mergeMemoryFacts(userSettingsRef.current.memory, newFacts, { module: memThread === 'stella' ? 'stella' : resolvePromptModule() });
         if (memorySignature(memory) !== before) {
           const settings = mergeUserSettingsFields({ ...userSettingsRef.current, memory });
           setUserSettings(settings);
@@ -5615,23 +5709,24 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     const pending = pendingMemoryConfirmRef.current;
     if (!pending) return;
     const extra = (pending.extraFacts || []).filter((f) => f && !isFileOrIntakeMemoryFact(f));
+    const memModule = pending.thread === 'stella' ? 'stella' : resolvePromptModule();
     let next = userSettingsRef.current.memory;
     if (action === 'accept') {
       const proposed = String(pending.proposed || '').trim();
       next = applyMemoryConfirmation(
         next,
         { ...pending, accept: true, reason: proposed ? `Replaced by “${proposed}”` : '' },
-        { module: resolvePromptModule() },
+        { module: memModule },
       );
     } else if (action === 'custom') {
       const custom = String(customText || '').trim();
       next = applyMemoryConfirmation(
         next,
         { ...pending, proposed: custom, accept: true, reason: custom ? `User confirmed: “${custom}”` : '' },
-        { module: resolvePromptModule() },
+        { module: memModule },
       );
     }
-    if (extra.length) next = mergeMemoryFacts(next, extra, { module: resolvePromptModule() });
+    if (extra.length) next = mergeMemoryFacts(next, extra, { module: memModule });
     await persistConfirmedMemory(next);
     pendingMemoryConfirmRef.current = null;
     setPendingMemoryConfirm(null);
@@ -5780,15 +5875,18 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       ...incoming,
     });
     const liveExisting = (chatSessionsRef.current || []).find((c) => c.id === (activeChatIdRef.current));
+    const liveModule = liveChatModule();
+    const existingIsStella = !!(liveExisting && (liveExisting.module || inferChatModule(liveExisting)) === 'stella');
+    const liveIsStella = liveModule === 'stella';
     const liveSnap = serializeChatSnapshot({
-      id: activeChatIdRef.current || newChatId(),
-      messages: messagesRef.current,
-      currentWorkflow: currentWorkflowRef.current,
-      pendingWorkflow: pendingWorkflowRef.current,
-      uploadedFile: uploadedFileRef.current,
-      module: liveExisting?.module,
-      createdAt: liveExisting?.createdAt,
-      workflowRuns: liveExisting?.workflowRuns,
+      id: (liveExisting && existingIsStella !== liveIsStella) ? newChatId() : (activeChatIdRef.current || newChatId()),
+      messages: liveIsStella ? stellaMessagesRef.current : messagesRef.current,
+      currentWorkflow: liveIsStella ? null : currentWorkflowRef.current,
+      pendingWorkflow: liveIsStella ? null : pendingWorkflowRef.current,
+      uploadedFile: liveIsStella ? null : uploadedFileRef.current,
+      module: liveModule,
+      createdAt: (liveExisting && existingIsStella === liveIsStella) ? liveExisting.createdAt : undefined,
+      workflowRuns: (liveExisting && existingIsStella === liveIsStella) ? liveExisting.workflowRuns : undefined,
     });
     const liveChats = chatHasUserContent(liveSnap.messages)
       ? upsertChatInPlace(chatSessionsRef.current, liveSnap)
@@ -5966,6 +6064,14 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     } catch { /* next save retries */ }
   };
 
+  const liveChatModule = () => {
+    const existing = (chatSessionsRef.current || []).find((c) => c.id === activeChatIdRef.current);
+    if (activeTabRef.current === 'stella' || existing?.module === 'stella') return 'stella';
+    if (existing?.module) return existing.module;
+    if (activeTabRef.current === 'territory') return 'territory';
+    return 'incentives';
+  };
+
   const flushActiveChat = ({ preserveUpdatedAt = false } = {}) => {
     const id = activeChatIdRef.current || newChatId();
     if (!activeChatIdRef.current) {
@@ -5973,13 +6079,15 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       setActiveChatId(id);
     }
     const existing = (chatSessionsRef.current || []).find((c) => c.id === id);
+    const module = liveChatModule();
+    const msgs = module === 'stella' ? stellaMessagesRef.current : messagesRef.current;
     const snap = serializeChatSnapshot({
       id,
-      messages: messagesRef.current,
-      currentWorkflow: currentWorkflowRef.current,
-      pendingWorkflow: pendingWorkflowRef.current,
-      uploadedFile: uploadedFileRef.current,
-      module: existing?.module,
+      messages: msgs,
+      currentWorkflow: module === 'stella' ? null : currentWorkflowRef.current,
+      pendingWorkflow: module === 'stella' ? null : pendingWorkflowRef.current,
+      uploadedFile: module === 'stella' ? null : uploadedFileRef.current,
+      module,
       createdAt: existing?.createdAt,
       updatedAt: preserveUpdatedAt ? existing?.updatedAt : undefined,
       workflowRuns: existing?.workflowRuns,
@@ -5996,22 +6104,30 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     skipChatPersistRef.current = true;
     setActiveChatId(id);
     activeChatIdRef.current = id;
-    setMessages(snapshot?.messages?.length ? snapshot.messages : [consultationWelcome(currentUser.id)]);
-    setCurrentWorkflow(snapshot?.currentWorkflow || null);
-    setPendingWorkflow(snapshot?.pendingWorkflow || null);
-    setUploadedFile(snapshot?.uploadedFile || null);
+    const destTab = tab || (snapshot ? chatModuleMeta(snapshot).tab : (activeTabRef.current === 'stella' ? 'stella' : 'chat'));
+    if (destTab === 'stella') {
+      setStellaMessages(snapshot?.messages?.length ? snapshot.messages : [stellaWelcome()]);
+      setStellaInput('');
+      setStellaIsLoading(false);
+    } else {
+      setMessages(snapshot?.messages?.length ? snapshot.messages : [consultationWelcome(currentUser.id)]);
+      setCurrentWorkflow(snapshot?.currentWorkflow || null);
+      setPendingWorkflow(snapshot?.pendingWorkflow || null);
+      setUploadedFile(snapshot?.uploadedFile || null);
+      setInput('');
+      setIsLoading(false);
+    }
     setOrchestratorDecision(null);
     setPendingButtonAction(null);
     setPendingImageReview(null);
     pendingImageReviewRef.current = null;
-    setInput('');
     setSuggestedPrompts([]);
     setPptxOffers(null);
     setPptxClarifyPending(false);
-    setIsLoading(false);
     setShowLanding(false);
-    setActiveTab(tab || (snapshot ? chatModuleMeta(snapshot).tab : 'chat'));
-    if (memoryConfirmThreadOf(pendingMemoryConfirmRef.current) !== 'stella') {
+    setActiveTab(destTab);
+    activeTabRef.current = destTab;
+    if (memoryConfirmThreadOf(pendingMemoryConfirmRef.current) !== (destTab === 'stella' ? 'stella' : 'chat')) {
       pendingMemoryConfirmRef.current = null;
       setPendingMemoryConfirm(null);
       setMemoryCustomOpen(false);
@@ -6032,9 +6148,31 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   const startNewChat = () => {
     const { list } = flushActiveChat();
     const id = newChatId();
-    resetLiveChat(id);
+    const destTab = activeTabRef.current === 'stella' ? 'stella' : (activeTabRef.current === 'territory' ? 'territory' : 'chat');
+    const module = destTab === 'stella' ? 'stella' : (destTab === 'territory' ? 'territory' : 'incentives');
+    resetLiveChat(id, { module }, { tab: destTab });
     persistChatList(list, id);
     setMobileChatHistoryOpen(false);
+  };
+
+  const openHubModule = (tab) => {
+    setShowLanding(false);
+    const destMod = tab === 'stella' ? 'stella' : tab === 'territory' ? 'territory' : 'incentives';
+    const current = (chatSessionsRef.current || []).find((c) => c.id === activeChatIdRef.current);
+    if (current && (current.module || inferChatModule(current)) === destMod) {
+      setActiveTab(tab);
+      activeTabRef.current = tab;
+      return;
+    }
+    const last = sidebarChats(chatSessionsRef.current).find((c) => (c.module || inferChatModule(c)) === destMod);
+    if (last) {
+      void continueChat(last.id);
+      return;
+    }
+    const { list } = flushActiveChat();
+    const id = newChatId();
+    resetLiveChat(id, { module: destMod }, { tab });
+    persistChatList(list, id);
   };
 
   const continueChat = async (chatId) => {
@@ -6070,7 +6208,9 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     setChatSessions(next);
     if (activeChatIdRef.current === chatId) {
       const id = newChatId();
-      resetLiveChat(id);
+      const destTab = activeTabRef.current === 'stella' ? 'stella' : (activeTabRef.current === 'territory' ? 'territory' : 'chat');
+      const module = destTab === 'stella' ? 'stella' : (destTab === 'territory' ? 'territory' : 'incentives');
+      resetLiveChat(id, { module }, { tab: destTab });
       persistChatList(next, id);
       return;
     }
@@ -6082,6 +6222,128 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     persistChatList(chatSessionsRef.current, activeChatIdRef.current);
     clearCurrentUser();
     window.location.reload();
+  };
+
+  const renderChatHistorySidebar = () => {
+    const listed = sidebarChats(chatSessions);
+    const row = (chat) => {
+      const mod = chatModuleMeta(chat);
+      return (
+        <div
+          key={chat.id}
+          className={`group flex items-start gap-1 rounded-lg border ${chat.id === activeChatId ? 'bg-blue-500/20 border-blue-400/40' : 'border-transparent hover:bg-slate-700/40 hover:border-blue-400/20'}`}
+        >
+          <button
+            type="button"
+            onClick={() => continueChat(chat.id)}
+            className="flex-1 min-w-0 text-left px-2.5 py-2"
+          >
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/80">{mod.label}</div>
+            <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
+            <div className="text-[10px] text-blue-300/55 mt-0.5">
+              {formatChatTime(chat.updatedAt)}
+              {chat.currentWorkflow || chat.hasWorkflow ? ' · in progress' : ''}
+            </div>
+          </button>
+          <button
+            type="button"
+            title="Delete"
+            onClick={(e) => deleteChat(chat.id, e)}
+            className="mt-1.5 mr-1 p-1 rounded text-slate-400 hover:text-red-300"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      );
+    };
+    return (
+      <>
+        {mobileChatHistoryOpen && (
+          <div className="md:hidden fixed inset-0 z-50">
+            <button
+              type="button"
+              className="absolute inset-0 bg-slate-950/70"
+              aria-label="Close chat history"
+              onClick={() => setMobileChatHistoryOpen(false)}
+            />
+            <aside className="absolute inset-y-0 left-0 w-[min(20rem,88vw)] bg-slate-900 border-r border-blue-400/25 flex flex-col shadow-2xl">
+              <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
+                  <History className="w-3.5 h-3.5" /> Chats
+                </div>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={startNewChat}
+                    className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-[11px] text-blue-100 font-semibold"
+                  >
+                    <Plus className="w-3 h-3" /> New
+                  </button>
+                  <button
+                    type="button"
+                    title="Close"
+                    onClick={() => setMobileChatHistoryOpen(false)}
+                    className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1">
+                {listed.length === 0 && (
+                  <div className="text-[11px] text-blue-300/50 px-2 py-3">No saved chats yet. Start a conversation and it will appear here.</div>
+                )}
+                {listed.map(row)}
+              </div>
+            </aside>
+          </div>
+        )}
+        {chatHistoryCollapsed ? (
+          <aside className="hidden md:flex w-10 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
+            <button
+              type="button"
+              title="Show chat history"
+              onClick={toggleChatHistoryCollapsed}
+              className="flex-1 flex flex-col items-center gap-2 py-3 text-blue-200 hover:bg-slate-700/40"
+            >
+              <History className="w-4 h-4" />
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </aside>
+        ) : (
+          <aside className="hidden md:flex w-56 lg:w-64 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
+            <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
+                <History className="w-3.5 h-3.5" /> Chats
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={startNewChat}
+                  className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-[11px] text-blue-100 font-semibold"
+                >
+                  <Plus className="w-3 h-3" /> New
+                </button>
+                <button
+                  type="button"
+                  title="Collapse chat history"
+                  onClick={toggleChatHistoryCollapsed}
+                  className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
+                >
+                  <ChevronDown className="w-3.5 h-3.5 -rotate-90" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1">
+              {listed.length === 0 && (
+                <div className="text-[11px] text-blue-300/50 px-2 py-3">No saved chats yet. Start a conversation and it will appear here.</div>
+              )}
+              {listed.map(row)}
+            </div>
+          </aside>
+        )}
+      </>
+    );
   };
 
   const handlePptxTemplateUpload = async (event) => {
@@ -10196,8 +10458,8 @@ ${stepInstruction}`;
                 </button>
               )}
               <div className="hidden sm:flex flex-col items-end leading-tight ml-3 sm:ml-6 pl-3 sm:pl-6 border-l border-blue-400/25">
-                <span className="text-xs font-semibold text-white max-w-[140px] truncate">{currentUser.name}</span>
-                <span className="text-[10px] text-blue-300/60">{isAdmin ? 'Admin' : 'User'}</span>
+                <span className="text-xs font-semibold text-white max-w-[180px] truncate">{currentUser.name}</span>
+                <span className="text-[10px] text-blue-300/60 max-w-[180px] truncate">{userSettings.companyName || resolveUserCompany(currentUser)}</span>
               </div>
               <button
                 type="button"
@@ -10280,7 +10542,7 @@ ${stepInstruction}`;
                       </button>
                       <button
                         type="button"
-                        onClick={() => { setShowLanding(false); setActiveTab(mod.tab); }}
+                        onClick={() => openHubModule(mod.tab)}
                         className="text-left w-full group"
                       >
                         <div className={`w-12 h-12 ${mod.iconBg} rounded-xl flex items-center justify-center mb-4 group-hover:scale-110 transition-transform`}>
@@ -10386,148 +10648,7 @@ ${stepInstruction}`;
           }>
           {activeTab === 'chat' ? (
             <div className="flex gap-3 h-full min-h-0">
-              {mobileChatHistoryOpen && (
-                <div className="md:hidden fixed inset-0 z-50">
-                  <button
-                    type="button"
-                    className="absolute inset-0 bg-slate-950/70"
-                    aria-label="Close chat history"
-                    onClick={() => setMobileChatHistoryOpen(false)}
-                  />
-                  <aside className="absolute inset-y-0 left-0 w-[min(20rem,88vw)] bg-slate-900 border-r border-blue-400/25 flex flex-col shadow-2xl">
-                    <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
-                        <History className="w-3.5 h-3.5" /> Chats
-                      </div>
-                      <div className="flex items-center gap-1">
-                        <button
-                          type="button"
-                          onClick={startNewChat}
-                          className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-[11px] text-blue-100 font-semibold"
-                        >
-                          <Plus className="w-3 h-3" /> New
-                        </button>
-                        <button
-                          type="button"
-                          title="Close"
-                          onClick={() => setMobileChatHistoryOpen(false)}
-                          className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
-                        >
-                          <X className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-                    <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1">
-                      {recentChats(chatSessions).length === 0 && (
-                        <div className="text-[11px] text-blue-300/50 px-2 py-3">No saved chats yet. Start a conversation and it will appear here.</div>
-                      )}
-                      {recentChats(chatSessions).map((chat) => {
-                        const mod = chatModuleMeta(chat);
-                        return (
-                          <div
-                            key={chat.id}
-                            className={`flex items-start gap-1 rounded-lg border ${chat.id === activeChatId ? 'bg-blue-500/20 border-blue-400/40' : 'border-transparent hover:bg-slate-700/40 hover:border-blue-400/20'}`}
-                          >
-                            <button
-                              type="button"
-                              onClick={() => continueChat(chat.id)}
-                              className="flex-1 min-w-0 text-left px-2.5 py-2"
-                            >
-                              <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/80">{mod.label}</div>
-                              <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
-                              <div className="text-[10px] text-blue-300/55 mt-0.5">
-                                {formatChatTime(chat.updatedAt)}
-                                {chat.currentWorkflow || chat.hasWorkflow ? ' · in progress' : ''}
-                              </div>
-                            </button>
-                            <button
-                              type="button"
-                              title="Delete"
-                              onClick={(e) => deleteChat(chat.id, e)}
-                              className="mt-1.5 mr-1 p-1 rounded text-slate-400 hover:text-red-300"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </aside>
-                </div>
-              )}
-              {chatHistoryCollapsed ? (
-                <aside className="hidden md:flex w-10 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
-                  <button
-                    type="button"
-                    title="Show chat history"
-                    onClick={toggleChatHistoryCollapsed}
-                    className="flex-1 flex flex-col items-center gap-2 py-3 text-blue-200 hover:bg-slate-700/40"
-                  >
-                    <History className="w-4 h-4" />
-                    <ChevronRight className="w-4 h-4" />
-                  </button>
-                </aside>
-              ) : (
-              <aside className="hidden md:flex w-56 lg:w-64 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
-                <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
-                    <History className="w-3.5 h-3.5" /> Chats
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={startNewChat}
-                      className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-[11px] text-blue-100 font-semibold"
-                    >
-                      <Plus className="w-3 h-3" /> New
-                    </button>
-                    <button
-                      type="button"
-                      title="Collapse chat history"
-                      onClick={toggleChatHistoryCollapsed}
-                      className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
-                    >
-                      <ChevronDown className="w-3.5 h-3.5 -rotate-90" />
-                    </button>
-                  </div>
-                </div>
-                <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1">
-                  {recentChats(chatSessions).length === 0 && (
-                    <div className="text-[11px] text-blue-300/50 px-2 py-3">No saved chats yet. Start a conversation and it will appear here.</div>
-                  )}
-                  {recentChats(chatSessions).map((chat) => {
-                    const mod = chatModuleMeta(chat);
-                    return (
-                    <div
-                      key={chat.id}
-                      className={`group flex items-start gap-1 rounded-lg border ${chat.id === activeChatId ? 'bg-blue-500/20 border-blue-400/40' : 'border-transparent hover:bg-slate-700/40 hover:border-blue-400/20'}`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => continueChat(chat.id)}
-                        className="flex-1 min-w-0 text-left px-2.5 py-2"
-                      >
-                        <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/80">{mod.label}</div>
-                        <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
-                        <div className="text-[10px] text-blue-300/55 mt-0.5">
-                          {formatChatTime(chat.updatedAt)}
-                          {chat.currentWorkflow || chat.hasWorkflow ? ' · in progress' : ''}
-                        </div>
-                      </button>
-                      <button
-                        type="button"
-                        title="Delete"
-                        onClick={(e) => deleteChat(chat.id, e)}
-                        className="mt-1.5 mr-1 p-1 rounded text-slate-500 hover:text-red-300 opacity-0 group-hover:opacity-100"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                      </button>
-                    </div>
-                    );
-                  })}
-                </div>
-              </aside>
-              )}
+              {renderChatHistorySidebar()}
               <div className="flex flex-col h-full min-w-0 flex-1">
               {/* Quick Actions */}
               <div className="flex flex-wrap gap-2 mb-3 flex-shrink-0">
@@ -11061,8 +11182,10 @@ ${stepInstruction}`;
             </div>
 
           ) : activeTab === 'stella' ? (
-            <div className="flex flex-col h-full overflow-hidden">
-              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-4">
+            <div className="flex gap-3 h-full min-h-0">
+              {renderChatHistorySidebar()}
+              <div className="flex flex-col h-full min-w-0 flex-1 overflow-hidden">
+              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-3">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
                   <div className="flex items-center gap-3">
                     <Layers className="w-6 h-6" />
@@ -11071,7 +11194,15 @@ ${stepInstruction}`;
                       <p className="text-cyan-100 text-xs">Chat with your data — analyse trends and chart insights</p>
                     </div>
                   </div>
-                  <button onClick={() => { setShowLanding(false); setActiveTab('user-settings'); setUserSettingsPane('stella'); setStellaSettingsTab('connections'); setStellaConnectionsTab('files'); }} className="flex items-center gap-2 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold transition-all"><Settings className="w-4 h-4" /> Manage data & context</button>
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={() => setMobileChatHistoryOpen(true)} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
+                      <History className="w-4 h-4" /> Chats
+                    </button>
+                    <button type="button" onClick={startNewChat} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
+                      <Plus className="w-4 h-4" /> New
+                    </button>
+                    <button onClick={() => { setShowLanding(false); setActiveTab('user-settings'); setUserSettingsPane('stella'); setStellaSettingsTab('connections'); setStellaConnectionsTab('files'); }} className="flex items-center gap-2 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold transition-all"><Settings className="w-4 h-4" /> Manage data & context</button>
+                  </div>
                 </div>
               </div>
 
@@ -11134,6 +11265,7 @@ ${stepInstruction}`;
                   </div>
                 </form>
               </div>
+              </div>
             </div>
 
           ) : activeTab === 'user-settings' ? (
@@ -11156,17 +11288,26 @@ ${stepInstruction}`;
 
               {renderHubAnswerDetail()}
 
-              <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit flex-wrap">
-                {[['general', 'General'], ['context-map', 'Context Map'], ['incentives', 'Incentives'], ['territory', 'Territory'], ['stella', 'Stella Insights']].map(([id, label]) => (
-                  <button
-                    key={id}
-                    type="button"
-                    onClick={() => setUserSettingsPane(id)}
-                    className={`px-3 sm:px-4 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${userSettingsPane === id ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
-                  >
-                    {label}
-                  </button>
-                ))}
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit flex-wrap">
+                  {[['general', 'General'], ['incentives', 'Incentives'], ['territory', 'Territory'], ['stella', 'Stella Insights']].map(([id, label]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => setUserSettingsPane(id)}
+                      className={`px-3 sm:px-4 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${userSettingsPane === id ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setUserSettingsPane('context-map')}
+                  className={`px-3 sm:px-4 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all border ${userSettingsPane === 'context-map' ? 'bg-amber-500 text-slate-900 border-amber-300 shadow-lg shadow-amber-500/20' : 'bg-amber-500/15 text-amber-200 border-amber-400/40 hover:bg-amber-500/25'}`}
+                >
+                  Context Map
+                </button>
               </div>
 
               <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 sm:p-6">
@@ -11363,6 +11504,19 @@ ${stepInstruction}`;
                     <ContextMap
                       userSettings={userSettings}
                       stellaDataFiles={stellaDataFiles}
+                      userName={currentUser.name}
+                      companyName={userSettings.companyName || resolveUserCompany(currentUser)}
+                      layout={userSettings.contextMapLayout}
+                      onLayoutChange={(next) => {
+                        const settings = mergeUserSettingsFields({ ...userSettingsRef.current, contextMapLayout: next });
+                        setUserSettings(settings);
+                        userSettingsRef.current = settings;
+                        void queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
+                          currentUser.id,
+                          mergeUserSettingsFields(userSettingsRef.current),
+                          { userName: currentUser.name },
+                        ));
+                      }}
                       onOpenPane={(pane, extra) => {
                         setUserSettingsPane(pane);
                         if (pane === 'stella' && extra?.stellaTab) setStellaSettingsTab(extra.stellaTab);
