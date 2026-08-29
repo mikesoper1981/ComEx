@@ -3,10 +3,12 @@ import {
   ChevronRight,
   DollarSign,
   FileText,
+  Files,
   Layers,
   Link2,
   Map as MapIcon,
   Network,
+  Table2,
   UserCog,
 } from 'lucide-react';
 import { activeMemoryItems } from './chatMemory';
@@ -61,7 +63,16 @@ const ACCOUNT_FIELDS = [
   ['customContext', 'Additional context'],
 ];
 
-const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 245, leafR: 138 };
+const FILE_KINDS = [
+  { id: 'spreadsheet', title: 'Spreadsheet', subtitle: 'Excel / CSV', match: (f) => kindOfFile(f) === 'spreadsheet' },
+  { id: 'powerpoint', title: 'PowerPoint', subtitle: 'Strategy decks', match: (f) => kindOfFile(f) === 'powerpoint' },
+  { id: 'pdf', title: 'PDF', subtitle: 'Documents', match: (f) => kindOfFile(f) === 'pdf' },
+  { id: 'document', title: 'Other files', subtitle: 'Text / other', match: (f) => kindOfFile(f) === 'document' },
+];
+
+const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 250, leafR: 150 };
+
+const EMPTY_FOCUS = { moduleId: '', group: '', kind: '', fileId: '' };
 
 function clip(text, max = 140) {
   const t = String(text || '').replace(/\s+/g, ' ').trim();
@@ -71,8 +82,8 @@ function clip(text, max = 140) {
 
 function isPptxLike(file) {
   const name = String(file?.name || '').toLowerCase();
-  const type = String(file?.kind || file?.fileType || file?.type || '').toLowerCase();
-  return /\.pptx?$/.test(name) || /ppt|presentation/.test(type);
+  const type = String(file?.kind || file?.fileType || file?.type || file?.kindLabel || '').toLowerCase();
+  return /\.pptx?$/.test(name) || /ppt|presentation/.test(type) || !!file?.isPptx;
 }
 
 function contextFileKindLabel(file) {
@@ -82,6 +93,15 @@ function contextFileKindLabel(file) {
   if (/\.pdf$/.test(name) || type.includes('pdf')) return 'PDF';
   if (/\.(xlsx?|csv)$/.test(name) || /excel|spreadsheet|csv/.test(type)) return 'Spreadsheet';
   return file?.fileType || 'Context file';
+}
+
+function kindOfFile(file) {
+  if (isPptxLike(file)) return 'powerpoint';
+  const name = String(file?.name || '').toLowerCase();
+  const type = String(file?.kind || file?.fileType || file?.kindLabel || '').toLowerCase();
+  if (/\.pdf$/.test(name) || type.includes('pdf')) return 'pdf';
+  if (/\.(xlsx?|csv)$/.test(name) || /excel|spreadsheet|csv/.test(type) || file?.tableName) return 'spreadsheet';
+  return 'document';
 }
 
 function filledAccountFields(settings) {
@@ -107,6 +127,8 @@ function contextFileSummary(file) {
     processing: !!file.processing,
     highlights,
     blockCount: blocks.length,
+    source: 'context',
+    nodeId: `ctx-${file.id}`,
   };
 }
 
@@ -139,6 +161,8 @@ function stellaFileSummary(file) {
     isPptx: pptx,
     kindLabel: pptx ? 'PowerPoint / strategy' : (file.tableName ? 'Data table' : 'Document'),
     highlights,
+    source: 'stella',
+    nodeId: `data-${file.id}`,
   };
 }
 
@@ -186,6 +210,60 @@ function memoryFor(settings, moduleId) {
   return items.filter((m) => m.module === moduleId);
 }
 
+function moduleFiles(mod) {
+  return [...(mod.files || []), ...(mod.stellaFiles || [])];
+}
+
+function groupsFor(mod, generalMemory) {
+  const files = moduleFiles(mod);
+  const tagged = mod.memory || [];
+  const groups = [];
+  groups.push({
+    id: 'memory',
+    title: 'Chat memory',
+    subtitle: tagged.length
+      ? `${tagged.length} tagged to ${mod.short}`
+      : (generalMemory.length ? `${generalMemory.length} passed from centre` : 'None yet'),
+    count: tagged.length + generalMemory.length,
+    kind: 'memory',
+  });
+  if (files.length) {
+    groups.push({
+      id: 'files',
+      title: 'Files',
+      subtitle: `${files.length} file${files.length === 1 ? '' : 's'}`,
+      count: files.length,
+      kind: 'files',
+    });
+  }
+  if (mod.pptx) {
+    groups.push({
+      id: 'pptx-template',
+      title: 'PPT export template',
+      subtitle: clip(mod.pptx.fileName || 'Custom', 22),
+      count: 1,
+      kind: 'leaf',
+    });
+  }
+  if (mod.goals) {
+    groups.push({
+      id: 'goals',
+      title: 'Analysis goals',
+      subtitle: clip(mod.goals, 22),
+      count: 1,
+      kind: 'leaf',
+    });
+  }
+  return groups;
+}
+
+function kindsFor(mod) {
+  const files = moduleFiles(mod);
+  return FILE_KINDS
+    .map((k) => ({ ...k, files: files.filter(k.match) }))
+    .filter((k) => k.files.length);
+}
+
 function clampNode(n) {
   const pad = 8;
   return {
@@ -212,7 +290,7 @@ function edgePath(a, b, kind, hub) {
     const vx = mx - hub.x;
     const vy = my - hub.y;
     const len = Math.hypot(vx, vy) || 1;
-    const bump = kind === 'share' ? 56 : 28;
+    const bump = kind === 'share' ? 56 : 36;
     const qx = mx + (vx / len) * bump;
     const qy = my + (vy / len) * bump;
     return {
@@ -228,153 +306,172 @@ function edgePath(a, b, kind, hub) {
   };
 }
 
-function layoutStar(model) {
+function placeLeaves(nodes, edges, parentId, parent, leaves, angle) {
+  if (!leaves.length) return;
+  const spread = Math.min(1.5, 0.32 * Math.max(leaves.length, 1));
+  const dist = CANVAS.leafR + Math.min(48, Math.max(0, leaves.length - 3) * 8);
+  fanAngles(angle, leaves.length, spread).forEach((ang, i) => {
+    const lp = polar(parent.x, parent.y, dist, ang);
+    const leaf = clampNode({ ...leaves[i], x: lp.x, y: lp.y, moduleId: parent.moduleId || parent.id });
+    nodes.push(leaf);
+    edges.push({ from: parentId, to: leaf.id, kind: 'leaf' });
+  });
+}
+
+function layoutStar(model, focus) {
   const nodes = [];
   const edges = [];
-  const { cx, cy, moduleR, leafR } = CANVAS;
+  const { cx, cy, moduleR } = CANVAS;
 
   nodes.push(clampNode({
     id: 'account',
     kind: 'hub',
     x: cx,
     y: cy,
-    w: 248,
-    h: 104,
+    w: 260,
+    h: 118,
     title: model.hubTitle || 'You',
-    subtitle: model.hubSubtitle || `${model.accountFields.length} setting${model.accountFields.length === 1 ? '' : 's'} · ${model.generalMemory.length} fact${model.generalMemory.length === 1 ? '' : 's'}`,
+    subtitle: model.hubSubtitle || 'No company set',
+    caption: 'Context map passed to AI',
   }));
-
-  const hubSatellites = [];
-  if (model.accountFields.length) {
-    hubSatellites.push({
-      id: 'account-settings',
-      kind: 'hub-leaf',
-      title: 'General settings',
-      subtitle: model.accountFields.map((f) => f.label).slice(0, 3).join(' · '),
-      w: 132,
-      h: 46,
-    });
-  }
-  if (model.generalMemory.length) {
-    hubSatellites.push({
-      id: 'account-memory',
-      kind: 'memory',
-      title: 'Chat memory',
-      subtitle: `${model.generalMemory.length} standing fact${model.generalMemory.length === 1 ? '' : 's'}`,
-      w: 132,
-      h: 46,
-    });
-  }
-  fanAngles(Math.PI / 2, hubSatellites.length, 0.7).forEach((ang, i) => {
-    const p = polar(cx, cy, 108, ang);
-    const leaf = clampNode({ ...hubSatellites[i], x: p.x, y: p.y, moduleId: 'account' });
-    nodes.push(leaf);
-    edges.push({ from: 'account', to: leaf.id, kind: 'spoke', label: '' });
-  });
 
   for (const mod of model.modules) {
     const p = polar(cx, cy, moduleR, mod.angle);
+    const groups = groupsFor(mod, model.generalMemory);
+    const files = moduleFiles(mod);
     nodes.push(clampNode({
       id: mod.id,
       kind: 'module',
       moduleId: mod.id,
       x: p.x,
       y: p.y,
-      w: 158,
-      h: 70,
+      w: 168,
+      h: 78,
       title: mod.short,
-      subtitle: mod.linked.length
-        ? `Sharing with ${mod.linked.map((id) => MODULES.find((m) => m.id === id)?.short || id).join(', ')}`
-        : 'Standalone',
+      subtitle: focus.moduleId === mod.id
+        ? 'Click a type to expand'
+        : `${files.length} file${files.length === 1 ? '' : 's'} · ${mod.memory.length} tagged fact${mod.memory.length === 1 ? '' : 's'}`,
       fill: mod.fill,
     }));
-    edges.push({ from: 'account', to: mod.id, kind: 'spoke', label: 'always' });
+    edges.push({ from: 'account', to: mod.id, kind: 'spoke' });
 
-    const leaves = [];
-    if (mod.pptx) {
-      leaves.push({
+    if (focus.moduleId !== mod.id) continue;
+
+    const parent = { x: p.x, y: p.y, id: mod.id, moduleId: mod.id };
+
+    if (!focus.group) {
+      placeLeaves(nodes, edges, mod.id, parent, groups.map((g) => ({
+        id: `${mod.id}-grp-${g.id}`,
+        kind: g.kind === 'memory' ? 'memory' : (g.kind === 'files' ? 'files' : 'leaf'),
+        groupId: g.id,
+        title: g.title,
+        subtitle: g.subtitle,
+        w: 148,
+        h: 52,
+      })), mod.angle);
+      continue;
+    }
+
+    if (focus.group === 'memory') {
+      const tagged = mod.memory || [];
+      const centre = model.generalMemory || [];
+      const facts = [
+        ...tagged.map((m) => ({ ...m, origin: 'tagged' })),
+        ...centre.map((m) => ({ ...m, origin: 'centre' })),
+      ].slice(0, 10);
+      const cards = facts.length
+        ? facts.map((m) => ({
+            id: `${mod.id}-fact-${m.id}`,
+            kind: 'memory',
+            groupId: 'memory',
+            title: clip(m.text, 28),
+            subtitle: m.origin === 'centre' ? 'From centre (always passed)' : `Tagged to ${mod.short}`,
+            w: 150,
+            h: 50,
+          }))
+        : [{
+            id: `${mod.id}-mem-empty`,
+            kind: 'empty',
+            groupId: 'memory',
+            title: 'No chat memory yet',
+            subtitle: 'Facts appear after you confirm them',
+            w: 160,
+            h: 52,
+          }];
+      placeLeaves(nodes, edges, mod.id, parent, cards, mod.angle);
+      continue;
+    }
+
+    if (focus.group === 'pptx-template' && mod.pptx) {
+      placeLeaves(nodes, edges, mod.id, parent, [{
         id: `${mod.id}-pptx`,
-        kind: 'leaf',
+        kind: 'pptx',
+        groupId: 'pptx-template',
         title: 'PPT export template',
         subtitle: clip(mod.pptx.fileName || 'Custom', 22),
-        w: 128,
-        h: 44,
-      });
-    }
-    if (mod.goals) {
-      leaves.push({
-        id: `${mod.id}-goals`,
-        kind: 'leaf',
-        title: 'Analysis goals',
-        subtitle: clip(mod.goals, 22),
-        w: 128,
-        h: 44,
-      });
-    }
-    mod.files.forEach((f) => {
-      leaves.push({
-        id: `ctx-${f.id}`,
-        kind: f.kindLabel?.startsWith('PowerPoint') ? 'pptx' : 'file',
-        fileId: f.id,
-        title: clip(f.name, 22),
-        subtitle: f.kindLabel || 'Context file',
-        w: 136,
-        h: 48,
-      });
-    });
-    mod.stellaFiles.forEach((f) => {
-      leaves.push({
-        id: `data-${f.id}`,
-        kind: f.isPptx ? 'pptx' : 'data',
-        fileId: f.id,
-        title: clip(f.name, 20),
-        subtitle: f.kindLabel || (f.tableName ? 'Data table' : 'Document'),
-        w: 128,
-        h: 44,
-      });
-    });
-    if (mod.memory.length) {
-      leaves.push({
-        id: `${mod.id}-mem`,
-        kind: 'memory',
-        title: 'Chat memory',
-        subtitle: `${mod.memory.length} fact${mod.memory.length === 1 ? '' : 's'}`,
-        w: 128,
-        h: 44,
-      });
-    }
-    if (!leaves.length) {
-      leaves.push({
-        id: `${mod.id}-empty`,
-        kind: 'empty',
-        title: 'Nothing yet',
-        subtitle: 'Upload in settings',
-        w: 128,
-        h: 44,
-      });
+        w: 150,
+        h: 50,
+      }], mod.angle);
+      continue;
     }
 
-    const spread = Math.min(1.45, 0.26 * Math.max(leaves.length, 1));
-    const dist = leafR + Math.min(36, Math.max(0, leaves.length - 4) * 6);
-    fanAngles(mod.angle, leaves.length, spread).forEach((ang, i) => {
-      const lp = polar(p.x, p.y, dist, ang);
-      const leaf = clampNode({ ...leaves[i], x: lp.x, y: lp.y, moduleId: mod.id });
-      nodes.push(leaf);
-      edges.push({ from: mod.id, to: leaf.id, kind: 'leaf' });
-    });
+    if (focus.group === 'goals' && mod.goals) {
+      placeLeaves(nodes, edges, mod.id, parent, [{
+        id: `${mod.id}-goals`,
+        kind: 'leaf',
+        groupId: 'goals',
+        title: 'Analysis goals',
+        subtitle: clip(mod.goals, 28),
+        w: 150,
+        h: 50,
+      }], mod.angle);
+      continue;
+    }
+
+    if (focus.group === 'files' && !focus.kind) {
+      placeLeaves(nodes, edges, mod.id, parent, kindsFor(mod).map((k) => ({
+        id: `${mod.id}-kind-${k.id}`,
+        kind: k.id === 'spreadsheet' ? 'data' : (k.id === 'powerpoint' ? 'pptx' : 'file'),
+        groupId: 'files',
+        kindKey: k.id,
+        title: k.title,
+        subtitle: `${k.files.length} file${k.files.length === 1 ? '' : 's'}`,
+        w: 148,
+        h: 52,
+      })), mod.angle);
+      continue;
+    }
+
+    if (focus.group === 'files' && focus.kind) {
+      const kind = FILE_KINDS.find((k) => k.id === focus.kind);
+      const list = kind ? moduleFiles(mod).filter(kind.match) : [];
+      placeLeaves(nodes, edges, mod.id, parent, list.map((f) => ({
+        id: f.nodeId,
+        kind: kindOfFile(f) === 'powerpoint' ? 'pptx' : (kindOfFile(f) === 'spreadsheet' ? 'data' : 'file'),
+        groupId: 'files',
+        kindKey: focus.kind,
+        fileId: f.id,
+        title: clip(f.name, 22),
+        subtitle: f.kindLabel || kind?.title || 'File',
+        w: 150,
+        h: 52,
+      })), mod.angle);
+    }
   }
 
   for (const c of model.connections || []) {
     edges.push({ from: c.a, to: c.b, kind: 'share', label: 'sharing context' });
   }
 
-  const stella = model.modules.find((m) => m.id === 'stella');
   const nodeIds = new Set(nodes.map((n) => n.id));
-  for (const j of stella?.joins || []) {
-    const a = `data-${j.fromId}`;
-    const b = `data-${j.toId}`;
-    if (!nodeIds.has(a) || !nodeIds.has(b)) continue;
-    edges.push({ from: a, to: b, kind: 'join', label: j.label });
+  const stella = model.modules.find((m) => m.id === 'stella');
+  if (focus.moduleId === 'stella' && focus.group === 'files' && focus.kind) {
+    for (const j of stella?.joins || []) {
+      const a = `data-${j.fromId}`;
+      const b = `data-${j.toId}`;
+      if (!nodeIds.has(a) || !nodeIds.has(b)) continue;
+      edges.push({ from: a, to: b, kind: 'join', label: j.label });
+    }
   }
 
   return { nodes, edges };
@@ -383,8 +480,8 @@ function layoutStar(model) {
 function usedWhenChatting(model, moduleId) {
   const mod = model.modules.find((m) => m.id === moduleId);
   if (!mod) return [];
-  const parts = [`${model.hubTitle}${model.hubSubtitle ? ` · ${model.hubSubtitle}` : ''} (company, role, definitions)`];
-  if (model.generalMemory.length) parts.push(`${model.generalMemory.length} general remembered fact${model.generalMemory.length === 1 ? '' : 's'}`);
+  const parts = [`Centre context for ${model.hubTitle}${model.hubSubtitle ? ` · ${model.hubSubtitle}` : ''} (always passed to the AI)`];
+  if (model.generalMemory.length) parts.push(`${model.generalMemory.length} remembered fact${model.generalMemory.length === 1 ? '' : 's'} from the centre`);
   if (mod.memory.length) parts.push(`${mod.memory.length} ${mod.short} remembered fact${mod.memory.length === 1 ? '' : 's'}`);
   if (mod.files.length) parts.push(`${mod.files.length} context file${mod.files.length === 1 ? '' : 's'} in this module`);
   if (mod.pptx) parts.push('PowerPoint template (export style only)');
@@ -403,6 +500,15 @@ function usedWhenChatting(model, moduleId) {
   return parts;
 }
 
+function nodeIcon(node, mod) {
+  if (node.kind === 'hub') return UserCog;
+  if (node.kind === 'files' || (node.groupId === 'files' && !node.kindKey && !node.fileId)) return Files;
+  if (node.kindKey === 'spreadsheet' || node.kind === 'data') return Table2;
+  if (node.kind === 'file' || node.kind === 'pptx' || node.fileId) return FileText;
+  if (node.kind === 'memory') return Network;
+  return mod?.Icon || FileText;
+}
+
 export default function ContextMap({
   userSettings,
   stellaDataFiles = [],
@@ -413,6 +519,7 @@ export default function ContextMap({
   onOpenPane,
 }) {
   const [selected, setSelected] = useState('account');
+  const [focus, setFocus] = useState(EMPTY_FOCUS);
   const [openFileId, setOpenFileId] = useState('');
   const [livePos, setLivePos] = useState({});
   const dragRef = useRef(null);
@@ -452,7 +559,7 @@ export default function ContextMap({
   }, [userSettings, stellaDataFiles, userName, companyName]);
 
   const graph = useMemo(() => {
-    const laid = layoutStar(model);
+    const laid = layoutStar(model, focus);
     const saved = layout?.nodes && typeof layout.nodes === 'object' ? layout.nodes : {};
     const nodes = laid.nodes.map((n) => {
       const s = saved[n.id];
@@ -468,7 +575,7 @@ export default function ContextMap({
       return clampNode(next);
     });
     return { nodes, edges: laid.edges };
-  }, [model, layout, livePos]);
+  }, [model, layout, livePos, focus]);
 
   const byId = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n])), [graph]);
   const hub = byId.get('account') || { x: CANVAS.cx, y: CANVAS.cy };
@@ -496,6 +603,44 @@ export default function ContextMap({
       x: ((clientX - r.left) / r.width) * CANVAS.w,
       y: ((clientY - r.top) / r.height) * CANVAS.h,
     };
+  };
+
+  const selectNode = (node) => {
+    if (!node) return;
+    if (node.kind === 'hub' || node.id === 'account') {
+      setSelected('account');
+      setFocus(EMPTY_FOCUS);
+      setOpenFileId('');
+      return;
+    }
+    if (node.kind === 'module') {
+      setSelected(node.id);
+      setFocus({ moduleId: node.id, group: '', kind: '', fileId: '' });
+      setOpenFileId('');
+      return;
+    }
+    if (node.fileId) {
+      setSelected(node.moduleId);
+      setFocus({
+        moduleId: node.moduleId,
+        group: node.groupId || 'files',
+        kind: node.kindKey || focus.kind || '',
+        fileId: node.fileId,
+      });
+      setOpenFileId(node.fileId);
+      return;
+    }
+    if (node.kindKey) {
+      setSelected(node.moduleId);
+      setFocus({ moduleId: node.moduleId, group: 'files', kind: node.kindKey, fileId: '' });
+      setOpenFileId('');
+      return;
+    }
+    if (node.groupId) {
+      setSelected(node.moduleId);
+      setFocus({ moduleId: node.moduleId, group: node.groupId, kind: '', fileId: '' });
+      setOpenFileId('');
+    }
   };
 
   const onNodePointerDown = (ev, node, mode = 'move') => {
@@ -559,20 +704,21 @@ export default function ContextMap({
   };
 
   const selectedModule = model.modules.find((m) => m.id === selected) || null;
-  const selectedIsAccount = selected === 'account' || selected === 'account-settings' || selected === 'account-memory';
-
-  const selectNode = (node) => {
-    if (!node) return;
-    if (node.id === 'account' || node.kind === 'hub-leaf' || node.id === 'account-memory') {
-      setSelected('account');
-      setOpenFileId('');
-      return;
-    }
-    if (node.moduleId && MODULES.some((m) => m.id === node.moduleId)) {
-      setSelected(node.moduleId);
-      setOpenFileId(node.fileId || '');
-    }
-  };
+  const selectedIsAccount = selected === 'account';
+  const focusedFile = selectedModule
+    ? moduleFiles(selectedModule).find((f) => f.id === (focus.fileId || openFileId))
+    : null;
+  const breadcrumb = (() => {
+    if (!selectedModule) return [];
+    const bits = [selectedModule.short];
+    if (focus.group === 'memory') bits.push('Chat memory');
+    if (focus.group === 'files') bits.push('Files');
+    if (focus.kind) bits.push(FILE_KINDS.find((k) => k.id === focus.kind)?.title || focus.kind);
+    if (focusedFile) bits.push(focusedFile.name);
+    if (focus.group === 'pptx-template') bits.push('PPT export template');
+    if (focus.group === 'goals') bits.push('Analysis goals');
+    return bits;
+  })();
 
   return (
     <div className="space-y-5">
@@ -581,8 +727,8 @@ export default function ContextMap({
           <Network className="w-4 h-4 text-cyan-400" /> Context map
         </h3>
         <p className="text-xs text-blue-300/70 leading-relaxed">
-          Star schema of captured context for this login. Drag any card to rearrange, and pull the corner to resize.
-          PowerPoint strategy decks sit on the module they were uploaded to. Cyan links mean modules share context.
+          Click a module to expand types, then files. Drag any card to rearrange; pull the corner to resize.
+          The centre is always sent to the AI. Cyan links mean modules share context.
         </p>
       </div>
 
@@ -599,6 +745,9 @@ export default function ContextMap({
                 <stop offset="0%" stopColor="rgba(139,92,246,0.18)" />
                 <stop offset="100%" stopColor="rgba(139,92,246,0)" />
               </radialGradient>
+              <filter id="ctx-label-shadow" x="-20%" y="-20%" width="140%" height="140%">
+                <feDropShadow dx="0" dy="1" stdDeviation="1.2" floodColor="#020617" floodOpacity="0.9" />
+              </filter>
             </defs>
             <circle cx={CANVAS.cx} cy={CANVAS.cy} r="168" fill="url(#ctx-hub-glow)" />
             {graph.edges.map((e) => {
@@ -607,15 +756,17 @@ export default function ContextMap({
               if (!a || !b) return null;
               const path = edgePath(a, b, e.kind, hub);
               const stroke = e.kind === 'share' || e.kind === 'join'
-                ? 'rgba(34,211,238,0.85)'
+                ? 'rgba(34,211,238,0.9)'
                 : e.kind === 'spoke'
                   ? 'rgba(167,139,250,0.75)'
                   : 'rgba(148,163,184,0.45)';
-              const width = e.kind === 'share' ? 3.2 : e.kind === 'join' ? 2.2 : e.kind === 'spoke' ? 2.4 : 1.4;
+              const width = e.kind === 'share' ? 3.2 : e.kind === 'join' ? 2.4 : e.kind === 'spoke' ? 2.4 : 1.4;
               const dash = e.kind === 'join' ? '7 5' : e.kind === 'leaf' ? '4 4' : undefined;
               const related = selected === e.from || selected === e.to
                 || (selectedModule && (e.from === selectedModule.id || e.to === selectedModule.id))
                 || (selectedIsAccount && (e.from === 'account' || e.to === 'account'));
+              const labelW = e.label ? Math.max(48, e.label.length * 6.6 + 16) : 0;
+              const labelH = 18;
               return (
                 <g key={`${e.kind}|${e.from}|${e.to}|${e.label || ''}`}>
                   <path
@@ -628,16 +779,28 @@ export default function ContextMap({
                     opacity={related ? 1 : 0.55}
                   />
                   {e.label ? (
-                    <text
-                      x={path.labelX}
-                      y={path.labelY - 6}
-                      textAnchor="middle"
-                      fill={e.kind === 'spoke' ? '#c4b5fd' : '#a5f3fc'}
-                      fontSize="10"
-                      fontWeight="600"
-                    >
-                      {e.label}
-                    </text>
+                    <g filter="url(#ctx-label-shadow)">
+                      <rect
+                        x={path.labelX - labelW / 2}
+                        y={path.labelY - labelH - 2}
+                        width={labelW}
+                        height={labelH}
+                        rx="5"
+                        fill={e.kind === 'join' ? 'rgba(8,47,73,0.96)' : 'rgba(15,23,42,0.94)'}
+                        stroke={e.kind === 'join' ? 'rgba(103,232,249,0.7)' : 'rgba(196,181,253,0.45)'}
+                        strokeWidth="1"
+                      />
+                      <text
+                        x={path.labelX}
+                        y={path.labelY - 6}
+                        textAnchor="middle"
+                        fill={e.kind === 'join' ? '#ecfeff' : '#ede9fe'}
+                        fontSize="11"
+                        fontWeight="700"
+                      >
+                        {e.label}
+                      </text>
+                    </g>
                   ) : null}
                 </g>
               );
@@ -647,10 +810,13 @@ export default function ContextMap({
           {graph.nodes.map((node) => {
             const isOpenFile = !!(node.fileId && node.fileId === openFileId);
             const on = selected === node.id
-              || (selectedIsAccount && (node.kind === 'hub' || node.moduleId === 'account'))
-              || (selectedModule && (node.id === selectedModule.id || node.moduleId === selectedModule.id));
+              || node.id === focus.moduleId
+              || (node.groupId && node.groupId === focus.group && !node.kindKey && !node.fileId)
+              || (node.kindKey && node.kindKey === focus.kind && !node.fileId)
+              || isOpenFile
+              || (selectedIsAccount && node.kind === 'hub');
             const mod = MODULES.find((m) => m.id === node.moduleId) || MODULES.find((m) => m.id === node.id);
-            const Icon = node.kind === 'hub' ? UserCog : (mod?.Icon || FileText);
+            const Icon = nodeIcon(node, mod);
             return (
               <button
                 key={node.id}
@@ -668,15 +834,15 @@ export default function ContextMap({
                     ? 'bg-violet-600/90 border-violet-200/40 text-white'
                     : node.kind === 'module'
                       ? 'bg-slate-900/95 border-white/20 text-white'
-                      : node.kind === 'data'
+                      : node.kind === 'data' || node.kind === 'files'
                         ? 'bg-slate-900/90 border-cyan-400/35 text-slate-100'
                         : node.kind === 'pptx'
                           ? 'bg-slate-900/90 border-amber-400/40 text-slate-100'
-                        : node.kind === 'memory'
-                          ? 'bg-slate-900/90 border-violet-400/35 text-slate-100'
-                          : node.kind === 'empty'
-                            ? 'bg-slate-900/60 border-slate-600/40 text-slate-400'
-                            : 'bg-slate-900/90 border-blue-400/25 text-slate-100'
+                          : node.kind === 'memory'
+                            ? 'bg-slate-900/90 border-violet-400/35 text-slate-100'
+                            : node.kind === 'empty'
+                              ? 'bg-slate-900/60 border-slate-600/40 text-slate-400'
+                              : 'bg-slate-900/90 border-blue-400/25 text-slate-100'
                 } ${isOpenFile ? 'ring-2 ring-cyan-300 z-20' : on ? 'ring-2 ring-white/60 z-20' : 'z-10 hover:ring-1 hover:ring-cyan-300/50'}`}
                 style={{
                   left: `${(node.x / CANVAS.w) * 100}%`,
@@ -689,18 +855,15 @@ export default function ContextMap({
                   <span className={`mt-0.5 flex-shrink-0 rounded-md p-1 ${
                     node.kind === 'hub' ? 'bg-white/15' : (mod?.iconBg || 'bg-slate-700/80')
                   }`}>
-                    {node.kind === 'file' || node.kind === 'data' || node.kind === 'pptx' ? (
-                      <FileText className="w-3 h-3 text-white" />
-                    ) : node.kind === 'memory' ? (
-                      <Network className="w-3 h-3 text-white" />
-                    ) : (
-                      <Icon className="w-3 h-3 text-white" />
-                    )}
+                    <Icon className="w-3 h-3 text-white" />
                   </span>
                   <span className="min-w-0 leading-tight">
                     <span className="block text-[11px] font-bold truncate">{node.title}</span>
                     {node.subtitle ? (
                       <span className="block text-[9px] text-blue-100/70 truncate mt-0.5">{node.subtitle}</span>
+                    ) : null}
+                    {node.caption ? (
+                      <span className="block text-[9px] text-amber-200 font-semibold mt-0.5">{node.caption}</span>
                     ) : null}
                   </span>
                 </span>
@@ -715,7 +878,7 @@ export default function ContextMap({
           })}
         </div>
         <div className="flex flex-wrap gap-x-4 gap-y-1 px-4 py-2.5 border-t border-blue-400/15 text-[10px] text-blue-200/70 bg-slate-900/40">
-          <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always available from this login</span>
+          <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always passed to the AI</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-cyan-400 rounded" /> Modules sharing context</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Stored file join</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
@@ -729,7 +892,7 @@ export default function ContextMap({
             <div className="flex items-start justify-between gap-3 flex-wrap">
               <div>
                 <div className="text-sm font-bold text-white">{model.hubTitle}{model.hubSubtitle ? ` · ${model.hubSubtitle}` : ''}</div>
-                <p className="text-[11px] text-blue-300/55 mt-1">The centre of the schema — used in every module. No linking required.</p>
+                <p className="text-[11px] text-amber-200/80 mt-1 font-semibold">Context map passed to AI — used in every module, no linking required.</p>
               </div>
               <button
                 type="button"
@@ -752,7 +915,7 @@ export default function ContextMap({
               <p className="text-xs text-blue-300/45">Fill in company, role, and definitions under General so every chat starts with the same background.</p>
             )}
             <div>
-              <div className="text-xs font-semibold text-blue-200 mb-2">Remembered from chats (not tied to a module)</div>
+              <div className="text-xs font-semibold text-blue-200 mb-2">Remembered from chats (always passed to the AI)</div>
               {model.generalMemory.length ? (
                 <ul className="space-y-1.5">
                   {model.generalMemory.map((m) => (
@@ -760,7 +923,7 @@ export default function ContextMap({
                   ))}
                 </ul>
               ) : (
-                <p className="text-[11px] text-blue-300/45">No untagged facts. Facts harvested in a module sit on that module’s arm of the star.</p>
+                <p className="text-[11px] text-blue-300/45">No untagged facts yet. Facts harvested in a module also sit on that module — click Stella or Incentives, then Chat memory.</p>
               )}
             </div>
           </div>
@@ -771,11 +934,15 @@ export default function ContextMap({
             <div className="flex items-start justify-between gap-3 flex-wrap">
               <div>
                 <div className="text-sm font-bold text-white">{selectedModule.title}</div>
-                <p className="text-[11px] text-blue-300/55 mt-1">
-                  {selectedModule.linked.length
-                    ? `Cyan link: shares context with ${selectedModule.linked.map((id) => MODULE_CONTEXT_LABELS[id]).join(' and ')}.`
-                    : 'No cyan link — other modules do not receive these files unless you connect them on the home page.'}
-                </p>
+                {breadcrumb.length > 1 ? (
+                  <p className="text-[11px] text-cyan-200/80 mt-1">{breadcrumb.join(' › ')}</p>
+                ) : (
+                  <p className="text-[11px] text-blue-300/55 mt-1">
+                    {selectedModule.linked.length
+                      ? `Cyan link: shares context with ${selectedModule.linked.map((id) => MODULE_CONTEXT_LABELS[id]).join(' and ')}.`
+                      : 'No cyan link — other modules do not receive these files unless you connect them on the home page.'}
+                  </p>
+                )}
               </div>
               <button
                 type="button"
@@ -786,141 +953,139 @@ export default function ContextMap({
               </button>
             </div>
 
-            <div className="bg-slate-900/40 border border-cyan-400/15 rounded-lg p-3">
-              <div className="text-[10px] uppercase tracking-wide text-cyan-300/70 font-semibold mb-2">Used when you chat here</div>
-              <ul className="space-y-1">
-                {usedWhenChatting(model, selectedModule.id).map((line) => (
-                  <li key={line} className="text-xs text-slate-200 flex items-start gap-2">
-                    <span className="text-cyan-400 mt-0.5">•</span>
-                    <span>{line}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
+            {!focus.group && (
+              <div className="bg-slate-900/40 border border-cyan-400/15 rounded-lg p-3">
+                <div className="text-[10px] uppercase tracking-wide text-cyan-300/70 font-semibold mb-2">Used when you chat here</div>
+                <ul className="space-y-1">
+                  {usedWhenChatting(model, selectedModule.id).map((line) => (
+                    <li key={line} className="text-xs text-slate-200 flex items-start gap-2">
+                      <span className="text-cyan-400 mt-0.5">•</span>
+                      <span>{line}</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-[11px] text-blue-300/50 mt-2">Click Chat memory or Files on the map to drill in.</p>
+              </div>
+            )}
 
-            {selectedModule.pptx && (
+            {focus.group === 'memory' && (
+              <div className="space-y-4">
+                <div>
+                  <div className="text-xs font-semibold text-blue-200 mb-2">Tagged to {selectedModule.short}</div>
+                  {selectedModule.memory.length ? (
+                    <ul className="space-y-1.5">
+                      {selectedModule.memory.map((m) => (
+                        <li key={m.id} className="text-xs text-slate-200 bg-slate-900/40 border border-violet-400/20 rounded-lg px-3 py-2">{m.text}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-[11px] text-blue-300/45">Nothing tagged to this module yet. Confirm a remembered fact while chatting here and it will show up on this arm.</p>
+                  )}
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-blue-200 mb-2">Always passed from the centre</div>
+                  {model.generalMemory.length ? (
+                    <ul className="space-y-1.5">
+                      {model.generalMemory.map((m) => (
+                        <li key={m.id} className="text-xs text-slate-200 bg-slate-900/40 border border-blue-400/10 rounded-lg px-3 py-2">{m.text}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-[11px] text-blue-300/45">No untagged centre facts. Those are shared with every module automatically.</p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {focus.group === 'pptx-template' && selectedModule.pptx && (
               <div className="bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
                 <div className="text-[10px] uppercase tracking-wide text-blue-300/50 font-semibold">PowerPoint template</div>
                 <div className="text-xs text-slate-200 mt-1">{selectedModule.pptx.fileName || 'Custom template'} — colours and fonts for Incentive exports, not chat context.</div>
               </div>
             )}
 
-            {selectedModule.goals && (
+            {focus.group === 'goals' && selectedModule.goals && (
               <div className="bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
                 <div className="text-[10px] uppercase tracking-wide text-blue-300/50 font-semibold">Analysis goals</div>
                 <div className="text-xs text-slate-200 mt-1 whitespace-pre-wrap">{clip(selectedModule.goals, 400)}</div>
               </div>
             )}
 
-            {selectedModule.stellaFiles.length > 0 && (
-              <div>
-                <div className="text-xs font-semibold text-blue-200 mb-2">Data & strategy files (intake stays on the file)</div>
-                <div className="space-y-2">
-                  {selectedModule.stellaFiles.map((f) => {
-                    const open = openFileId === f.id;
-                    return (
-                      <div key={f.id} className="bg-slate-900/40 border border-blue-400/15 rounded-lg">
-                        <button
-                          type="button"
-                          onClick={() => setOpenFileId(open ? '' : f.id)}
-                          className="w-full text-left px-3 py-2 flex items-start justify-between gap-2"
-                        >
-                          <span className="min-w-0">
-                            <span className={`block text-xs font-semibold truncate ${f.isPptx ? 'text-amber-100' : 'text-white'}`}>{f.name}</span>
-                            <span className="block text-[10px] text-blue-300/50 mt-0.5">
-                              {f.kindLabel || (f.tableName ? `Table ${f.tableName}` : 'Document')}
-                              {f.tableName && !f.isPptx ? ` · ${f.tableName}` : ''}
-                              {f.rowCount != null ? ` · ${f.rowCount} rows` : ''}
-                              {f.intakeComplete ? ' · Intake captured' : ' · Intake incomplete'}
-                            </span>
-                          </span>
-                          <ChevronRight className={`w-4 h-4 text-blue-300/50 flex-shrink-0 mt-0.5 transition-transform ${open ? 'rotate-90' : ''}`} />
-                        </button>
-                        {open && (
-                          <div className="px-3 pb-3 space-y-1.5 text-[11px] text-slate-300">
-                            {f.represents ? <div><span className="text-blue-300/60">Represents: </span>{f.represents}</div> : null}
-                            {f.period ? <div><span className="text-blue-300/60">Period: </span>{f.period}</div> : null}
-                            {f.metrics.length ? <div><span className="text-blue-300/60">Metrics: </span>{f.metrics.join(', ')}</div> : null}
-                            {f.maps.length ? <div><span className="text-blue-300/60">Name maps: </span>{f.maps.join('; ')}</div> : null}
-                            {f.qaCount ? <div>{f.qaCount} intake answer{f.qaCount === 1 ? '' : 's'} stored on this file</div> : null}
-                            {f.highlights.filter((h) => h !== f.represents).map((h, i) => (
-                              <div key={`${f.id}-h-${i}`}>• {h}</div>
-                            ))}
-                            {!f.represents && !f.period && !f.metrics.length && !f.maps.length && !f.qaCount && !f.highlights.length && (
-                              <div className="text-blue-300/45">No interpretive notes yet — finish intake on Connections.</div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+            {focus.group === 'files' && !focus.kind && (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold text-blue-200">File types — click one on the map</div>
+                {kindsFor(selectedModule).map((k) => (
+                  <button
+                    key={k.id}
+                    type="button"
+                    onClick={() => setFocus({ moduleId: selectedModule.id, group: 'files', kind: k.id, fileId: '' })}
+                    className="w-full text-left bg-slate-900/40 border border-blue-400/15 hover:border-cyan-400/40 rounded-lg px-3 py-2"
+                  >
+                    <span className="text-xs font-semibold text-white">{k.title}</span>
+                    <span className="block text-[10px] text-blue-300/50 mt-0.5">{k.files.length} file{k.files.length === 1 ? '' : 's'}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {focus.group === 'files' && focus.kind && !focusedFile && (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold text-blue-200">
+                  {FILE_KINDS.find((k) => k.id === focus.kind)?.title || 'Files'} — click a file to see captured context
                 </div>
+                {moduleFiles(selectedModule).filter((f) => kindOfFile(f) === focus.kind).map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => {
+                      setFocus((prev) => ({ ...prev, fileId: f.id }));
+                      setOpenFileId(f.id);
+                    }}
+                    className="w-full text-left bg-slate-900/40 border border-blue-400/15 hover:border-cyan-400/40 rounded-lg px-3 py-2"
+                  >
+                    <span className="text-xs font-semibold text-white">{f.name}</span>
+                    <span className="block text-[10px] text-blue-300/50 mt-0.5">{f.kindLabel}{f.tableName ? ` · ${f.tableName}` : ''}{f.rowCount != null ? ` · ${f.rowCount} rows` : ''}</span>
+                  </button>
+                ))}
+                {selectedModule.joins.length > 0 && focus.kind === 'spreadsheet' && (
+                  <div className="pt-2">
+                    <div className="text-xs font-semibold text-blue-200 mb-2">How those files join</div>
+                    <ul className="space-y-1.5">
+                      {selectedModule.joins.map((e) => (
+                        <li key={`${e.fromId}|${e.toId}|${e.label}`} className="text-xs text-slate-200 bg-slate-900/40 border border-cyan-400/20 rounded-lg px-3 py-2 flex items-center gap-2">
+                          <Link2 className="w-3.5 h-3.5 text-cyan-300 flex-shrink-0" />
+                          <span><span className="font-semibold">{e.fromName}</span> {e.label} <span className="font-semibold">{e.toName}</span></span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             )}
 
-            {selectedModule.joins.length > 0 && (
-              <div>
-                <div className="text-xs font-semibold text-blue-200 mb-2">How those files join</div>
-                <ul className="space-y-1.5">
-                  {selectedModule.joins.map((e) => (
-                    <li key={`${e.fromId}|${e.toId}|${e.label}`} className="text-xs text-slate-200 bg-slate-900/40 border border-cyan-400/20 rounded-lg px-3 py-2 flex items-center gap-2">
-                      <Link2 className="w-3.5 h-3.5 text-cyan-300 flex-shrink-0" />
-                      <span><span className="font-semibold">{e.fromName}</span> {e.label} <span className="font-semibold">{e.toName}</span></span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {selectedModule.files.length > 0 && (
-              <div>
-                <div className="text-xs font-semibold text-blue-200 mb-2">Context files</div>
-                <div className="space-y-2">
-                  {selectedModule.files.map((f) => {
-                    const open = openFileId === f.id;
-                    return (
-                      <div key={f.id} className="bg-slate-900/40 border border-blue-400/15 rounded-lg">
-                        <button
-                          type="button"
-                          onClick={() => setOpenFileId(open ? '' : f.id)}
-                          className="w-full text-left px-3 py-2 flex items-start justify-between gap-2"
-                        >
-                          <span className="min-w-0">
-                            <span className="block text-xs font-semibold text-white truncate flex items-center gap-1.5">
-                              <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${f.kindLabel?.startsWith('PowerPoint') ? 'text-amber-300' : 'text-cyan-400'}`} /> {f.name}
-                            </span>
-                            <span className="block text-[10px] text-blue-300/50 mt-0.5">
-                              {f.kind} · {f.kindLabel || 'Context'} · {f.blockCount ? `${f.blockCount} captured field${f.blockCount === 1 ? '' : 's'}` : 'No extracted fields yet'}
-                            </span>
-                          </span>
-                          <ChevronRight className={`w-4 h-4 text-blue-300/50 flex-shrink-0 mt-0.5 transition-transform ${open ? 'rotate-90' : ''}`} />
-                        </button>
-                        {open && f.highlights.length > 0 && (
-                          <ul className="px-3 pb-3 space-y-1">
-                            {f.highlights.map((h, i) => (
-                              <li key={`${f.id}-h-${i}`} className="text-[11px] text-slate-300">• {h}</li>
-                            ))}
-                          </ul>
-                        )}
-                      </div>
-                    );
-                  })}
+            {focusedFile && (
+              <div className="bg-slate-900/40 border border-cyan-400/25 rounded-lg px-3 py-3 space-y-1.5 text-[11px] text-slate-300">
+                <div className="text-xs font-semibold text-white">{focusedFile.name}</div>
+                <div className="text-[10px] text-blue-300/50">
+                  {focusedFile.kindLabel}
+                  {focusedFile.tableName ? ` · Table ${focusedFile.tableName}` : ''}
+                  {focusedFile.rowCount != null ? ` · ${focusedFile.rowCount} rows` : ''}
+                  {focusedFile.intakeComplete ? ' · Intake captured' : ' · Intake incomplete'}
                 </div>
+                {focusedFile.represents ? <div><span className="text-blue-300/60">Represents: </span>{focusedFile.represents}</div> : null}
+                {focusedFile.period ? <div><span className="text-blue-300/60">Period: </span>{focusedFile.period}</div> : null}
+                {focusedFile.metrics?.length ? <div><span className="text-blue-300/60">Metrics: </span>{focusedFile.metrics.join(', ')}</div> : null}
+                {focusedFile.maps?.length ? <div><span className="text-blue-300/60">Name maps: </span>{focusedFile.maps.join('; ')}</div> : null}
+                {focusedFile.qaCount ? <div>{focusedFile.qaCount} intake answer{focusedFile.qaCount === 1 ? '' : 's'} stored on this file</div> : null}
+                {focusedFile.blockCount ? <div>{focusedFile.blockCount} captured field{focusedFile.blockCount === 1 ? '' : 's'}</div> : null}
+                {(focusedFile.highlights || []).filter((h) => h !== focusedFile.represents).map((h, i) => (
+                  <div key={`${focusedFile.id}-h-${i}`}>• {h}</div>
+                ))}
+                {!focusedFile.represents && !focusedFile.period && !(focusedFile.metrics || []).length && !(focusedFile.highlights || []).length && (
+                  <div className="text-blue-300/45">No interpretive notes yet — finish intake on Connections.</div>
+                )}
               </div>
             )}
-
-            <div>
-              <div className="text-xs font-semibold text-blue-200 mb-2">Chat memory tagged to this module</div>
-              {selectedModule.memory.length ? (
-                <ul className="space-y-1.5">
-                  {selectedModule.memory.map((m) => (
-                    <li key={m.id} className="text-xs text-slate-200 bg-slate-900/40 border border-blue-400/10 rounded-lg px-3 py-2">{m.text}</li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-[11px] text-blue-300/45">No remembered facts from chats in this module. File intake is not stored here.</p>
-              )}
-            </div>
           </div>
         )}
       </div>
