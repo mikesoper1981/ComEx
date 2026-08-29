@@ -8,6 +8,7 @@ const BOOTSTRAP_SQL = require('./stella-bootstrap-sql');
 
 let bootstrapped = false;
 let bootstrapInFlight = null;
+const ensuredSchemas = new Set();
 
 function supabaseRest() {
   const supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').replace(/\/$/, '');
@@ -66,22 +67,22 @@ async function withPg(fn) {
   throw lastErr || new Error('Could not connect to Postgres');
 }
 
-async function rpcEnsureSchema(schema) {
+async function supabaseRpc(fn, args) {
   const { supabaseUrl, serviceKey } = supabaseRest();
-  if (!supabaseUrl || !serviceKey) return false;
+  if (!supabaseUrl || !serviceKey) return { ok: false, status: 0 };
   try {
-    const res = await fetch(`${supabaseUrl}/rest/v1/rpc/stella_ensure_schema`, {
+    const res = await fetch(`${supabaseUrl}/rest/v1/rpc/${fn}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         apikey: serviceKey,
         Authorization: `Bearer ${serviceKey}`,
       },
-      body: JSON.stringify({ p_schema: schema }),
+      body: JSON.stringify(args || {}),
     });
-    return res.ok;
+    return { ok: res.ok, status: res.status };
   } catch {
-    return false;
+    return { ok: false, status: 0 };
   }
 }
 
@@ -111,28 +112,48 @@ async function createSchemaViaPg(schema) {
 }
 
 /**
- * Create c_<company> (and install Stella helpers if needed).
+ * Create c_<company> (and install Stella helpers / company RLS if needed).
  * Safe to call repeatedly.
  */
 async function ensureCompanyPgSchema(companyOrSchema) {
   const raw = String(companyOrSchema || '').trim();
   const schema = isCompanyPgSchema(raw) ? raw : companyPgSchema(raw);
   if (!isCompanyPgSchema(schema)) return false;
-
-  if (await rpcEnsureSchema(schema)) {
-    bootstrapped = true;
-    return true;
-  }
+  if (ensuredSchemas.has(schema) && bootstrapped) return true;
 
   try {
-    await createSchemaViaPg(schema);
-    return true;
+    await bootstrapViaPg();
   } catch (err) {
-    console.warn('Could not create company schema', schema, err?.message || err);
-    return false;
+    console.warn('Could not bootstrap Stella tenant SQL', err?.message || err);
   }
+
+  let ok = false;
+  const rpc = await supabaseRpc('stella_ensure_schema', { p_schema: schema });
+  if (rpc.ok) {
+    ok = true;
+  } else {
+    try {
+      await createSchemaViaPg(schema);
+      ok = true;
+    } catch (err) {
+      console.warn('Could not create company schema', schema, err?.message || err);
+    }
+  }
+
+  const lockdown = await supabaseRpc('stella_apply_tenant_security', {});
+  if (lockdown.ok) bootstrapped = true;
+
+  if (ok) ensuredSchemas.add(schema);
+  return ok;
+}
+
+async function ensureAllCompanySchemas(companies) {
+  const names = [...new Set((companies || []).map((c) => String(c || '').trim()).filter(Boolean))];
+  const results = await Promise.all(names.map((c) => ensureCompanyPgSchema(c)));
+  return names.length === 0 || results.some(Boolean);
 }
 
 module.exports = {
   ensureCompanyPgSchema,
+  ensureAllCompanySchemas,
 };

@@ -11,6 +11,9 @@
     },
     "api/stella-query.js": {
       "maxDuration": 30
+    },
+    "api/stella-files.js": {
+      "maxDuration": 30
     }
   }
 }

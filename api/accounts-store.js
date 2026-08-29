@@ -9,7 +9,7 @@ const {
   companySlug,
   companyPgSchema,
   userObjectPrefix,
-  ensureCompanyPgSchema,
+  ensureAllCompanySchemas,
 } = require('./company');
 
 const ACCOUNTS_PATH = 'accounts.json';
@@ -358,9 +358,11 @@ async function loadAccounts() {
           ...data,
           updatedAt: new Date().toISOString(),
         });
-        const companies = [...new Set(users.map((u) => u.company).filter(Boolean))];
-        Promise.all(companies.map((c) => ensureCompanyPgSchema(c))).catch(() => {});
       }
+      const companies = [...new Set(users.map((u) => u.company).filter(Boolean))];
+      ensureAllCompanySchemas(companies).catch((err) => {
+        console.warn('Could not ensure company schemas', err?.message || err);
+      });
       return data;
     }
     const seeded = {
@@ -371,6 +373,10 @@ async function loadAccounts() {
       await uploadObject(ACCOUNTS_PATH, seeded);
     }
     accountsCache = { at: Date.now(), data: seeded };
+    const companies = [...new Set(seeded.users.map((u) => u.company).filter(Boolean))];
+    ensureAllCompanySchemas(companies).catch((err) => {
+      console.warn('Could not ensure company schemas', err?.message || err);
+    });
     return seeded;
   })();
   try {

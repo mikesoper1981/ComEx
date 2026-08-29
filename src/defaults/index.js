@@ -21,6 +21,12 @@ export {
   DEFAULT_STELLA_PROMPTS,
 };
 
+/** Filenames under /knowledge (and intelligence bucket) that power the KB. */
+export const KNOWLEDGE_SEED_FILES = [
+  'default-best-practices.md',
+  'pillar-2-strategic-alignment.md',
+];
+
 /** Map legacy numeric knowledge file ids → storage filenames. */
 function normalizeKnowledgeFiles(files) {
   if (!Array.isArray(files)) return [];
@@ -28,6 +34,58 @@ function normalizeKnowledgeFiles(files) {
     if (f === 1 || f === '1') return 'default-best-practices.md';
     if (f === 2 || f === '2') return 'pillar-2-strategic-alignment.md';
     return String(f);
+  });
+}
+
+const DEFAULT_KNOWLEDGE_FLAGS = { generalContext: true, agents: true };
+
+/** Per-file access flags stored in product.json (not user settings). */
+export function mergeKnowledgeAccess(raw = {}) {
+  const map = {};
+  const apply = (name, flags) => {
+    const n = String(name || '').trim();
+    if (!n) return;
+    const f = flags && typeof flags === 'object' ? flags : {};
+    map[n] = {
+      generalContext: f.generalContext !== false,
+      agents: f.agents !== false,
+    };
+  };
+  if (Array.isArray(raw)) {
+    for (const item of raw) apply(item?.name, item);
+  } else if (raw && typeof raw === 'object') {
+    for (const [name, flags] of Object.entries(raw)) apply(name, flags);
+  }
+  for (const seed of KNOWLEDGE_SEED_FILES) {
+    if (!map[seed]) apply(seed, DEFAULT_KNOWLEDGE_FLAGS);
+  }
+  return map;
+}
+
+export function knowledgeFileFlags(access, name) {
+  const n = String(name || '').trim();
+  const flags = access && typeof access === 'object' ? access[n] : null;
+  if (!flags || typeof flags !== 'object') return { ...DEFAULT_KNOWLEDGE_FLAGS };
+  return {
+    generalContext: flags.generalContext !== false,
+    agents: flags.agents !== false,
+  };
+}
+
+export function knowledgeFileAllowsGeneral(access, name) {
+  return knowledgeFileFlags(access, name).generalContext;
+}
+
+export function knowledgeFileAllowsAgents(access, name) {
+  return knowledgeFileFlags(access, name).agents;
+}
+
+export function filterKnowledgeDocuments(docs, access, role) {
+  return (docs || []).filter((d) => {
+    if (!d || d.status !== 'active' || !d.content) return false;
+    if (role === 'general') return knowledgeFileAllowsGeneral(access, d.name);
+    if (role === 'agents') return knowledgeFileAllowsAgents(access, d.name);
+    return true;
   });
 }
 
@@ -49,6 +107,7 @@ export const DEFAULT_INTELLIGENCE_CONTEXT = {
   },
   workflowRuntime: { ...DEFAULT_WORKFLOW_RUNTIME },
   stellaPrompts: { ...DEFAULT_STELLA_PROMPTS },
+  knowledgeAccess: mergeKnowledgeAccess({}),
 };
 
 function cloneAgents(list) {
@@ -64,15 +123,32 @@ function cloneAgents(list) {
 
 function cloneOrchestrator(orch) {
   const o = orch && typeof orch === 'object' ? orch : {};
+  let wrapUpPrompt = o.wrapUpPrompt != null ? String(o.wrapUpPrompt) : DEFAULT_ORCHESTRATOR_PROMPTS.wrapUpPrompt;
+  if (/brief, warm closing summary \(3-5 sentences\)/i.test(wrapUpPrompt)) {
+    wrapUpPrompt = DEFAULT_ORCHESTRATOR_PROMPTS.wrapUpPrompt;
+  }
+  let introFull = o.introFull != null ? String(o.introFull) : DEFAULT_ORCHESTRATOR_PROMPTS.introFull;
+  if (/Introduce yourself briefly \(1-2 sentences\)/i.test(introFull)
+    || /Introduce yourself briefly as the IC analysis orchestrator \(1-2 sentences\)/i.test(introFull)) {
+    introFull = o.introFull != null && /IC analysis orchestrator/i.test(introFull)
+      ? (DEFAULT_TOPICS.find((t) => t.id === 'analyze_ic')?.orchestrator?.introFull || DEFAULT_ORCHESTRATOR_PROMPTS.introFull)
+      : DEFAULT_ORCHESTRATOR_PROMPTS.introFull;
+  }
+  let introFocused = o.introFocused != null ? String(o.introFocused) : DEFAULT_ORCHESTRATOR_PROMPTS.introFocused;
+  if (/Keep your introduction to 1 sentence/i.test(introFocused)) {
+    introFocused = /specific territory/i.test(introFocused)
+      ? (DEFAULT_TOPICS.find((t) => t.id === 'territory_assessment')?.orchestrator?.introFocused || DEFAULT_ORCHESTRATOR_PROMPTS.introFocused)
+      : DEFAULT_ORCHESTRATOR_PROMPTS.introFocused;
+  }
   return {
     role: o.role != null ? String(o.role) : '',
     goal: o.goal != null ? String(o.goal) : '',
     approach: o.approach != null ? String(o.approach) : '',
     evaluatePrompt: o.evaluatePrompt != null ? String(o.evaluatePrompt) : DEFAULT_ORCHESTRATOR_PROMPTS.evaluatePrompt,
-    introFull: o.introFull != null ? String(o.introFull) : DEFAULT_ORCHESTRATOR_PROMPTS.introFull,
-    introFocused: o.introFocused != null ? String(o.introFocused) : DEFAULT_ORCHESTRATOR_PROMPTS.introFocused,
+    introFull,
+    introFocused,
     briefingPrompt: o.briefingPrompt != null ? String(o.briefingPrompt) : DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt,
-    wrapUpPrompt: o.wrapUpPrompt != null ? String(o.wrapUpPrompt) : DEFAULT_ORCHESTRATOR_PROMPTS.wrapUpPrompt,
+    wrapUpPrompt,
     evalFallbackMessage: o.evalFallbackMessage != null ? String(o.evalFallbackMessage) : DEFAULT_ORCHESTRATOR_PROMPTS.evalFallbackMessage,
   };
 }
@@ -111,7 +187,16 @@ export function mergeAgents(partial) {
   for (const a of saved) {
     if (!defaults.some((d) => d.id === a.id)) ordered.push(a);
   }
-  return ordered;
+  return ordered.map((a) => {
+    const d = defaults.find((x) => x.id === a.id);
+    if (!d) return a;
+    const prompt = String(a.systemPrompt || '');
+    const staleLength = /keep responses SHORT/i.test(prompt)
+      || /summarise it concisely and STOP/i.test(prompt)
+      || (/full plan overviews/i.test(prompt) && /Explain complex concepts simply with examples/i.test(prompt));
+    if (staleLength) return { ...a, systemPrompt: d.systemPrompt };
+    return a;
+  });
 }
 
 function mergeWorkflowSteps(saved, defaults) {
@@ -232,6 +317,9 @@ export function mergeWorkflowRuntime(partial) {
     || !/"reason"/i.test(String(out.matchDetectorPrompt || ''))) {
     out.matchDetectorPrompt = DEFAULT_WORKFLOW_RUNTIME.matchDetectorPrompt;
   }
+  if (!/unless this step or your role specifies/i.test(String(out.agentTaskWrapper || ''))) {
+    out.agentTaskWrapper = DEFAULT_WORKFLOW_RUNTIME.agentTaskWrapper;
+  }
   // Refresh stale factory prompts that dropped scheme images / vision extracts
   const classify = String(out.proposalImageClassifyPrompt || '');
   if (classify.includes('Prefer false positives of') || classify.includes('DEFAULT: relevant=false')) {
@@ -266,8 +354,13 @@ export function mergeStellaPrompts(partial) {
     out.contentSummary = DEFAULT_STELLA_PROMPTS.contentSummary;
   }
   if (/You are the Stella Insights data intake agent/i.test(out.intake)
-      && !/MUST ask whether\/how this file joins/i.test(out.intake)) {
+      && (!/MUST ask whether\/how this file joins/i.test(out.intake) || !/name_maps/i.test(out.intake))) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
+  }
+  if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)
+      || !/NAME MAPS already captured/i.test(out.analyst)
+      || !/unless this question or your instructions specify/i.test(out.analyst)) {
+    out.analyst = DEFAULT_STELLA_PROMPTS.analyst;
   }
   return out;
 }
@@ -283,6 +376,7 @@ export function mergeIntelligenceContext(raw = {}) {
     pptxClarify: mergePptxClarify(raw.pptxClarify),
     workflowRuntime: mergeWorkflowRuntime(raw.workflowRuntime),
     stellaPrompts: mergeStellaPrompts(raw.stellaPrompts),
+    knowledgeAccess: mergeKnowledgeAccess(raw.knowledgeAccess),
   };
 }
 
@@ -291,12 +385,6 @@ export function fillTemplate(template, vars = {}) {
     vars[key] != null ? String(vars[key]) : ''
   ));
 }
-
-/** Filenames under /knowledge (and intelligence bucket) that power the KB. */
-export const KNOWLEDGE_SEED_FILES = [
-  'default-best-practices.md',
-  'pillar-2-strategic-alignment.md',
-];
 
 export function isKnowledgeStorageFile(name) {
   const n = String(name || '').toLowerCase();
@@ -307,9 +395,11 @@ export function isKnowledgeStorageFile(name) {
   return /\.(md|txt|yml|yaml)$/i.test(n);
 }
 
-export function buildKnowledgeBaseFromDocuments(docs) {
-  return (docs || [])
-    .filter((d) => d.status === 'active' && d.content)
-    .map((d) => `## ${d.name}\n${d.content}`)
+export function buildKnowledgeBaseFromDocuments(docs, { access, role, hideNames = false } = {}) {
+  const list = role
+    ? filterKnowledgeDocuments(docs, access, role)
+    : (docs || []).filter((d) => d && d.status === 'active' && d.content);
+  return list
+    .map((d, i) => (hideNames ? `## Best-practice guidance ${i + 1}\n${d.content}` : `## ${d.name}\n${d.content}`))
     .join('\n\n');
 }

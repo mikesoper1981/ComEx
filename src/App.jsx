@@ -51,7 +51,8 @@ import {
   memorySignature,
   applyMemoryConfirmation,
   factsAreSimilar,
-  factsShareMemoryTopic,
+  factsAreExclusiveConflict,
+  isMemoryEnrichmentFact,
   activeMemoryItems,
   formatMemoryStamp,
   describeObsoleteReason,
@@ -73,6 +74,9 @@ import {
   KNOWLEDGE_SEED_FILES,
   isKnowledgeStorageFile,
   buildKnowledgeBaseFromDocuments,
+  mergeKnowledgeAccess,
+  knowledgeFileFlags,
+  filterKnowledgeDocuments,
 } from './defaults';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import JSZip from 'jszip';
@@ -104,6 +108,7 @@ const StellaChart = lazy(() => import('./StellaChart'));
 const MANAGER_COLOURS = ['#34d399', '#60a5fa', '#a78bfa'];
 
 const STELLA_QUERY_API_PATH = '/api/stella-query';
+const STELLA_FILES_API_PATH = '/api/stella-files';
 const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
 const CHAT_API_PATH = '/api/chat';
@@ -353,7 +358,7 @@ function getResponseLengthLevel(settings) {
 
 function formatResponseLengthPrompt(settings) {
   const level = getResponseLengthLevel(settings);
-  return `RESPONSE LENGTH — MATCH THIS LEVEL STRICTLY (chat and agent replies the user reads, including Stella).
+  return `RESPONSE LENGTH — MATCH THIS LEVEL STRICTLY for every reply the user reads: free chat, Stella, workflow specialist steps, orchestrator intro/wrap-up, and agent handoffs.
 The three levels are different kinds of reply, not small length tweaks. Do not drift toward a generic mid-length answer.
 1 Executive = verdict + table/icon bullets (no how, no why). 2 Standard = what + how + a short because (no example walkthrough). 3 Teaching = explain: why it matters, impact, and a concrete example.
 RICH FORMAT AT EVERY LEVEL, including Executive: markdown tables for numbers/comparisons, emoji icons (✅ ⚠️ 🎯 📊) on key points, **bold** on the decision and figures. Short does not mean plain text — keep it scannable and clean, with no extra prose.
@@ -362,7 +367,39 @@ Never omit a needed fact, number, question, or recommendation to hit a word targ
 Current setting: ${level.value} of ${RESPONSE_LENGTH_MAX} — ${level.label}.
 ${level.instruction}
 
-Do not apply this to exported PowerPoint/document content, structured JSON, classification, extraction, or schema-only tasks; those must follow their specified format and stay compact.`;
+This is the hub-wide default. EXCEPTION: if this role, workflow step, or task specifies an explicit length (for example "300 words", "max 5 sentences"), follow that specification exactly — do not expand it to Teaching or shrink it to Executive. Vague "keep short" without a number still follows this setting. Numbered clarifying questions stay compact. Do not apply this to exported PowerPoint/document content, structured JSON, classification, extraction, or schema-only tasks; those must follow their specified format and stay compact.`;
+}
+
+/** Final-word reminder so workflow agents do not ignore the slider — unless the task itself sets a word/length cap. */
+function formatResponseLengthOverride(settings) {
+  const level = getResponseLengthLevel(settings);
+  return `USER ANSWER DETAIL (mandatory for this reply unless the role/step specifies an explicit length such as "300 words"): ${level.label} — ${level.value} of ${RESPONSE_LENGTH_MAX}.
+Write the user-visible output at this level only. Ignore vague "keep SHORT" / "full pack" length hints in your role. If this task specifies a word count, sentence cap, or similar, follow that instead. Clarifying-question lists stay short. JSON, extraction, and classification stay compact and complete.`;
+}
+
+/** True when a role/step/task sets its own length (word count etc.) — that beats the hub slider. */
+function systemHasExplicitLengthSpec(text) {
+  const stripped = String(text || '')
+    .replace(/USER ANSWER DETAIL[\s\S]{0,500}/gi, ' ')
+    .replace(/Match USER ANSWER DETAIL[\s\S]{0,400}/gi, ' ')
+    .replace(/RESPONSE LENGTH[\s\S]{0,1200}/gi, ' ');
+  return /\b\d{2,4}\s*words?\b/i.test(stripped)
+    || /\b(no more than|not more than|at most|maximum of|max(?:imum)?|up to|exactly)\s+\d{1,3}\s*(sentences?|paragraphs?|bullets?)\b/i.test(stripped)
+    || /\bkeep (this |your |the )?(answer|response|summary|output|write-?up) (to|under|below) \d/i.test(stripped);
+}
+
+function resolveUserFacingMaxTokens(base, settings, systemText = '') {
+  if (systemHasExplicitLengthSpec(systemText)) {
+    const match = String(systemText || '').match(/\b(\d{2,4})\s*words?\b/i);
+    if (match) {
+      const words = Number(match[1]);
+      if (Number.isFinite(words) && words > 0) {
+        return Math.max(500, Math.min(8192, Math.round(words * 1.7) + 250));
+      }
+    }
+    return Math.max(500, Math.min(8192, Math.round(Number(base) || 1600)));
+  }
+  return scaleUserFacingMaxTokens(base, settings);
 }
 
 /** Scale a user-facing token budget with the length slider (1 ≈ 40% of base, 3 ≈ 175%). */
@@ -406,7 +443,7 @@ function extractProductIntelligence(raw) {
   const src = raw.intelligence && typeof raw.intelligence === 'object'
     ? raw.intelligence
     : (raw.settings && typeof raw.settings === 'object' ? raw.settings : raw);
-  if (!(src.agents || src.topics || src.systemPrompt || src.workflowRuntime || src.stellaPrompts || src.pptxContext)) {
+  if (!(src.agents || src.topics || src.systemPrompt || src.workflowRuntime || src.stellaPrompts || src.pptxContext || src.knowledgeAccess)) {
     return null;
   }
   return mergeProductIntelligence(src);
@@ -1123,22 +1160,31 @@ function isMemoryConfirmDecline(text) {
     || /^(keep|keep it|keep existing)([\s.!,'"]*)$/i.test(t);
 }
 
+function memoryConfirmThreadOf(pending) {
+  return pending && pending.thread === 'stella' ? 'stella' : 'chat';
+}
+
 function matchConflictingMemory(existingActive, { existingId = '', existingText = '', proposed = '' } = {}) {
   const list = Array.isArray(existingActive) ? existingActive : [];
   const proposedText = String(proposed || '').trim();
+  if (proposedText && isMemoryEnrichmentFact(proposedText)) return null;
   if (existingId) {
     const byId = list.find((m) => m.id === existingId);
-    if (byId && (!proposedText || byId.text.toLowerCase() !== proposedText.toLowerCase())) return byId;
+    if (byId && (!proposedText || byId.text.toLowerCase() !== proposedText.toLowerCase())) {
+      if (factsAreExclusiveConflict(byId.text, proposedText)) return byId;
+    }
   }
   const named = String(existingText || '').trim();
   if (named) {
     const byNamed = list.find((m) => m.text.toLowerCase() === named.toLowerCase() || factsAreSimilar(m.text, named));
-    if (byNamed && (!proposedText || byNamed.text.toLowerCase() !== proposedText.toLowerCase())) return byNamed;
+    if (byNamed && (!proposedText || byNamed.text.toLowerCase() !== proposedText.toLowerCase())) {
+      if (factsAreExclusiveConflict(byNamed.text, proposedText)) return byNamed;
+    }
   }
   if (!proposedText) return null;
   return list.find((m) => (
     m.text.toLowerCase() !== proposedText.toLowerCase()
-    && factsShareMemoryTopic(m.text, proposedText)
+    && factsAreExclusiveConflict(m.text, proposedText)
   )) || null;
 }
 
@@ -1175,7 +1221,7 @@ function looksLikeInfoRequest(text) {
 }
 
 /** Format user preferences into a system-prompt block that all LLMs/agents must respect. */
-function buildUserSettingsPromptBlock(settings, { moduleId = '' } = {}) {
+function buildUserSettingsPromptBlock(settings, { moduleId = '', applyResponseLength = true } = {}) {
   const s = settings && typeof settings === 'object' ? settings : {};
   const lines = [];
   const push = (label, value) => {
@@ -1193,9 +1239,9 @@ function buildUserSettingsPromptBlock(settings, { moduleId = '' } = {}) {
   const extra = isEmptyContextValue(s.customContext) ? '' : String(s.customContext).trim();
   const linkedIds = moduleId ? connectedModuleIds(s.moduleConnections, moduleId) : [];
   const memoryBlock = formatMemoryPromptBlock(s, { moduleId, linkedIds });
-  const lengthBlock = formatResponseLengthPrompt(s);
+  const lengthBlock = applyResponseLength ? formatResponseLengthPrompt(s) : '';
   const identity = `${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}`;
-  return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, constraints, and response length in every response; do not contradict them):\n${identity ? `${identity}\n\n` : ''}${lengthBlock}\n`;
+  return `\n\nUSER SETTINGS (mandatory — always respect these preferences, definitions, abbreviations, constraints${applyResponseLength ? ', and response length' : ''} in every response; do not contradict them):\n${identity ? `${identity}\n\n` : ''}${lengthBlock}\n`;
 }
 
 function stellaNormalizeIntakeQuestions(raw) {
@@ -1451,6 +1497,112 @@ function stellaFormatConfirmedJoins(files) {
     }
   }
   return lines.join('\n');
+}
+
+function stellaFileShortName(name) {
+  const raw = String(name || 'File').trim();
+  if (raw.length <= 28) return raw;
+  const dot = raw.lastIndexOf('.');
+  if (dot > 8 && dot < raw.length - 1) {
+    const stem = raw.slice(0, dot);
+    const ext = raw.slice(dot);
+    return `${stem.slice(0, 18)}…${ext}`;
+  }
+  return `${raw.slice(0, 25)}…`;
+}
+
+/** Undirected join graph from intake-confirmed relationships. Multiple keys between the same pair stay as separate edges. */
+function stellaBuildFileLinkGraph(files) {
+  const list = (files || []).filter((f) => f && !f.processing);
+  const nodes = list.map((f) => ({
+    id: f.id,
+    name: f.name || 'File',
+    tableName: f.tableName || '',
+    intakeComplete: !!(f.intakeComplete || f.capturedContext),
+    joinCount: 0,
+  }));
+  const byTable = new Map();
+  const byName = new Map();
+  for (const f of list) {
+    if (f.tableName) byTable.set(String(f.tableName).toLowerCase(), f.id);
+    byName.set(String(f.name || '').toLowerCase(), f.id);
+  }
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const edges = [];
+  const seen = new Set();
+  for (const f of list) {
+    const rels = Array.isArray(f.capturedContext?.relationships) ? f.capturedContext.relationships : [];
+    for (const r of rels) {
+      if (!r) continue;
+      const otherId = (
+        (r.related_table && byTable.get(String(r.related_table).toLowerCase()))
+        || (r.related_file && byName.get(String(r.related_file).toLowerCase()))
+      );
+      if (!otherId || otherId === f.id) continue;
+      const thisField = String(r.this_field || '').trim();
+      const relatedField = String(r.related_field || '').trim();
+      if (!thisField || !relatedField) continue;
+      const pair = [f.id, otherId].sort().join('|');
+      const joinKey = [thisField, relatedField].map((s) => s.toLowerCase()).sort().join('=');
+      const edgeKey = `${pair}|${joinKey}`;
+      if (seen.has(edgeKey)) continue;
+      seen.add(edgeKey);
+      const other = list.find((x) => x.id === otherId);
+      edges.push({
+        from: f.id,
+        to: otherId,
+        thisField,
+        relatedField,
+        note: String(r.note || '').trim(),
+        label: `${thisField} ↔ ${relatedField}`,
+        fromName: f.name,
+        toName: other?.name || r.related_file || r.related_table,
+      });
+      const a = nodeById.get(f.id);
+      const b = nodeById.get(otherId);
+      if (a) a.joinCount += 1;
+      if (b) b.joinCount += 1;
+    }
+  }
+  return { nodes, edges };
+}
+
+function stellaFileGraphLayout(nodes, width, height) {
+  const n = nodes.length;
+  if (!n) return [];
+  const cx = width / 2;
+  const cy = height / 2;
+  if (n === 1) return [{ ...nodes[0], x: cx, y: cy }];
+  if (n === 2) {
+    const gap = Math.min(width * 0.28, 200);
+    return [
+      { ...nodes[0], x: cx - gap, y: cy },
+      { ...nodes[1], x: cx + gap, y: cy },
+    ];
+  }
+  const r = Math.min(width, height) * 0.34;
+  return nodes.map((node, i) => {
+    const a = -Math.PI / 2 + ((2 * Math.PI) * i) / n;
+    return { ...node, x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+  });
+}
+
+function stellaJoinCurvePath(a, b, index, total) {
+  const mx = (a.x + b.x) / 2;
+  const my = (a.y + b.y) / 2;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len;
+  const ny = dx / len;
+  const offset = (index - (total - 1) / 2) * 36;
+  const cx = mx + nx * offset;
+  const cy = my + ny * (offset || (total > 1 ? 0 : 18));
+  return {
+    d: `M ${a.x} ${a.y} Q ${cx} ${cy} ${b.x} ${b.y}`,
+    lx: (a.x + 2 * cx + b.x) / 4,
+    ly: (a.y + 2 * cy + b.y) / 4,
+  };
 }
 
 // Short, URL/identifier-safe random id (used for stella_data_<id> tables).
@@ -2453,10 +2605,112 @@ function stellaProfileRecords(records) {
   return lines.join('\n');
 }
 
+function stellaClipNamePart(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().replace(/^[«"']+|[»"'.]+$/g, '').slice(0, 80);
+}
+
+function stellaNormalizeNameMaps(raw) {
+  const list = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? [raw] : []);
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (!item) continue;
+    const from = stellaClipNamePart(item.from || item.local || item.source || item.alias);
+    const to = stellaClipNamePart(item.to || item.global || item.canonical || item.target || item.maps_to);
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) continue;
+    const key = `${from.toLowerCase()}=>${to.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const note = stellaClipNamePart(item.note);
+    out.push(note ? { from, to, note } : { from, to });
+  }
+  return out;
+}
+
+function stellaExtractNameMapsFromText(text) {
+  const src = String(text || '').replace(/\s+/g, ' ').trim();
+  if (src.length < 12) return [];
+  const found = [];
+  const push = (from, to, note) => {
+    stellaNormalizeNameMaps([{ from, to, note }]).forEach((m) => found.push(m));
+  };
+  const patterns = [
+    /["']?([^"'.,;:]{2,80}?)["']?\s+is the\s+(.{0,40}?)name for\s+["']?([^"'.,;:]{2,80}?)["']?(?:[.,;]|$)/gi,
+    /["']?([^"'.,;:]{2,80}?)["']?\s+(?:maps?|mapped)\s+to\s+["']?([^"'.,;:]{2,80}?)["']?(?:[.,;]|$)/gi,
+    /["']?([^"'.,;:]{2,80}?)["']?\s+is also (?:known as|called)\s+["']?([^"'.,;:]{2,80}?)["']?(?:[.,;]|$)/gi,
+    /["']?([^"'.,;:]{2,80}?)["']?\s+and\s+["']?([^"'.,;:]{2,80}?)["']?\s+are the same (?:product|brand|sku)/gi,
+  ];
+  for (const re of patterns) {
+    re.lastIndex = 0;
+    let match;
+    while ((match = re.exec(src))) {
+      if (match.length >= 4 && match[3] && re === patterns[0]) push(match[1], match[3], match[2] ? String(match[2]).trim() : '');
+      else push(match[1], match[2], '');
+    }
+  }
+  return stellaNormalizeNameMaps(found);
+}
+
+function stellaCollectNameMaps(ctx, intakeMessages = []) {
+  const blobs = [];
+  const base = ctx && typeof ctx === 'object' ? ctx : {};
+  const fromModel = stellaNormalizeNameMaps(base.name_maps || base.aliases || base.value_maps);
+  if (base.interpretation_notes) blobs.push(base.interpretation_notes);
+  (Array.isArray(base.qa_pairs) ? base.qa_pairs : []).forEach((p) => {
+    if (p?.answer) blobs.push(p.answer);
+    if (p?.question && p?.answer) blobs.push(`${p.question} ${p.answer}`);
+  });
+  (intakeMessages || []).forEach((m) => {
+    if (m?.role === 'user' && m.content) blobs.push(m.content);
+  });
+  return stellaNormalizeNameMaps([
+    ...fromModel,
+    ...blobs.flatMap((t) => stellaExtractNameMapsFromText(t)),
+  ]);
+}
+
+function stellaNameMapFact(map) {
+  if (!map?.from || !map?.to) return '';
+  const note = String(map.note || '').trim().replace(/\s*name$/i, '');
+  if (note) return `${map.from} is the ${note} name for ${map.to}`.replace(/\s+/g, ' ').trim();
+  return `${map.from} is the same product as ${map.to}`;
+}
+
+function factsFromStellaCapturedContext(ctx) {
+  if (!ctx || typeof ctx !== 'object') return [];
+  const facts = [];
+  for (const map of stellaCollectNameMaps(ctx)) {
+    const fact = stellaNameMapFact(map);
+    if (fact.length >= 12) facts.push(fact);
+  }
+  const notes = String(ctx.interpretation_notes || '').trim();
+  if (notes.length >= 16 && isMemoryEnrichmentFact(notes)) {
+    facts.push(notes.slice(0, 280));
+  }
+  (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).forEach((p) => {
+    const answer = String(p?.answer || '').replace(/\s+/g, ' ').trim();
+    if (answer.length >= 16 && isMemoryEnrichmentFact(answer)) {
+      facts.push(answer.slice(0, 280));
+    }
+  });
+  return facts;
+}
+
+function factsFromStellaFiles(files) {
+  return (Array.isArray(files) ? files : []).flatMap((f) => factsFromStellaCapturedContext(f?.capturedContext));
+}
+
 // Human-readable rendering of the structured context_qa JSON for prompts.
 function stellaFormatContextQa(ctx) {
   if (!ctx || typeof ctx !== 'object') return '(no interpretive context captured yet)';
   const lines = [];
+  const maps = stellaCollectNameMaps(ctx);
+  if (maps.length) {
+    lines.push('NAME MAPS (authoritative — treat these as the same product; apply in queries, do not re-ask, do not ask to update chat memory):');
+    maps.forEach((m) => {
+      lines.push(`  - "${m.from}" = "${m.to}"${m.note ? ` (${m.note})` : ''}`);
+    });
+  }
   if (ctx.what_it_represents) lines.push(`What it represents: ${ctx.what_it_represents}`);
   if (ctx.time_period) lines.push(`Time period: ${ctx.time_period}`);
   if (Array.isArray(ctx.key_metrics) && ctx.key_metrics.length) lines.push(`Key metrics: ${ctx.key_metrics.join(', ')}`);
@@ -2480,8 +2734,47 @@ function stellaFormatContextQa(ctx) {
 }
 
 // Map a stella_files DB row into the local file object used by the UI.
+function stellaFilesApiDown(res) {
+  return !res || res.status === 404 || res.status === 502 || res.status === 503;
+}
+
+async function stellaListFilesViaSupabase(user, { isAdmin } = {}) {
+  const userOrg = stellaOrgIdForUser(user);
+  const orgCandidates = stellaOrgIdCandidates(user);
+  if (isAdmin) {
+    const { data: own } = await supabase.from('stella_files').select('id').eq('org_id', userOrg).limit(1);
+    if (!own?.length) {
+      const { data: legacy } = await supabase.from('stella_files').select('id').eq('org_id', 'default').limit(1);
+      if (legacy?.length) {
+        await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', 'default');
+      }
+    }
+  }
+  let data = [];
+  let sourceOrg = '';
+  for (const org of orgCandidates) {
+    const { data: rows, error } = await supabase
+      .from('stella_files')
+      .select('*')
+      .eq('org_id', org)
+      .order('uploaded_at', { ascending: true });
+    if (!error && Array.isArray(rows) && rows.length) {
+      data = rows;
+      sourceOrg = org;
+      break;
+    }
+  }
+  if (sourceOrg && sourceOrg !== userOrg) {
+    await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', sourceOrg);
+    data = data.map((row) => ({ ...row, org_id: userOrg }));
+  }
+  return data;
+}
+
 function stellaMapRegistryRow(row) {
-  const ctx = row.context_qa && typeof row.context_qa === 'object' ? row.context_qa : null;
+  const rawCtx = row.context_qa && typeof row.context_qa === 'object' ? row.context_qa : null;
+  const maps = rawCtx ? stellaCollectNameMaps(rawCtx) : [];
+  const ctx = rawCtx && maps.length ? { ...rawCtx, name_maps: maps } : rawCtx;
   const qa = ctx && Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : [];
   const intakeMessages = qa.flatMap(p => [
     ...(p && p.question ? [{ role: 'assistant', content: p.question }] : []),
@@ -2933,6 +3226,7 @@ export default function CommercialExcellenceApp() {
   const pendingWorkflowRef = useRef(pendingWorkflow);
   const uploadedFileRef = useRef(uploadedFile);
   const userSettingsRef = useRef(userSettings);
+  const stellaDataFilesRef = useRef(stellaDataFiles);
   const persistChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
   const chatsBodiesRef = useRef([]);
@@ -2949,6 +3243,11 @@ export default function CommercialExcellenceApp() {
   const stellaResumeRef = useRef(null);
   const declinedWorkflowIdsRef = useRef(new Set());
   const [pendingMemoryConfirm, setPendingMemoryConfirm] = useState(null);
+  const memoryPendingFor = (thread) => {
+    const pending = pendingMemoryConfirmRef.current || pendingMemoryConfirm;
+    if (!pending) return null;
+    return memoryConfirmThreadOf(pending) === thread ? pending : null;
+  };
   const [memoryCustomOpen, setMemoryCustomOpen] = useState(false);
   const [memoryCustomDraft, setMemoryCustomDraft] = useState('');
   const memoryCustomInputRef = useRef(null);
@@ -3213,48 +3512,25 @@ export default function CommercialExcellenceApp() {
       chatsFullLoadedRef.current = false;
       chatsFullPromiseRef.current = null;
       chatsBodiesRef.current = [];
-      const userOrg = stellaOrgIdForUser(currentUser);
-      const orgCandidates = stellaOrgIdCandidates(currentUser);
 
       const loadStellaFiles = async () => {
       // File registry (stella_files table), scoped to this company + user.
       try {
-        if (isAdmin) {
-          const { data: own } = await supabase
-            .from('stella_files')
-            .select('id')
-            .eq('org_id', userOrg)
-            .limit(1);
-          if (!own?.length) {
-            const { data: legacy } = await supabase
-              .from('stella_files')
-              .select('id')
-              .eq('org_id', 'default')
-              .limit(1);
-            if (legacy?.length) {
-              await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', 'default');
-            }
-          }
-        }
         let data = [];
-        let sourceOrg = '';
-        for (const org of orgCandidates) {
-          const { data: rows, error } = await supabase
-            .from('stella_files')
-            .select('*')
-            .eq('org_id', org)
-            .order('uploaded_at', { ascending: true });
-          if (!error && Array.isArray(rows) && rows.length) {
-            data = rows;
-            sourceOrg = org;
-            break;
+        try {
+          const res = await fetch(STELLA_FILES_API_PATH, {
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
+          });
+          if (res.ok) {
+            const payload = await res.json().catch(() => ({}));
+            data = Array.isArray(payload.files) ? payload.files : [];
+          } else if (stellaFilesApiDown(res)) {
+            data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
           }
+        } catch {
+          data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
         }
-        if (sourceOrg && sourceOrg !== userOrg) {
-          await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', sourceOrg);
-          data = data.map((row) => ({ ...row, org_id: userOrg }));
-        }
-        if (Array.isArray(data) && data.length) {
+        if (data.length) {
           const mapped = data.map(stellaMapRegistryRow);
           setStellaDataFiles(prev => {
             const existing = new Set(prev.map(f => f.dbId).filter(Boolean));
@@ -3447,6 +3723,8 @@ export default function CommercialExcellenceApp() {
         .then(() => runMemoryBackfillIfNeeded())
         .catch((err) => console.warn('Chat transcripts load failed:', err?.message || err));
       await restDone;
+      const intakeFacts = factsFromStellaFiles(stellaDataFilesRef.current);
+      if (intakeFacts.length) void persistMemoryFactsQuietly(intakeFacts, { module: 'stella' });
     };
     loadStella();
   }, [currentUser.id]);
@@ -3461,6 +3739,7 @@ export default function CommercialExcellenceApp() {
     pendingWorkflowRef.current = pendingWorkflow;
     uploadedFileRef.current = uploadedFile;
     userSettingsRef.current = userSettings;
+    stellaDataFilesRef.current = stellaDataFiles;
     activeChatIdRef.current = activeChatId;
     chatSessionsRef.current = chatSessions;
   });
@@ -3845,7 +4124,7 @@ export default function CommercialExcellenceApp() {
   const generateSuggestions = async (conversationHistory) => {
     if (!suggestionsEnabled || conversationHistory.length === 0) { setSuggestedPrompts([]); return; }
     // Never invent answers while an agent is waiting on clarifying questions
-    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser || pendingProposalIntake || pendingMemoryConfirmRef.current) {
+    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser || pendingProposalIntake || memoryPendingFor('chat')) {
       setSuggestedPrompts([]);
       return;
     }
@@ -3909,7 +4188,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
       const pptxCtx = getPptxContext(productIntel);
       const response = await anthropicMessagesPost({
-        system: `${pptxCtx.intentDetection}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule() })}`,
+        system: `${pptxCtx.intentDetection}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule(), applyResponseLength: false })}`,
         messages: [{ role: 'user', content: `Conversation:\n${recentMessages}` }],
         max_tokens: 400,
       });
@@ -3952,14 +4231,19 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
   };
 
   const harvestChatMemory = async (assistantText, userText, recentTurns = [], { thread = 'chat' } = {}) => {
+    const memThread = thread === 'stella' ? 'stella' : 'chat';
     if (!isMemoryEnabled(userSettingsRef.current)) return { conflict: false };
-    if (pendingMemoryConfirmRef.current) return { conflict: true };
+    if (memoryConfirmThreadOf(pendingMemoryConfirmRef.current) === memThread && pendingMemoryConfirmRef.current) {
+      return { conflict: true };
+    }
     if (!shouldHarvestChatMemory(assistantText, userText)) return { conflict: false };
     let spins = 0;
     while (harvestMemoryBusyRef.current && spins < 80) {
       await new Promise((r) => setTimeout(r, 50));
       spins += 1;
-      if (pendingMemoryConfirmRef.current) return { conflict: true };
+      if (memoryConfirmThreadOf(pendingMemoryConfirmRef.current) === memThread && pendingMemoryConfirmRef.current) {
+        return { conflict: true };
+      }
     }
     if (!userSettingsReadyRef.current || harvestMemoryBusyRef.current) {
       harvestMemoryPendingRef.current = { assistantText, userText, recentTurns, thread };
@@ -3977,6 +4261,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
             userText,
             recentTurns,
             existingMemory: userSettingsRef.current.memory,
+            knownFileFacts: factsFromStellaFiles(stellaDataFilesRef.current),
           }),
         }],
         500,
@@ -4037,7 +4322,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
         const existing = String(conflict.existingText || '').trim();
         const proposed = String(conflict.proposed || '').trim();
         const question = `Should I update a remembered fact?\n\n**Currently:** ${existing}\n**Update to:** ${proposed}`;
-        const pending = { ...conflict, extraFacts: [], thread };
+        const pending = { ...conflict, extraFacts: [], thread: memThread };
         pendingMemoryConfirmRef.current = pending;
         setPendingMemoryConfirm(pending);
         setMemoryCustomOpen(false);
@@ -4056,7 +4341,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     if (pending && (pending.userText !== userText || pending.assistantText !== assistantText) && !pendingMemoryConfirmRef.current) {
       void harvestChatMemory(pending.assistantText, pending.userText, pending.recentTurns, { thread: pending.thread || 'chat' });
     }
-    return { conflict: openedConflict || !!pendingMemoryConfirmRef.current };
+    return { conflict: openedConflict || !!(pendingMemoryConfirmRef.current && memoryConfirmThreadOf(pendingMemoryConfirmRef.current) === memThread) };
   };
 
   const persistConfirmedMemory = async (nextMemory) => {
@@ -4068,6 +4353,17 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
       mergeUserSettingsFields(userSettingsRef.current),
       { userName: currentUser.name },
     ));
+  };
+
+  const persistMemoryFactsQuietly = async (facts, { module = 'stella' } = {}) => {
+    if (!userSettingsReadyRef.current) return;
+    if (!isMemoryEnabled(userSettingsRef.current)) return;
+    const incoming = (facts || []).map((f) => String(f || '').replace(/\s+/g, ' ').trim()).filter((f) => f.length >= 12);
+    if (!incoming.length) return;
+    const before = memorySignature(userSettingsRef.current.memory);
+    const memory = mergeMemoryFacts(userSettingsRef.current.memory, incoming, { module });
+    if (memorySignature(memory) === before) return;
+    await persistConfirmedMemory(memory);
   };
 
   const applyPendingMemoryDecision = async (action, customText = '') => {
@@ -4115,7 +4411,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     return 'incentives';
   };
 
-  const withUserSettings = (system, { moduleContext = true } = {}) => {
+  const withUserSettings = (system, { moduleContext = true, applyResponseLength = true } = {}) => {
     let prompt = String(system || '');
     if (!isAdmin) {
       prompt = prompt.replace(
@@ -4127,15 +4423,17 @@ Do not cite sources. Never name knowledge files, intelligence documents, or file
       prompt = prompt.replace(/loaded from intelligence files/gi, 'best-practice guidance');
     }
     const settings = userSettingsRef.current || userSettings;
+    const useLength = applyResponseLength && !systemHasExplicitLengthSpec(prompt);
     const moduleBlock = moduleContext
       ? formatLinkedModulesPromptBlock(settings, resolvePromptModule(), { stellaFiles: stellaDataFiles })
       : '';
-    const base = `${prompt}${buildUserSettingsPromptBlock(settings, { moduleId: resolvePromptModule() })}${moduleBlock}`;
-    if (isAdmin) return base;
-    return `${base}
+    const base = `${prompt}${buildUserSettingsPromptBlock(settings, { moduleId: resolvePromptModule(), applyResponseLength: useLength })}${moduleBlock}`;
+    const endUser = isAdmin ? '' : `
 
 END-USER MODE: Never cite or name knowledge files, intelligence documents, or source filenames. Do not use [1]/[2] markers or a References section. Apply best-practice knowledge in your reasoning without mentioning where it came from.
 MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. Do not write "Memory updated". The app confirms memory changes separately.`;
+    const lengthTail = useLength ? `\n\n${formatResponseLengthOverride(settings)}` : '';
+    return `${base}${endUser}${lengthTail}`;
   };
 
   const getIntel = () => mergeProductIntelligence({
@@ -4152,6 +4450,26 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   const getWorkflowRuntime = () => getIntel().workflowRuntime;
   const getPptxClarify = () => getIntel().pptxClarify;
   const getStellaPrompts = () => getIntel().stellaPrompts;
+
+  const knowledgeAccessLive = () => mergeKnowledgeAccess(getIntel().knowledgeAccess);
+
+  const moduleGetsGeneralKnowledge = (moduleId) => {
+    if (moduleId === 'incentives') return true;
+    const settings = userSettingsRef.current || userSettings;
+    return connectedModuleIds(settings.moduleConnections, moduleId).includes('incentives');
+  };
+
+  const formatGeneralKnowledgeBlock = () => {
+    const kb = buildKnowledgeBaseFromDocuments(documents, {
+      access: knowledgeAccessLive(),
+      role: 'general',
+      hideNames: !isAdmin,
+    });
+    if (!kb) return '';
+    return isAdmin
+      ? `\n\nKNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
+      : `\n\nKNOWLEDGE BASE (best-practice guidance — never name source files):\n${kb}`;
+  };
 
   /** Persist Admin intelligence into the shared product JSON (not per-user). */
   const persistIntelligenceSettings = async (overrides = {}) => {
@@ -4191,6 +4509,22 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
     }
     return intel;
+  };
+
+  const syncKnowledgeAccessMap = (patch = {}) => {
+    const next = mergeKnowledgeAccess(knowledgeAccessLive());
+    for (const doc of documents) {
+      if (doc?.name && !next[doc.name]) next[doc.name] = { generalContext: true, agents: true };
+    }
+    return { ...next, ...patch };
+  };
+
+  const setKnowledgeFileFlag = async (fileName, field, value) => {
+    const name = String(fileName || '').trim();
+    if (!name) return;
+    const next = syncKnowledgeAccessMap();
+    next[name] = { ...knowledgeFileFlags(next, name), [field]: !!value };
+    await persistIntelligenceSettings({ knowledgeAccess: next });
   };
 
   const saveUserSettings = async (next) => {
@@ -4413,12 +4747,14 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     setIsLoading(false);
     setShowLanding(false);
     setActiveTab(tab || (snapshot ? chatModuleMeta(snapshot).tab : 'chat'));
-    pendingMemoryConfirmRef.current = null;
-    setPendingMemoryConfirm(null);
-    setMemoryCustomOpen(false);
-    setMemoryCustomDraft('');
-    memoryResumeRef.current = null;
-    memoryCustomForcedRef.current = false;
+    if (memoryConfirmThreadOf(pendingMemoryConfirmRef.current) !== 'stella') {
+      pendingMemoryConfirmRef.current = null;
+      setPendingMemoryConfirm(null);
+      setMemoryCustomOpen(false);
+      setMemoryCustomDraft('');
+      memoryResumeRef.current = null;
+      memoryCustomForcedRef.current = false;
+    }
     skipMemoryHarvestRef.current = false;
     stellaResumeRef.current = null;
     const declined = new Set();
@@ -4534,10 +4870,10 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   const buildAgentKnowledge = (agent) => {
     const keys = agent.knowledgeFiles || [];
     if (!keys.length) return '';
-    const active = documents.filter((d) => d.status === 'active' && d.content);
+    const eligible = filterKnowledgeDocuments(documents, knowledgeAccessLive(), 'agents');
     const selected = keys.includes('*')
-      ? active
-      : active.filter((d) => keys.some((k) => d.name === k || d.name.endsWith(`/${k}`) || d.id === k));
+      ? eligible
+      : eligible.filter((d) => keys.some((k) => d.name === k || d.name.endsWith(`/${k}`) || d.id === k));
     return selected.map((d, i) => `${isAdmin ? `## ${d.name}` : `## Best-practice guidance ${i + 1}`}\n${d.content}`).join('\n\n');
   };
 
@@ -4559,7 +4895,8 @@ ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 ${taskBlock}
 
 ${clarifyingPolicy}`);
-    return await callAnthropic(system, messages, scaleUserFacingMaxTokens(3000, userSettings));
+    const lengthSource = `${agent.systemPrompt}\n${taskBlock}\n${step.goal || ''}\n${step.successCriteria || ''}`;
+    return await callAnthropic(system, messages, resolveUserFacingMaxTokens(3000, userSettingsRef.current || userSettings, lengthSource));
   };
 
   const normalizeOrchestratorAction = (action) => {
@@ -4650,7 +4987,7 @@ ${orch.approach ? `\nApproach rules:\n${orch.approach}` : ''}
 Workflow steps:
 ${stepList}
 
-${evaluatePrompt}`);
+${evaluatePrompt}`, { applyResponseLength: false });
 
     const contextStr = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output.substring(0, 300)}`).join('\n\n');
     const userContent = `Workflow: ${topic.name}
@@ -4710,7 +5047,7 @@ Rules:
     const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 ${getWorkflowRuntime().handoffAddon}`);
-    return await callAnthropic(system, [{ role: 'user', content: task }], scaleUserFacingMaxTokens(2000, userSettings));
+    return await callAnthropic(system, [{ role: 'user', content: task }], resolveUserFacingMaxTokens(2000, userSettingsRef.current || userSettings, `${agent.systemPrompt}\n${task}`));
   };
 
   const executeOrchestrator = async (topic, userMessage, stepIndex = null, focusedContextOverride = null) => {
@@ -4736,7 +5073,7 @@ ${introInstr}`);
       const introLead = await callAnthropic(
         introSystem,
         [{ role: 'user', content: `The user wants to: ${userMessage}\n\nOverall orchestrator goal: ${orch.goal}` }],
-        400,
+        resolveUserFacingMaxTokens(900, userSettingsRef.current || userSettings, `${orch.role}\n${introInstr}`),
       );
       const handoff = `I'll now hand you to **${firstAgent?.name || 'the first specialist'}** to begin.`;
       const introResponse = isFocused
@@ -5015,8 +5352,16 @@ ${introInstr}`);
   };
 
   const wrapUpWorkflow = async (topic, updatedContext) => {
-    const wrapSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.wrapUpPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.wrapUpPrompt}`);
-    const wrapSummary = await callAnthropic(wrapSystem, [{ role: 'user', content: `Completed: ${topic.name}\n${updatedContext.map(c => `${c.step}: ${c.output.substring(0, 150)}`).join('\n')}` }], 300);
+    const wrapSettings = userSettingsRef.current || userSettings;
+    const wrapLen = normalizeResponseLength(wrapSettings?.responseLength);
+    const snippet = wrapLen >= 3 ? 900 : wrapLen >= 2 ? 350 : 180;
+    const wrapPrompt = `${topic.orchestrator?.role || ''}\n${topic.orchestrator?.wrapUpPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.wrapUpPrompt}`;
+    const wrapSystem = withUserSettings(wrapPrompt);
+    const wrapSummary = await callAnthropic(
+      wrapSystem,
+      [{ role: 'user', content: `Completed: ${topic.name}\n${updatedContext.map((c) => `${c.step}: ${c.output.substring(0, snippet)}`).join('\n')}` }],
+      resolveUserFacingMaxTokens(1600, wrapSettings, wrapPrompt),
+    );
     setMessages(prev => {
       const updated = [...prev, { role: 'orchestrator', content: wrapSummary }];
       setTimeout(() => generateSuggestions(updated), 800);
@@ -5088,7 +5433,7 @@ ${topic.autoAdvance
           const isFinalSummary = agentId === 'assessment_summary_agent' || stepIndex === (topic.workflow.length - 1);
           const stepInstruction = isFinalSummary
             ? `INSTRUCTION: This is the FINAL step (Assessment Summary). You HAVE prior specialist outputs below — use them.
-1) Write a short executive summary of findings (strengths, weaknesses, compliance issues, information gaps).
+1) Summarise findings (strengths, weaknesses, compliance issues, information gaps) at the user's ANSWER DETAIL level.
 2) Produce a markdown Recommendations table: | Priority | Recommendation | Rationale / explanation | Evidence basis | Severity if unaddressed |
 3) Include INFORMATION GAPS as recommendation rows when material facts were missing.
 4) End with Next actions.
@@ -5118,7 +5463,7 @@ ${stepInstruction}`;
         }
       } else if (workflowContext.length > 0) {
         const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
-        const briefingSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.briefingPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt}`);
+        const briefingSystem = withUserSettings(`${topic.orchestrator?.role || ''}\n${topic.orchestrator?.briefingPrompt || DEFAULT_ORCHESTRATOR_PROMPTS.briefingPrompt}`, { applyResponseLength: false });
         const briefingPrompt = `Context from prior steps:\n${contextSummary}\n\nNext agent: ${agent.name}\nTask: Step ${step.step} - ${step.name}\nGoal: ${step.goal}\nUser's message: ${userMessage}\n\nWrite the briefing.`;
         taskBriefing = await callAnthropic(briefingSystem, [{ role: 'user', content: briefingPrompt }], 300);
       }
@@ -5194,7 +5539,7 @@ ${stepInstruction}`;
         const extracted = await extractProposalImages(file, { textLength: extractedText.length });
         const finalized = await finalizeProposalImages(
           extracted,
-          classifyPrompt || withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt, { moduleContext: false }),
+          classifyPrompt || withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt, { moduleContext: false, applyResponseLength: false }),
         );
         const images = finalized.images || [];
         unsure = finalized.unsure || [];
@@ -5297,7 +5642,7 @@ ${stepInstruction}`;
           }]);
           visionText = await interpretProposalImages(
             images,
-            withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt, { moduleContext: false }),
+            withUserSettings(getWorkflowRuntime().proposalImageInterpretPrompt, { moduleContext: false, applyResponseLength: false }),
             {
               onProgress: (n, total, name) => {
                 setMessages((prev) => {
@@ -5547,7 +5892,7 @@ ${stepInstruction}`;
     onStatus?.(`Reading ${Math.min(images.length, 8)} image(s)…`);
     return interpretProposalImages(
       images,
-      withUserSettings(getWorkflowRuntime().contextImageInterpretPrompt, { moduleContext: false }),
+      withUserSettings(getWorkflowRuntime().contextImageInterpretPrompt, { moduleContext: false, applyResponseLength: false }),
       {
         onProgress: (n, total, name) => onStatus?.(`Reading image ${n}/${total} (${name})…`),
       },
@@ -5708,7 +6053,7 @@ ${stepInstruction}`;
     setUserSettingsPane(moduleId === 'stella' ? 'stella' : moduleId === 'territory' ? 'territory' : 'incentives');
     try {
       const extracts = await extractDocumentForIngest(file, {
-        classifyPrompt: withUserSettings(getWorkflowRuntime().contextImageClassifyPrompt, { moduleContext: false }),
+        classifyPrompt: withUserSettings(getWorkflowRuntime().contextImageClassifyPrompt, { moduleContext: false, applyResponseLength: false }),
         onStatus: (msg) => {
           setUserSettings((prev) => ({
             ...prev,
@@ -6186,7 +6531,7 @@ ${stepInstruction}`;
         const extracted = await extractProposalImages(file, { textLength: extractedText.length });
         const finalized = await finalizeProposalImages(
           extracted,
-          withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt, { moduleContext: false }),
+          withUserSettings(getWorkflowRuntime().proposalImageClassifyPrompt, { moduleContext: false, applyResponseLength: false }),
         );
         const images = finalized.images || [];
         const unsure = finalized.unsure || [];
@@ -6292,6 +6637,12 @@ ${stepInstruction}`;
       return;
     }
 
+    void persistIntelligenceSettings({
+      knowledgeAccess: syncKnowledgeAccessMap({
+        [file.name]: { generalContext: true, agents: true },
+      }),
+    });
+
     const reader = new FileReader();
     reader.onload = (e) => {
       const content = String(e.target.result || '');
@@ -6323,6 +6674,9 @@ ${stepInstruction}`;
     try {
       await supabase.storage.from('intelligence').remove([doc.name]);
     } catch { /* ignore */ }
+    const nextAccess = { ...syncKnowledgeAccessMap() };
+    delete nextAccess[doc.name];
+    void persistIntelligenceSettings({ knowledgeAccess: nextAccess });
     setDocuments((prev) => {
       const next = prev.filter((d) => d.id !== doc.id && d.name !== doc.name);
       setKnowledgeBase(buildKnowledgeBaseFromDocuments(next));
@@ -6356,17 +6710,32 @@ ${stepInstruction}`;
 
   // ── STELLA: DB registry (stella_files) + local state helpers ──
   const stellaPatchLocal = (fileId, patch) =>
-    setStellaDataFiles(prev => prev.map(f => (f.id === fileId ? { ...f, ...patch } : f)));
+    setStellaDataFiles((prev) => {
+      const next = prev.map((f) => (f.id === fileId ? { ...f, ...patch } : f));
+      stellaDataFilesRef.current = next;
+      return next;
+    });
 
   const stellaReloadRegistry = async () => {
     try {
-      const { data, error } = await supabase
-        .from('stella_files')
-        .select('*')
-        .eq('org_id', stellaOrgIdForUser(currentUser))
-        .order('uploaded_at', { ascending: true });
-      if (error || !Array.isArray(data)) return null;
+      let data = null;
+      try {
+        const res = await fetch(STELLA_FILES_API_PATH, {
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+        });
+        if (res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          if (Array.isArray(payload.files)) data = payload.files;
+        } else if (stellaFilesApiDown(res)) {
+          data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
+        }
+      } catch {
+        data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
+      }
+      if (!Array.isArray(data)) return null;
       const mapped = data.map(stellaMapRegistryRow);
+      const intakeFacts = factsFromStellaFiles(mapped);
+      if (intakeFacts.length) void persistMemoryFactsQuietly(intakeFacts, { module: 'stella' });
       setStellaDataFiles(prev => {
         const prevById = new globalThis.Map(prev.filter(f => f.dbId).map(f => [f.dbId, f]));
         const merged = mapped.map(m => {
@@ -6387,6 +6756,22 @@ ${stepInstruction}`;
   };
 
   const stellaInsertRegistry = async (record) => {
+    try {
+      const res = await fetch(STELLA_FILES_API_PATH, {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action: 'insert', record }),
+      });
+      if (res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        if (payload.file) return payload.file;
+      } else if (!stellaFilesApiDown(res)) {
+        const payload = await res.json().catch(() => ({}));
+        throw new Error(payload?.error?.message || 'Registry insert failed');
+      }
+    } catch (err) {
+      if (err?.message && err.message !== 'Failed to fetch') throw err;
+    }
     const { data, error } = await supabase
       .from('stella_files')
       .insert({ org_id: stellaOrgIdForUser(currentUser), ...record })
@@ -6398,8 +6783,51 @@ ${stepInstruction}`;
 
   const stellaUpdateRegistry = async (dbId, patch) => {
     if (!dbId) return;
+    try {
+      const res = await fetch(STELLA_FILES_API_PATH, {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action: 'update', id: dbId, patch }),
+      });
+      if (res.ok) return;
+      if (!stellaFilesApiDown(res)) {
+        const payload = await res.json().catch(() => ({}));
+        throw new Error(payload?.error?.message || 'Registry update failed');
+      }
+    } catch (err) {
+      if (err?.message && err.message !== 'Failed to fetch') throw err;
+    }
     const { error } = await supabase.from('stella_files').update(patch).eq('id', dbId);
     if (error) throw new Error(`Registry update failed: ${error.message}`);
+  };
+
+  const stellaOtherTabularFiles = (exceptId) => {
+    const except = new Set([exceptId, String(exceptId || '')].filter(Boolean));
+    return (stellaDataFilesRef.current || []).filter((x) => (
+      x && x.tableName
+      && !except.has(x.id)
+      && !except.has(x.dbId)
+      && !x.processing
+    ));
+  };
+
+  const stellaRelationshipIntakeHint = (thisFile, otherTabular) => {
+    if (!otherTabular.length) return '';
+    const candidates = stellaGuessJoinCandidates(thisFile, otherTabular);
+    const otherFilesBlob = otherTabular.map((x) => {
+      const cols = (x.columns || []).map((c) => (
+        c.original && c.original !== c.name ? `${c.name} (header "${c.original}")` : (c.name || '')
+      )).filter(Boolean).join(', ');
+      return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
+    }).join('\n');
+    const candidateBlob = candidates.length
+      ? `\n\nLIKELY JOINS (from shared IDs / territory / product / similar keys — confirm with the user, do not assume):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
+      : '';
+    const knownJoins = stellaFormatConfirmedJoins(otherTabular);
+    const knownBlob = knownJoins
+      ? `\n\nALREADY CONFIRMED JOINS among previously loaded files (do not re-ask these; propose how THIS file connects):\n${knownJoins}`
+      : '';
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Propose likely links in PLAIN ENGLISH (territory, product, shared ID) — never ask for SQL. If the user confirms, store exact SQL column names in context_qa.relationships. If they say the files are unrelated, store an empty array.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -6499,14 +6927,17 @@ ${stepInstruction}`;
   const normalizeContextQa = (ctx, intakeMessages) => {
     const base = ctx && typeof ctx === 'object' ? ctx : {};
     let qa = Array.isArray(base.qa_pairs) ? base.qa_pairs.filter(p => p && (p.question || p.answer)) : [];
-    if (!qa.length) {
-      const msgs = intakeMessages || [];
-      for (let i = 0; i < msgs.length; i++) {
-        if (msgs[i].role === 'assistant') {
-          const ans = msgs.slice(i + 1).find(m => m.role === 'user');
-          if (ans) qa.push({ question: msgs[i].content, answer: ans.content });
-        }
-      }
+    const seen = new Set(qa.map((p) => `${String(p.question || '').trim()}|${String(p.answer || '').trim()}`.toLowerCase()));
+    const msgs = intakeMessages || [];
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].role !== 'assistant') continue;
+      const ans = msgs.slice(i + 1).find(m => m.role === 'user');
+      if (!ans) continue;
+      const pair = { question: msgs[i].content, answer: ans.content };
+      const key = `${String(pair.question || '').trim()}|${String(pair.answer || '').trim()}`.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      qa.push(pair);
     }
     const relationships = Array.isArray(base.relationships)
       ? base.relationships.filter(r => r && (r.related_file || r.related_table)).map(r => ({
@@ -6517,6 +6948,8 @@ ${stepInstruction}`;
           note: r.note || '',
         }))
       : [];
+    const withQa = { ...base, qa_pairs: qa };
+    const name_maps = stellaCollectNameMaps(withQa, msgs);
     return {
       what_it_represents: base.what_it_represents || '',
       time_period: base.time_period || '',
@@ -6524,7 +6957,22 @@ ${stepInstruction}`;
       interpretation_notes: base.interpretation_notes || '',
       qa_pairs: qa,
       relationships,
+      ...(name_maps.length ? { name_maps } : {}),
     };
+  };
+
+  const persistStellaIntakeContext = async (fileRec, ctx, intakeMessages) => {
+    const maps = stellaCollectNameMaps(ctx, intakeMessages);
+    const nextCtx = maps.length ? { ...ctx, name_maps: maps } : ctx;
+    stellaPatchLocal(fileRec.id, { intakeMessages, capturedContext: nextCtx, intakeComplete: true });
+    try {
+      if (fileRec.dbId) await stellaUpdateRegistry(fileRec.dbId, { context_qa: nextCtx });
+    } catch (e) {
+      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not save captured context: ${e.message}` }]);
+    }
+    const memoryFacts = factsFromStellaCapturedContext(nextCtx);
+    if (memoryFacts.length) void persistMemoryFactsQuietly(memoryFacts, { module: 'stella' });
+    return nextCtx;
   };
 
   const stellaSaveBusinessContext = async (next) => {
@@ -6554,7 +7002,7 @@ ${stepInstruction}`;
   });
 
   const stellaBuildContentSummary = async ({ name, type, textSample, columns = [], profile = '' }) => {
-    const system = withUserSettings(getStellaPrompts().contentSummary, { moduleContext: false });
+    const system = withUserSettings(getStellaPrompts().contentSummary, { moduleContext: false, applyResponseLength: false });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
     const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions MUST be 3–5 meaning/intent questions (what it represents, time period, units/definitions, caveats). Never return an empty array. Do not ask about row counts, distinct values, or column names already listed.`;
@@ -6577,21 +7025,10 @@ ${stepInstruction}`;
     const isDoc = !f.tableName;
 
     // Other tabular datasets this file could relate to (for AI-suggested joins).
-    const otherTabular = (stellaDataFiles || []).filter(x => x.id !== f.id && x.tableName);
+    const otherTabular = stellaOtherTabularFiles(f.id);
     const candidates = !isDoc ? stellaGuessJoinCandidates(f, otherTabular) : [];
-    const otherFilesBlob = otherTabular.length
-      ? otherTabular.map(x => {
-        const cols = (x.columns || []).map(c => (
-          c.original && c.original !== c.name ? `${c.name} (header "${c.original}")` : (c.name || '')
-        )).filter(Boolean).join(', ');
-        return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
-      }).join('\n')
-      : '(no other datasets uploaded yet)';
-    const candidateBlob = candidates.length
-      ? `\n\nLIKELY JOINS (from shared IDs / territory / product / similar keys — confirm with the user, do not assume):\n${candidates.map(c => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
-      : '';
     const relationshipGuidance = (!isDoc && otherTabular.length)
-      ? `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Propose likely links in PLAIN ENGLISH (territory, product, shared ID) — never ask for SQL. If the user confirms, store exact SQL column names in context_qa.relationships. If they say the files are unrelated, store an empty array.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}`
+      ? stellaRelationshipIntakeHint(f, otherTabular)
       : '';
 
     const colsBlob = Array.isArray(f.columns) && f.columns.length
@@ -6650,18 +7087,14 @@ ${stepInstruction}`;
     }
 
     const nextIntakeMessages = [...(f.intakeMessages || []), { role: 'assistant', content: assistantMessage }];
+    const shouldPersistContext = complete || !!f.intakeComplete;
 
-    if (complete) {
+    if (shouldPersistContext) {
       const ctx = {
-        ...normalizeContextQa(parsed?.context_qa, nextIntakeMessages),
-        relationships: declinedJoin ? [] : rels,
+        ...normalizeContextQa({ ...(f.capturedContext || {}), ...(parsed?.context_qa || {}) }, nextIntakeMessages),
+        relationships: declinedJoin ? [] : (rels.length ? rels : (f.capturedContext?.relationships || [])),
       };
-      stellaPatchLocal(f.id, { intakeMessages: nextIntakeMessages, capturedContext: ctx, intakeComplete: true });
-      try {
-        await stellaUpdateRegistry(f.dbId, { context_qa: ctx });
-      } catch (e) {
-        setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not save captured context: ${e.message}` }]);
-      }
+      await persistStellaIntakeContext(f, ctx, nextIntakeMessages);
       if (rels.length) {
         for (const r of rels) {
           const other = otherTabular.find(x => (
@@ -6821,7 +7254,7 @@ ${stepInstruction}`;
         onboarding,
         stellaDefaultIntakeQuestions({ isTabular, columns: mergedColumns }),
       );
-      const otherTabular = (stellaDataFiles || []).filter((x) => x.id !== tempId && x.tableName);
+      const otherTabular = stellaOtherTabularFiles(tempId);
       if (isTabular && otherTabular.length) {
         const joinQ = stellaJoinQuestion(
           stellaGuessJoinCandidates({ id: tempId, columns: mergedColumns }, otherTabular),
@@ -6846,7 +7279,11 @@ ${stepInstruction}`;
         intakeComplete: false, processing: false,
         uploadedAt: dbRow?.uploaded_at || new Date().toISOString(),
       };
-      setStellaDataFiles(prev => prev.map(f => (f.id === tempId ? finalFile : f)));
+      setStellaDataFiles((prev) => {
+        const next = prev.map((f) => (f.id === tempId ? finalFile : f));
+        stellaDataFilesRef.current = next;
+        return next;
+      });
       setActiveStellaDataId(prev => (prev === tempId ? dbId : prev));
     } catch (e) {
       setStellaDataFiles(prev => prev.map(f => f.id === tempId
@@ -6873,7 +7310,27 @@ ${stepInstruction}`;
     if (!f) return;
     if (!window.confirm(`Delete "${f.name}" and its captured context? This cannot be undone.`)) return;
     try {
-      if (f.dbId) await supabase.from('stella_files').delete().eq('id', f.dbId);
+      if (f.dbId) {
+        let usedApi = false;
+        try {
+          const res = await fetch(STELLA_FILES_API_PATH, {
+            method: 'POST',
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ action: 'delete', id: f.dbId }),
+          });
+          if (res.ok) usedApi = true;
+          else if (!stellaFilesApiDown(res)) {
+            const payload = await res.json().catch(() => ({}));
+            throw new Error(payload?.error?.message || 'Could not remove file from the registry');
+          }
+        } catch (err) {
+          if (err?.message && !/failed to fetch/i.test(err.message) && err.message !== 'Failed to fetch') throw err;
+        }
+        if (!usedApi) {
+          const { error } = await supabase.from('stella_files').delete().eq('id', f.dbId);
+          if (error) throw new Error(error.message);
+        }
+      }
     } catch (e) {
       setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not remove "${f.name}" from the registry: ${e.message}` }]);
     }
@@ -6893,8 +7350,180 @@ ${stepInstruction}`;
     });
   };
 
-  const renderStellaDataPanel = () => (
-    <div className="flex flex-col lg:flex-row gap-4">
+  const renderStellaFileLinkMap = () => {
+    const files = (stellaDataFiles || []).filter((f) => f && !f.processing);
+    if (!files.length) return null;
+    const graph = stellaBuildFileLinkGraph(files);
+    const width = 720;
+    const height = graph.nodes.length <= 2 ? 160 : graph.nodes.length <= 4 ? 248 : 300;
+    const laid = stellaFileGraphLayout(graph.nodes, width, height);
+    const pos = new Map(laid.map((n) => [n.id, n]));
+    const pairBuckets = new Map();
+    for (const e of graph.edges) {
+      const key = [e.from, e.to].sort().join('|');
+      if (!pairBuckets.has(key)) pairBuckets.set(key, []);
+      pairBuckets.get(key).push(e);
+    }
+    const isolated = graph.nodes.filter((n) => n.joinCount === 0);
+    const pending = graph.nodes.filter((n) => !n.intakeComplete);
+
+    return (
+      <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
+        <div className="flex items-start justify-between gap-3 mb-3">
+          <div>
+            <div className="text-sm font-bold text-white flex items-center gap-2">
+              <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
+            </div>
+            <p className="text-xs text-blue-300/60 mt-1">
+              Joins Stella stored from intake. One pair of files can have several links (different keys). Files with no confirmed join stay unconnected.
+            </p>
+          </div>
+          <div className="text-right shrink-0 text-[10px] text-blue-300/50">
+            <div>{graph.edges.length} join{graph.edges.length === 1 ? '' : 's'}</div>
+            <div>{isolated.length} unconnected</div>
+          </div>
+        </div>
+
+        <div className="bg-slate-950/40 border border-blue-400/15 rounded-xl overflow-hidden">
+          <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto max-h-[320px]" role="img" aria-label="File connection map">
+            {Array.from(pairBuckets.values()).flatMap((bucket) => (
+              bucket.map((e, i) => {
+                const a = pos.get(e.from);
+                const b = pos.get(e.to);
+                if (!a || !b) return null;
+                const curve = stellaJoinCurvePath(a, b, i, bucket.length);
+                const active = activeStellaDataId === e.from || activeStellaDataId === e.to;
+                return (
+                  <g key={`${e.from}-${e.to}-${e.thisField}-${e.relatedField}`}>
+                    <path
+                      d={curve.d}
+                      fill="none"
+                      stroke={active ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.45)'}
+                      strokeWidth={active ? 2.4 : 1.6}
+                    />
+                    <rect
+                      x={curve.lx - 62}
+                      y={curve.ly - 10}
+                      width={124}
+                      height={20}
+                      rx={6}
+                      fill="rgba(15, 23, 42, 0.92)"
+                      stroke="rgba(34, 211, 238, 0.25)"
+                    />
+                    <text
+                      x={curve.lx}
+                      y={curve.ly + 4}
+                      textAnchor="middle"
+                      className="fill-cyan-200"
+                      style={{ fontSize: 10, fontWeight: 600 }}
+                    >
+                      {e.label.length > 28 ? `${e.label.slice(0, 26)}…` : e.label}
+                    </text>
+                  </g>
+                );
+              })
+            ))}
+            {laid.map((n) => {
+              const selected = activeStellaDataId === n.id;
+              const linked = n.joinCount > 0;
+              return (
+                <g
+                  key={n.id}
+                  className="cursor-pointer"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Select ${n.name}`}
+                  onClick={() => setActiveStellaDataId(n.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setActiveStellaDataId(n.id);
+                    }
+                  }}
+                >
+                  <rect
+                    x={n.x - 78}
+                    y={n.y - 22}
+                    width={156}
+                    height={44}
+                    rx={10}
+                    fill={selected ? 'rgb(8, 47, 73)' : 'rgba(15, 23, 42, 0.95)'}
+                    stroke={selected ? 'rgb(34, 211, 238)' : linked ? 'rgba(52, 211, 153, 0.55)' : 'rgba(148, 163, 184, 0.35)'}
+                    strokeWidth={selected ? 2 : 1.2}
+                    strokeDasharray={linked || !n.intakeComplete ? undefined : '4 3'}
+                  />
+                  <text
+                    x={n.x}
+                    y={n.y - 2}
+                    textAnchor="middle"
+                    className="fill-white"
+                    style={{ fontSize: 11, fontWeight: 700 }}
+                  >
+                    {stellaFileShortName(n.name)}
+                  </text>
+                  <text
+                    x={n.x}
+                    y={n.y + 13}
+                    textAnchor="middle"
+                    className={linked ? 'fill-emerald-300' : 'fill-slate-400'}
+                    style={{ fontSize: 9 }}
+                  >
+                    {!n.intakeComplete
+                      ? 'Intake pending'
+                      : linked
+                        ? `${n.joinCount} join${n.joinCount === 1 ? '' : 's'}`
+                        : 'Not joined'}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+
+        {graph.edges.length > 0 && (
+          <div className="mt-3 space-y-1.5">
+            {graph.edges.map((e) => (
+              <button
+                key={`${e.from}-${e.to}-${e.thisField}-${e.relatedField}`}
+                type="button"
+                onClick={() => setActiveStellaDataId(e.from)}
+                className="w-full text-left text-xs bg-slate-900/40 border border-blue-400/15 hover:border-cyan-400/40 rounded-lg px-3 py-2 text-blue-100/90"
+              >
+                <span className="text-cyan-200 font-semibold">{e.fromName}</span>
+                <span className="text-blue-400/70">.{e.thisField}</span>
+                <span className="text-blue-300/50"> = </span>
+                <span className="text-cyan-200 font-semibold">{e.toName}</span>
+                <span className="text-blue-400/70">.{e.relatedField}</span>
+                {e.note ? <span className="block text-blue-300/55 mt-0.5">{e.note}</span> : null}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {isolated.length > 0 && (
+          <p className="text-xs text-blue-300/55 mt-3">
+            {isolated.map((n) => n.name).join(', ')}
+            {isolated.length === 1 ? ' has' : ' have'} no confirmed join
+            {pending.length ? ' — finish intake to capture links, or confirm they should stay separate.' : '.'}
+          </p>
+        )}
+        {graph.nodes.length > 1 && graph.edges.length === 0 && isolated.length === graph.nodes.length && (
+          <p className="text-xs text-blue-300/55 mt-2">
+            Stella only draws a connection when you confirm it in intake. Unrelated files are expected to stay apart.
+          </p>
+        )}
+      </div>
+    );
+  };
+
+  const renderStellaDataPanel = () => {
+    const joinCountById = new Map(
+      stellaBuildFileLinkGraph(stellaDataFiles).nodes.map((n) => [n.id, n.joinCount])
+    );
+    return (
+    <div className="space-y-4">
+      {renderStellaFileLinkMap()}
+      <div className="flex flex-col lg:flex-row gap-4">
       <div className="w-full lg:w-2/5">
         <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
           <div className="flex items-center justify-between gap-3">
@@ -6928,6 +7557,14 @@ ${stepInstruction}`;
                     <span className="px-2 py-1 bg-green-500/20 text-green-300 text-xs rounded border border-green-400/30">Context captured</span>
                   ) : (
                     <span className="px-2 py-1 bg-yellow-500/15 text-yellow-200 text-xs rounded border border-yellow-400/25">Intake pending</span>
+                  )}
+                  {f.capturedContext && !f.processing && (joinCountById.get(f.id) || 0) > 0 && (
+                    <span className="px-2 py-1 bg-cyan-500/15 text-cyan-200 text-xs rounded border border-cyan-400/25">
+                      {joinCountById.get(f.id)} join{joinCountById.get(f.id) === 1 ? '' : 's'}
+                    </span>
+                  )}
+                  {f.capturedContext && !f.processing && !(joinCountById.get(f.id) || 0) && (
+                    <span className="px-2 py-1 bg-slate-700/40 text-slate-300 text-xs rounded border border-slate-500/30">Not joined</span>
                   )}
                   <button onClick={() => handleStellaDeleteFile(f.id)} className="p-1.5 hover:bg-red-500/20 rounded transition-colors text-red-400" title="Delete file and context"><Trash2 className="w-4 h-4" /></button>
                 </div>
@@ -6993,8 +7630,10 @@ ${stepInstruction}`;
           })()}
         </div>
       </div>
+      </div>
     </div>
-  );
+    );
+  };
 
   const renderStellaBusinessPanel = () => (
     <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
@@ -7100,7 +7739,7 @@ ${stepInstruction}`;
       ? `\nCROSS-SOURCE QUESTIONS:\nMany questions combine tabular data (sales, engagement metrics in SQL) with document context (policies, reports, PDFs). For these:\n1. Use \`read_document\` to pull relevant passages from PDFs/text files\n2. Use \`inspect_table\` / \`run_sql\` for quantitative data\n3. Synthesise both in your answer — explicitly connect numbers to document context\n4. Verify that findings from each source align before answering\n`
       : '';
 
-    return withUserSettings(fillTemplate(getStellaPrompts().analyst, {
+    return withUserSettings(`${fillTemplate(getStellaPrompts().analyst, {
       bizText,
       fileCount: files.length,
       filePlural: files.length === 1 ? '' : 's',
@@ -7108,7 +7747,7 @@ ${stepInstruction}`;
       sqlInstr,
       docInstr,
       crossInstr,
-    }));
+    })}${moduleGetsGeneralKnowledge('stella') ? formatGeneralKnowledgeBlock() : ''}`);
   };
 
   const stellaRunQuery = async (sql) => {
@@ -7249,7 +7888,7 @@ ${stepInstruction}`;
     let skipHarvest = false;
     const resume = stellaResumeRef.current;
 
-    if (pendingMemoryConfirmRef.current) {
+    if (memoryPendingFor('stella')) {
       const forcedCustom = memoryCustomForcedRef.current;
       memoryCustomForcedRef.current = false;
       if (isMemoryConfirmAccept(messageContent)) {
@@ -7308,7 +7947,7 @@ ${stepInstruction}`;
       setStellaInput('');
     }
 
-    if (!skipHarvest && shouldHarvestChatMemory('', messageContent)) {
+    if (!skipHarvest && shouldHarvestChatMemory('', messageContent) && !/\?/.test(messageContent)) {
       const priorAsk = [...stellaMessages].reverse().find((m) => m.role === 'assistant');
       const harvested = await harvestChatMemory(
         priorAsk?.content,
@@ -7316,7 +7955,7 @@ ${stepInstruction}`;
         recentChatTurnsForMemory([...(stellaMessages || []), { role: 'user', content: messageContent }]),
         { thread: 'stella' },
       );
-      if (harvested?.conflict || pendingMemoryConfirmRef.current) {
+      if (harvested?.conflict || memoryPendingFor('stella')) {
         stellaResumeRef.current = { messageContent };
         setStellaIsLoading(false);
         return;
@@ -7339,6 +7978,8 @@ ${stepInstruction}`;
 
       const steps = [];
       let finalText = '';
+      const stellaSettings = userSettingsRef.current || userSettings;
+      const stellaAnswerTokens = scaleUserFacingMaxTokens(2500, stellaSettings);
       const MAX_STEPS = 8;
 
       for (let round = 0; round < MAX_STEPS; round++) {
@@ -7346,7 +7987,7 @@ ${stepInstruction}`;
           system: systemPrompt,
           messages: convo,
           tools: STELLA_TOOLS,
-          max_tokens: 5000,
+          max_tokens: Math.min(8192, 2500 + stellaAnswerTokens),
           thinking: { type: 'enabled', budget_tokens: 2500 },
         });
         const data = await resp.json();
@@ -7392,7 +8033,7 @@ ${stepInstruction}`;
           const wrapResp = await anthropicMessagesPost({
             system: systemPrompt,
             messages: [...convo, { role: 'user', content: 'Please give your final answer now based on what you found.' }],
-            max_tokens: 4000,
+            max_tokens: Math.min(8192, 2000 + scaleUserFacingMaxTokens(2000, stellaSettings)),
             thinking: { type: 'enabled', budget_tokens: 2000 },
           });
           const wrapData = await wrapResp.json();
@@ -7422,7 +8063,7 @@ ${stepInstruction}`;
 
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
-    if (pendingMemoryConfirm) return null;
+    if (memoryPendingFor('chat')) return null;
     if (pptxClarifyPending) return getPptxClarify().options;
     if (currentWorkflow?.awaitingAgentReply) return null;
     if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
@@ -7437,7 +8078,7 @@ ${stepInstruction}`;
 
   const clarifyingReplyHint = useMemo(() => {
     if (isLoading || pptxGenerating) return false;
-    if (pendingWorkflow || orchestratorDecision || pptxClarifyPending || pendingMemoryConfirm) return false;
+    if (pendingWorkflow || orchestratorDecision || pptxClarifyPending || memoryPendingFor('chat')) return false;
     const list = Array.isArray(messages) ? messages : [];
     const last = [...list].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
     if (currentWorkflow?.awaitingAgentReply) return hasNumberedClarifyingQuestions(last?.content);
@@ -7521,7 +8162,7 @@ ${stepInstruction}`;
     try {
       const pptxCtx = getPptxContext(productIntel);
       const raw = await callAnthropic(
-        `${pptxCtx.messageClassify}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule() })}`,
+        `${pptxCtx.messageClassify}${buildUserSettingsPromptBlock(userSettings, { moduleId: resolvePromptModule(), applyResponseLength: false })}`,
         [{ role: 'user', content: `User message:\n${text}` }],
         350,
       );
@@ -7577,7 +8218,7 @@ ${stepInstruction}`;
     const deckType = offer?.deckType || (isSummary ? 'session_summary' : 'general');
     const conversationContext = buildPptxConversationContext(messages);
     const pptxCtx = getPptxContext(productIntel);
-    const systemPrompt = withUserSettings(isSummary ? pptxCtx.summary : pptxCtx.produced);
+    const systemPrompt = withUserSettings(isSummary ? pptxCtx.summary : pptxCtx.produced, { applyResponseLength: false });
     const userContent = [
       `Export mode: ${isSummary ? 'SESSION SUMMARY (chat facts only)' : 'PRODUCED WORKING DOCUMENT'}`,
       `Requested title: "${offer?.title || (isSummary ? 'Session Summary' : 'Working Document')}"`,
@@ -7613,7 +8254,7 @@ ${stepInstruction}`;
       // If truncated, ask the model to finish a complete JSON payload.
       if (!slideData?.slides?.length && (raw.length > 1500 || /slides/i.test(raw))) {
         const contRes = await anthropicMessagesPost({
-          system: withUserSettings(getWorkflowRuntime().pptxRepairPrompt),
+          system: withUserSettings(getWorkflowRuntime().pptxRepairPrompt, { applyResponseLength: false }),
           messages: [{
             role: 'user',
             content: `Finish this PowerPoint JSON. Mode=${isSummary ? 'summary' : 'produced'}, deckType=${deckType}, title="${offer?.title || ''}".\n\nPartial output:\n${raw.slice(-3500)}\n\nConversation Context:\n${conversationContext.slice(0, 12000)}`,
@@ -7751,7 +8392,7 @@ ${stepInstruction}`;
     skipMemoryHarvestRef.current = false;
     const resumeAfterConfirm = memoryResumeRef.current;
 
-    if (pendingMemoryConfirmRef.current && !currentWorkflow) {
+    if (memoryPendingFor('chat') && !currentWorkflow) {
       const forcedCustom = memoryCustomForcedRef.current;
       memoryCustomForcedRef.current = false;
       if (isMemoryConfirmAccept(messageContent)) {
@@ -7872,7 +8513,7 @@ ${stepInstruction}`;
         recentChatTurnsForMemory(messagesRef.current),
         { thread: 'chat' },
       );
-      if (harvested?.conflict || pendingMemoryConfirmRef.current) {
+      if (harvested?.conflict || memoryPendingFor('chat')) {
         memoryResumeRef.current = { messageContent, isFileAnalysis };
         setIsLoading(false);
         return;
@@ -7921,13 +8562,11 @@ ${stepInstruction}`;
     const continueFreeform = async (extraInstruction = '') => {
       try {
         const fileContext = isFileAnalysis && uploadedFile ? `\n\nCONTEXT: The user has just uploaded a file named "${uploadedFile.name}" for assessment.` : '';
-        const kbRaw = knowledgeBase || buildKnowledgeBaseFromDocuments(documents);
-        const kb = isAdmin
-          ? kbRaw
-          : (documents || [])
-            .filter((d) => d.status === 'active' && d.content)
-            .map((d, i) => `## Best-practice guidance ${i + 1}\n${d.content}`)
-            .join('\n\n');
+        const kb = buildKnowledgeBaseFromDocuments(documents, {
+          access: knowledgeAccessLive(),
+          role: 'general',
+          hideNames: !isAdmin,
+        });
         const systemPrompt = withUserSettings(customSystemPrompt
           .replace(
             'KNOWLEDGE BASE:\nYou have access to comprehensive best practices and the complete Pillar 2: Strategic Alignment & Principles framework.',
@@ -7935,7 +8574,7 @@ ${stepInstruction}`;
               ? (isAdmin
                 ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
                 : `KNOWLEDGE BASE (best-practice guidance — never name source files):\n${kb}`)
-              : 'KNOWLEDGE BASE:\nNo knowledge files are loaded yet. Answer from conversation context and user settings only.'
+              : 'KNOWLEDGE BASE:\nNo knowledge files are marked General Context yet. Answer from conversation context and user settings only.'
           )
           + fileContext
           + (extraInstruction ? `\n\n${extraInstruction}` : ''));
@@ -7959,7 +8598,7 @@ ${stepInstruction}`;
         if (!skipMemoryHarvest && shouldHarvestChatMemory(assistantMessage, messageContent)) {
           await harvestChatMemory(assistantMessage, messageContent, recentChatTurnsForMemory(withReply), { thread: 'chat' });
         }
-        if (!pendingMemoryConfirmRef.current) {
+        if (!memoryPendingFor('chat')) {
           setTimeout(() => generateSuggestions(withReply), 400);
         } else {
           setSuggestedPrompts([]);
@@ -8129,6 +8768,75 @@ ${stepInstruction}`;
             </button>
           </div>
         )}
+      </div>
+    );
+  };
+
+  const setHubAnswerDetail = (raw) => {
+    void saveUserSettings({ responseLength: storedResponseLength(raw) });
+  };
+
+  const renderHubAnswerDetail = () => {
+    const lengthLevel = getResponseLengthLevel(userSettings);
+    return (
+      <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 sm:p-5">
+        <div className="flex items-start justify-between gap-3 mb-2">
+          <div>
+            <div className="text-sm font-semibold text-white">Answer detail</div>
+            <p className="text-xs mt-1 text-blue-300/60">
+              Hub-wide default for this account — Incentive chat, workflows, Territory, and Stella. Executive = decide. Standard = recommend. Teaching = explain with why, impact, and an example. If a workflow step or agent specifies its own length (for example 300 words), that instruction is used instead.
+            </p>
+          </div>
+          <div className="text-right shrink-0">
+            <div className="text-sm font-bold text-cyan-300">{lengthLevel.label}</div>
+            <div className="text-[10px] text-blue-300/50">{lengthLevel.value} of {RESPONSE_LENGTH_MAX}</div>
+          </div>
+        </div>
+        <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-full sm:w-fit mb-1">
+          {RESPONSE_LENGTH_LEVELS.map((level) => (
+            <button
+              key={level.id}
+              type="button"
+              onClick={() => setHubAnswerDetail(level.id)}
+              className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                level.value === lengthLevel.value
+                  ? 'bg-blue-500 text-white shadow-lg'
+                  : 'text-blue-300 hover:bg-slate-700/50'
+              }`}
+            >
+              {level.label}
+            </button>
+          ))}
+        </div>
+        <input
+          id="response-length"
+          type="range"
+          min={RESPONSE_LENGTH_MIN}
+          max={RESPONSE_LENGTH_MAX}
+          step={1}
+          value={lengthLevel.value}
+          onChange={(e) => setHubAnswerDetail(e.target.value)}
+          className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-400 mt-3"
+          aria-valuemin={RESPONSE_LENGTH_MIN}
+          aria-valuemax={RESPONSE_LENGTH_MAX}
+          aria-valuenow={lengthLevel.value}
+          aria-valuetext={lengthLevel.label}
+        />
+        <div className="grid grid-cols-3 mt-2">
+          {RESPONSE_LENGTH_LEVELS.map((level) => (
+            <button
+              key={level.value}
+              type="button"
+              onClick={() => setHubAnswerDetail(level.id)}
+              className={`text-[10px] sm:text-xs font-semibold ${
+                level.value === 1 ? 'text-left' : level.value === 3 ? 'text-right' : 'text-center'
+              } ${level.value === lengthLevel.value ? 'text-cyan-300' : 'text-blue-300/40 hover:text-blue-200/70'}`}
+            >
+              {level.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-xs text-blue-200/70 mt-3">{lengthLevel.hint}</p>
       </div>
     );
   };
@@ -8817,7 +9525,7 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {pendingMemoryConfirm && !isLoading && !pptxGenerating && (
+                {memoryPendingFor('chat') && !isLoading && !pptxGenerating && (
                   <div className="mb-3 p-3 bg-slate-800/70 border border-cyan-400/35 rounded-xl">
                     <div className="text-xs font-semibold text-cyan-200 mb-2">Confirm remembered fact</div>
                     {renderMemoryConfirmActions()}
@@ -8842,7 +9550,7 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !pendingMemoryConfirm && !currentWorkflow && !pendingImageReview && !pendingProposalIntake && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
+                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !memoryPendingFor('chat') && !currentWorkflow && !pendingImageReview && !pendingProposalIntake && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
                   <div className="mb-3">
                     <div className="text-xs text-blue-300/70 mb-2 flex items-center gap-2"><span>💡 Suggested next steps:</span></div>
                     <div className="flex flex-wrap gap-2">
@@ -9093,7 +9801,7 @@ ${stepInstruction}`;
                   <div ref={messagesEndRef} />
                 </div>
 
-                {pendingMemoryConfirm && !stellaIsLoading && (
+                {memoryPendingFor('stella') && !stellaIsLoading && (
                   <div className="mb-3 p-3 bg-slate-800/70 border border-cyan-400/35 rounded-xl">
                     <div className="text-xs font-semibold text-cyan-200 mb-2">Confirm remembered fact</div>
                     {renderMemoryConfirmActions()}
@@ -9138,6 +9846,8 @@ ${stepInstruction}`;
                 </div>
               </div>
 
+              {renderHubAnswerDetail()}
+
               <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit">
                 {[['general', 'General'], ['incentives', 'Incentives'], ['territory', 'Territory'], ['stella', 'Stella Insights']].map(([id, label]) => (
                   <button
@@ -9160,79 +9870,6 @@ ${stepInstruction}`;
                       {' '}<code className="text-cyan-300/80">{userSettingsRemotePath(currentUser)}</code>.
                       {' '}Chat history is <code className="text-cyan-300/80">{userChatsRemotePath(currentUser)}</code>.
                     </p>
-                    {(() => {
-                      const lengthLevel = getResponseLengthLevel(userSettings);
-                      return (
-                        <div className="mb-6 bg-slate-900/40 border border-blue-400/20 rounded-xl p-4 sm:p-5">
-                          <div className="flex items-start justify-between gap-3 mb-2">
-                            <div>
-                              <label htmlFor="response-length" className="block text-sm font-semibold text-white">Response length</label>
-                              <p className="text-xs text-blue-300/60 mt-1">
-                                How chat and agent replies are written. Executive = decide. Standard = recommend. Teaching = explain with why, impact, and an example.
-                              </p>
-                            </div>
-                            <div className="text-right shrink-0">
-                              <div className="text-sm font-bold text-cyan-300">{lengthLevel.label}</div>
-                              <div className="text-[10px] text-blue-300/50">{lengthLevel.value} of {RESPONSE_LENGTH_MAX}</div>
-                            </div>
-                          </div>
-                          <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-full sm:w-fit mb-3">
-                            {RESPONSE_LENGTH_LEVELS.map((level) => (
-                              <button
-                                key={level.id}
-                                type="button"
-                                onClick={() => setUserSettings((prev) => ({
-                                  ...prev,
-                                  responseLength: storedResponseLength(level.id),
-                                }))}
-                                className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
-                                  level.value === lengthLevel.value
-                                    ? 'bg-blue-500 text-white shadow-lg'
-                                    : 'text-blue-300 hover:bg-slate-700/50'
-                                }`}
-                              >
-                                {level.label}
-                              </button>
-                            ))}
-                          </div>
-                          <input
-                            id="response-length"
-                            type="range"
-                            min={RESPONSE_LENGTH_MIN}
-                            max={RESPONSE_LENGTH_MAX}
-                            step={1}
-                            value={lengthLevel.value}
-                            onChange={(e) => setUserSettings((prev) => ({
-                              ...prev,
-                              responseLength: storedResponseLength(e.target.value),
-                            }))}
-                            className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                            aria-valuemin={RESPONSE_LENGTH_MIN}
-                            aria-valuemax={RESPONSE_LENGTH_MAX}
-                            aria-valuenow={lengthLevel.value}
-                            aria-valuetext={lengthLevel.label}
-                          />
-                          <div className="grid grid-cols-3 mt-2">
-                            {RESPONSE_LENGTH_LEVELS.map((level) => (
-                              <button
-                                key={level.value}
-                                type="button"
-                                onClick={() => setUserSettings((prev) => ({
-                                  ...prev,
-                                  responseLength: storedResponseLength(level.id),
-                                }))}
-                                className={`text-[10px] sm:text-xs font-semibold ${
-                                  level.value === 1 ? 'text-left' : level.value === 3 ? 'text-right' : 'text-center'
-                                } ${level.value === lengthLevel.value ? 'text-cyan-300' : 'text-blue-300/40 hover:text-blue-200/70'}`}
-                              >
-                                {level.label}
-                              </button>
-                            ))}
-                          </div>
-                          <p className="text-xs text-blue-200/70 mt-3">{lengthLevel.hint}</p>
-                        </div>
-                      );
-                    })()}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-xs text-blue-300/70 font-semibold mb-2">Company name</label>
@@ -9614,10 +10251,17 @@ ${stepInstruction}`;
                   <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
                     <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><FileText className="w-6 h-6 text-blue-400" />Knowledge Base Management</h2>
                     <p className="text-sm text-blue-300/70 mb-2">
-                      Knowledge is <span className="text-cyan-300 font-semibold">not hardcoded</span>. Files in the Supabase <code className="text-cyan-300/80">intelligence</code> bucket are loaded on every visit and injected into chat/agents.
+                      Knowledge is <span className="text-cyan-300 font-semibold">not hardcoded</span>. Files in the Supabase <code className="text-cyan-300/80">intelligence</code> bucket are loaded on every visit.
+                    </p>
+                    <p className="text-xs text-blue-300/50 mb-2">
+                      <span className="text-cyan-200/90 font-semibold">General Context</span> is injected into Incentive chat, and into other modules when they are linked to Incentives on the home page.
+                      {' '}<span className="text-cyan-200/90 font-semibold">Agents</span> makes the file available to assign to workflow specialists.
+                      {' '}These flags are stored in shared <code className="text-cyan-300/80">product.json</code>, not in user settings.
                     </p>
                     <p className="text-xs text-blue-300/50 mb-6">
                       Status: {knowledgeLoadStatus === 'loading' ? 'Loading…' : knowledgeLoadStatus === 'ready' ? `${documents.length} file(s) loaded` : knowledgeLoadStatus === 'error' ? 'Storage error (tried public seed fallback)' : 'Idle'}
+                      {userSettingsSaveStatus === 'saved' && <span className="text-emerald-300/80 ml-2">product.json updated.</span>}
+                      {userSettingsSaveStatus === 'saved-local' && <span className="text-amber-300/80 ml-2">Saved locally — cloud write failed.</span>}
                     </p>
                     <div className="space-y-3 mb-6">
                       {documents.length === 0 && (
@@ -9625,21 +10269,42 @@ ${stepInstruction}`;
                           No knowledge files loaded yet. Upload .md / .txt / .yml files below (seed files: {KNOWLEDGE_SEED_FILES.join(', ')}).
                         </div>
                       )}
-                      {documents.map(doc => (
-                        <div key={doc.id} className="flex items-center justify-between bg-slate-700/30 border border-blue-400/20 rounded-lg p-4 hover:border-blue-400/40 transition-all">
-                          <div className="flex items-center gap-3">
-                            <FileText className="w-5 h-5 text-blue-400" />
-                            <div>
-                              <div className="font-medium text-sm">{doc.name}</div>
+                      {documents.map(doc => {
+                        const flags = knowledgeFileFlags(knowledgeAccessLive(), doc.name);
+                        return (
+                        <div key={doc.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-700/30 border border-blue-400/20 rounded-lg p-4 hover:border-blue-400/40 transition-all">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <FileText className="w-5 h-5 text-blue-400 shrink-0" />
+                            <div className="min-w-0">
+                              <div className="font-medium text-sm truncate">{doc.name}</div>
                               <div className="text-xs text-blue-300/50">{doc.size} • {doc.status}{doc.type === 'yaml' && <span className="ml-2 px-2 py-0.5 bg-cyan-500/20 text-cyan-400 rounded text-xs">YAML</span>}</div>
                             </div>
                           </div>
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-3 sm:gap-4">
+                            <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={flags.generalContext}
+                                onChange={(e) => setKnowledgeFileFlag(doc.name, 'generalContext', e.target.checked)}
+                                className="rounded border-blue-400/40"
+                              />
+                              General Context
+                            </label>
+                            <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={flags.agents}
+                                onChange={(e) => setKnowledgeFileFlag(doc.name, 'agents', e.target.checked)}
+                                className="rounded border-blue-400/40"
+                              />
+                              Agents
+                            </label>
                             <span className="px-2 py-1 bg-green-500/20 text-green-400 text-xs rounded border border-green-400/30 flex items-center gap-1"><CheckCircle className="w-3 h-3" />Active</span>
                             <button onClick={() => removeDocument(doc.id)} className="p-2 hover:bg-red-500/20 rounded transition-colors text-red-400"><Trash2 className="w-4 h-4" /></button>
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                     <button onClick={() => adminFileInputRef.current?.click()} className="w-full py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Plus className="w-5 h-5" />Upload Intelligence File</button>
                     <p className="text-xs text-blue-300/50 text-center mt-2">Supports: .yml, .yaml, .txt, .md • Saved to Supabase and reloaded every visit</p>
@@ -9882,12 +10547,17 @@ ${stepInstruction}`;
                       <div><label className="block text-sm font-semibold mb-2">System Prompt</label><textarea value={editingAgent.systemPrompt} rows={15} onChange={(e) => setEditingAgent({...editingAgent, systemPrompt: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white font-mono text-sm" /></div>
                       <div>
                         <label className="block text-sm font-semibold mb-2">Knowledge files</label>
-                        <p className="text-xs text-blue-300/50 mb-2">Select intelligence files from the loaded knowledge base to pass as guidance to this agent.</p>
-                        {documents.length === 0 ? (
+                        <p className="text-xs text-blue-300/50 mb-2">Only files marked <span className="text-cyan-200">Agents</span> in Knowledge Base Management can be assigned here.</p>
+                        {(() => {
+                          const agentDocs = (documents || []).filter((d) => knowledgeFileFlags(knowledgeAccessLive(), d.name).agents);
+                          if (!agentDocs.length) {
+                            return (
                           <div className="text-xs text-amber-300/80 bg-amber-500/10 border border-amber-400/20 rounded-lg p-3">
-                            No knowledge files loaded yet. Upload files in Admin → Knowledge first.
+                            No agent-eligible knowledge files. Tick <span className="font-semibold">Agents</span> on a file in Admin → Knowledge first.
                           </div>
-                        ) : (
+                            );
+                          }
+                          return (
                           <div className="bg-slate-800 border border-blue-400/30 rounded-lg p-3 space-y-2 max-h-48 overflow-y-auto">
                             <label className="flex items-center gap-2 text-sm text-cyan-200 cursor-pointer">
                               <input
@@ -9899,10 +10569,10 @@ ${stepInstruction}`;
                                 })}
                                 className="rounded border-blue-400/40"
                               />
-                              All loaded knowledge files
+                              All files marked Agents
                             </label>
                             <div className="border-t border-blue-400/15 pt-2 space-y-1.5">
-                              {documents.map((doc) => {
+                              {agentDocs.map((doc) => {
                                 const all = (editingAgent.knowledgeFiles || []).includes('*');
                                 const checked = all || (editingAgent.knowledgeFiles || []).includes(doc.name);
                                 return (
@@ -9927,7 +10597,8 @@ ${stepInstruction}`;
                               })}
                             </div>
                           </div>
-                        )}
+                          );
+                        })()}
                       </div>
                     </div>
                     <div className="border-t border-blue-400/20 p-6 flex gap-3 bg-slate-900 rounded-b-xl">

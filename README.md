@@ -45,11 +45,18 @@ Do not use your normal Gmail password. Hotmail SMTP will not work.
 ## Stella Insights setup
 
 Company Postgres schemas (`c_pharmaco`, `c_comex`, …) and Stella helper
-functions are created by the app when you add a company in Users. There is
-nothing to run in the SQL editor.
+functions are created by the app when someone from that company signs in,
+or when you add a user for that company. Dataset tables live in the
+company schema — pick it in the Table Editor dropdown (not `public`).
+There is nothing to run in the SQL editor.
+
+`public.stella_files` has row-level security per company. The browser
+anon key cannot read another tenant’s registry; the app loads files
+through `/api/stella-files` using the signed-in session.
 
 If schemas are not appearing, set `DATABASE_URL` or `SUPABASE_DB_PASSWORD`
-(Supabase → Settings → Database) in Vercel so the server can create them.
+(Supabase → Settings → Database) so the server can create them. Sign in
+once after that, then refresh the Table Editor.
 
 Currently, two official plugins are available:
 

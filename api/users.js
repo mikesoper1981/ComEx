@@ -141,7 +141,9 @@ module.exports = async function handler(req, res) {
       }
       recordLogin(user);
       await saveAccounts(accounts);
-      ensureCompanyPgSchema(user.company).catch(() => {});
+      await ensureCompanyPgSchema(user.company).catch((err) => {
+        console.warn('Could not ensure company schema on login', user.company, err?.message || err);
+      });
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
         user: publicUser(user),
@@ -197,7 +199,9 @@ module.exports = async function handler(req, res) {
       user.otpExpiresAt = null;
       recordLogin(user);
       await saveAccounts(accounts);
-      ensureCompanyPgSchema(user.company).catch(() => {});
+      await ensureCompanyPgSchema(user.company).catch((err) => {
+        console.warn('Could not ensure company schema after password change', user.company, err?.message || err);
+      });
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
         user: publicUser(user),

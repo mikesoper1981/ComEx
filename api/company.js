@@ -34,6 +34,10 @@ async function ensureCompanyPgSchema(companyOrSchema) {
   return require('./stella-db').ensureCompanyPgSchema(companyOrSchema);
 }
 
+async function ensureAllCompanySchemas(companies) {
+  return require('./stella-db').ensureAllCompanySchemas(companies);
+}
+
 function userObjectPrefix(user) {
   const company = companySlug(resolveUserCompany(user));
   const raw = user && typeof user === 'object' ? (user.name || user.id) : user;
@@ -54,5 +58,6 @@ module.exports = {
   resolveUserCompany,
   isCompanyPgSchema,
   ensureCompanyPgSchema,
+  ensureAllCompanySchemas,
   userObjectPrefix,
 };

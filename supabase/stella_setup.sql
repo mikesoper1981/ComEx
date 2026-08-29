@@ -24,11 +24,53 @@ create table if not exists public.stella_files (
   uploaded_at  timestamptz default now()
 );
 
+alter table public.stella_files add column if not exists company_slug text;
+
+update public.stella_files
+  set company_slug = split_part(org_id, ':', 2)
+  where org_id like 'company:%'
+    and coalesce(company_slug, '') = '';
+
+create index if not exists stella_files_company_slug_idx on public.stella_files (company_slug);
+create index if not exists stella_files_org_id_idx on public.stella_files (org_id);
+
 alter table public.stella_files enable row level security;
+alter table public.stella_files force row level security;
+
+create or replace function public.stella_request_company()
+returns text
+language plpgsql
+stable
+as $$
+declare
+  claims json;
+begin
+  begin
+    claims := nullif(current_setting('request.jwt.claims', true), '')::json;
+  exception when others then
+    claims := null;
+  end;
+  if claims is null then
+    return null;
+  end if;
+  return nullif(btrim(coalesce(claims ->> 'company_slug', claims ->> 'company')), '');
+end;
+$$;
 
 drop policy if exists "stella_files allow all" on public.stella_files;
-create policy "stella_files allow all" on public.stella_files
-  for all using (true) with check (true);
+drop policy if exists "stella_files company isolation" on public.stella_files;
+create policy "stella_files company isolation"
+  on public.stella_files
+  for all
+  to anon, authenticated
+  using (
+    coalesce(company_slug, '') <> ''
+    and company_slug = public.stella_request_company()
+  )
+  with check (
+    coalesce(company_slug, '') <> ''
+    and company_slug = public.stella_request_company()
+  );
 
 -- ---------------------------------------------------------------------
 -- Company schemas (c_pharmaco, c_comex, …) are created by the app via
@@ -48,6 +90,17 @@ begin
     raise exception 'Invalid company schema: %', p_schema;
   end if;
   execute format('create schema if not exists %I', p_schema);
+  execute format('comment on schema %I is %L', p_schema, 'ComEx company tenant');
+  begin
+    execute format('revoke all on schema %I from public, anon, authenticated', p_schema);
+  exception when others then
+    null;
+  end;
+  begin
+    execute format('grant usage on schema %I to service_role', p_schema);
+  exception when others then
+    null;
+  end;
 end;
 $$;
 
@@ -170,12 +223,20 @@ begin
 end;
 $$;
 
-grant execute on function public.stella_ensure_schema(text) to anon, authenticated, service_role;
-grant execute on function public.stella_create_table(text, jsonb, text) to anon, authenticated, service_role;
-grant execute on function public.stella_insert_rows(text, jsonb, text) to anon, authenticated, service_role;
-grant execute on function public.stella_drop_table(text, text) to anon, authenticated, service_role;
-grant execute on function public.stella_run_select(text, text) to anon, authenticated, service_role;
-grant execute on function public.stella_move_table(text, text) to anon, authenticated, service_role;
+revoke all on function public.stella_ensure_schema(text) from public, anon, authenticated;
+revoke all on function public.stella_create_table(text, jsonb, text) from public, anon, authenticated;
+revoke all on function public.stella_insert_rows(text, jsonb, text) from public, anon, authenticated;
+revoke all on function public.stella_drop_table(text, text) from public, anon, authenticated;
+revoke all on function public.stella_run_select(text, text) from public, anon, authenticated;
+revoke all on function public.stella_move_table(text, text) from public, anon, authenticated;
+
+grant execute on function public.stella_request_company() to anon, authenticated, service_role;
+grant execute on function public.stella_ensure_schema(text) to service_role;
+grant execute on function public.stella_create_table(text, jsonb, text) to service_role;
+grant execute on function public.stella_insert_rows(text, jsonb, text) to service_role;
+grant execute on function public.stella_drop_table(text, text) to service_role;
+grant execute on function public.stella_run_select(text, text) to service_role;
+grant execute on function public.stella_move_table(text, text) to service_role;
 
 -- ---------------------------------------------------------------------
 -- Storage bucket for PDF / text source files (stella/ prefix).

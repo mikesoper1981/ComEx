@@ -17,11 +17,67 @@ create table if not exists public.stella_files (
   uploaded_at  timestamptz default now()
 );
 
-alter table public.stella_files enable row level security;
+alter table public.stella_files add column if not exists company_slug text;
 
-drop policy if exists "stella_files allow all" on public.stella_files;
-create policy "stella_files allow all" on public.stella_files
-  for all using (true) with check (true);
+update public.stella_files
+  set company_slug = split_part(org_id, ':', 2)
+  where org_id like 'company:%'
+    and coalesce(company_slug, '') = '';
+
+create index if not exists stella_files_company_slug_idx on public.stella_files (company_slug);
+create index if not exists stella_files_org_id_idx on public.stella_files (org_id);
+
+alter table public.stella_files enable row level security;
+alter table public.stella_files force row level security;
+
+create or replace function public.stella_request_company()
+returns text
+language plpgsql
+stable
+as $$
+declare
+  claims json;
+begin
+  begin
+    claims := nullif(current_setting('request.jwt.claims', true), '')::json;
+  exception when others then
+    claims := null;
+  end;
+  if claims is null then
+    return null;
+  end if;
+  return nullif(btrim(coalesce(claims ->> 'company_slug', claims ->> 'company')), '');
+end;
+$$;
+
+create or replace function public.stella_lock_relation(p_schema text, p_table text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if p_schema is null or p_table is null then
+    return;
+  end if;
+  if p_schema <> 'public' and p_schema !~ '^c_[a-z0-9_]+$' then
+    raise exception 'Invalid company schema: %', p_schema;
+  end if;
+  if p_table !~ '^stella_data_[a-z0-9_]+$' then
+    raise exception 'Invalid table name: %', p_table;
+  end if;
+  if to_regclass(format('%I.%I', p_schema, p_table)) is null then
+    return;
+  end if;
+  execute format('alter table %I.%I enable row level security', p_schema, p_table);
+  execute format('alter table %I.%I force row level security', p_schema, p_table);
+  begin
+    execute format('revoke all on table %I.%I from public, anon, authenticated', p_schema, p_table);
+  exception when others then
+    null;
+  end;
+end;
+$$;
 
 create or replace function public.stella_ensure_schema(p_schema text)
 returns void
@@ -29,6 +85,8 @@ language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  r record;
 begin
   if p_schema is null or p_schema = 'public' then
     return;
@@ -37,11 +95,25 @@ begin
     raise exception 'Invalid company schema: %', p_schema;
   end if;
   execute format('create schema if not exists %I', p_schema);
+  execute format('comment on schema %I is %L', p_schema, 'ComEx company tenant');
   begin
-    execute format('grant usage on schema %I to anon, authenticated, service_role', p_schema);
+    execute format('revoke all on schema %I from public, anon, authenticated', p_schema);
   exception when others then
     null;
   end;
+  begin
+    execute format('grant usage on schema %I to service_role', p_schema);
+  exception when others then
+    null;
+  end;
+  for r in
+    select tablename
+    from pg_tables
+    where schemaname = p_schema
+      and tablename ~ '^stella_data_[a-z0-9_]+$'
+  loop
+    perform public.stella_lock_relation(p_schema, r.tablename);
+  end loop;
 end;
 $$;
 
@@ -72,6 +144,7 @@ begin
     raise exception 'No columns provided';
   end if;
   execute format('create table if not exists %I.%I (%s)', sch, p_table_name, rtrim(col_defs, ', '));
+  perform public.stella_lock_relation(sch, p_table_name);
 end;
 $$;
 
@@ -161,13 +234,69 @@ begin
      and to_regclass(format('%I.%I', p_schema, p_table_name)) is null then
     execute format('alter table public.%I set schema %I', p_table_name, p_schema);
   end if;
+  perform public.stella_lock_relation(p_schema, p_table_name);
 end;
 $$;
 
-grant execute on function public.stella_ensure_schema(text) to anon, authenticated, service_role;
-grant execute on function public.stella_create_table(text, jsonb, text) to anon, authenticated, service_role;
-grant execute on function public.stella_insert_rows(text, jsonb, text) to anon, authenticated, service_role;
-grant execute on function public.stella_drop_table(text, text) to anon, authenticated, service_role;
-grant execute on function public.stella_run_select(text, text) to anon, authenticated, service_role;
-grant execute on function public.stella_move_table(text, text) to anon, authenticated, service_role;
+create or replace function public.stella_apply_tenant_security()
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  r record;
+begin
+  alter table public.stella_files enable row level security;
+  alter table public.stella_files force row level security;
+
+  drop policy if exists "stella_files allow all" on public.stella_files;
+  drop policy if exists "stella_files company isolation" on public.stella_files;
+  create policy "stella_files company isolation"
+    on public.stella_files
+    for all
+    to anon, authenticated
+    using (
+      coalesce(company_slug, '') <> ''
+      and company_slug = public.stella_request_company()
+    )
+    with check (
+      coalesce(company_slug, '') <> ''
+      and company_slug = public.stella_request_company()
+    );
+
+  for r in
+    select n.nspname as schema_name, c.relname as table_name
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    where c.relkind = 'r'
+      and n.nspname ~ '^c_[a-z0-9_]+$'
+      and c.relname ~ '^stella_data_[a-z0-9_]+$'
+  loop
+    perform public.stella_lock_relation(r.schema_name, r.table_name);
+  end loop;
+end;
+$$;
+
+select public.stella_apply_tenant_security();
+
+revoke all on function public.stella_request_company() from public, anon, authenticated;
+revoke all on function public.stella_lock_relation(text, text) from public, anon, authenticated;
+revoke all on function public.stella_ensure_schema(text) from public, anon, authenticated;
+revoke all on function public.stella_create_table(text, jsonb, text) from public, anon, authenticated;
+revoke all on function public.stella_insert_rows(text, jsonb, text) from public, anon, authenticated;
+revoke all on function public.stella_drop_table(text, text) from public, anon, authenticated;
+revoke all on function public.stella_run_select(text, text) from public, anon, authenticated;
+revoke all on function public.stella_move_table(text, text) from public, anon, authenticated;
+revoke all on function public.stella_apply_tenant_security() from public, anon, authenticated;
+
+grant execute on function public.stella_request_company() to anon, authenticated, service_role;
+grant execute on function public.stella_lock_relation(text, text) to service_role;
+grant execute on function public.stella_ensure_schema(text) to service_role;
+grant execute on function public.stella_create_table(text, jsonb, text) to service_role;
+grant execute on function public.stella_insert_rows(text, jsonb, text) to service_role;
+grant execute on function public.stella_drop_table(text, text) to service_role;
+grant execute on function public.stella_run_select(text, text) to service_role;
+grant execute on function public.stella_move_table(text, text) to service_role;
+grant execute on function public.stella_apply_tenant_security() to service_role;
 `;

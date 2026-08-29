@@ -631,9 +631,9 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                   Same fields as User Settings → General, including company, industry, metrics, and terminology used by Stella. Saved for {editUser.name}; they take effect the next time that user loads the hub.
                 </p>
                 <div className="mb-6 bg-slate-900/40 border border-blue-400/20 rounded-xl p-4">
-                  <label className="block text-sm font-semibold text-white mb-1">Response length</label>
+                  <label className="block text-sm font-semibold text-white mb-1">Hub-wide answer detail</label>
                   <p className="text-xs text-blue-300/60 mb-3">
-                    How chat and agent replies are written. Executive = decide. Standard = recommend. Teaching = explain.
+                    Default across Incentive chat, workflows, Territory, and Stella for this account. Executive = decide. Standard = recommend. Teaching = explain. A workflow step or agent that specifies its own length (for example 300 words) keeps that limit.
                   </p>
                   <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit">
                     {RESPONSE_LENGTH_OPTIONS.map((level) => (

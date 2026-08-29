@@ -20,7 +20,13 @@ NEVER save conversation-specific or this-session detail, including:
 - Recommendations, working assumptions, or what they want to do in this conversation
 
 When in doubt return {"facts":[],"conflicts":[]}. Prefer names and definitions over numbers. Max 2 new facts.
-If a new durable fact contradicts an already remembered fact (same topic, different value — e.g. product was Alpha, now Beta), do NOT put it in facts. Put it in conflicts with a short confirmation question.
+
+ENRICHMENT vs REPLACEMENT (mandatory):
+- Local / UK / country names, aliases, "X is the name for Y", "map X to Y", SKU/code mappings, and "also known as" ENRICH an existing product/brand list. Put them in facts. NEVER put them in conflicts against a remembered product list — they do not replace those products.
+- File-intake interpretive context (name maps, definitions, how to read a column) is already stored. Do not emit those as conflicts.
+- Conflicts ONLY when the user is replacing a standing identity (they no longer work on product A; the product is now B — mutually exclusive, not an extra name).
+
+If a new durable fact truly contradicts an already remembered fact (same exclusive identity, different value), do NOT put it in facts. Put it in conflicts with a short confirmation question.
 Return JSON only: {"facts":["..."],"conflicts":[{"existingId":"mem_…","existingText":"…","proposed":"…","question":"I currently remember X. Update this to Y?"}]}`;
 
 export const MEMORY_BACKFILL_SYSTEM = `${MEMORY_HARVEST_SYSTEM}
@@ -287,6 +293,32 @@ export function factsShareMemoryTopic(a, b) {
   return !!(ta && ta === topic(b));
 }
 
+/** True when the text adds an alias / local name / mapping rather than replacing an identity. */
+export function isMemoryEnrichmentFact(text) {
+  const t = String(text || '');
+  return /\b(also known as|also called|a\.?\s*k\.?\s*a\.?|alias(?:es)?|synonym|local name|uk name|us name|eu name|trade name|brand name|generic name|inn\b|maps? (?:to|onto)|mapped to|name mapping|same (?:product|brand|sku) as|equivalent to|known (?:locally|in [a-z]+) as|is the .{0,48} name for|called .{0,40} in (?:the )?[a-z]+|code for|sku for)\b/i.test(t);
+}
+
+function existingCoveredByProposed(existing, proposed) {
+  const ta = factTokens(existing);
+  const tb = factTokens(proposed);
+  if (!ta.size || !tb.size) return false;
+  let inter = 0;
+  for (const tok of ta) if (tb.has(tok)) inter += 1;
+  return (inter / ta.size) >= 0.7 || (inter / tb.size) >= 0.7;
+}
+
+/** True only for mutually exclusive identity changes — not aliases, extra names, or list extensions. */
+export function factsAreExclusiveConflict(existing, proposed) {
+  const a = String(existing || '').trim();
+  const b = String(proposed || '').trim();
+  if (!a || !b) return false;
+  if (factsAreSimilar(a, b)) return false;
+  if (isMemoryEnrichmentFact(a) || isMemoryEnrichmentFact(b)) return false;
+  if (existingCoveredByProposed(a, b)) return false;
+  return factsShareMemoryTopic(a, b);
+}
+
 export function memorySignature(items) {
   return normalizeMemoryItems(items).map((m) => m.text.toLowerCase()).sort().join('\n');
 }
@@ -366,7 +398,8 @@ export function isDurableMemoryFact(text, { allowExplicit = false } = {}) {
   if (/\b\d+\s+reps?\b/i.test(t)) return false;
   const standing = /\b(means|equals|defined as|is defined|stands for|abbreviation|always|eligibility|pay curve|accelerator|threshold|quota cycle|fiscal year|calendar year)\b/i.test(t)
     || /\s=\s/.test(t)
-    || /\b(product|brand|competitor|territory|country|market) is\b/i.test(t);
+    || /\b(product|brand|competitor|territory|country|market) is\b/i.test(t)
+    || isMemoryEnrichmentFact(t);
   const pcts = t.match(/\d+(?:\.\d+)?%/g) || [];
   if (pcts.length && !standing) return false;
   if (/\b(achieved|attained|payout|performance|score)\b/i.test(t) && /\d/.test(t) && !standing) return false;
@@ -443,12 +476,16 @@ function formatKnownMemory(existingMemory) {
   return `\n\nAlready remembered for this user (id + fact — do not repeat similar facts; use conflicts if a new fact contradicts one of these):\n${items.map((m) => `- [${m.id}] ${m.text}`).join('\n')}`;
 }
 
-export function buildHarvestExchange({ assistantText = '', userText = '', recentTurns = [], existingMemory = [] } = {}) {
+export function buildHarvestExchange({ assistantText = '', userText = '', recentTurns = [], existingMemory = [], knownFileFacts = [] } = {}) {
   const recent = (recentTurns || [])
     .map((t) => `${String(t.role || '').toUpperCase()}: ${clipTurn(t.content, 400)}`)
     .filter(Boolean)
     .join('\n');
-  return `Recent assistant message (may be empty):\n${String(assistantText || '').slice(0, 2500)}\n\nUser said:\n${String(userText || '').slice(0, 2500)}${recent ? `\n\nEarlier turns in this chat:\n${recent.slice(0, 3500)}` : ''}${formatKnownMemory(existingMemory)}`;
+  const intake = (knownFileFacts || []).map((f) => String(f || '').replace(/\s+/g, ' ').trim()).filter((f) => f.length >= 8);
+  const intakeBlock = intake.length
+    ? `\n\nAlready stored from file intake (interpretive context — do NOT emit as conflicts; aliases/name maps ENRICH remembered product lists, they do not replace them):\n${intake.slice(0, 20).map((f) => `- ${f}`).join('\n')}`
+    : '';
+  return `Recent assistant message (may be empty):\n${String(assistantText || '').slice(0, 2500)}\n\nUser said:\n${String(userText || '').slice(0, 2500)}${recent ? `\n\nEarlier turns in this chat:\n${recent.slice(0, 3500)}` : ''}${formatKnownMemory(existingMemory)}${intakeBlock}`;
 }
 
 export function buildBackfillExchange(transcript, existingMemory = []) {

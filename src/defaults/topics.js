@@ -27,10 +27,10 @@ CRITICAL — multi-step workflows:
 - workflowComplete=true ONLY when the current step is the LAST step in the workflow AND its success criteria are met.
 - If more steps remain, workflowComplete MUST be false even if the agent wrote a long/comprehensive answer.
 - Judge the agent only against THIS step's success criteria — do not treat an early step as finishing the whole workflow.`,
-  introFull: 'Introduce yourself briefly (1-2 sentences) and state the overall goal. Do NOT list the workflow steps yourself — they are appended separately from the plan. Keep it short.',
-  introFocused: 'The user has already selected a specific focus. Keep your introduction to 1 sentence. Do NOT list workflow steps — they are appended separately.',
-  briefingPrompt: 'Prepare a focused task briefing for the next specialist agent. Be specific and concise (3-5 sentences max).',
-  wrapUpPrompt: 'The workflow is now complete. Write a brief, warm closing summary (3-5 sentences) covering what was accomplished.',
+  introFull: 'Introduce yourself and state the overall goal. Do NOT list the workflow steps yourself — they are appended separately from the plan. Match USER ANSWER DETAIL: Executive = 1–2 sentences; Standard = short goal intro; Teaching = brief why this workflow and what the user will get. Do not write a full report.',
+  introFocused: 'The user has already selected a specific focus. Match USER ANSWER DETAIL for the intro (Executive = 1 sentence; Teaching may add why this focus matters). Do NOT list workflow steps — they are appended separately.',
+  briefingPrompt: 'Prepare a focused task briefing for the next specialist agent. Be specific and concise (3-5 sentences max). This is an internal handoff, not a user-facing reply.',
+  wrapUpPrompt: 'The workflow is now complete. Write a closing summary covering what was accomplished. Match USER ANSWER DETAIL: Executive = verdict + bullets; Standard = what was done and key outcomes; Teaching = what was done, why it matters, and what happens next. Do not pad beyond that level.',
   evalFallbackMessage: 'The agent has completed its work. How would you like to proceed?',
 };
 
@@ -71,7 +71,7 @@ export const DEFAULT_TOPICS = [
       role: 'You are the Workflow Orchestrator for IC scheme analysis.',
       goal: 'Produce a complete assessment: extract/axes (1), compliance (2), narrative report (3), then a final recommendations table (4). All four specialists must run.',
       approach: 'AUTO-ADVANCE PIPELINE: Do not wait for clarifying answers. Specialists use ONLY evidenced proposal facts (including image/payout-scale extracts) — NEVER invent or assume missing details. Missing information must be recorded as INFORMATION GAPS (often critical findings). Never mark workflowComplete until Step 4 (Assessment Summary) has finished. After Steps 1–3, set workflowComplete=false and proceed. EVALUATING STEPS: Judge each agent only against THAT step\'s success criteria.',
-      introFull: 'Introduce yourself briefly as the IC analysis orchestrator (1-2 sentences) and state that specialists will extract, check compliance, report, then summarise recommendations. Do NOT list the workflow steps yourself — they are appended separately.',
+      introFull: 'Introduce yourself as the IC analysis orchestrator and state that specialists will extract, check compliance, report, then summarise recommendations. Do NOT list the workflow steps yourself — they are appended separately. Match USER ANSWER DETAIL for this intro (keep it an intro, not a full assessment).',
     }),
     workflow: [
       { step: 1, name: 'Extract & Analyze', agents: ['analysis_agent'], goal: 'Extract key scheme info (text + image/payout extracts) and assess against 6 Fundamental Axes only', successCriteria: 'Scheme structure extracted including any payment-scale evidence; 6-axes strengths/gaps noted; STOP — no full compliance checklist and no final recommendations table' },
@@ -90,7 +90,7 @@ export const DEFAULT_TOPICS = [
       role: 'You are the Workflow Orchestrator for territory assessment.',
       goal: 'Produce a complete territory assessment covering structure, sales performance, HCP coverage, and actionable redesign recommendations.',
       approach: 'DATA STEPS (Steps 1-3): Let agents gather information, do not intervene while they are asking questions. WORKFLOW END: Only mark workflowComplete when the design strategist has produced concrete recommendations.',
-      introFocused: 'The user has already selected a specific territory. Keep your introduction to 1 sentence. Do NOT list workflow steps — they are appended separately.',
+      introFocused: 'The user has already selected a specific territory. Match USER ANSWER DETAIL for the intro (Executive = 1 sentence; Teaching may add why this territory review matters). Do NOT list workflow steps — they are appended separately.',
     }),
     workflow: [
       { step: 1, name: 'Load Territory Structure', agents: ['territory_structure_agent'], goal: 'Capture the current territory structure', successCriteria: 'Clear summary of territory count, rep roles, alignment method' },

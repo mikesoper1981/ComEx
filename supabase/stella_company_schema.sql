@@ -18,6 +18,16 @@ begin
     raise exception 'Invalid company schema: %', p_schema;
   end if;
   execute format('create schema if not exists %I', p_schema);
+  begin
+    execute format('revoke all on schema %I from public, anon, authenticated', p_schema);
+  exception when others then
+    null;
+  end;
+  begin
+    execute format('grant usage on schema %I to service_role', p_schema);
+  exception when others then
+    null;
+  end;
 end;
 $$;
 
@@ -140,9 +150,16 @@ begin
 end;
 $$;
 
-grant execute on function public.stella_ensure_schema(text) to anon, authenticated, service_role;
-grant execute on function public.stella_create_table(text, jsonb, text) to anon, authenticated, service_role;
-grant execute on function public.stella_insert_rows(text, jsonb, text) to anon, authenticated, service_role;
-grant execute on function public.stella_drop_table(text, text) to anon, authenticated, service_role;
-grant execute on function public.stella_run_select(text, text) to anon, authenticated, service_role;
-grant execute on function public.stella_move_table(text, text) to anon, authenticated, service_role;
+revoke all on function public.stella_ensure_schema(text) from public, anon, authenticated;
+revoke all on function public.stella_create_table(text, jsonb, text) from public, anon, authenticated;
+revoke all on function public.stella_insert_rows(text, jsonb, text) from public, anon, authenticated;
+revoke all on function public.stella_drop_table(text, text) from public, anon, authenticated;
+revoke all on function public.stella_run_select(text, text) from public, anon, authenticated;
+revoke all on function public.stella_move_table(text, text) from public, anon, authenticated;
+
+grant execute on function public.stella_ensure_schema(text) to service_role;
+grant execute on function public.stella_create_table(text, jsonb, text) to service_role;
+grant execute on function public.stella_insert_rows(text, jsonb, text) to service_role;
+grant execute on function public.stella_drop_table(text, text) to service_role;
+grant execute on function public.stella_run_select(text, text) to service_role;
+grant execute on function public.stella_move_table(text, text) to service_role;
