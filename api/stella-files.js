@@ -12,6 +12,7 @@
 
 const { sessionUserFromRequest } = require('./accounts-store');
 const { companySlug, companyPgSchema, resolveUserCompany, ensureCompanyPgSchema } = require('./company');
+const { getLastEnsureError } = require('./stella-db');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_FIELDS = [
@@ -166,7 +167,13 @@ module.exports = async function handler(req, res) {
         );
         rows = rows.map((row) => ({ ...row, org_id: userOrg, company_slug: slug }));
       }
-      return res.status(200).json({ files: rows, schema, company: slug, schemaReady: !!schemaReady });
+      return res.status(200).json({
+        files: rows,
+        schema,
+        company: slug,
+        schemaReady: !!schemaReady,
+        schemaError: schemaReady ? '' : (getLastEnsureError() || ''),
+      });
     }
 
     if (req.method !== 'POST') {

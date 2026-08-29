@@ -54,9 +54,10 @@ There is nothing to run in the SQL editor.
 anon key cannot read another tenant’s registry; the app loads files
 through `/api/stella-files` using the signed-in session.
 
-If schemas are not appearing, set `DATABASE_URL` or `SUPABASE_DB_PASSWORD`
-(Supabase → Settings → Database) so the server can create them. Sign in
-once after that, then refresh the Table Editor.
+If schemas are not appearing, set `DATABASE_URL` to the **session pooler**
+URI (Connect → Session pooler, host `*.pooler.supabase.com`) or set
+`SUPABASE_DB_PASSWORD`. Vercel cannot use the direct `db.*.supabase.co`
+host. Sign in once after a redeploy, then refresh the Table Editor.
 
 Currently, two official plugins are available:
 

@@ -2750,7 +2750,11 @@ function stellaFilesApiDown(res) {
 function stellaSchemaStatusFromPayload(payload) {
   const name = typeof payload?.schema === 'string' ? payload.schema.trim() : '';
   if (!name) return null;
-  return { name, ready: payload.schemaReady !== false };
+  return {
+    name,
+    ready: payload.schemaReady !== false,
+    error: typeof payload.schemaError === 'string' ? payload.schemaError.trim() : '',
+  };
 }
 
 async function stellaListFilesViaSupabase(user, { isAdmin } = {}) {
@@ -7580,7 +7584,7 @@ ${stepInstruction}`;
                 <div className={`text-[11px] mt-1.5 ${stellaTenantSchema.ready ? 'text-blue-300/50' : 'text-amber-300/85'}`}>
                   {stellaTenantSchema.ready
                     ? `Company schema ${stellaTenantSchema.name} — pick that schema in the Table Editor, not public.`
-                    : `Schema ${stellaTenantSchema.name} is not on the database yet. Deleting files will not create it.`}
+                    : `Schema ${stellaTenantSchema.name} is not on the database yet. ${stellaTenantSchema.error || 'Deleting files will not create it.'}`}
                 </div>
               ) : null}
             </div>
