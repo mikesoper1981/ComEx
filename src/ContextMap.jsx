@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   ChevronRight,
   DollarSign,
@@ -100,7 +100,7 @@ function kindOfFile(file) {
   const name = String(file?.name || '').toLowerCase();
   const type = String(file?.kind || file?.fileType || file?.kindLabel || '').toLowerCase();
   if (/\.pdf$/.test(name) || type.includes('pdf')) return 'pdf';
-  if (/\.(xlsx?|csv)$/.test(name) || /excel|spreadsheet|csv/.test(type) || file?.tableName) return 'spreadsheet';
+  if (file?.tableName || /\.(xlsx?|csv)$/.test(name) || /excel|spreadsheet|csv|data table/.test(type)) return 'spreadsheet';
   return 'document';
 }
 
@@ -307,29 +307,50 @@ function edgePath(a, b, kind, hub) {
 }
 
 function isDrillNodeId(id) {
-  return /-(grp|kind|fact)-/.test(String(id || '')) || /-(mem-empty|pptx|goals)$/.test(String(id || ''));
+  const s = String(id || '');
+  return /-(grp|kind|fact)-/.test(s)
+    || /-(mem-empty|pptx|goals)$/.test(s)
+    || s.startsWith('data-')
+    || s.startsWith('ctx-');
 }
 
-function placeLeaves(nodes, edges, parentId, parent, leaves, angle) {
+function applySavedAndLive(n, saved, livePos) {
+  let next = { ...n };
+  if (!isDrillNodeId(n.id)) {
+    const s = saved?.[n.id];
+    if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
+      next.x = s.x * CANVAS.w;
+      next.y = s.y * CANVAS.h;
+      if (s.w) next.w = Math.max(88, s.w * CANVAS.w);
+      if (s.h) next.h = Math.max(40, s.h * CANVAS.h);
+    }
+  }
+  if (livePos?.[n.id]) next = { ...next, ...livePos[n.id] };
+  return clampNode(next);
+}
+
+function placeLeaves(nodes, edges, parentId, parent, leaves, angle, saved, livePos) {
   if (!leaves.length) return;
-  const spread = Math.min(1.65, 0.38 * Math.max(leaves.length, 1));
+  const spread = Math.min(1.05, 0.28 * Math.max(leaves.length, 1));
   const parentHalf = Math.max(parent.w || 168, parent.h || 78) / 2;
   const leafHalf = Math.max(...leaves.map((l) => Math.max(l.w || 148, l.h || 52))) / 2;
-  const dist = parentHalf + leafHalf + 28 + Math.min(36, Math.max(0, leaves.length - 3) * 6);
+  const dist = parentHalf + leafHalf + 48;
   fanAngles(angle, leaves.length, spread).forEach((ang, i) => {
     const lp = polar(parent.x, parent.y, dist, ang);
-    const leaf = clampNode({ ...leaves[i], x: lp.x, y: lp.y, moduleId: parent.moduleId || parent.id });
+    const leaf = applySavedAndLive({ ...leaves[i], x: lp.x, y: lp.y, moduleId: parent.moduleId || parent.id }, saved, livePos);
     nodes.push(leaf);
     edges.push({ from: parentId, to: leaf.id, kind: 'leaf' });
   });
 }
 
-function layoutStar(model, focus) {
+function layoutStar(model, focus, saved, livePos) {
   const nodes = [];
   const edges = [];
   const { cx, cy, moduleR } = CANVAS;
+  const pos = saved && typeof saved === 'object' ? saved : {};
+  const live = livePos && typeof livePos === 'object' ? livePos : {};
 
-  nodes.push(clampNode({
+  nodes.push(applySavedAndLive({
     id: 'account',
     kind: 'hub',
     x: cx,
@@ -339,13 +360,13 @@ function layoutStar(model, focus) {
     title: model.hubTitle || 'You',
     subtitle: model.hubSubtitle || 'No company set',
     caption: 'Context map passed to AI',
-  }));
+  }, pos, live));
 
   for (const mod of model.modules) {
     const p = polar(cx, cy, moduleR, mod.angle);
     const groups = groupsFor(mod, model.generalMemory);
     const files = moduleFiles(mod);
-    nodes.push(clampNode({
+    const moduleNode = applySavedAndLive({
       id: mod.id,
       kind: 'module',
       moduleId: mod.id,
@@ -358,15 +379,17 @@ function layoutStar(model, focus) {
         ? (focus.group ? 'Click to go back' : 'Click again to collapse')
         : `${files.length} file${files.length === 1 ? '' : 's'} · ${mod.memory.length} tagged fact${mod.memory.length === 1 ? '' : 's'}`,
       fill: mod.fill,
-    }));
+    }, pos, live);
+    nodes.push(moduleNode);
     edges.push({ from: 'account', to: mod.id, kind: 'spoke' });
 
     if (focus.moduleId !== mod.id) continue;
 
-    const parent = { x: p.x, y: p.y, id: mod.id, moduleId: mod.id };
+    const parent = moduleNode;
+    const plant = (leaves) => placeLeaves(nodes, edges, mod.id, parent, leaves, mod.angle, pos, live);
 
     if (!focus.group) {
-      placeLeaves(nodes, edges, mod.id, parent, groups.map((g) => ({
+      plant(groups.map((g) => ({
         id: `${mod.id}-grp-${g.id}`,
         kind: g.kind === 'memory' ? 'memory' : (g.kind === 'files' ? 'files' : 'leaf'),
         groupId: g.id,
@@ -374,7 +397,7 @@ function layoutStar(model, focus) {
         subtitle: g.subtitle,
         w: 148,
         h: 52,
-      })), mod.angle);
+      })));
       continue;
     }
 
@@ -385,7 +408,7 @@ function layoutStar(model, focus) {
         ...tagged.map((m) => ({ ...m, origin: 'tagged' })),
         ...centre.map((m) => ({ ...m, origin: 'centre' })),
       ].slice(0, 10);
-      const cards = facts.length
+      plant(facts.length
         ? facts.map((m) => ({
             id: `${mod.id}-fact-${m.id}`,
             kind: 'memory',
@@ -401,13 +424,12 @@ function layoutStar(model, focus) {
             subtitle: 'Facts appear after you confirm them',
             w: 160,
             h: 52,
-          }];
-      placeLeaves(nodes, edges, mod.id, parent, cards, mod.angle);
+          }]);
       continue;
     }
 
     if (focus.group === 'pptx-template' && mod.pptx) {
-      placeLeaves(nodes, edges, mod.id, parent, [{
+      plant([{
         id: `${mod.id}-pptx`,
         kind: 'pptx',
         groupId: 'pptx-template',
@@ -415,12 +437,12 @@ function layoutStar(model, focus) {
         subtitle: clip(mod.pptx.fileName || 'Custom', 22),
         w: 150,
         h: 50,
-      }], mod.angle);
+      }]);
       continue;
     }
 
     if (focus.group === 'goals' && mod.goals) {
-      placeLeaves(nodes, edges, mod.id, parent, [{
+      plant([{
         id: `${mod.id}-goals`,
         kind: 'leaf',
         groupId: 'goals',
@@ -428,12 +450,27 @@ function layoutStar(model, focus) {
         subtitle: clip(mod.goals, 28),
         w: 150,
         h: 50,
-      }], mod.angle);
+      }]);
       continue;
     }
 
     if (focus.group === 'files' && !focus.kind) {
-      placeLeaves(nodes, edges, mod.id, parent, kindsFor(mod).map((k) => ({
+      const kinds = kindsFor(mod);
+      if (!kinds.length) {
+        plant(moduleFiles(mod).map((f) => ({
+          id: f.nodeId,
+          kind: kindOfFile(f) === 'spreadsheet' ? 'data' : (kindOfFile(f) === 'powerpoint' ? 'pptx' : 'file'),
+          groupId: 'files',
+          kindKey: kindOfFile(f),
+          fileId: f.id,
+          title: clip(f.name, 22),
+          subtitle: f.kindLabel || 'File',
+          w: 150,
+          h: 52,
+        })));
+        continue;
+      }
+      plant(kinds.map((k) => ({
         id: `${mod.id}-kind-${k.id}`,
         kind: k.id === 'spreadsheet' ? 'data' : (k.id === 'powerpoint' ? 'pptx' : 'file'),
         groupId: 'files',
@@ -442,14 +479,14 @@ function layoutStar(model, focus) {
         subtitle: `${k.files.length} file${k.files.length === 1 ? '' : 's'}`,
         w: 148,
         h: 52,
-      })), mod.angle);
+      })));
       continue;
     }
 
     if (focus.group === 'files' && focus.kind) {
       const kind = FILE_KINDS.find((k) => k.id === focus.kind);
       const list = kind ? moduleFiles(mod).filter(kind.match) : [];
-      placeLeaves(nodes, edges, mod.id, parent, list.map((f) => ({
+      plant(list.map((f) => ({
         id: f.nodeId,
         kind: kindOfFile(f) === 'powerpoint' ? 'pptx' : (kindOfFile(f) === 'spreadsheet' ? 'data' : 'file'),
         groupId: 'files',
@@ -459,7 +496,7 @@ function layoutStar(model, focus) {
         subtitle: f.kindLabel || kind?.title || 'File',
         w: 150,
         h: 52,
-      })), mod.angle);
+      })));
     }
   }
 
@@ -526,10 +563,11 @@ export default function ContextMap({
   const [focus, setFocus] = useState(EMPTY_FOCUS);
   const [openFileId, setOpenFileId] = useState('');
   const [livePos, setLivePos] = useState({});
-  const dragRef = useRef(null);
-  const skipClickRef = useRef(false);
   const canvasRef = useRef(null);
   const focusRef = useRef(focus);
+  const modelRef = useRef(null);
+  const graphRef = useRef(null);
+  const persistLayoutRef = useRef(null);
   focusRef.current = focus;
 
   const model = useMemo(() => {
@@ -564,24 +602,10 @@ export default function ContextMap({
     };
   }, [userSettings, stellaDataFiles, userName, companyName]);
 
-  const graph = useMemo(() => {
-    const laid = layoutStar(model, focus);
-    const saved = layout?.nodes && typeof layout.nodes === 'object' ? layout.nodes : {};
-    const nodes = laid.nodes.map((n) => {
-      const s = !isDrillNodeId(n.id) && saved[n.id] ? saved[n.id] : null;
-      const live = livePos[n.id];
-      let next = { ...n };
-      if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
-        next.x = s.x * CANVAS.w;
-        next.y = s.y * CANVAS.h;
-        if (s.w) next.w = Math.max(88, s.w * CANVAS.w);
-        if (s.h) next.h = Math.max(40, s.h * CANVAS.h);
-      }
-      if (live) next = { ...next, ...live };
-      return clampNode(next);
-    });
-    return { nodes, edges: laid.edges };
-  }, [model, layout, livePos, focus]);
+  const graph = useMemo(
+    () => layoutStar(model, focus, layout?.nodes, livePos),
+    [model, layout, livePos, focus],
+  );
 
   const byId = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n])), [graph]);
   const hub = byId.get('account') || { x: CANVAS.cx, y: CANVAS.cy };
@@ -590,6 +614,7 @@ export default function ContextMap({
     if (!onLayoutChange) return;
     const next = { nodes: {} };
     for (const n of nodes) {
+      if (!n?.id || isDrillNodeId(n.id)) continue;
       next.nodes[n.id] = {
         x: n.x / CANVAS.w,
         y: n.y / CANVAS.h,
@@ -599,6 +624,9 @@ export default function ContextMap({
     }
     onLayoutChange(next);
   };
+  modelRef.current = model;
+  graphRef.current = graph;
+  persistLayoutRef.current = persistLayout;
 
   const clientToCanvas = (clientX, clientY) => {
     const el = canvasRef.current;
@@ -665,8 +693,14 @@ export default function ContextMap({
         setOpenFileId('');
         return;
       }
+      let kind = '';
+      if (node.groupId === 'files') {
+        const mod = (modelRef.current?.modules || []).find((m) => m.id === node.moduleId);
+        const kinds = mod ? kindsFor(mod) : [];
+        if (kinds.length === 1) kind = kinds[0].id;
+      }
       setSelected(node.moduleId);
-      setFocus({ moduleId: node.moduleId, group: node.groupId, kind: '', fileId: '' });
+      setFocus({ moduleId: node.moduleId, group: node.groupId, kind, fileId: '' });
       setOpenFileId('');
     }
   };
@@ -697,61 +731,51 @@ export default function ContextMap({
     if (ev.button !== 0) return;
     ev.preventDefault();
     ev.stopPropagation();
-    const loc = clientToCanvas(ev.clientX, ev.clientY);
-    dragRef.current = {
-      id: node.id,
-      node,
-      mode,
-      moved: false,
-      startClientX: ev.clientX,
-      startClientY: ev.clientY,
-      origin: { x: node.x, y: node.y, w: node.w, h: node.h },
-      grab: loc,
-    };
-    try { ev.currentTarget.setPointerCapture?.(ev.pointerId); } catch { /* ignore */ }
-  };
+    const pointerId = ev.pointerId;
+    const startClientX = ev.clientX;
+    const startClientY = ev.clientY;
+    const origin = { x: node.x, y: node.y, w: node.w, h: node.h };
+    const grab = clientToCanvas(ev.clientX, ev.clientY);
+    let moved = false;
 
-  useEffect(() => {
-    const onMove = (ev) => {
-      const drag = dragRef.current;
-      if (!drag) return;
-      const dist = Math.hypot(ev.clientX - drag.startClientX, ev.clientY - drag.startClientY);
-      if (dist > 6) drag.moved = true;
-      if (!drag.moved) return;
-      const loc = clientToCanvas(ev.clientX, ev.clientY);
-      if (!loc || !drag.grab) return;
-      if (drag.mode === 'resize') {
-        const w = Math.max(88, drag.origin.w + (loc.x - drag.grab.x));
-        const h = Math.max(40, drag.origin.h + (loc.y - drag.grab.y));
-        setLivePos((prev) => ({ ...prev, [drag.id]: { ...(prev[drag.id] || {}), w, h } }));
+    const onMove = (e) => {
+      if (e.pointerId !== pointerId) return;
+      if (Math.hypot(e.clientX - startClientX, e.clientY - startClientY) > 8) moved = true;
+      if (!moved || !grab) return;
+      const loc = clientToCanvas(e.clientX, e.clientY);
+      if (!loc) return;
+      if (mode === 'resize') {
+        const w = Math.max(88, origin.w + (loc.x - grab.x));
+        const h = Math.max(40, origin.h + (loc.y - grab.y));
+        setLivePos((prev) => ({ ...prev, [node.id]: { ...(prev[node.id] || {}), w, h } }));
         return;
       }
-      const x = drag.origin.x + (loc.x - drag.grab.x);
-      const y = drag.origin.y + (loc.y - drag.grab.y);
-      setLivePos((prev) => ({ ...prev, [drag.id]: { ...(prev[drag.id] || {}), x, y } }));
+      const x = origin.x + (loc.x - grab.x);
+      const y = origin.y + (loc.y - grab.y);
+      setLivePos((prev) => ({ ...prev, [node.id]: { ...(prev[node.id] || {}), x, y } }));
     };
-    const onUp = () => {
-      const drag = dragRef.current;
-      dragRef.current = null;
-      if (!drag) return;
-      if (drag.moved) {
-        skipClickRef.current = true;
+
+    const onUp = (e) => {
+      if (e.pointerId !== pointerId) return;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      if (moved) {
+        const latest = graphRef.current?.nodes || [];
         setLivePos((current) => {
-          const merged = graph.nodes.map((n) => (current[n.id] ? clampNode({ ...n, ...current[n.id] }) : n));
-          persistLayout(merged);
+          const merged = latest.map((n) => (current[n.id] ? clampNode({ ...n, ...current[n.id] }) : n));
+          persistLayoutRef.current?.(merged);
           return {};
         });
         return;
       }
-      if (drag.mode === 'move' && drag.node) selectNode(drag.node);
+      if (mode === 'move') selectNode(node);
     };
+
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-    return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-    };
-  }, [graph.nodes]);
+    window.addEventListener('pointercancel', onUp);
+  };
 
   const resetLayout = () => {
     setLivePos({});
@@ -782,7 +806,7 @@ export default function ContextMap({
           <Network className="w-4 h-4 text-cyan-400" /> Context map
         </h3>
         <p className="text-xs text-blue-300/70 leading-relaxed">
-          Click a module to expand types, then files. Click the same card again to collapse. Drag to rearrange; pull the corner to resize.
+          Click a module, then Files. If there is only one type (e.g. Excel), the files open immediately. Click the module again to go back, or use Back / Collapse. Drag a card to move it.
         </p>
       </div>
 
@@ -791,9 +815,6 @@ export default function ContextMap({
           ref={canvasRef}
           className="relative w-full"
           style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}
-          onPointerDown={(ev) => {
-            if (ev.target === ev.currentTarget || ev.target instanceof SVGElement) collapseOne();
-          }}
         >
           <svg
             viewBox={`0 0 ${CANVAS.w} ${CANVAS.h}`}
@@ -936,6 +957,22 @@ export default function ContextMap({
           <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-cyan-400 rounded" /> Modules sharing context</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Stored file join</span>
           <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
+          <button
+            type="button"
+            onClick={collapseOne}
+            disabled={!focus.moduleId}
+            className="text-[10px] font-semibold text-cyan-200 hover:text-white disabled:text-blue-300/30"
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            onClick={() => { setSelected('account'); setFocus(EMPTY_FOCUS); setOpenFileId(''); }}
+            disabled={!focus.moduleId}
+            className="text-[10px] font-semibold text-cyan-200 hover:text-white disabled:text-blue-300/30"
+          >
+            Collapse
+          </button>
           <button type="button" onClick={resetLayout} className="ml-auto text-[10px] font-semibold text-cyan-200 hover:text-white">Reset layout</button>
         </div>
       </div>
