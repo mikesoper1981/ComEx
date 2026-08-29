@@ -70,7 +70,7 @@ const FILE_KINDS = [
   { id: 'document', title: 'Other files', subtitle: 'Text / other', match: (f) => kindOfFile(f) === 'document' },
 ];
 
-const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 250, leafR: 150 };
+const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 250, leafR: 210 };
 
 const EMPTY_FOCUS = { moduleId: '', group: '', kind: '', fileId: '' };
 
@@ -306,10 +306,16 @@ function edgePath(a, b, kind, hub) {
   };
 }
 
+function isDrillNodeId(id) {
+  return /-(grp|kind|fact)-/.test(String(id || '')) || /-(mem-empty|pptx|goals)$/.test(String(id || ''));
+}
+
 function placeLeaves(nodes, edges, parentId, parent, leaves, angle) {
   if (!leaves.length) return;
-  const spread = Math.min(1.5, 0.32 * Math.max(leaves.length, 1));
-  const dist = CANVAS.leafR + Math.min(48, Math.max(0, leaves.length - 3) * 8);
+  const spread = Math.min(1.65, 0.38 * Math.max(leaves.length, 1));
+  const parentHalf = Math.max(parent.w || 168, parent.h || 78) / 2;
+  const leafHalf = Math.max(...leaves.map((l) => Math.max(l.w || 148, l.h || 52))) / 2;
+  const dist = parentHalf + leafHalf + 28 + Math.min(36, Math.max(0, leaves.length - 3) * 6);
   fanAngles(angle, leaves.length, spread).forEach((ang, i) => {
     const lp = polar(parent.x, parent.y, dist, ang);
     const leaf = clampNode({ ...leaves[i], x: lp.x, y: lp.y, moduleId: parent.moduleId || parent.id });
@@ -349,7 +355,7 @@ function layoutStar(model, focus) {
       h: 78,
       title: mod.short,
       subtitle: focus.moduleId === mod.id
-        ? 'Click a type to expand'
+        ? (focus.group ? 'Click to go back' : 'Click again to collapse')
         : `${files.length} file${files.length === 1 ? '' : 's'} · ${mod.memory.length} tagged fact${mod.memory.length === 1 ? '' : 's'}`,
       fill: mod.fill,
     }));
@@ -383,7 +389,6 @@ function layoutStar(model, focus) {
         ? facts.map((m) => ({
             id: `${mod.id}-fact-${m.id}`,
             kind: 'memory',
-            groupId: 'memory',
             title: clip(m.text, 28),
             subtitle: m.origin === 'centre' ? 'From centre (always passed)' : `Tagged to ${mod.short}`,
             w: 150,
@@ -392,7 +397,6 @@ function layoutStar(model, focus) {
         : [{
             id: `${mod.id}-mem-empty`,
             kind: 'empty',
-            groupId: 'memory',
             title: 'No chat memory yet',
             subtitle: 'Facts appear after you confirm them',
             w: 160,
@@ -525,6 +529,8 @@ export default function ContextMap({
   const dragRef = useRef(null);
   const skipClickRef = useRef(false);
   const canvasRef = useRef(null);
+  const focusRef = useRef(focus);
+  focusRef.current = focus;
 
   const model = useMemo(() => {
     const connections = Array.isArray(userSettings?.moduleConnections) ? userSettings.moduleConnections : [];
@@ -562,7 +568,7 @@ export default function ContextMap({
     const laid = layoutStar(model, focus);
     const saved = layout?.nodes && typeof layout.nodes === 'object' ? layout.nodes : {};
     const nodes = laid.nodes.map((n) => {
-      const s = saved[n.id];
+      const s = !isDrillNodeId(n.id) && saved[n.id] ? saved[n.id] : null;
       const live = livePos[n.id];
       let next = { ...n };
       if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
@@ -607,6 +613,7 @@ export default function ContextMap({
 
   const selectNode = (node) => {
     if (!node) return;
+    const current = focusRef.current;
     if (node.kind === 'hub' || node.id === 'account') {
       setSelected('account');
       setFocus(EMPTY_FOCUS);
@@ -614,31 +621,74 @@ export default function ContextMap({
       return;
     }
     if (node.kind === 'module') {
+      if (current.moduleId === node.id && !current.group) {
+        setSelected('account');
+        setFocus(EMPTY_FOCUS);
+        setOpenFileId('');
+        return;
+      }
       setSelected(node.id);
       setFocus({ moduleId: node.id, group: '', kind: '', fileId: '' });
       setOpenFileId('');
       return;
     }
     if (node.fileId) {
+      if (current.fileId === node.fileId) {
+        setFocus({ moduleId: node.moduleId, group: node.groupId || 'files', kind: node.kindKey || current.kind || '', fileId: '' });
+        setOpenFileId('');
+        return;
+      }
       setSelected(node.moduleId);
       setFocus({
         moduleId: node.moduleId,
         group: node.groupId || 'files',
-        kind: node.kindKey || focus.kind || '',
+        kind: node.kindKey || current.kind || '',
         fileId: node.fileId,
       });
       setOpenFileId(node.fileId);
       return;
     }
     if (node.kindKey) {
+      if (current.kind === node.kindKey && !current.fileId) {
+        setFocus({ moduleId: node.moduleId, group: 'files', kind: '', fileId: '' });
+        setOpenFileId('');
+        return;
+      }
       setSelected(node.moduleId);
       setFocus({ moduleId: node.moduleId, group: 'files', kind: node.kindKey, fileId: '' });
       setOpenFileId('');
       return;
     }
     if (node.groupId) {
+      if (current.group === node.groupId && !current.kind && !current.fileId) {
+        setFocus({ moduleId: node.moduleId, group: '', kind: '', fileId: '' });
+        setOpenFileId('');
+        return;
+      }
       setSelected(node.moduleId);
       setFocus({ moduleId: node.moduleId, group: node.groupId, kind: '', fileId: '' });
+      setOpenFileId('');
+    }
+  };
+
+  const collapseOne = () => {
+    const current = focusRef.current;
+    if (current.fileId) {
+      setFocus({ ...current, fileId: '' });
+      setOpenFileId('');
+      return;
+    }
+    if (current.kind) {
+      setFocus({ ...current, kind: '', fileId: '' });
+      return;
+    }
+    if (current.group) {
+      setFocus({ ...current, group: '', kind: '', fileId: '' });
+      return;
+    }
+    if (current.moduleId) {
+      setSelected('account');
+      setFocus(EMPTY_FOCUS);
       setOpenFileId('');
     }
   };
@@ -650,6 +700,7 @@ export default function ContextMap({
     const loc = clientToCanvas(ev.clientX, ev.clientY);
     dragRef.current = {
       id: node.id,
+      node,
       mode,
       moved: false,
       startClientX: ev.clientX,
@@ -658,7 +709,6 @@ export default function ContextMap({
       grab: loc,
     };
     try { ev.currentTarget.setPointerCapture?.(ev.pointerId); } catch { /* ignore */ }
-    selectNode(node);
   };
 
   useEffect(() => {
@@ -666,7 +716,8 @@ export default function ContextMap({
       const drag = dragRef.current;
       if (!drag) return;
       const dist = Math.hypot(ev.clientX - drag.startClientX, ev.clientY - drag.startClientY);
-      if (dist > 4) drag.moved = true;
+      if (dist > 6) drag.moved = true;
+      if (!drag.moved) return;
       const loc = clientToCanvas(ev.clientX, ev.clientY);
       if (!loc || !drag.grab) return;
       if (drag.mode === 'resize') {
@@ -682,13 +733,17 @@ export default function ContextMap({
     const onUp = () => {
       const drag = dragRef.current;
       dragRef.current = null;
-      if (!drag?.moved) return;
-      skipClickRef.current = true;
-      setLivePos((current) => {
-        const merged = graph.nodes.map((n) => (current[n.id] ? clampNode({ ...n, ...current[n.id] }) : n));
-        persistLayout(merged);
-        return {};
-      });
+      if (!drag) return;
+      if (drag.moved) {
+        skipClickRef.current = true;
+        setLivePos((current) => {
+          const merged = graph.nodes.map((n) => (current[n.id] ? clampNode({ ...n, ...current[n.id] }) : n));
+          persistLayout(merged);
+          return {};
+        });
+        return;
+      }
+      if (drag.mode === 'move' && drag.node) selectNode(drag.node);
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
@@ -727,16 +782,22 @@ export default function ContextMap({
           <Network className="w-4 h-4 text-cyan-400" /> Context map
         </h3>
         <p className="text-xs text-blue-300/70 leading-relaxed">
-          Click a module to expand types, then files. Drag any card to rearrange; pull the corner to resize.
-          The centre is always sent to the AI. Cyan links mean modules share context.
+          Click a module to expand types, then files. Click the same card again to collapse. Drag to rearrange; pull the corner to resize.
         </p>
       </div>
 
       <div className="bg-slate-950/50 border border-blue-400/20 rounded-xl overflow-hidden">
-        <div ref={canvasRef} className="relative w-full" style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}>
+        <div
+          ref={canvasRef}
+          className="relative w-full"
+          style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}
+          onPointerDown={(ev) => {
+            if (ev.target === ev.currentTarget || ev.target instanceof SVGElement) collapseOne();
+          }}
+        >
           <svg
             viewBox={`0 0 ${CANVAS.w} ${CANVAS.h}`}
-            className="absolute inset-0 w-full h-full"
+            className="absolute inset-0 w-full h-full pointer-events-none"
             role="img"
             aria-label="Star schema of captured context"
           >
@@ -822,13 +883,6 @@ export default function ContextMap({
                 key={node.id}
                 type="button"
                 onPointerDown={(ev) => onNodePointerDown(ev, node, 'move')}
-                onClick={() => {
-                  if (skipClickRef.current) {
-                    skipClickRef.current = false;
-                    return;
-                  }
-                  selectNode(node);
-                }}
                 className={`absolute -translate-x-1/2 -translate-y-1/2 text-left rounded-xl border shadow-lg transition-shadow cursor-grab active:cursor-grabbing touch-none ${
                   node.kind === 'hub'
                     ? 'bg-violet-600/90 border-violet-200/40 text-white'
@@ -843,7 +897,7 @@ export default function ContextMap({
                             : node.kind === 'empty'
                               ? 'bg-slate-900/60 border-slate-600/40 text-slate-400'
                               : 'bg-slate-900/90 border-blue-400/25 text-slate-100'
-                } ${isOpenFile ? 'ring-2 ring-cyan-300 z-20' : on ? 'ring-2 ring-white/60 z-20' : 'z-10 hover:ring-1 hover:ring-cyan-300/50'}`}
+                } ${isOpenFile || node.kind === 'files' || node.kindKey || node.fileId || node.groupId ? 'z-30' : node.kind === 'module' ? 'z-20' : on ? 'z-20' : 'z-10'} ${isOpenFile ? 'ring-2 ring-cyan-300' : on ? 'ring-2 ring-white/60' : 'hover:ring-1 hover:ring-cyan-300/50'}`}
                 style={{
                   left: `${(node.x / CANVAS.w) * 100}%`,
                   top: `${(node.y / CANVAS.h) * 100}%`,
