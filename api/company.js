@@ -30,6 +30,10 @@ function isCompanyPgSchema(schema) {
   return /^c_[a-z0-9_]+$/.test(String(schema || ''));
 }
 
+async function companySchemaPresent(companyOrSchema) {
+  return require('./stella-db').companySchemaPresent(companyOrSchema);
+}
+
 async function ensureCompanyPgSchema(companyOrSchema) {
   return require('./stella-db').ensureCompanyPgSchema(companyOrSchema);
 }
@@ -57,6 +61,7 @@ module.exports = {
   defaultCompanyForRole,
   resolveUserCompany,
   isCompanyPgSchema,
+  companySchemaPresent,
   ensureCompanyPgSchema,
   ensureAllCompanySchemas,
   userObjectPrefix,

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2 } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2 } from 'lucide-react';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
@@ -1569,13 +1569,6 @@ function stellaBuildFileLinkGraph(files) {
   return { nodes, edges };
 }
 
-function stellaPairJoinLabel(edges) {
-  const names = [...new Set((edges || []).map((e) => e.thisField).filter(Boolean))];
-  if (!names.length) return 'join';
-  if (names.length <= 4) return names.join(' · ');
-  return `${names.length} keys`;
-}
-
 function stellaFileGraphLayout(nodes, width, height) {
   const n = nodes.length;
   if (!n) return [];
@@ -1612,6 +1605,355 @@ function stellaJoinCurvePath(a, b, index, total) {
     lx: (a.x + 2 * cx + b.x) / 4,
     ly: (a.y + 2 * cy + b.y) / 4,
   };
+}
+
+const STELLA_CARD_W = 196;
+const STELLA_HEADER_H = 46;
+const STELLA_ROW_H = 20;
+
+function stellaJoinFieldsForNode(nodeId, edges) {
+  const fields = [];
+  const seen = new Set();
+  for (const e of edges || []) {
+    if (e.from === nodeId && e.thisField && !seen.has(e.thisField.toLowerCase())) {
+      seen.add(e.thisField.toLowerCase());
+      fields.push(e.thisField);
+    }
+    if (e.to === nodeId && e.relatedField && !seen.has(e.relatedField.toLowerCase())) {
+      seen.add(e.relatedField.toLowerCase());
+      fields.push(e.relatedField);
+    }
+  }
+  return fields;
+}
+
+function stellaCardSize(expanded, fieldCount) {
+  if (!expanded) return { w: STELLA_CARD_W, h: STELLA_HEADER_H };
+  const rows = Math.max(fieldCount, 1);
+  return { w: STELLA_CARD_W, h: STELLA_HEADER_H + 10 + rows * STELLA_ROW_H + 8 };
+}
+
+function stellaFieldAnchor(node, fieldName, side) {
+  const i = Math.max(0, (node.fields || []).findIndex((f) => f === fieldName));
+  const { w, h } = stellaCardSize(true, node.fields?.length || 1);
+  return {
+    x: side === 'right' ? node.x + w / 2 : node.x - w / 2,
+    y: node.y - h / 2 + STELLA_HEADER_H + 10 + i * STELLA_ROW_H + STELLA_ROW_H / 2,
+  };
+}
+
+function StellaFileConnectionMap({ files, activeId, onSelectFile }) {
+  const graph = useMemo(() => stellaBuildFileLinkGraph(files || []), [files]);
+  const nodeIds = graph.nodes.map((n) => n.id).join('|');
+  const [large, setLarge] = useState(false);
+  const [expanded, setExpanded] = useState(() => new Set());
+  const [pos, setPos] = useState({});
+  const svgRef = useRef(null);
+  const dragRef = useRef(null);
+
+  useEffect(() => {
+    setPos((prev) => {
+      const next = { ...prev };
+      const laid = stellaFileGraphLayout(graph.nodes, 1000, 560);
+      for (const n of laid) {
+        if (next[n.id]) continue;
+        next[n.id] = { x: n.x / 1000, y: n.y / 560 };
+      }
+      return next;
+    });
+  }, [nodeIds, graph.nodes]);
+
+  useEffect(() => {
+    if (!large) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') setLarge(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [large]);
+
+  const width = large ? 1400 : 900;
+  const height = large ? 820 : (graph.nodes.length <= 2 ? 280 : graph.nodes.length <= 4 ? 360 : 420);
+  const pairBuckets = new Map();
+  for (const e of graph.edges) {
+    const key = [e.from, e.to].sort().join('|');
+    if (!pairBuckets.has(key)) pairBuckets.set(key, []);
+    pairBuckets.get(key).push(e);
+  }
+  const isolated = graph.nodes.filter((n) => n.joinCount === 0);
+  const pending = graph.nodes.filter((n) => !n.intakeComplete);
+  const pairCount = pairBuckets.size;
+
+  const laid = graph.nodes.map((n) => {
+    const p = pos[n.id] || { x: 0.5, y: 0.5 };
+    const fields = stellaJoinFieldsForNode(n.id, graph.edges);
+    const isOpen = expanded.has(n.id);
+    const size = stellaCardSize(isOpen, fields.length);
+    return {
+      ...n,
+      fields,
+      expanded: isOpen,
+      x: 24 + p.x * (width - 48),
+      y: 24 + p.y * (height - 48),
+      w: size.w,
+      h: size.h,
+    };
+  });
+  const posMap = new Map(laid.map((n) => [n.id, n]));
+
+  const clientToFrac = (clientX, clientY) => {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    const pt = svg.createSVGPoint();
+    pt.x = clientX;
+    pt.y = clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    const loc = pt.matrixTransform(ctm.inverse());
+    return {
+      x: Math.min(0.96, Math.max(0.04, loc.x / width)),
+      y: Math.min(0.96, Math.max(0.04, loc.y / height)),
+    };
+  };
+
+  const toggleExpand = (id) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      const opening = !next.has(id);
+      if (opening) {
+        next.add(id);
+        const node = graph.nodes.find((n) => n.id === id);
+        for (const pid of node?.partners || []) next.add(pid);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
+    onSelectFile?.(id);
+  };
+
+  const onPointerDown = (ev, id) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const frac = clientToFrac(ev.clientX, ev.clientY);
+    const cur = pos[id] || { x: 0.5, y: 0.5 };
+    dragRef.current = {
+      id,
+      moved: false,
+      startClientX: ev.clientX,
+      startClientY: ev.clientY,
+      origin: cur,
+      grab: frac,
+    };
+    ev.currentTarget.setPointerCapture?.(ev.pointerId);
+  };
+
+  const onPointerMove = (ev) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const dist = Math.hypot(ev.clientX - drag.startClientX, ev.clientY - drag.startClientY);
+    if (dist > 5) drag.moved = true;
+    if (!drag.moved) return;
+    const frac = clientToFrac(ev.clientX, ev.clientY);
+    if (!frac || !drag.grab) return;
+    const nx = Math.min(0.96, Math.max(0.04, drag.origin.x + (frac.x - drag.grab.x)));
+    const ny = Math.min(0.96, Math.max(0.04, drag.origin.y + (frac.y - drag.grab.y)));
+    setPos((prev) => ({ ...prev, [drag.id]: { x: nx, y: ny } }));
+  };
+
+  const onPointerUp = (ev, id) => {
+    const drag = dragRef.current;
+    const moved = !!(drag && drag.moved);
+    dragRef.current = null;
+    try { ev.currentTarget.releasePointerCapture?.(ev.pointerId); } catch { /* ignore */ }
+    if (!moved) toggleExpand(id);
+  };
+
+  const toolbar = (
+    <button
+      type="button"
+      onClick={(e) => { e.preventDefault(); e.stopPropagation(); setLarge((v) => !v); }}
+      className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-cyan-200 bg-slate-900/60 border border-cyan-400/25 hover:bg-cyan-500/15 flex items-center gap-1.5"
+      title={large ? 'Close large view' : 'Open larger view'}
+    >
+      {large ? <X className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+      {large ? 'Close' : 'Larger view'}
+    </button>
+  );
+
+  const drawCanvas = (isLarge) => (
+    <div className={`bg-slate-950/40 border border-blue-400/15 rounded-xl overflow-hidden relative ${isLarge ? 'h-full' : ''}`}>
+      <svg
+        ref={isLarge === large ? svgRef : undefined}
+        viewBox={`0 0 ${width} ${height}`}
+        className={isLarge ? 'w-full h-full' : 'w-full h-auto max-h-[420px]'}
+        role="img"
+        aria-label="File connection map"
+        onPointerMove={onPointerMove}
+        onPointerUp={() => { dragRef.current = null; }}
+      >
+        {Array.from(pairBuckets.values()).map((bucket) => {
+          const e0 = bucket[0];
+          const a = posMap.get(e0.from);
+          const b = posMap.get(e0.to);
+          if (!a || !b) return null;
+          const pairKey = `${[e0.from, e0.to].sort().join('|')}${isLarge ? '-lg' : ''}`;
+          const bothOpen = a.expanded && b.expanded;
+          const aRight = a.x <= b.x;
+          const stroke = (activeId === a.id || activeId === b.id) ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.55)';
+          if (!bothOpen) {
+            const curve = stellaJoinCurvePath(a, b, 0, 1);
+            return (
+              <g key={pairKey}>
+                <path d={curve.d} fill="none" stroke={stroke} strokeWidth={1.7} />
+              </g>
+            );
+          }
+          return (
+            <g key={pairKey}>
+              {bucket.map((k, i) => {
+                const fromPt = stellaFieldAnchor(a, k.thisField, aRight ? 'right' : 'left');
+                const toPt = stellaFieldAnchor(b, k.relatedField, aRight ? 'left' : 'right');
+                const curve = stellaJoinCurvePath(fromPt, toPt, i, bucket.length);
+                return (
+                  <g key={`${k.thisField}-${k.relatedField}`}>
+                    <path d={curve.d} fill="none" stroke={stroke} strokeWidth={1.8} />
+                    <circle cx={fromPt.x} cy={fromPt.y} r={3.2} fill={stroke} />
+                    <circle cx={toPt.x} cy={toPt.y} r={3.2} fill={stroke} />
+                  </g>
+                );
+              })}
+            </g>
+          );
+        })}
+        {laid.map((n) => {
+          const selected = activeId === n.id;
+          const linked = n.joinCount > 0;
+          const x = n.x - n.w / 2;
+          const y = n.y - n.h / 2;
+          return (
+            <g
+              key={`${n.id}${isLarge ? '-lg' : ''}`}
+              className="cursor-grab active:cursor-grabbing"
+              onPointerDown={(ev) => onPointerDown(ev, n.id)}
+              onPointerMove={onPointerMove}
+              onPointerUp={(ev) => onPointerUp(ev, n.id)}
+            >
+              <rect
+                x={x}
+                y={y}
+                width={n.w}
+                height={n.h}
+                rx={10}
+                fill={selected ? 'rgb(8, 47, 73)' : 'rgba(15, 23, 42, 0.96)'}
+                stroke={selected ? 'rgb(34, 211, 238)' : linked ? 'rgba(52, 211, 153, 0.55)' : 'rgba(148, 163, 184, 0.35)'}
+                strokeWidth={selected ? 2 : 1.2}
+                strokeDasharray={linked || !n.intakeComplete ? undefined : '4 3'}
+              />
+              <text x={n.x} y={y + 18} textAnchor="middle" className="fill-white" style={{ fontSize: 11, fontWeight: 700 }}>
+                {stellaFileShortName(n.name)}
+              </text>
+              <text
+                x={n.x}
+                y={y + 34}
+                textAnchor="middle"
+                className={linked ? 'fill-emerald-300' : 'fill-slate-400'}
+                style={{ fontSize: 9 }}
+              >
+                {!n.intakeComplete ? 'Intake pending' : linked ? (n.expanded ? `${n.fields.length} key${n.fields.length === 1 ? '' : 's'}` : 'Connected · click to expand') : 'Not joined'}
+              </text>
+              {n.expanded && (
+                n.fields.length
+                  ? n.fields.map((field, i) => (
+                    <text
+                      key={field}
+                      x={n.x}
+                      y={y + STELLA_HEADER_H + 10 + i * STELLA_ROW_H + 14}
+                      textAnchor="middle"
+                      className="fill-cyan-100"
+                      style={{ fontSize: 10, fontFamily: 'ui-monospace, monospace' }}
+                    >
+                      {field.length > 24 ? `${field.slice(0, 22)}…` : field}
+                    </text>
+                  ))
+                  : (
+                    <text x={n.x} y={y + STELLA_HEADER_H + 22} textAnchor="middle" className="fill-slate-500" style={{ fontSize: 10 }}>
+                      No join keys
+                    </text>
+                  )
+              )}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+
+  return (
+    <>
+      <details className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4 group">
+        <summary className="cursor-pointer list-none flex items-start justify-between gap-3 [&::-webkit-details-marker]:hidden">
+          <div>
+            <div className="text-sm font-bold text-white flex items-center gap-2">
+              <ChevronRight className="w-4 h-4 text-cyan-300 transition-transform group-open:rotate-90" />
+              <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
+            </div>
+            <p className="text-xs text-blue-300/60 mt-1">
+              {pairCount
+                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Click a table to see keys; drag to rearrange.`
+                : 'No confirmed connections yet. Expand for the map.'}
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {toolbar}
+            <div className="text-right text-[10px] text-blue-300/50">
+              <div>{pairCount} connection{pairCount === 1 ? '' : 's'}</div>
+              <div>{isolated.length} unconnected</div>
+            </div>
+          </div>
+        </summary>
+
+        <p className="text-xs text-blue-300/60 mt-3 mb-3">
+          Click a table to list join fields and draw key-to-key lines. Drag tables to tidy the layout.
+        </p>
+        {drawCanvas(false)}
+        {isolated.length > 0 && (
+          <p className="text-xs text-blue-300/55 mt-3">
+            {isolated.map((n) => n.name).join(', ')}
+            {isolated.length === 1 ? ' has' : ' have'} no confirmed connection
+            {pending.length ? ' — finish intake to capture links, or confirm they should stay separate.' : '.'}
+          </p>
+        )}
+        {graph.nodes.length > 1 && graph.edges.length === 0 && isolated.length === graph.nodes.length && (
+          <p className="text-xs text-blue-300/55 mt-2">
+            Stella only draws a connection when you confirm it in intake. Unrelated files are expected to stay apart.
+          </p>
+        )}
+      </details>
+
+      {large && (
+        <div
+          className="fixed inset-0 z-[80] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-8"
+          onClick={() => setLarge(false)}
+        >
+          <div
+            className="w-full max-w-[1400px] h-[min(90vh,900px)] bg-slate-900 border border-cyan-400/25 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
+              <div className="text-sm font-bold text-white flex items-center gap-2">
+                <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
+                <span className="text-xs font-normal text-blue-300/60">Drag tables · click to expand keys</span>
+              </div>
+              {toolbar}
+            </div>
+            <div className="flex-1 min-h-0 p-4 overflow-hidden">
+              {drawCanvas(true)}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
 // Short, URL/identifier-safe random id (used for stella_data_<id> tables).
@@ -2742,6 +3084,98 @@ function stellaFormatContextQa(ctx) {
   return lines.length ? lines.join('\n') : '(no interpretive context captured yet)';
 }
 
+function stellaContextText(value) {
+  if (value == null) return '';
+  if (Array.isArray(value)) return value.map((v) => String(v || '').trim()).filter(Boolean);
+  const s = String(value).trim();
+  return s ? s : '';
+}
+
+function StellaCapturedContextView({ ctx }) {
+  if (!ctx || typeof ctx !== 'object') {
+    return <p className="text-xs text-emerald-200/70">No interpretive notes stored yet.</p>;
+  }
+  const maps = stellaCollectNameMaps(ctx);
+  const metrics = stellaContextText(ctx.key_metrics);
+  const metricList = Array.isArray(metrics) ? metrics : (metrics ? [metrics] : []);
+  const rels = (Array.isArray(ctx.relationships) ? ctx.relationships : []).filter((r) => r && (r.related_file || r.related_table));
+  const qa = (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).filter((p) => p && (p.question || p.answer));
+  const represents = String(ctx.what_it_represents || '').trim();
+  const period = String(ctx.time_period || '').trim();
+  const notes = String(ctx.interpretation_notes || '').trim();
+  const hasAny = represents || period || metricList.length || notes || maps.length || rels.length || qa.length;
+  if (!hasAny) {
+    return <p className="text-xs text-emerald-200/70">No interpretive notes stored yet.</p>;
+  }
+
+  const Section = ({ title, children }) => (
+    <div>
+      <div className="text-[10px] font-bold uppercase tracking-wide text-emerald-400/80 mb-1">{title}</div>
+      <div className="text-xs text-emerald-50/95 leading-relaxed">{children}</div>
+    </div>
+  );
+
+  return (
+    <div className="px-4 pb-4 space-y-3">
+      {represents ? <Section title="What this file is">{represents}</Section> : null}
+      {period ? <Section title="Time period">{period}</Section> : null}
+      {metricList.length ? (
+        <Section title="Key metrics">
+          <ul className="list-disc pl-4 space-y-0.5">
+            {metricList.map((m) => <li key={m}>{m}</li>)}
+          </ul>
+        </Section>
+      ) : null}
+      {notes ? <Section title="How to read it">{notes}</Section> : null}
+      {maps.length ? (
+        <Section title="Same product, different names">
+          <ul className="space-y-1">
+            {maps.map((m, i) => (
+              <li key={`${m.from}-${m.to}-${i}`}>
+                <span className="text-cyan-200 font-semibold">{m.from}</span>
+                <span className="text-emerald-300/50"> is </span>
+                <span className="text-cyan-200 font-semibold">{m.to}</span>
+                {m.note ? <span className="text-emerald-200/60"> — {m.note}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </Section>
+      ) : null}
+      {rels.length ? (
+        <Section title="Joins to other files">
+          <ul className="space-y-1.5">
+            {rels.map((r, i) => {
+              const target = r.related_file || r.related_table || 'another file';
+              const join = (r.this_field && r.related_field)
+                ? `${r.this_field} matches ${r.related_field}`
+                : '';
+              return (
+                <li key={`${target}-${r.this_field}-${i}`}>
+                  <span className="text-cyan-200 font-semibold">{target}</span>
+                  {join ? <span className="text-emerald-200/80"> — {join}</span> : null}
+                  {r.note ? <div className="text-emerald-200/60 mt-0.5">{r.note}</div> : null}
+                </li>
+              );
+            })}
+          </ul>
+        </Section>
+      ) : null}
+      {qa.length ? (
+        <Section title="Intake answers">
+          <ol className="space-y-2">
+            {qa.map((p, i) => (
+              <li key={i} className="bg-slate-950/35 border border-emerald-400/15 rounded-lg px-3 py-2">
+                {p.question ? <div className="text-emerald-200/70 mb-1">{p.question}</div> : null}
+                {p.answer ? <div className="text-emerald-50">{p.answer}</div> : null}
+              </li>
+            ))}
+          </ol>
+        </Section>
+      ) : null}
+    </div>
+  );
+}
+
 // Map a stella_files DB row into the local file object used by the UI.
 function stellaFilesApiDown(res) {
   return !res || res.status === 404 || res.status === 502 || res.status === 503;
@@ -3692,11 +4126,13 @@ export default function CommercialExcellenceApp() {
         let migratedChats = false;
         if (indexParsed && typeof indexParsed === 'object') {
           ({ chats: indexChats, activeChatId: remoteActive } = extractChatIndexFromDocument(indexParsed));
+        }
+        if (indexChats.length) {
           applyChatIndex(indexChats, remoteActive);
         } else {
           const fromSettings = extractChatIndexFromDocument(parsed);
           indexChats = fromSettings.chats;
-          remoteActive = fromSettings.activeChatId;
+          remoteActive = fromSettings.activeChatId || remoteActive;
           migratedChats = indexChats.length > 0;
           if (migratedChats) applyChatIndex(indexChats, remoteActive);
           else {
@@ -3704,7 +4140,9 @@ export default function CommercialExcellenceApp() {
               await ensureFullChatsLoaded();
               setChatIndexLoading(false);
             } catch {
-              setChatIndexLoading(false);
+              const cached = readCachedChatIndex(currentUser.id);
+              if (cached.chats.length) applyChatIndex(cached.chats, cached.activeChatId);
+              else setChatIndexLoading(false);
             }
           }
         }
@@ -3784,6 +4222,7 @@ export default function CommercialExcellenceApp() {
       } catch {
         return;
       }
+      if (!chatsFullLoadedRef.current) return;
       const id = activeChatIdRef.current || newChatId();
       if (!activeChatIdRef.current) {
         activeChatIdRef.current = id;
@@ -3807,11 +4246,14 @@ export default function CommercialExcellenceApp() {
       chatSessionsRef.current = next;
       chatsBodiesRef.current = next;
       setChatSessions(next);
+      const toSave = mergeChatListForPersist(next);
+      const listed = (next || []).filter(chatIsListed);
+      if (listed.some((c) => !toSave.some((s) => s.id === c.id))) return;
       try {
         await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
           {
-            chats: mergeChatListForPersist(chatSessionsRef.current),
+            chats: toSave,
             activeChatId: activeChatIdRef.current,
             userName: currentUser.name,
           },
@@ -4580,14 +5022,18 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
         chatSessionsRef.current = liveChats;
         setChatSessions(liveChats);
       }
-      void queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
-        currentUser.id,
-        {
-          chats: mergeChatListForPersist(chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats),
-          activeChatId: activeChatIdRef.current || liveSnap.id,
-          userName: currentUser.name,
-        },
-      ));
+      const chatsToSave = mergeChatListForPersist(chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats);
+      const listedChats = (chatSessionsRef.current || liveChats || []).filter(chatIsListed);
+      if (!listedChats.some((c) => !chatsToSave.some((s) => s.id === c.id))) {
+        void queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
+          currentUser.id,
+          {
+            chats: chatsToSave,
+            activeChatId: activeChatIdRef.current || liveSnap.id,
+            userName: currentUser.name,
+          },
+        ));
+      }
       const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
         currentUser.id,
         mergeUserSettingsFields(userSettingsRef.current),
@@ -4697,12 +5143,22 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   };
 
   const mergeChatListForPersist = (list) => {
-    const fullById = new Map((chatsBodiesRef.current || []).map((c) => [c.id, c]));
-    return (list || []).map((c) => {
-      if (!c?.id) return c;
-      if (Array.isArray(c.messages) && c.messages.length) return c;
-      return fullById.get(c.id) || c;
-    });
+    const fullById = new Map(
+      (chatsBodiesRef.current || [])
+        .filter((c) => c?.id && Array.isArray(c.messages) && c.messages.length)
+        .map((c) => [c.id, c]),
+    );
+    const out = [];
+    for (const c of list || []) {
+      if (!c?.id) continue;
+      if (Array.isArray(c.messages) && c.messages.length) {
+        out.push(c);
+        continue;
+      }
+      const full = fullById.get(c.id);
+      if (full) out.push(full);
+    }
+    return out;
   };
 
   const persistChatList = async (list, activeId) => {
@@ -4713,10 +5169,14 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       } catch {
         return;
       }
+      if (!chatsFullLoadedRef.current) return;
+      const chats = mergeChatListForPersist(list);
+      const listed = (list || []).filter(chatIsListed);
+      if (listed.some((c) => !chats.some((s) => s.id === c.id))) return;
       await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
         currentUser.id,
         {
-          chats: mergeChatListForPersist(list),
+          chats,
           activeChatId: activeId,
           userName: currentUser.name,
         },
@@ -7380,189 +7840,12 @@ ${stepInstruction}`;
   const renderStellaFileLinkMap = () => {
     const files = (stellaDataFiles || []).filter((f) => f && !f.processing);
     if (!files.length) return null;
-    const graph = stellaBuildFileLinkGraph(files);
-    const width = 720;
-    const height = graph.nodes.length <= 2 ? 160 : graph.nodes.length <= 4 ? 248 : 300;
-    const laid = stellaFileGraphLayout(graph.nodes, width, height);
-    const pos = new Map(laid.map((n) => [n.id, n]));
-    const pairBuckets = new Map();
-    for (const e of graph.edges) {
-      const key = [e.from, e.to].sort().join('|');
-      if (!pairBuckets.has(key)) pairBuckets.set(key, []);
-      pairBuckets.get(key).push(e);
-    }
-    const isolated = graph.nodes.filter((n) => n.joinCount === 0);
-    const pending = graph.nodes.filter((n) => !n.intakeComplete);
-
-    const pairCount = pairBuckets.size;
-
     return (
-      <details className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4 group">
-        <summary className="cursor-pointer list-none flex items-start justify-between gap-3 [&::-webkit-details-marker]:hidden">
-          <div>
-            <div className="text-sm font-bold text-white flex items-center gap-2">
-              <ChevronRight className="w-4 h-4 text-cyan-300 transition-transform group-open:rotate-90" />
-              <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
-            </div>
-            <p className="text-xs text-blue-300/60 mt-1">
-              {pairCount
-                ? `${pairCount} connection${pairCount === 1 ? '' : 's'} between files. Expand to see keys.`
-                : 'No confirmed connections yet. Expand for the map.'}
-            </p>
-          </div>
-          <div className="text-right shrink-0 text-[10px] text-blue-300/50">
-            <div>{pairCount} connection{pairCount === 1 ? '' : 's'}</div>
-            <div>{isolated.length} unconnected</div>
-          </div>
-        </summary>
-
-        <p className="text-xs text-blue-300/60 mt-3 mb-3">
-          One connection per pair of files. Every matching key (date, territory, product, and so on) is listed — not a preferred subset.
-        </p>
-
-        <div className="bg-slate-950/40 border border-blue-400/15 rounded-xl overflow-hidden">
-          <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto max-h-[320px]" role="img" aria-label="File connection map">
-            {Array.from(pairBuckets.values()).map((bucket) => {
-              const e = bucket[0];
-              const a = pos.get(e.from);
-              const b = pos.get(e.to);
-              if (!a || !b) return null;
-              const curve = stellaJoinCurvePath(a, b, 0, 1);
-              const active = activeStellaDataId === e.from || activeStellaDataId === e.to;
-              const label = stellaPairJoinLabel(bucket);
-              return (
-                <g key={[e.from, e.to].sort().join('|')}>
-                  <path
-                    d={curve.d}
-                    fill="none"
-                    stroke={active ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.45)'}
-                    strokeWidth={active ? 2.4 : 1.6}
-                  />
-                  <rect
-                    x={curve.lx - 62}
-                    y={curve.ly - 10}
-                    width={124}
-                    height={20}
-                    rx={6}
-                    fill="rgba(15, 23, 42, 0.92)"
-                    stroke="rgba(34, 211, 238, 0.25)"
-                  />
-                  <text
-                    x={curve.lx}
-                    y={curve.ly + 4}
-                    textAnchor="middle"
-                    className="fill-cyan-200"
-                    style={{ fontSize: 10, fontWeight: 600 }}
-                  >
-                    {label.length > 28 ? `${label.slice(0, 26)}…` : label}
-                  </text>
-                </g>
-              );
-            })}
-            {laid.map((n) => {
-              const selected = activeStellaDataId === n.id;
-              const linked = n.joinCount > 0;
-              return (
-                <g
-                  key={n.id}
-                  className="cursor-pointer"
-                  role="button"
-                  tabIndex={0}
-                  aria-label={`Select ${n.name}`}
-                  onClick={() => setActiveStellaDataId(n.id)}
-                  onKeyDown={(ev) => {
-                    if (ev.key === 'Enter' || ev.key === ' ') {
-                      ev.preventDefault();
-                      setActiveStellaDataId(n.id);
-                    }
-                  }}
-                >
-                  <rect
-                    x={n.x - 78}
-                    y={n.y - 22}
-                    width={156}
-                    height={44}
-                    rx={10}
-                    fill={selected ? 'rgb(8, 47, 73)' : 'rgba(15, 23, 42, 0.95)'}
-                    stroke={selected ? 'rgb(34, 211, 238)' : linked ? 'rgba(52, 211, 153, 0.55)' : 'rgba(148, 163, 184, 0.35)'}
-                    strokeWidth={selected ? 2 : 1.2}
-                    strokeDasharray={linked || !n.intakeComplete ? undefined : '4 3'}
-                  />
-                  <text
-                    x={n.x}
-                    y={n.y - 2}
-                    textAnchor="middle"
-                    className="fill-white"
-                    style={{ fontSize: 11, fontWeight: 700 }}
-                  >
-                    {stellaFileShortName(n.name)}
-                  </text>
-                  <text
-                    x={n.x}
-                    y={n.y + 13}
-                    textAnchor="middle"
-                    className={linked ? 'fill-emerald-300' : 'fill-slate-400'}
-                    style={{ fontSize: 9 }}
-                  >
-                    {!n.intakeComplete
-                      ? 'Intake pending'
-                      : linked
-                        ? 'Connected'
-                        : 'Not joined'}
-                  </text>
-                </g>
-              );
-            })}
-          </svg>
-        </div>
-
-        {graph.edges.length > 0 && (
-          <div className="mt-3 space-y-2">
-            {Array.from(pairBuckets.values()).map((bucket) => {
-              const e = bucket[0];
-              return (
-                <div
-                  key={[e.from, e.to].sort().join('|')}
-                  className="text-xs bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2 text-blue-100/90"
-                >
-                  <button
-                    type="button"
-                    onClick={() => setActiveStellaDataId(e.from)}
-                    className="text-left w-full"
-                  >
-                    <span className="text-cyan-200 font-semibold">{e.fromName}</span>
-                    <span className="text-blue-300/50"> ↔ </span>
-                    <span className="text-cyan-200 font-semibold">{e.toName}</span>
-                  </button>
-                  <ul className="mt-1.5 space-y-0.5 text-blue-300/80">
-                    {bucket.map((k) => (
-                      <li key={`${k.thisField}-${k.relatedField}`}>
-                        <span className="text-blue-400/70">{k.thisField}</span>
-                        <span className="text-blue-300/50"> = </span>
-                        <span className="text-blue-400/70">{k.relatedField}</span>
-                        {k.note ? <span className="text-blue-300/55"> — {k.note}</span> : null}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {isolated.length > 0 && (
-          <p className="text-xs text-blue-300/55 mt-3">
-            {isolated.map((n) => n.name).join(', ')}
-            {isolated.length === 1 ? ' has' : ' have'} no confirmed connection
-            {pending.length ? ' — finish intake to capture links, or confirm they should stay separate.' : '.'}
-          </p>
-        )}
-        {graph.nodes.length > 1 && graph.edges.length === 0 && isolated.length === graph.nodes.length && (
-          <p className="text-xs text-blue-300/55 mt-2">
-            Stella only draws a connection when you confirm it in intake. Unrelated files are expected to stay apart.
-          </p>
-        )}
-      </details>
+      <StellaFileConnectionMap
+        files={files}
+        activeId={activeStellaDataId}
+        onSelectFile={setActiveStellaDataId}
+      />
     );
   };
 
@@ -7584,7 +7867,7 @@ ${stepInstruction}`;
                 <div className={`text-[11px] mt-1.5 ${stellaTenantSchema.ready ? 'text-blue-300/50' : 'text-amber-300/85'}`}>
                   {stellaTenantSchema.ready
                     ? `Company schema ${stellaTenantSchema.name} — pick that schema in the Table Editor, not public.`
-                    : `Schema ${stellaTenantSchema.name} is not on the database yet. ${stellaTenantSchema.error || 'Deleting files will not create it.'}`}
+                    : `Schema ${stellaTenantSchema.name} is not on the database yet. ${stellaTenantSchema.error || 'It is created when the first file is loaded or uploaded.'}`}
                 </div>
               ) : null}
             </div>
@@ -7675,11 +7958,11 @@ ${stepInstruction}`;
                 )}
 
                 {f.capturedContext && (
-                  <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden">
+                  <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden" open>
                     <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">
                       <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
                     </summary>
-                    <pre className="px-4 pb-4 text-[11px] text-emerald-200/90 whitespace-pre-wrap">{JSON.stringify(f.capturedContext, null, 2)}</pre>
+                    <StellaCapturedContextView ctx={f.capturedContext} />
                   </details>
                 )}
               </div>

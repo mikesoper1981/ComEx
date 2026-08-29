@@ -124,6 +124,17 @@ begin
   loop
     perform public.stella_lock_relation(p_schema, r.tablename);
   end loop;
+  begin
+    execute format('create table if not exists %I.stella_files (like public.stella_files including all)', p_schema);
+    execute format(
+      'insert into %I.stella_files select * from public.stella_files where company_slug = %L or org_id like %L on conflict (id) do nothing',
+      p_schema,
+      regexp_replace(p_schema, '^c_', ''),
+      'company:' || regexp_replace(p_schema, '^c_', '') || ':%'
+    );
+  exception when others then
+    null;
+  end;
 end;
 $$;
 

@@ -1,6 +1,7 @@
 /**
- * Company Postgres schemas. Created by the app when a company is added.
- * Helpers are installed automatically — no SQL editor.
+ * Company Postgres schemas. Created on first Stella file load/upload, and
+ * only if the namespace is not already present. Helpers are installed
+ * automatically — no SQL editor.
  *
  * Vercel is IPv4-only. Never use db.*.supabase.co (IPv6). Connect through
  * the session pooler, passing the password as a field so special characters
@@ -150,6 +151,7 @@ function connectionCandidates() {
 
   if (workingConfig) add(workingConfig);
 
+  const fromEnv = [];
   for (const raw of [
     process.env.POSTGRES_URL_NON_POOLING,
     process.env.DIRECT_URL,
@@ -157,10 +159,25 @@ function connectionCandidates() {
     process.env.POSTGRES_URL,
     process.env.SUPABASE_DB_URL,
   ]) {
-    add(configFromUrl(raw));
+    const cfg = configFromUrl(raw);
+    if (cfg) {
+      add(cfg);
+      fromEnv.push(cfg);
+    }
   }
 
-  for (const cfg of poolerConfigs()) add(cfg);
+  if (fromEnv.length) {
+    const password = envPassword();
+    if (password && fromEnv[0].host) {
+      add({
+        ...fromEnv[0],
+        password,
+        connectionTimeoutMillis: 8000,
+      });
+    }
+  } else {
+    for (const cfg of poolerConfigs()) add(cfg);
+  }
   return out;
 }
 
@@ -232,7 +249,12 @@ async function bootstrapViaPg() {
   if (bootstrapInFlight) return bootstrapInFlight;
   bootstrapInFlight = (async () => {
     await withPg(async (client) => {
-      await client.query(BOOTSTRAP_SQL);
+      const { rows } = await client.query(
+        `select to_regprocedure('public.stella_ensure_schema(text)') is not null as ok`,
+      );
+      if (!rows[0]?.ok) {
+        await client.query(BOOTSTRAP_SQL);
+      }
     });
     bootstrapped = true;
     return true;
@@ -245,6 +267,54 @@ async function bootstrapViaPg() {
   }
 }
 
+function quoteIdent(name) {
+  if (!isCompanyPgSchema(name) && name !== 'public') {
+    throw new Error('Invalid identifier');
+  }
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
+
+function slugFromSchema(schema) {
+  return String(schema || '').replace(/^c_/, '');
+}
+
+async function ensureCompanyFilesTable(schema) {
+  if (!isCompanyPgSchema(schema)) return;
+  const q = quoteIdent(schema);
+  const slug = slugFromSchema(schema);
+  await withPg(async (client) => {
+    const pub = await client.query(`select to_regclass('public.stella_files') is not null as ok`);
+    if (pub.rows[0]?.ok) {
+      await client.query(`create table if not exists ${q}.stella_files (like public.stella_files including all)`);
+      await client.query(
+        `insert into ${q}.stella_files
+         select * from public.stella_files
+         where company_slug = $1
+            or org_id like $2
+         on conflict (id) do nothing`,
+        [slug, `company:${slug}:%`],
+      );
+    } else {
+      await client.query(`
+        create table if not exists ${q}.stella_files (
+          id uuid primary key default gen_random_uuid(),
+          org_id text default 'default',
+          file_name text,
+          file_type text,
+          storage_path text,
+          table_name text,
+          columns jsonb,
+          row_count integer,
+          summary text,
+          context_qa jsonb,
+          uploaded_at timestamptz default now(),
+          company_slug text
+        )
+      `);
+    }
+  });
+}
+
 async function createSchemaViaPg(schema) {
   await bootstrapViaPg();
   await withPg(async (client) => {
@@ -252,27 +322,76 @@ async function createSchemaViaPg(schema) {
   });
 }
 
+function resolveSchemaName(companyOrSchema) {
+  const raw = String(companyOrSchema || '').trim();
+  return isCompanyPgSchema(raw) ? raw : companyPgSchema(raw);
+}
+
+async function inspectCompanySchema(schema) {
+  const { rows } = await withPg((client) => client.query(
+    `select
+       exists(select 1 from pg_namespace where nspname = $1) as schema_ok,
+       to_regclass(($1 || '.stella_files')::text) is not null as files_ok`,
+    [schema],
+  ));
+  return {
+    schemaOk: !!rows[0]?.schema_ok,
+    filesOk: !!rows[0]?.files_ok,
+  };
+}
+
+/** True when c_<company> already exists. Does not create anything. */
+async function companySchemaPresent(companyOrSchema) {
+  const schema = resolveSchemaName(companyOrSchema);
+  if (!isCompanyPgSchema(schema)) return false;
+  if (ensuredSchemas.has(schema)) return true;
+  try {
+    const { schemaOk } = await inspectCompanySchema(schema);
+    lastEnsureError = '';
+    return schemaOk;
+  } catch (err) {
+    lastEnsureError = redact(err);
+    return false;
+  }
+}
+
 /**
- * Create c_<company> (and install Stella helpers / company RLS if needed).
- * Safe to call repeatedly.
+ * Create c_<company> only if it is missing (first Stella file load/upload).
+ * If the namespace already exists, this is a cheap existence check.
  */
 async function ensureCompanyPgSchema(companyOrSchema) {
-  const raw = String(companyOrSchema || '').trim();
-  const schema = isCompanyPgSchema(raw) ? raw : companyPgSchema(raw);
+  const schema = resolveSchemaName(companyOrSchema);
   if (!isCompanyPgSchema(schema)) {
     lastEnsureError = 'Invalid company schema name.';
     return false;
   }
-  if (ensuredSchemas.has(schema) && bootstrapped) {
+  if (ensuredSchemas.has(schema)) {
     lastEnsureError = '';
     return true;
   }
 
   lastEnsureError = '';
   try {
-    await bootstrapViaPg();
+    const { schemaOk, filesOk } = await inspectCompanySchema(schema);
+    if (schemaOk) {
+      if (!filesOk) {
+        try {
+          await ensureCompanyFilesTable(schema);
+        } catch (err) {
+          console.warn('Could not ensure company file registry', schema, err?.message || err);
+        }
+      }
+      ensuredSchemas.add(schema);
+      return true;
+    }
   } catch (err) {
     lastEnsureError = redact(err);
+  }
+
+  try {
+    await bootstrapViaPg();
+  } catch (err) {
+    lastEnsureError = lastEnsureError || redact(err);
     console.warn('Could not bootstrap Stella tenant SQL', lastEnsureError);
   }
 
@@ -292,10 +411,14 @@ async function ensureCompanyPgSchema(companyOrSchema) {
     }
   }
 
-  const lockdown = await supabaseRpc('stella_apply_tenant_security', {});
-  if (lockdown.ok) bootstrapped = true;
-
-  if (ok) ensuredSchemas.add(schema);
+  if (ok) {
+    try {
+      await ensureCompanyFilesTable(schema);
+    } catch (err) {
+      console.warn('Could not ensure company file registry', schema, err?.message || err);
+    }
+    ensuredSchemas.add(schema);
+  }
   return ok;
 }
 
@@ -310,7 +433,11 @@ function getLastEnsureError() {
 }
 
 module.exports = {
+  companySchemaPresent,
   ensureCompanyPgSchema,
   ensureAllCompanySchemas,
+  ensureCompanyFilesTable,
   getLastEnsureError,
+  withPg,
+  quoteIdent,
 };

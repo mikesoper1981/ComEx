@@ -1,8 +1,7 @@
 /**
- * Stella Insights file registry (public.stella_files).
- *
- * Browser never talks to this table with the anon key. Session company is
- * applied here so RLS can deny cross-tenant reads.
+ * Stella Insights file registry.
+ * Lives in the company schema (c_<slug>.stella_files). public.stella_files is
+ * only a fallback for older rows until they are copied across.
  *
  * GET  /api/stella-files
  * POST { action: 'insert', record }
@@ -11,8 +10,8 @@
  */
 
 const { sessionUserFromRequest } = require('./accounts-store');
-const { companySlug, companyPgSchema, resolveUserCompany, ensureCompanyPgSchema } = require('./company');
-const { getLastEnsureError } = require('./stella-db');
+const { companySlug, companyPgSchema, resolveUserCompany, companySchemaPresent, ensureCompanyPgSchema } = require('./company');
+const { getLastEnsureError, withPg, quoteIdent } = require('./stella-db');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_FIELDS = [
@@ -107,6 +106,48 @@ async function patchByFilter(filter, patch) {
   return restJson('PATCH', `stella_files?${filter}`, { body: patch });
 }
 
+async function listByOrgPg(schema, orgId) {
+  const q = quoteIdent(schema);
+  const result = await withPg((client) => client.query(
+    `select * from ${q}.stella_files where org_id = $1 order by uploaded_at asc`,
+    [orgId],
+  ));
+  return result.rows || [];
+}
+
+async function insertPg(schema, record) {
+  const q = quoteIdent(schema);
+  const keys = Object.keys(record);
+  const cols = keys.map((k) => `"${k.replace(/"/g, '')}"`).join(', ');
+  const vals = keys.map((_, i) => `$${i + 1}`).join(', ');
+  const result = await withPg((client) => client.query(
+    `insert into ${q}.stella_files (${cols}) values (${vals}) returning *`,
+    keys.map((k) => record[k]),
+  ));
+  return result.rows[0] || null;
+}
+
+async function updatePg(schema, id, orgId, patch) {
+  const q = quoteIdent(schema);
+  const keys = Object.keys(patch);
+  if (!keys.length) return true;
+  const sets = keys.map((k, i) => `"${k.replace(/"/g, '')}" = $${i + 1}`).join(', ');
+  await withPg((client) => client.query(
+    `update ${q}.stella_files set ${sets} where id = $${keys.length + 1} and org_id = $${keys.length + 2}`,
+    [...keys.map((k) => patch[k]), id, orgId],
+  ));
+  return true;
+}
+
+async function deletePg(schema, id, orgId) {
+  const q = quoteIdent(schema);
+  await withPg((client) => client.query(
+    `delete from ${q}.stella_files where id = $1 and org_id = $2`,
+    [id, orgId],
+  ));
+  return true;
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'no-store');
@@ -124,14 +165,16 @@ module.exports = async function handler(req, res) {
   const slug = companySlug(resolveUserCompany(user));
   const userOrg = orgIdForUser(user);
   const schema = companyPgSchema(resolveUserCompany(user));
-  const schemaReady = await ensureCompanyPgSchema(schema);
 
-  const action = String(req.method === 'GET' ? 'list' : (parseBody(req).body?.action || 'list')).trim().toLowerCase();
   const parsed = req.method === 'GET' ? { body: {} } : parseBody(req);
   if (parsed.error) {
     return res.status(400).json({ error: { message: parsed.error } });
   }
   const body = parsed.body;
+  const action = String(req.method === 'GET' ? 'list' : (body.action || 'list')).trim().toLowerCase();
+  const schemaReady = action === 'insert'
+    ? await ensureCompanyPgSchema(schema)
+    : await companySchemaPresent(schema);
 
   try {
     if (req.method === 'GET' || action === 'list') {
@@ -152,7 +195,16 @@ module.exports = async function handler(req, res) {
       let rows = [];
       let sourceOrg = '';
       for (const org of orgCandidates(user)) {
-        const listed = await listByOrg(org);
+        let listed = { rows: [] };
+        if (schemaReady) {
+          try {
+            listed = { rows: await listByOrgPg(schema, org) };
+          } catch {
+            listed = await listByOrg(org);
+          }
+        } else {
+          listed = await listByOrg(org);
+        }
         if (listed.error) return res.status(listed.status || 502).json({ error: { message: listed.error } });
         if (listed.rows.length) {
           rows = listed.rows;
@@ -186,6 +238,14 @@ module.exports = async function handler(req, res) {
       if (!record.file_name) {
         return res.status(400).json({ error: { message: 'file_name is required' } });
       }
+      if (schemaReady) {
+        try {
+          const row = await insertPg(schema, record);
+          if (row) return res.status(200).json({ file: row });
+        } catch (err) {
+          console.warn('Company registry insert failed, trying public', err?.message || err);
+        }
+      }
       let result = await restJson('POST', 'stella_files', { body: record });
       if (!result.ok && /company_slug/i.test(JSON.stringify(result.data || {}))) {
         const { company_slug: _slug, ...withoutSlug } = record;
@@ -210,6 +270,14 @@ module.exports = async function handler(req, res) {
         return res.status(400).json({ error: { message: 'Nothing to update' } });
       }
       const filter = `id=eq.${encodeURIComponent(id)}&org_id=eq.${encodeURIComponent(userOrg)}`;
+      if (schemaReady) {
+        try {
+          await updatePg(schema, id, userOrg, patch);
+          return res.status(200).json({ ok: true });
+        } catch (err) {
+          console.warn('Company registry update failed, trying public', err?.message || err);
+        }
+      }
       const result = await patchByFilter(filter, patch);
       if (!result.ok) {
         return res.status(result.status).json({
@@ -223,6 +291,14 @@ module.exports = async function handler(req, res) {
       const id = String(body.id || '').trim();
       if (!UUID_RE.test(id)) {
         return res.status(400).json({ error: { message: 'Invalid file id' } });
+      }
+      if (schemaReady) {
+        try {
+          await deletePg(schema, id, userOrg);
+          return res.status(200).json({ ok: true });
+        } catch (err) {
+          console.warn('Company registry delete failed, trying public', err?.message || err);
+        }
       }
       const result = await restJson(
         'DELETE',

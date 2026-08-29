@@ -113,8 +113,10 @@ module.exports = async function handler(req, res) {
   }
   const body = parsed.body;
   const schema = companyPgSchema(resolveUserCompany(user));
-  await ensureCompanyPgSchema(schema);
   const action = String(body.action || (body.sql ? 'query' : '')).trim().toLowerCase();
+  if (action === 'create' || action === 'insert' || action === 'move' || action === 'drop') {
+    await ensureCompanyPgSchema(schema);
+  }
   const tableName = String(body.tableName || body.p_table_name || '').trim();
 
   try {

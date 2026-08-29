@@ -29,7 +29,6 @@ const {
   recordLogin,
   loginHistoryForUser,
 } = require('./accounts-store');
-const { ensureCompanyPgSchema } = require('./company');
 const { appLoginUrl, welcomeEmail, resetEmail, sendEmail } = require('./mail');
 
 const OTP_TTL_MS = 24 * 60 * 60 * 1000;
@@ -141,9 +140,6 @@ module.exports = async function handler(req, res) {
       }
       recordLogin(user);
       await saveAccounts(accounts);
-      await ensureCompanyPgSchema(user.company).catch((err) => {
-        console.warn('Could not ensure company schema on login', user.company, err?.message || err);
-      });
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
         user: publicUser(user),
@@ -199,9 +195,6 @@ module.exports = async function handler(req, res) {
       user.otpExpiresAt = null;
       recordLogin(user);
       await saveAccounts(accounts);
-      await ensureCompanyPgSchema(user.company).catch((err) => {
-        console.warn('Could not ensure company schema after password change', user.company, err?.message || err);
-      });
       const { token, expiresAt } = issueToken(user);
       return res.status(200).json({
         user: publicUser(user),
@@ -260,10 +253,6 @@ module.exports = async function handler(req, res) {
       };
       accounts.users.push(created);
       await saveAccounts(accounts);
-      const schemaCreated = await ensureCompanyPgSchema(company);
-      if (!schemaCreated) {
-        console.warn('Company schema was not created for', company);
-      }
       let emailSent = false;
       let emailError = '';
       try {
