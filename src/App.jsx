@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
+import { useState, useRef, useEffect, useMemo, lazy, Suspense, Component } from 'react';
 import { createPortal } from 'react-dom';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Undo2 } from 'lucide-react';
 import { supabase } from './supabase';
@@ -1324,13 +1324,13 @@ function stellaJoinFamily(col) {
 }
 
 function stellaIdStem(col) {
-  const t = stellaNormJoinToken(col.name || col.original);
+  const t = stellaNormJoinToken(col?.name || col?.original || (typeof col === 'string' ? col : ''));
   if (!t) return '';
   return t.replace(/(uuid|code|key|id)$/g, '');
 }
 
 function stellaFindJoinColumn(file, hint) {
-  const cols = (file?.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
+  const cols = (Array.isArray(file?.columns) ? file.columns : []).map(stellaColumnJoinMeta).filter((c) => c.name);
   const resolved = stellaResolveJoinField(file, hint);
   const h = stellaNormJoinToken(resolved || hint);
   return cols.find((c) => stellaNormJoinToken(c.name) === h || stellaNormJoinToken(c.original) === h)
@@ -1551,7 +1551,8 @@ function stellaResolveJoinField(file, hint) {
 }
 
 function stellaFileColumnNames(file) {
-  return (file?.columns || []).map((c) => {
+  const cols = Array.isArray(file?.columns) ? file.columns : [];
+  return cols.map((c) => {
     if (typeof c === 'string') return c.trim();
     return String(c?.name || c?.original || '').trim();
   }).filter(Boolean);
@@ -1731,7 +1732,10 @@ function stellaBuildFileLinkGraph(files) {
       if (b) b.partners.add(f.id);
     }
   }
-  for (const n of nodes) n.joinCount = n.partners.size;
+  for (const n of nodes) {
+    n.joinCount = n.partners.size;
+    n.partners = [...n.partners];
+  }
   return { nodes, edges };
 }
 
@@ -1841,15 +1845,17 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
 
   useEffect(() => {
     setPos((prev) => {
+      let changed = false;
       const next = { ...prev };
       const laid = stellaFileGraphLayout(graph.nodes, 1000, 560);
       for (const n of laid) {
         if (next[n.id]) continue;
         next[n.id] = { x: n.x / 1000, y: n.y / 560 };
+        changed = true;
       }
-      return next;
+      return changed ? next : prev;
     });
-  }, [nodeIds, graph.nodes]);
+  }, [nodeIds, graph]);
 
   useEffect(() => {
     if (!large) return undefined;
@@ -3625,8 +3631,8 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
             {qa.map((p, i) => (
               <li key={i} className="bg-slate-950/35 border border-emerald-400/15 rounded-lg px-3 py-2 flex items-start justify-between gap-2">
                 <div>
-                  {p.question ? <div className="text-emerald-200/70 mb-1">{p.question}</div> : null}
-                  {p.answer ? <div className="text-emerald-50">{p.answer}</div> : null}
+                  {p.question ? <div className="text-emerald-200/70 mb-1">{String(p.question)}</div> : null}
+                  {p.answer ? <div className="text-emerald-50">{String(p.answer)}</div> : null}
                 </div>
                 <Remove
                   onClick={() => onPatch({ ...ctx, qa_pairs: qa.filter((_, idx) => idx !== i) })}
@@ -4005,8 +4011,53 @@ const MOCK_PERFORMANCE = {
 };
 
 // Prevents a single bad message/chart render from blanking the whole app.
-function MessageErrorBoundary({ children }) {
-  return children;
+class MessageErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error('ComEx render error:', error, info?.componentStack);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    const message = String(this.state.error?.message || this.state.error);
+    const retry = (
+      <button
+        type="button"
+        onClick={() => this.setState({ error: null })}
+        className="mt-3 px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-red-500/80 hover:bg-red-500"
+      >
+        Try again
+      </button>
+    );
+    if (this.props.fallback) {
+      return (
+        <div>
+          {this.props.fallback}
+          <pre className="mt-3 text-[11px] text-red-200/85 whitespace-pre-wrap font-mono">{message}</pre>
+          {retry}
+        </div>
+      );
+    }
+    return (
+      <div className="text-xs text-red-300">
+        Could not render this. {message}
+        {retry}
+      </div>
+    );
+  }
+}
+
+/** Runs a render callback as a child so errors are caught by MessageErrorBoundary. */
+function StellaSafePanel({ render }) {
+  return render();
 }
 
 function contextBlocksFromFile(f) {
@@ -4934,9 +4985,10 @@ export default function CommercialExcellenceApp() {
 
   const formatMarkdown = (content) => {
     const hideCitations = !isAdmin;
-    const source = hideCitations ? stripKnowledgeCitations(content) : content;
+    const raw = typeof content === 'string' ? content : (content == null ? '' : String(content));
+    const source = hideCitations ? stripKnowledgeCitations(raw) : raw;
     const references = hideCitations ? {} : parseReferences(source);
-    const cleanContent = source.replace(/[-]{2,}\s*\nReferences:\s*\n[\s\S]+?(\n[-]{2,}|\s*$)/i, '').trimEnd();
+    const cleanContent = String(source || '').replace(/[-]{2,}\s*\nReferences:\s*\n[\s\S]+?(\n[-]{2,}|\s*$)/i, '').trimEnd();
     const chartMatch = cleanContent.match(/```chart-payout\n([\s\S]+?)\n```/);
     if (chartMatch) {
       try {
@@ -8427,23 +8479,34 @@ ${stepInstruction}`;
     const files = (stellaDataFiles || []).filter((f) => f && !f.processing);
     if (!files.length) return null;
     return (
-      <StellaFileConnectionMap
-        files={files}
-        activeId={activeStellaDataId}
-        onSelectFile={setActiveStellaDataId}
-        onJoinChange={handleStellaJoinChange}
-        onRequestRemoveJoin={requestStellaJoinRemove}
-        onUndoJoin={undoStellaJoin}
-        joinUndo={stellaJoinUndo}
-        joinConfirmOpen={!!stellaJoinPending}
-      />
+      <MessageErrorBoundary fallback={
+        <div className="bg-red-500/10 border border-red-400/25 rounded-xl p-4 text-xs text-red-200">
+          Could not draw the file connection map.
+        </div>
+      }>
+        <StellaFileConnectionMap
+          files={files}
+          activeId={activeStellaDataId}
+          onSelectFile={setActiveStellaDataId}
+          onJoinChange={handleStellaJoinChange}
+          onRequestRemoveJoin={requestStellaJoinRemove}
+          onUndoJoin={undoStellaJoin}
+          joinUndo={stellaJoinUndo}
+          joinConfirmOpen={!!stellaJoinPending}
+        />
+      </MessageErrorBoundary>
     );
   };
 
   const renderStellaDataPanel = () => {
-    const joinCountById = new Map(
-      stellaBuildFileLinkGraph(stellaDataFiles).nodes.map((n) => [n.id, n.joinCount])
-    );
+    let joinCountById = new Map();
+    try {
+      joinCountById = new Map(
+        stellaBuildFileLinkGraph(stellaDataFiles).nodes.map((n) => [n.id, n.joinCount])
+      );
+    } catch (err) {
+      console.error('Stella file graph failed:', err);
+    }
     return (
     <div className="space-y-4">
       {renderStellaFileLinkMap()}
@@ -10022,7 +10085,7 @@ ${stepInstruction}`;
         </div>
       ) : (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 sm:py-6 h-[calc(100vh-80px)] sm:h-[calc(100vh-100px)] overflow-hidden">
-          <MessageErrorBoundary fallback={
+          <MessageErrorBoundary key={activeTab} fallback={
             <div className="h-full flex items-center justify-center">
               <div className="max-w-md text-center bg-red-500/10 border border-red-400/25 rounded-xl p-6">
                 <AlertTriangle className="w-8 h-8 text-red-400 mx-auto mb-3" />
@@ -11118,16 +11181,30 @@ ${stepInstruction}`;
                         </button>
                       ))}
                     </div>
-                    {stellaSettingsTab === 'goals' && (
-                      <>
-                        {renderStellaBusinessPanel()}
-                        <p className="text-xs text-blue-300/70 mt-6 mb-2">
-                          Optional background notes used as guidance in Stella. Dataset files live under Connections → Files.
-                        </p>
-                        {renderModuleContextPanel('stella')}
-                      </>
-                    )}
-                    {stellaSettingsTab === 'connections' && renderStellaConnectionsPanel()}
+                    <MessageErrorBoundary
+                      key={stellaSettingsTab}
+                      fallback={
+                        <div className="bg-red-500/10 border border-red-400/25 rounded-xl p-4">
+                          <div className="text-sm font-semibold text-red-200 mb-1">Stella Insights could not render</div>
+                          <div className="text-xs text-red-300/70">The rest of User Settings still works. Try Analysis goals, or reload.</div>
+                        </div>
+                      }
+                    >
+                      {stellaSettingsTab === 'goals' && (
+                        <StellaSafePanel render={() => (
+                          <>
+                            {renderStellaBusinessPanel()}
+                            <p className="text-xs text-blue-300/70 mt-6 mb-2">
+                              Optional background notes used as guidance in Stella. Dataset files live under Connections → Files.
+                            </p>
+                            {renderModuleContextPanel('stella')}
+                          </>
+                        )} />
+                      )}
+                      {stellaSettingsTab === 'connections' && (
+                        <StellaSafePanel render={renderStellaConnectionsPanel} />
+                      )}
+                    </MessageErrorBoundary>
                   </>
                 )}
 
