@@ -1329,6 +1329,144 @@ function stellaIdStem(col) {
   return t.replace(/(uuid|code|key|id)$/g, '');
 }
 
+function stellaFindJoinColumn(file, hint) {
+  const cols = (file?.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
+  const resolved = stellaResolveJoinField(file, hint);
+  const h = stellaNormJoinToken(resolved || hint);
+  return cols.find((c) => stellaNormJoinToken(c.name) === h || stellaNormJoinToken(c.original) === h)
+    || { name: resolved || String(hint || '').trim(), original: '', type: '' };
+}
+
+function stellaLooksLikeMeasureCol(col) {
+  const blobs = [col?.name, col?.original].map(stellaNormJoinToken).filter(Boolean);
+  return blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b));
+}
+
+function stellaJoinTypeBucket(type) {
+  const t = String(type || '').toLowerCase();
+  if (/date|time|timestamp/.test(t)) return 'date';
+  if (/int|numeric|float|double|number|decimal|real/.test(t)) return 'number';
+  if (/bool/.test(t)) return 'bool';
+  return t ? 'text' : '';
+}
+
+function stellaJoinTypesCompatible(aType, bType) {
+  const a = stellaJoinTypeBucket(aType);
+  const b = stellaJoinTypeBucket(bType);
+  if (!a || !b) return true;
+  if (a === b) return true;
+  if ((a === 'text' && b === 'number') || (a === 'number' && b === 'text')) return true;
+  if ((a === 'date' && b === 'text') || (a === 'text' && b === 'date')) return true;
+  return false;
+}
+
+function stellaScoreJoinColumns(a, b) {
+  const warnings = [];
+  const aN = stellaNormJoinToken(a?.name);
+  const bN = stellaNormJoinToken(b?.name);
+  const aO = stellaNormJoinToken(a?.original);
+  const bO = stellaNormJoinToken(b?.original);
+  const fa = stellaJoinFamily(a);
+  const fb = stellaJoinFamily(b);
+  const aMeas = stellaLooksLikeMeasureCol(a);
+  const bMeas = stellaLooksLikeMeasureCol(b);
+  const typeOk = stellaJoinTypesCompatible(a?.type, b?.type);
+
+  let score = 0;
+  let reason = '';
+  if (aN && aN === bN) { score = 100; reason = 'same column name'; }
+  else if (aO && bO && aO === bO) { score = 90; reason = 'same source header'; }
+  else if (fa && fb && fa === fb) { score = 70; reason = `shared ${fa} key`; }
+  else {
+    const sa = stellaIdStem(a);
+    const sb = stellaIdStem(b);
+    const aId = /id$/.test(aN) || aN === 'id' || /id$/.test(aO);
+    const bId = /id$/.test(bN) || bN === 'id' || /id$/.test(bO);
+    if (aId && bId && sa && sa === sb && sa.length >= 3) {
+      score = 80;
+      reason = 'shared ID';
+    } else if (aN === 'id' && bN === 'id') {
+      score = 60;
+      reason = 'shared ID';
+    }
+  }
+
+  if (aMeas && bMeas && fa !== 'date' && fb !== 'date') {
+    return {
+      score: 0,
+      reason: 'both look like measures, not join keys',
+      typeOk,
+      verdict: 'block',
+      warnings: ['These look like values (revenue, qty, etc.), not keys to join on.'],
+    };
+  }
+  if (aMeas !== bMeas && score < 90) {
+    warnings.push('One field looks like a measure and the other like a key.');
+    return {
+      score: Math.min(score, 20),
+      reason: 'measure vs key',
+      typeOk,
+      verdict: 'block',
+      warnings,
+    };
+  }
+  if (fa && fb && fa !== fb) {
+    warnings.push(`Keys look like different things (${fa} vs ${fb}).`);
+    return {
+      score: Math.min(score, 25),
+      reason: `different key types (${fa} vs ${fb})`,
+      typeOk,
+      verdict: 'block',
+      warnings,
+    };
+  }
+  if (!typeOk) {
+    warnings.push(`Types look different (${a?.type || 'unknown'} vs ${b?.type || 'unknown'}).`);
+    if (score < 100) score = Math.min(score, 50);
+  }
+
+  let verdict = 'ok';
+  if (score < 40) verdict = 'block';
+  else if (score < 70 || warnings.length) verdict = 'warn';
+  if (!reason) reason = score ? 'possible join key' : 'column names and types do not match';
+  return { score, reason, typeOk, verdict, warnings };
+}
+
+function stellaAssessJoin(fromFile, toFile, thisField, relatedField) {
+  const a = stellaFindJoinColumn(fromFile, thisField);
+  const b = stellaFindJoinColumn(toFile, relatedField);
+  const scored = stellaScoreJoinColumns(a, b);
+  return {
+    ...scored,
+    thisLabel: `${thisField}${a.type ? ` [${a.type}]` : ''}`,
+    thatLabel: `${relatedField}${b.type ? ` [${b.type}]` : ''}`,
+  };
+}
+
+function stellaFilterJoinRels(rels, thisFile, otherFiles) {
+  const keep = [];
+  const dropped = [];
+  const others = otherFiles || [];
+  for (const r of rels || []) {
+    if (!r) continue;
+    const other = others.find((f) => (
+      (r.related_table && f.tableName === r.related_table)
+      || (r.related_file && String(f.name || '').toLowerCase() === String(r.related_file || '').toLowerCase())
+    ));
+    if (!other) {
+      dropped.push({ r, why: 'could not match the other file' });
+      continue;
+    }
+    const assessed = stellaAssessJoin(thisFile, other, r.this_field, r.related_field);
+    if (assessed.verdict === 'block') {
+      dropped.push({ r, why: assessed.warnings[0] || assessed.reason });
+    } else {
+      keep.push(r);
+    }
+  }
+  return { keep, dropped };
+}
+
 function stellaGuessJoinCandidates(thisFile, otherFiles) {
   const thisCols = (thisFile?.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
   const ranked = [];
@@ -1336,35 +1474,8 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
     const otherCols = (other.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
     for (const a of thisCols) {
       for (const b of otherCols) {
-        const aN = stellaNormJoinToken(a.name);
-        const bN = stellaNormJoinToken(b.name);
-        const aO = stellaNormJoinToken(a.original);
-        const bO = stellaNormJoinToken(b.original);
-        let score = 0;
-        let reason = '';
-        if (aN && aN === bN) { score = 100; reason = 'same column name'; }
-        else if (aO && bO && aO === bO) { score = 90; reason = 'same source header'; }
-        else {
-          const fa = stellaJoinFamily(a);
-          const fb = stellaJoinFamily(b);
-          if (fa && fa === fb) {
-            score = 70;
-            reason = `shared ${fa} key`;
-          } else {
-            const sa = stellaIdStem(a);
-            const sb = stellaIdStem(b);
-            const aId = /id$/.test(aN) || aN === 'id' || /id$/.test(aO);
-            const bId = /id$/.test(bN) || bN === 'id' || /id$/.test(bO);
-            if (aId && bId && sa && sa === sb && sa.length >= 3) {
-              score = 80;
-              reason = 'shared ID';
-            } else if (aN === 'id' && bN === 'id') {
-              score = 60;
-              reason = 'shared ID';
-            }
-          }
-        }
-        if (score < 55) continue;
+        const scored = stellaScoreJoinColumns(a, b);
+        if (scored.verdict === 'block' || scored.score < 55) continue;
         ranked.push({
           related_file: other.name,
           related_table: other.tableName,
@@ -1373,8 +1484,8 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
           related_field: b.name,
           this_header: a.original || a.name,
           related_header: b.original || b.name,
-          reason,
-          score,
+          reason: scored.reason,
+          score: scored.score,
         });
       }
     }
@@ -1715,7 +1826,7 @@ function stellaJoinActionLabel(action) {
 
 function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, onRequestRemoveJoin, onUndoJoin, joinUndo, joinConfirmOpen }) {
   const graph = useMemo(() => stellaBuildFileLinkGraph(files || []), [files]);
-  const nodeIds = graph.nodes.map((n) => n.id).join('|');
+  const fileById = useMemo(() => new Map((files || []).map((f) => [f.id, f])), [files]);
   const [large, setLarge] = useState(false);
   const [expanded, setExpanded] = useState(() => new Set());
   const [pos, setPos] = useState({});
@@ -1886,9 +1997,19 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
       if (!loc) return;
       const hit = fieldAtSvg(loc.x, loc.y);
       const valid = !!(hit && hit.id !== joinDragRef.current.fromId);
-      const nextHover = valid ? hit : null;
+      let verdict = 'ok';
+      if (valid) {
+        const fromFile = fileById.get(joinDragRef.current.fromId);
+        const toFile = fileById.get(hit.id);
+        if (fromFile && toFile) {
+          verdict = stellaAssessJoin(fromFile, toFile, joinDragRef.current.field, hit.field).verdict;
+        }
+      }
+      const nextHover = valid ? { id: hit.id, field: hit.field, verdict } : null;
       setJoinHover((prev) => (
-        prev?.id === nextHover?.id && prev?.field === nextHover?.field ? prev : nextHover
+        prev?.id === nextHover?.id && prev?.field === nextHover?.field && prev?.verdict === nextHover?.verdict
+          ? prev
+          : nextHover
       ));
       const fromNode = posMap.get(joinDragRef.current.fromId);
       const toNode = valid ? posMap.get(hit.id) : null;
@@ -2058,6 +2179,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
           const joinSet = new Set(stellaJoinFieldsForNode(n.id, graph.edges).map((f) => f.toLowerCase()));
           const isFromCard = joinFrom?.id === n.id;
           const isToCard = joinHover?.id === n.id;
+          const toLooksBad = isToCard && joinHover?.verdict && joinHover.verdict !== 'ok';
           return (
             <g
               key={`${n.id}${isLarge ? '-lg' : ''}`}
@@ -2072,8 +2194,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                 width={n.w}
                 height={n.h}
                 rx={10}
-                fill={isToCard ? 'rgb(6, 40, 32)' : isFromCard ? 'rgb(8, 47, 73)' : selected ? 'rgb(8, 47, 73)' : 'rgba(15, 23, 42, 0.96)'}
-                stroke={isToCard ? 'rgb(52, 211, 153)' : isFromCard ? 'rgb(34, 211, 238)' : selected ? 'rgb(34, 211, 238)' : linked ? 'rgba(52, 211, 153, 0.55)' : 'rgba(148, 163, 184, 0.35)'}
+                fill={toLooksBad ? 'rgb(66, 32, 6)' : isToCard ? 'rgb(6, 40, 32)' : isFromCard ? 'rgb(8, 47, 73)' : selected ? 'rgb(8, 47, 73)' : 'rgba(15, 23, 42, 0.96)'}
+                stroke={toLooksBad ? 'rgb(251, 191, 36)' : isToCard ? 'rgb(52, 211, 153)' : isFromCard ? 'rgb(34, 211, 238)' : selected ? 'rgb(34, 211, 238)' : linked ? 'rgba(52, 211, 153, 0.55)' : 'rgba(148, 163, 184, 0.35)'}
                 strokeWidth={isFromCard || isToCard || selected ? 2.4 : 1.2}
                 strokeDasharray={linked || !n.intakeComplete || isFromCard || isToCard ? undefined : '4 3'}
               />
@@ -2099,6 +2221,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                     const joined = joinSet.has(field.toLowerCase());
                     const isFrom = joinFrom?.id === n.id && joinFrom.field === field;
                     const isTo = joinHover?.id === n.id && joinHover.field === field;
+                    const toBad = isTo && joinHover?.verdict && joinHover.verdict !== 'ok';
                     const fy = y + STELLA_HEADER_H + 10 + i * STELLA_ROW_H;
                     return (
                       <g
@@ -2112,15 +2235,15 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                           width={n.w - 12}
                           height={STELLA_ROW_H - 1}
                           rx={4}
-                          fill={isFrom ? 'rgba(34, 211, 238, 0.45)' : isTo ? 'rgba(52, 211, 153, 0.5)' : joined ? 'rgba(8, 145, 178, 0.25)' : 'transparent'}
-                          stroke={isFrom ? 'rgb(34, 211, 238)' : isTo ? 'rgb(52, 211, 153)' : 'none'}
+                          fill={isFrom ? 'rgba(34, 211, 238, 0.45)' : toBad ? 'rgba(251, 191, 36, 0.45)' : isTo ? 'rgba(52, 211, 153, 0.5)' : joined ? 'rgba(8, 145, 178, 0.25)' : 'transparent'}
+                          stroke={isFrom ? 'rgb(34, 211, 238)' : toBad ? 'rgb(251, 191, 36)' : isTo ? 'rgb(52, 211, 153)' : 'none'}
                           strokeWidth={isFrom || isTo ? 1.6 : 0}
                         />
                         <text
                           x={n.x}
                           y={fy + 14}
                           textAnchor="middle"
-                          className={isFrom ? 'fill-cyan-50' : isTo ? 'fill-emerald-50' : joined ? 'fill-cyan-100' : 'fill-slate-300'}
+                          className={isFrom ? 'fill-cyan-50' : toBad ? 'fill-amber-50' : isTo ? 'fill-emerald-50' : joined ? 'fill-cyan-100' : 'fill-slate-300'}
                           style={{ fontSize: 10, fontWeight: isFrom || isTo ? 700 : 400, fontFamily: 'ui-monospace, monospace' }}
                         >
                           {field.length > 24 ? `${field.slice(0, 22)}…` : field}
@@ -2142,19 +2265,19 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
             <path
               d={`M ${joinLine.x1} ${joinLine.y1} L ${joinLine.x2} ${joinLine.y2}`}
               fill="none"
-              stroke={joinHover ? 'rgb(52, 211, 153)' : 'rgb(34, 211, 238)'}
+              stroke={!joinHover ? 'rgb(34, 211, 238)' : joinHover.verdict === 'ok' ? 'rgb(52, 211, 153)' : 'rgb(251, 191, 36)'}
               strokeWidth={joinHover ? 2.8 : 2}
-              strokeDasharray={joinHover ? undefined : '6 4'}
+              strokeDasharray={joinHover && joinHover.verdict === 'ok' ? undefined : '6 4'}
             />
             <circle cx={joinLine.x1} cy={joinLine.y1} r={5} fill="rgb(34, 211, 238)" />
             {joinHover ? (
               <>
-                <circle cx={joinLine.x2} cy={joinLine.y2} r={5} fill="rgb(52, 211, 153)" />
+                <circle cx={joinLine.x2} cy={joinLine.y2} r={5} fill={joinHover.verdict === 'ok' ? 'rgb(52, 211, 153)' : 'rgb(251, 191, 36)'} />
                 <text
                   x={(joinLine.x1 + joinLine.x2) / 2}
                   y={(joinLine.y1 + joinLine.y2) / 2 - 10}
                   textAnchor="middle"
-                  className="fill-emerald-100"
+                  className={joinHover.verdict === 'ok' ? 'fill-emerald-100' : 'fill-amber-100'}
                   style={{ fontSize: 11, fontWeight: 700, fontFamily: 'ui-monospace, monospace' }}
                 >
                   {joinFrom?.field} → {joinHover.field}
@@ -7665,7 +7788,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. List EVERY matching key in plain English (territory, date/month/quarter, product, rep, shared ID) — never pick only the "best" ones, never ask for SQL. Store all of those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Only propose keys of the same kind (territory, product, rep, shared ID, matching date grain) with compatible types. Never join a measure/metric (revenue, qty, amount) to a key, and never join product to territory or other mismatched families. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -7823,7 +7946,7 @@ ${stepInstruction}`;
     }
   };
 
-  const handleStellaJoinChange = async ({ type, fromId, toId, thisField, relatedField }) => {
+  const handleStellaJoinChange = async ({ type, fromId, toId, thisField, relatedField }, opts = {}) => {
     const files = stellaDataFilesRef.current || [];
     const from = files.find((f) => f.id === fromId);
     const to = files.find((f) => f.id === toId);
@@ -7831,6 +7954,22 @@ ${stepInstruction}`;
     const tf = String(thisField || '').trim();
     const rf = String(relatedField || '').trim();
     if (!tf || !rf) return;
+    if (type === 'add' && !opts.force) {
+      const assess = stellaAssessJoin(from, to, tf, rf);
+      if (assess.verdict !== 'ok') {
+        setStellaJoinPending({
+          action: 'add',
+          fromId: from.id,
+          toId: to.id,
+          thisField: tf,
+          relatedField: rf,
+          fromName: from.name,
+          toName: to.name,
+          assess,
+        });
+        return;
+      }
+    }
     const fromCtx = stellaMutateRelationships(from.capturedContext, to, tf, rf, type);
     const toCtx = stellaMutateRelationships(to.capturedContext, from, rf, tf, type);
     stellaPatchLocal(from.id, { capturedContext: fromCtx, intakeComplete: true });
@@ -7860,6 +7999,7 @@ ${stepInstruction}`;
     const rf = String(relatedField || '').trim();
     if (!from || !to || !tf || !rf) return;
     setStellaJoinPending({
+      action: 'remove',
       fromId: from.id,
       toId: to.id,
       thisField: tf,
@@ -7869,17 +8009,17 @@ ${stepInstruction}`;
     });
   };
 
-  const confirmStellaJoinRemove = async () => {
+  const confirmStellaJoinPending = async () => {
     const pending = stellaJoinPending;
     if (!pending) return;
     setStellaJoinPending(null);
     await handleStellaJoinChange({
-      type: 'remove',
+      type: pending.action === 'add' ? 'add' : 'remove',
       fromId: pending.fromId,
       toId: pending.toId,
       thisField: pending.thisField,
       relatedField: pending.relatedField,
-    });
+    }, { force: true });
   };
 
   const undoStellaJoin = async () => {
@@ -7892,7 +8032,7 @@ ${stepInstruction}`;
       toId: undo.toId,
       thisField: undo.thisField,
       relatedField: undo.relatedField,
-    });
+    }, { force: true });
   };
 
   const stellaSaveBusinessContext = async (next) => {
@@ -7976,15 +8116,20 @@ ${stepInstruction}`;
 
     const lastUserText = [...(f.intakeMessages || [])].reverse().find(m => m.role === 'user')?.content || '';
     const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
+    const acceptedJoin = stellaLooksLikeJoinAccept(lastUserText);
     let rels = stellaNormalizeStoredRelationships(parsed?.context_qa?.relationships, f, otherTabular);
-    if (!declinedJoin && candidates.length) {
+    const askedJoin = stellaIntakeAskedJoin(f.intakeMessages);
+    if (!declinedJoin && candidates.length && (acceptedJoin || askedJoin)) {
+      const strong = candidates.filter((c) => c.score >= 70);
       rels = stellaDedupeRelationships([
         ...rels,
-        ...stellaNormalizeStoredRelationships(candidates, f, otherTabular),
+        ...stellaNormalizeStoredRelationships(strong, f, otherTabular),
       ]);
     }
     const priorRels = stellaNormalizeStoredRelationships(f.capturedContext?.relationships, f, otherTabular);
     if (priorRels.length && !declinedJoin) rels = stellaDedupeRelationships([...priorRels, ...rels]);
+    const filteredJoins = stellaFilterJoinRels(rels, f, otherTabular);
+    rels = filteredJoins.keep;
 
     const joinAskCount = (f.intakeMessages || []).filter(m => (
       m?.role === 'assistant' && /\b(join|joined|share an id, territory|correct keys|should not be joined)\b/i.test(String(m.content || ''))
@@ -8008,6 +8153,10 @@ ${stepInstruction}`;
       const joinLines = rels.map(r => `- ${f.tableName}.${r.this_field} = ${r.related_table || r.related_file}.${r.related_field}${r.related_file ? ` (${r.related_file})` : ''}`);
       assistantMessage = `${assistantMessage}\n\nStored joins for queries:\n${joinLines.join('\n')}`;
     }
+    if (filteredJoins.dropped.length) {
+      const lines = filteredJoins.dropped.map((d) => `- ${d.r.this_field} ↔ ${d.r.related_field || d.r.related_file}: ${d.why}`);
+      assistantMessage = `${assistantMessage}\n\nI did not store these joins because they do not look like matching keys:\n${lines.join('\n')}`;
+    }
 
     const nextIntakeMessages = [...(f.intakeMessages || []), { role: 'assistant', content: assistantMessage }];
     const shouldPersistContext = complete || !!f.intakeComplete;
@@ -8015,7 +8164,7 @@ ${stepInstruction}`;
     if (shouldPersistContext) {
       const ctx = {
         ...normalizeContextQa({ ...(f.capturedContext || {}), ...(parsed?.context_qa || {}) }, nextIntakeMessages),
-        relationships: declinedJoin ? [] : (rels.length ? rels : (f.capturedContext?.relationships || [])),
+        relationships: declinedJoin ? [] : rels,
       };
       await persistStellaIntakeContext(f, ctx, nextIntakeMessages);
       if (rels.length) {
@@ -11624,32 +11773,70 @@ ${stepInstruction}`;
           className="fixed inset-0 z-[220] bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4"
           role="dialog"
           aria-modal="true"
-          aria-labelledby="stella-join-remove-title"
+          aria-labelledby="stella-join-pending-title"
           onClick={() => setStellaJoinPending(null)}
         >
           <div
-            className="w-full max-w-md bg-slate-900 border border-red-400/30 rounded-2xl shadow-2xl p-5"
+            className={`w-full max-w-md bg-slate-900 rounded-2xl shadow-2xl p-5 border ${stellaJoinPending.action === 'add' ? 'border-amber-400/35' : 'border-red-400/30'}`}
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 id="stella-join-remove-title" className="text-sm font-bold text-white">Remove this connection?</h3>
-            <p className="text-xs text-cyan-100 mt-3 font-mono leading-relaxed">{stellaJoinActionLabel(stellaJoinPending)}</p>
-            <p className="text-xs text-blue-300/60 mt-2">This updates both files. You can Undo afterwards.</p>
-            <div className="flex justify-end gap-2 mt-5">
-              <button
-                type="button"
-                onClick={() => setStellaJoinPending(null)}
-                className="px-3 py-1.5 rounded-lg text-sm font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={confirmStellaJoinRemove}
-                className="px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-red-500/85 hover:bg-red-500"
-              >
-                Remove
-              </button>
-            </div>
+            {stellaJoinPending.action === 'add' ? (
+              <>
+                <h3 id="stella-join-pending-title" className="text-sm font-bold text-white">
+                  {stellaJoinPending.assess?.verdict === 'block' ? 'This join looks wrong' : 'Check this connection'}
+                </h3>
+                <p className="text-xs text-cyan-100 mt-3 font-mono leading-relaxed">{stellaJoinActionLabel(stellaJoinPending)}</p>
+                <p className="text-xs text-amber-100/90 mt-3">
+                  {stellaJoinPending.assess?.thisLabel} → {stellaJoinPending.assess?.thatLabel}
+                </p>
+                {(stellaJoinPending.assess?.warnings || []).length ? (
+                  <ul className="mt-2 space-y-1 text-xs text-amber-200/85 list-disc pl-4">
+                    {stellaJoinPending.assess.warnings.map((w) => <li key={w}>{w}</li>)}
+                  </ul>
+                ) : (
+                  <p className="text-xs text-blue-300/70 mt-2">{stellaJoinPending.assess?.reason}</p>
+                )}
+                <p className="text-xs text-blue-300/55 mt-3">Connect anyway only if you know these fields really match.</p>
+                <div className="flex justify-end gap-2 mt-5">
+                  <button
+                    type="button"
+                    onClick={() => setStellaJoinPending(null)}
+                    className="px-3 py-1.5 rounded-lg text-sm font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={confirmStellaJoinPending}
+                    className="px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-amber-500/85 hover:bg-amber-500"
+                  >
+                    Connect anyway
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h3 id="stella-join-pending-title" className="text-sm font-bold text-white">Remove this connection?</h3>
+                <p className="text-xs text-cyan-100 mt-3 font-mono leading-relaxed">{stellaJoinActionLabel(stellaJoinPending)}</p>
+                <p className="text-xs text-blue-300/60 mt-2">This updates both files. You can Undo afterwards.</p>
+                <div className="flex justify-end gap-2 mt-5">
+                  <button
+                    type="button"
+                    onClick={() => setStellaJoinPending(null)}
+                    className="px-3 py-1.5 rounded-lg text-sm font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={confirmStellaJoinPending}
+                    className="px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-red-500/85 hover:bg-red-500"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>,
         document.body,
