@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense } from 'react';
 import { createPortal } from 'react-dom';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2 } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Undo2 } from 'lucide-react';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
@@ -1704,13 +1704,24 @@ function stellaFieldAnchor(node, fieldName, side) {
   };
 }
 
-function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }) {
+function stellaJoinActionLabel(action) {
+  if (!action) return '';
+  const left = action.fromName || 'File';
+  const right = action.toName || 'File';
+  const a = action.thisField || 'field';
+  const b = action.relatedField || 'field';
+  return `${left}: ${a}  ↔  ${right}: ${b}`;
+}
+
+function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, onRequestRemoveJoin, onUndoJoin, joinUndo, joinConfirmOpen }) {
   const graph = useMemo(() => stellaBuildFileLinkGraph(files || []), [files]);
   const nodeIds = graph.nodes.map((n) => n.id).join('|');
   const [large, setLarge] = useState(false);
   const [expanded, setExpanded] = useState(() => new Set());
   const [pos, setPos] = useState({});
   const [joinLine, setJoinLine] = useState(null);
+  const [joinFrom, setJoinFrom] = useState(null);
+  const [joinHover, setJoinHover] = useState(null);
   const [hoverJoin, setHoverJoin] = useState('');
   const svgRef = useRef(null);
   const dragRef = useRef(null);
@@ -1732,13 +1743,17 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
     if (!large) return undefined;
     const prev = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    const onKey = (e) => { if (e.key === 'Escape') setLarge(false); };
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      if (joinConfirmOpen) return;
+      setLarge(false);
+    };
     window.addEventListener('keydown', onKey);
     return () => {
       document.body.style.overflow = prev;
       window.removeEventListener('keydown', onKey);
     };
-  }, [large]);
+  }, [large, joinConfirmOpen]);
 
   const width = large ? 1400 : 900;
   const height = large ? 820 : (graph.nodes.length <= 2 ? 320 : graph.nodes.length <= 4 ? 400 : 460);
@@ -1855,6 +1870,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
     const loc = clientToSvg(ev.clientX, ev.clientY);
     const node = posMap.get(nodeId);
     joinDragRef.current = { fromId: nodeId, field };
+    setJoinFrom({ id: nodeId, field });
+    setJoinHover(null);
     setJoinLine({
       x1: node ? stellaFieldAnchor(node, field, 'right').x : loc?.x || 0,
       y1: node ? stellaFieldAnchor(node, field, 'right').y : loc?.y || 0,
@@ -1866,7 +1883,23 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
   const onPointerMove = (ev) => {
     if (joinDragRef.current) {
       const loc = clientToSvg(ev.clientX, ev.clientY);
-      if (loc) setJoinLine((prev) => (prev ? { ...prev, x2: loc.x, y2: loc.y } : prev));
+      if (!loc) return;
+      const hit = fieldAtSvg(loc.x, loc.y);
+      const valid = !!(hit && hit.id !== joinDragRef.current.fromId);
+      const nextHover = valid ? hit : null;
+      setJoinHover((prev) => (
+        prev?.id === nextHover?.id && prev?.field === nextHover?.field ? prev : nextHover
+      ));
+      const fromNode = posMap.get(joinDragRef.current.fromId);
+      const toNode = valid ? posMap.get(hit.id) : null;
+      const aRight = fromNode && toNode ? fromNode.x <= toNode.x : true;
+      const fromPt = fromNode
+        ? stellaFieldAnchor(fromNode, joinDragRef.current.field, aRight ? 'right' : 'left')
+        : loc;
+      const toPt = toNode && valid
+        ? stellaFieldAnchor(toNode, hit.field, aRight ? 'left' : 'right')
+        : loc;
+      setJoinLine({ x1: fromPt.x, y1: fromPt.y, x2: toPt.x, y2: toPt.y });
       return;
     }
     const drag = dragRef.current;
@@ -1885,6 +1918,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
     const drag = joinDragRef.current;
     joinDragRef.current = null;
     setJoinLine(null);
+    setJoinFrom(null);
+    setJoinHover(null);
     if (!drag) return;
     const loc = clientToSvg(ev.clientX, ev.clientY);
     if (!loc) return;
@@ -1919,8 +1954,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
   };
 
   const removeJoin = (edge) => {
-    onJoinChange?.({
-      type: 'remove',
+    onRequestRemoveJoin?.({
       fromId: edge.from,
       toId: edge.to,
       thisField: edge.thisField,
@@ -1929,15 +1963,28 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
   };
 
   const toolbar = (
-    <button
-      type="button"
-      onClick={(e) => { e.preventDefault(); e.stopPropagation(); setLarge((v) => !v); }}
-      className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-cyan-200 bg-slate-900/60 border border-cyan-400/25 hover:bg-cyan-500/15 flex items-center gap-1.5"
-      title={large ? 'Close large view' : 'Open larger view'}
-    >
-      {large ? <X className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
-      {large ? 'Close' : 'Larger view'}
-    </button>
+    <div className="flex items-center gap-2">
+      {joinUndo && onUndoJoin ? (
+        <button
+          type="button"
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onUndoJoin(); }}
+          className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-amber-100 bg-slate-900/60 border border-amber-400/30 hover:bg-amber-500/15 flex items-center gap-1.5"
+          title={`Undo: ${stellaJoinActionLabel(joinUndo)}`}
+        >
+          <Undo2 className="w-3.5 h-3.5" />
+          Undo
+        </button>
+      ) : null}
+      <button
+        type="button"
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); setLarge((v) => !v); }}
+        className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-cyan-200 bg-slate-900/60 border border-cyan-400/25 hover:bg-cyan-500/15 flex items-center gap-1.5"
+        title={large ? 'Close large view' : 'Open larger view'}
+      >
+        {large ? <X className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+        {large ? 'Close' : 'Larger view'}
+      </button>
+    </div>
   );
 
   const drawCanvas = (isLarge) => (
@@ -2003,22 +2050,14 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
             </g>
           );
         })}
-        {joinLine ? (
-          <path
-            d={`M ${joinLine.x1} ${joinLine.y1} L ${joinLine.x2} ${joinLine.y2}`}
-            fill="none"
-            stroke="rgb(34, 211, 238)"
-            strokeWidth={1.8}
-            strokeDasharray="6 4"
-            className="pointer-events-none"
-          />
-        ) : null}
         {laid.map((n) => {
           const selected = activeId === n.id;
           const linked = n.joinCount > 0;
           const x = n.x - n.w / 2;
           const y = n.y - n.h / 2;
           const joinSet = new Set(stellaJoinFieldsForNode(n.id, graph.edges).map((f) => f.toLowerCase()));
+          const isFromCard = joinFrom?.id === n.id;
+          const isToCard = joinHover?.id === n.id;
           return (
             <g
               key={`${n.id}${isLarge ? '-lg' : ''}`}
@@ -2033,10 +2072,10 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
                 width={n.w}
                 height={n.h}
                 rx={10}
-                fill={selected ? 'rgb(8, 47, 73)' : 'rgba(15, 23, 42, 0.96)'}
-                stroke={selected ? 'rgb(34, 211, 238)' : linked ? 'rgba(52, 211, 153, 0.55)' : 'rgba(148, 163, 184, 0.35)'}
-                strokeWidth={selected ? 2 : 1.2}
-                strokeDasharray={linked || !n.intakeComplete ? undefined : '4 3'}
+                fill={isToCard ? 'rgb(6, 40, 32)' : isFromCard ? 'rgb(8, 47, 73)' : selected ? 'rgb(8, 47, 73)' : 'rgba(15, 23, 42, 0.96)'}
+                stroke={isToCard ? 'rgb(52, 211, 153)' : isFromCard ? 'rgb(34, 211, 238)' : selected ? 'rgb(34, 211, 238)' : linked ? 'rgba(52, 211, 153, 0.55)' : 'rgba(148, 163, 184, 0.35)'}
+                strokeWidth={isFromCard || isToCard || selected ? 2.4 : 1.2}
+                strokeDasharray={linked || !n.intakeComplete || isFromCard || isToCard ? undefined : '4 3'}
               />
               <text x={n.x} y={y + 18} textAnchor="middle" className="fill-white" style={{ fontSize: 11, fontWeight: 700 }}>
                 {stellaFileShortName(n.name)}
@@ -2058,6 +2097,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
                 n.fields.length
                   ? n.fields.map((field, i) => {
                     const joined = joinSet.has(field.toLowerCase());
+                    const isFrom = joinFrom?.id === n.id && joinFrom.field === field;
+                    const isTo = joinHover?.id === n.id && joinHover.field === field;
                     const fy = y + STELLA_HEADER_H + 10 + i * STELLA_ROW_H;
                     return (
                       <g
@@ -2065,13 +2106,22 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
                         className="cursor-crosshair"
                         onPointerDown={(ev) => beginFieldJoin(ev, n.id, field)}
                       >
-                        <rect x={x + 6} y={fy} width={n.w - 12} height={STELLA_ROW_H - 1} rx={4} fill={joined ? 'rgba(8, 145, 178, 0.25)' : 'transparent'} />
+                        <rect
+                          x={x + 6}
+                          y={fy}
+                          width={n.w - 12}
+                          height={STELLA_ROW_H - 1}
+                          rx={4}
+                          fill={isFrom ? 'rgba(34, 211, 238, 0.45)' : isTo ? 'rgba(52, 211, 153, 0.5)' : joined ? 'rgba(8, 145, 178, 0.25)' : 'transparent'}
+                          stroke={isFrom ? 'rgb(34, 211, 238)' : isTo ? 'rgb(52, 211, 153)' : 'none'}
+                          strokeWidth={isFrom || isTo ? 1.6 : 0}
+                        />
                         <text
                           x={n.x}
                           y={fy + 14}
                           textAnchor="middle"
-                          className={joined ? 'fill-cyan-100' : 'fill-slate-300'}
-                          style={{ fontSize: 10, fontFamily: 'ui-monospace, monospace' }}
+                          className={isFrom ? 'fill-cyan-50' : isTo ? 'fill-emerald-50' : joined ? 'fill-cyan-100' : 'fill-slate-300'}
+                          style={{ fontSize: 10, fontWeight: isFrom || isTo ? 700 : 400, fontFamily: 'ui-monospace, monospace' }}
                         >
                           {field.length > 24 ? `${field.slice(0, 22)}…` : field}
                         </text>
@@ -2087,6 +2137,34 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
             </g>
           );
         })}
+        {joinLine ? (
+          <g className="pointer-events-none">
+            <path
+              d={`M ${joinLine.x1} ${joinLine.y1} L ${joinLine.x2} ${joinLine.y2}`}
+              fill="none"
+              stroke={joinHover ? 'rgb(52, 211, 153)' : 'rgb(34, 211, 238)'}
+              strokeWidth={joinHover ? 2.8 : 2}
+              strokeDasharray={joinHover ? undefined : '6 4'}
+            />
+            <circle cx={joinLine.x1} cy={joinLine.y1} r={5} fill="rgb(34, 211, 238)" />
+            {joinHover ? (
+              <>
+                <circle cx={joinLine.x2} cy={joinLine.y2} r={5} fill="rgb(52, 211, 153)" />
+                <text
+                  x={(joinLine.x1 + joinLine.x2) / 2}
+                  y={(joinLine.y1 + joinLine.y2) / 2 - 10}
+                  textAnchor="middle"
+                  className="fill-emerald-100"
+                  style={{ fontSize: 11, fontWeight: 700, fontFamily: 'ui-monospace, monospace' }}
+                >
+                  {joinFrom?.field} → {joinHover.field}
+                </text>
+              </>
+            ) : (
+              <circle cx={joinLine.x2} cy={joinLine.y2} r={4} fill="rgb(34, 211, 238)" />
+            )}
+          </g>
+        ) : null}
       </svg>
     </div>
   );
@@ -2104,7 +2182,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
         <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
           <div className="text-sm font-bold text-white flex items-center gap-2">
             <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
-            <span className="text-xs font-normal text-blue-300/60">Click a join to remove · drag a field onto another to add</span>
+            <span className="text-xs font-normal text-blue-300/60">Click a join to remove (confirm) · Undo restores the last change</span>
           </div>
           {toolbar}
         </div>
@@ -2127,7 +2205,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
             </div>
             <p className="text-xs text-blue-300/60 mt-1">
               {pairCount
-                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Click a join to remove it; drag a field to add one.`
+                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Click a join to remove it (you'll confirm first).`
                 : 'No connections yet. Expand, then drag a field onto another file to link them.'}
             </p>
           </div>
@@ -2141,7 +2219,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange }
         </summary>
 
         <p className="text-xs text-blue-300/60 mt-3 mb-3">
-          Click a table to list columns. Drag a field onto a field in another table to create a join. Click a join line to remove it. Changes are saved to that file&apos;s captured context.
+          Click a table to list columns. Drag a field onto another table to create a join. Click a join line to remove it — you'll be asked to confirm, and Undo puts it back.
         </p>
         {drawCanvas(false)}
         {isolated.length > 0 && (
@@ -3904,6 +3982,19 @@ export default function CommercialExcellenceApp() {
   const [stellaIsLoading, setStellaIsLoading] = useState(false);
   const [stellaDataFiles, setStellaDataFiles] = useState([]); // { id, name, type, size, uploadedAt, storageBucket, storagePath, metaPath, summary, capturedContext, intakeMessages }
   const [stellaTenantSchema, setStellaTenantSchema] = useState(null); // { name, ready }
+  const [stellaJoinPending, setStellaJoinPending] = useState(null);
+  const [stellaJoinUndo, setStellaJoinUndo] = useState(null);
+  useEffect(() => {
+    if (!stellaJoinPending) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setStellaJoinPending(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [stellaJoinPending]);
   const [activeStellaDataId, setActiveStellaDataId] = useState(null);
   const [stellaIntakeInput, setStellaIntakeInput] = useState('');
   const [stellaBusinessContext, setStellaBusinessContext] = useState(() => mergeStellaBusinessContext({}));
@@ -7744,12 +7835,64 @@ ${stepInstruction}`;
     const toCtx = stellaMutateRelationships(to.capturedContext, from, rf, tf, type);
     stellaPatchLocal(from.id, { capturedContext: fromCtx, intakeComplete: true });
     stellaPatchLocal(to.id, { capturedContext: toCtx, intakeComplete: true });
+    setStellaJoinUndo({
+      type: type === 'add' ? 'remove' : 'add',
+      fromId: from.id,
+      toId: to.id,
+      thisField: tf,
+      relatedField: rf,
+      fromName: from.name,
+      toName: to.name,
+    });
     try {
       if (from.dbId) await stellaUpdateRegistry(from.dbId, { context_qa: fromCtx });
       if (to.dbId) await stellaUpdateRegistry(to.dbId, { context_qa: toCtx });
     } catch (e) {
       setStellaMessages((prev) => [...prev, { role: 'system', content: `⚠️ Could not save join: ${e.message}` }]);
     }
+  };
+
+  const requestStellaJoinRemove = ({ fromId, toId, thisField, relatedField }) => {
+    const files = stellaDataFilesRef.current || [];
+    const from = files.find((f) => f.id === fromId);
+    const to = files.find((f) => f.id === toId);
+    const tf = String(thisField || '').trim();
+    const rf = String(relatedField || '').trim();
+    if (!from || !to || !tf || !rf) return;
+    setStellaJoinPending({
+      fromId: from.id,
+      toId: to.id,
+      thisField: tf,
+      relatedField: rf,
+      fromName: from.name,
+      toName: to.name,
+    });
+  };
+
+  const confirmStellaJoinRemove = async () => {
+    const pending = stellaJoinPending;
+    if (!pending) return;
+    setStellaJoinPending(null);
+    await handleStellaJoinChange({
+      type: 'remove',
+      fromId: pending.fromId,
+      toId: pending.toId,
+      thisField: pending.thisField,
+      relatedField: pending.relatedField,
+    });
+  };
+
+  const undoStellaJoin = async () => {
+    const undo = stellaJoinUndo;
+    if (!undo) return;
+    setStellaJoinUndo(null);
+    await handleStellaJoinChange({
+      type: undo.type,
+      fromId: undo.fromId,
+      toId: undo.toId,
+      thisField: undo.thisField,
+      relatedField: undo.relatedField,
+    });
   };
 
   const stellaSaveBusinessContext = async (next) => {
@@ -8139,6 +8282,10 @@ ${stepInstruction}`;
         activeId={activeStellaDataId}
         onSelectFile={setActiveStellaDataId}
         onJoinChange={handleStellaJoinChange}
+        onRequestRemoveJoin={requestStellaJoinRemove}
+        onUndoJoin={undoStellaJoin}
+        joinUndo={stellaJoinUndo}
+        joinConfirmOpen={!!stellaJoinPending}
       />
     );
   };
@@ -8273,8 +8420,7 @@ ${stepInstruction}`;
                           });
                           return;
                         }
-                        handleStellaJoinChange({
-                          type: 'remove',
+                        requestStellaJoinRemove({
                           fromId: f.id,
                           toId: other.id,
                           thisField: rel.this_field,
@@ -11471,6 +11617,42 @@ ${stepInstruction}`;
           ) : null}
           </MessageErrorBoundary>
         </div>
+      )}
+
+      {stellaJoinPending && createPortal(
+        <div
+          className="fixed inset-0 z-[220] bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="stella-join-remove-title"
+          onClick={() => setStellaJoinPending(null)}
+        >
+          <div
+            className="w-full max-w-md bg-slate-900 border border-red-400/30 rounded-2xl shadow-2xl p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 id="stella-join-remove-title" className="text-sm font-bold text-white">Remove this connection?</h3>
+            <p className="text-xs text-cyan-100 mt-3 font-mono leading-relaxed">{stellaJoinActionLabel(stellaJoinPending)}</p>
+            <p className="text-xs text-blue-300/60 mt-2">This updates both files. You can Undo afterwards.</p>
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                type="button"
+                onClick={() => setStellaJoinPending(null)}
+                className="px-3 py-1.5 rounded-lg text-sm font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmStellaJoinRemove}
+                className="px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-red-500/85 hover:bg-red-500"
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       {imageLightbox?.src && (
