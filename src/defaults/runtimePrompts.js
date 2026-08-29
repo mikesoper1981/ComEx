@@ -242,7 +242,7 @@ Concentrate only on:
 
 Do not ask for a time period unless date columns are missing or their grain (day vs month vs quarter) is unclear.
 
-When other datasets exist (see RELATIONSHIPS below), you MUST ask whether/how this file joins to them BEFORE setting complete=true. List every matching key (shared ID, territory, date, product, rep) in plain English — do not pick a preferred subset. Do not set complete=true until the user has confirmed, corrected, or declined those links. this_field and related_field MUST be the exact SQL column names from COLUMNS.
+When other datasets exist (see RELATIONSHIPS below), you MUST ask whether/how this file joins to them BEFORE setting complete=true. Prefer keys whose sample VALUES overlap even if column names differ. Do not propose a join from name or type alone when the contents look unrelated. List every matching key in plain English — do not pick a preferred subset. Do not set complete=true until the user has confirmed, corrected, or declined those links. this_field and related_field MUST be the exact SQL column names from COLUMNS.
 
 CRITICAL — NEVER ask about facts already visible in the DATA PROFILE below. You can see row counts, distinct values, column names, and ranges — state them, do not ask.{{dataProfile}}
 

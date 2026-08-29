@@ -61,10 +61,13 @@ import {
   filterMemoryFacts,
   isDurableMemoryFact,
   isExplicitRememberRequest,
+  isFileOrIntakeMemoryFact,
+  stripFileIntakeFromMemory,
 } from './chatMemory';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
 import AdminUsers from './AdminUsers';
+import ContextMap from './ContextMap';
 import {
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_PPTX_CLARIFY,
@@ -1294,10 +1297,134 @@ function stellaNormJoinToken(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+const STELLA_JOIN_SAMPLE_CAP = 48;
+const STELLA_JOIN_SAMPLE_LEN = 80;
+
+function stellaNormJoinValue(v) {
+  return String(v ?? '').trim().replace(/\s+/g, ' ').slice(0, STELLA_JOIN_SAMPLE_LEN);
+}
+
+function stellaNormJoinValueKey(v) {
+  return stellaNormJoinValue(v).toLowerCase();
+}
+
+function stellaJoinValueKeys(v) {
+  const raw = stellaNormJoinValueKey(v);
+  if (!raw) return [];
+  const keys = [raw];
+  const compact = raw.replace(/[^a-z0-9]/g, '');
+  if (compact && compact !== raw) keys.push(compact);
+  if (/^-?\d+(\.\d+)?$/.test(raw)) {
+    const n = String(Number(raw));
+    if (n !== raw && n !== 'NaN') keys.push(n);
+  }
+  return keys;
+}
+
+function stellaLooksLikeDateValue(s) {
+  const t = String(s || '').trim();
+  if (!t || t.length < 6) return false;
+  if (/^\d{4}-\d{2}-\d{2}/.test(t)) return true;
+  if (/^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/.test(t)) return true;
+  if (/^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(t) && /\d{2,4}/.test(t)) return true;
+  return Number.isFinite(Date.parse(t)) && /[-/]/.test(t);
+}
+
+function stellaProfileColumnValues(values) {
+  const filled = (values || []).filter((v) => v !== null && v !== undefined && v !== '');
+  const filledCount = filled.length;
+  const allDistinct = new Set();
+  const samples = [];
+  for (const v of filled) {
+    const key = stellaNormJoinValueKey(v);
+    if (!key || allDistinct.has(key)) continue;
+    allDistinct.add(key);
+    if (samples.length < STELLA_JOIN_SAMPLE_CAP) samples.push(stellaNormJoinValue(v));
+  }
+  const distinctCount = allDistinct.size;
+  const strs = filled.map((v) => String(v).trim());
+  const nums = strs.map((s) => Number(String(s).replace(/[,\s%£$€]/g, ''))).filter(Number.isFinite);
+  const numericRatio = filledCount ? nums.length / filledCount : 0;
+  const dateRatio = filledCount ? strs.filter(stellaLooksLikeDateValue).length / filledCount : 0;
+  const uniqRatio = filledCount ? distinctCount / filledCount : 0;
+  const hasDecimal = strs.some((s) => /\d+\.\d+/.test(s));
+  const avgLen = strs.length ? strs.reduce((a, s) => a + s.length, 0) / strs.length : 0;
+
+  let kind = 'text';
+  let pattern = '';
+  if (!filledCount) {
+    kind = 'empty';
+  } else if (dateRatio >= 0.7) {
+    kind = 'date';
+    pattern = 'date';
+  } else if (numericRatio >= 0.85) {
+    if (hasDecimal || (uniqRatio < 0.55 && distinctCount > 20)) {
+      kind = 'measure';
+      pattern = 'numeric';
+    } else if (uniqRatio >= 0.85 && distinctCount >= 8) {
+      kind = 'id';
+      pattern = 'numeric-id';
+    } else if (distinctCount <= 80) {
+      kind = 'code';
+      pattern = 'numeric-code';
+    } else {
+      kind = 'id';
+      pattern = 'numeric-id';
+    }
+  } else if (distinctCount <= 80 && avgLen <= 24) {
+    kind = 'code';
+    pattern = 'token';
+  } else if (avgLen <= 64 && uniqRatio >= 0.7) {
+    kind = 'id';
+    pattern = 'text-id';
+  } else {
+    kind = 'name';
+    pattern = 'text';
+  }
+
+  let cardinality = 'high';
+  if (distinctCount <= 12) cardinality = 'low';
+  else if (distinctCount <= 80 || uniqRatio < 0.2) cardinality = 'medium';
+  else if (uniqRatio >= 0.85) cardinality = 'unique';
+
+  return { samples, distinctCount, filledCount, cardinality, kind, pattern };
+}
+
+function stellaApplyRowSampleToColumns(columns, rows) {
+  if (!Array.isArray(columns) || !columns.length || !Array.isArray(rows) || !rows.length) return columns;
+  return columns.map((c) => {
+    if (Array.isArray(c?.samples) && c.samples.length && c.kind) return c;
+    const values = rows.map((r) => {
+      if (!r || typeof r !== 'object') return undefined;
+      if (c.name && r[c.name] !== undefined) return r[c.name];
+      if (c.original && r[c.original] !== undefined) return r[c.original];
+      return undefined;
+    });
+    return { ...c, ...stellaProfileColumnValues(values) };
+  });
+}
+
+function stellaFileNeedsValueProfile(file) {
+  const cols = Array.isArray(file?.columns) ? file.columns : [];
+  if (!file?.tableName || !cols.length) return false;
+  return cols.some((c) => !Array.isArray(c?.samples) || !c.samples.length);
+}
+
 function stellaColumnJoinMeta(col) {
   const name = String(col?.name || '').trim();
   const original = String(col?.original || '').trim();
-  return { name, original, type: col?.type || '' };
+  return {
+    name,
+    original,
+    type: col?.type || '',
+    description: String(col?.description || '').trim(),
+    samples: Array.isArray(col?.samples) ? col.samples.slice(0, STELLA_JOIN_SAMPLE_CAP) : [],
+    distinctCount: Number(col?.distinctCount) || 0,
+    filledCount: Number(col?.filledCount) || 0,
+    cardinality: col?.cardinality || '',
+    kind: col?.kind || '',
+    pattern: col?.pattern || '',
+  };
 }
 
 const STELLA_MEASURE_JOIN_TOKENS = /^(value|amount|revenue|rev|sales|qty|quantity|count|actual|target|attainment|percent|pct|score|rate|volume|units|calls|cost|price|margin|total|sum)$/;
@@ -1310,9 +1437,10 @@ const STELLA_JOIN_FAMILIES = [
 ];
 
 function stellaJoinFamily(col) {
-  const blobs = [col?.name, col?.original].map(stellaNormJoinToken).filter(Boolean);
+  const blobs = [col?.name, col?.original, col?.description].map(stellaNormJoinToken).filter(Boolean);
   if (blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b))) return null;
   if (blobs.some((b) => STELLA_DATE_JOIN_TOKENS.test(b))) return 'date';
+  if (col?.kind === 'date') return 'date';
   for (const fam of STELLA_JOIN_FAMILIES) {
     for (const t of fam.tokens) {
       const nt = stellaNormJoinToken(t);
@@ -1338,8 +1466,48 @@ function stellaFindJoinColumn(file, hint) {
 }
 
 function stellaLooksLikeMeasureCol(col) {
-  const blobs = [col?.name, col?.original].map(stellaNormJoinToken).filter(Boolean);
+  if (col?.kind === 'measure') return true;
+  const blobs = [col?.name, col?.original, col?.description].map(stellaNormJoinToken).filter(Boolean);
   return blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b));
+}
+
+function stellaJoinKindsCompatible(aKind, bKind) {
+  const a = String(aKind || '');
+  const b = String(bKind || '');
+  if (!a || !b || a === 'empty' || b === 'empty') return true;
+  if (a === b) return true;
+  const keys = new Set(['id', 'code', 'name']);
+  if (keys.has(a) && keys.has(b)) return true;
+  if (a === 'measure' || b === 'measure') return a === b;
+  if (a === 'date' || b === 'date') return a === b;
+  return true;
+}
+
+function stellaJoinValueOverlap(a, b) {
+  const aS = Array.isArray(a?.samples) ? a.samples : [];
+  const bS = Array.isArray(b?.samples) ? b.samples : [];
+  if (!aS.length || !bS.length) {
+    return { hits: 0, ratio: 0, smaller: 0, examples: [], compared: false };
+  }
+  const bKeys = new Set();
+  for (const v of bS) stellaJoinValueKeys(v).forEach((k) => bKeys.add(k));
+  const examples = [];
+  let hits = 0;
+  for (const v of aS) {
+    const keys = stellaJoinValueKeys(v);
+    if (keys.some((k) => bKeys.has(k))) {
+      hits += 1;
+      if (examples.length < 4) examples.push(stellaNormJoinValue(v));
+    }
+  }
+  const smaller = Math.min(aS.length, bS.length);
+  return {
+    hits,
+    ratio: smaller ? Math.min(1, hits / smaller) : 0,
+    smaller,
+    examples,
+    compared: true,
+  };
 }
 
 function stellaJoinTypeBucket(type) {
@@ -1371,13 +1539,32 @@ function stellaScoreJoinColumns(a, b) {
   const aMeas = stellaLooksLikeMeasureCol(a);
   const bMeas = stellaLooksLikeMeasureCol(b);
   const typeOk = stellaJoinTypesCompatible(a?.type, b?.type);
+  const kindOk = stellaJoinKindsCompatible(a?.kind, b?.kind);
+  const overlap = stellaJoinValueOverlap(a, b);
+  const strongOverlap = overlap.compared && overlap.hits >= 2 && overlap.ratio >= 0.25;
+  const someOverlap = overlap.compared && overlap.hits >= 1 && overlap.ratio >= 0.08;
+  const lowCard = (a?.cardinality === 'low' || a?.cardinality === 'medium')
+    && (b?.cardinality === 'low' || b?.cardinality === 'medium');
 
   let score = 0;
   let reason = '';
-  if (aN && aN === bN) { score = 100; reason = 'same column name'; }
-  else if (aO && bO && aO === bO) { score = 90; reason = 'same source header'; }
-  else if (fa && fb && fa === fb) { score = 70; reason = `shared ${fa} key`; }
-  else {
+  if (strongOverlap) {
+    score = overlap.ratio >= 0.5 ? 94 : 82;
+    reason = `${overlap.hits} matching values in both columns`;
+  } else if (someOverlap) {
+    score = 72;
+    reason = 'some matching values';
+  }
+  if (aN && aN === bN) {
+    if (!score) { score = 100; reason = 'same column name'; }
+    else score = Math.max(score, 88);
+  } else if (aO && bO && aO === bO) {
+    if (!score) { score = 90; reason = 'same source header'; }
+    else score = Math.max(score, 86);
+  } else if (fa && fb && fa === fb) {
+    if (!score) { score = 70; reason = `shared ${fa} key`; }
+    else score = Math.max(score, 70);
+  } else if (!score) {
     const sa = stellaIdStem(a);
     const sb = stellaIdStem(b);
     const aId = /id$/.test(aN) || aN === 'id' || /id$/.test(aO);
@@ -1391,31 +1578,49 @@ function stellaScoreJoinColumns(a, b) {
     }
   }
 
-  if (aMeas && bMeas && fa !== 'date' && fb !== 'date') {
+  if (aMeas && bMeas && fa !== 'date' && fb !== 'date' && a?.kind !== 'date' && b?.kind !== 'date') {
     return {
       score: 0,
       reason: 'both look like measures, not join keys',
       typeOk,
+      kindOk,
+      overlap,
       verdict: 'block',
       warnings: ['These look like values (revenue, qty, etc.), not keys to join on.'],
     };
   }
-  if (aMeas !== bMeas && score < 90) {
+  if (aMeas !== bMeas && !strongOverlap) {
     warnings.push('One field looks like a measure and the other like a key.');
     return {
       score: Math.min(score, 20),
       reason: 'measure vs key',
       typeOk,
+      kindOk,
+      overlap,
       verdict: 'block',
       warnings,
     };
   }
-  if (fa && fb && fa !== fb) {
+  if (fa && fb && fa !== fb && !strongOverlap) {
     warnings.push(`Keys look like different things (${fa} vs ${fb}).`);
     return {
       score: Math.min(score, 25),
       reason: `different key types (${fa} vs ${fb})`,
       typeOk,
+      kindOk,
+      overlap,
+      verdict: 'block',
+      warnings,
+    };
+  }
+  if (!kindOk && !strongOverlap) {
+    warnings.push(`Column contents look different (${a?.kind || 'unknown'} vs ${b?.kind || 'unknown'}).`);
+    return {
+      score: Math.min(score, 25),
+      reason: 'different kinds of values',
+      typeOk,
+      kindOk,
+      overlap,
       verdict: 'block',
       warnings,
     };
@@ -1424,22 +1629,42 @@ function stellaScoreJoinColumns(a, b) {
     warnings.push(`Types look different (${a?.type || 'unknown'} vs ${b?.type || 'unknown'}).`);
     if (score < 100) score = Math.min(score, 50);
   }
+  if (overlap.compared && overlap.smaller >= 6 && overlap.hits === 0) {
+    if (lowCard) {
+      warnings.push('Sample values do not overlap — these look like different lists.');
+      return {
+        score: Math.min(score, 28),
+        reason: 'values do not overlap',
+        typeOk,
+        kindOk,
+        overlap,
+        verdict: 'block',
+        warnings,
+      };
+    }
+    warnings.push('No matching values in the sampled rows. Names can still match, but the contents do not look shared yet.');
+    if (score >= 70) score = Math.min(score, 68);
+  }
 
   let verdict = 'ok';
   if (score < 40) verdict = 'block';
   else if (score < 70 || warnings.length) verdict = 'warn';
-  if (!reason) reason = score ? 'possible join key' : 'column names and types do not match';
-  return { score, reason, typeOk, verdict, warnings };
+  if (!reason) reason = score ? 'possible join key' : 'column names, types, and values do not match';
+  return { score, reason, typeOk, kindOk, overlap, verdict, warnings };
 }
 
 function stellaAssessJoin(fromFile, toFile, thisField, relatedField) {
   const a = stellaFindJoinColumn(fromFile, thisField);
   const b = stellaFindJoinColumn(toFile, relatedField);
   const scored = stellaScoreJoinColumns(a, b);
+  const examples = scored.overlap?.examples?.length
+    ? ` e.g. ${scored.overlap.examples.join(', ')}`
+    : '';
   return {
     ...scored,
-    thisLabel: `${thisField}${a.type ? ` [${a.type}]` : ''}`,
-    thatLabel: `${relatedField}${b.type ? ` [${b.type}]` : ''}`,
+    thisLabel: `${thisField}${a.type ? ` [${a.type}]` : ''}${a.kind ? ` · ${a.kind}` : ''}`,
+    thatLabel: `${relatedField}${b.type ? ` [${b.type}]` : ''}${b.kind ? ` · ${b.kind}` : ''}`,
+    examples,
   };
 }
 
@@ -1486,6 +1711,7 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
           related_header: b.original || b.name,
           reason: scored.reason,
           score: scored.score,
+          overlapHits: scored.overlap?.hits || 0,
         });
       }
     }
@@ -2428,7 +2654,7 @@ function stellaBuildTabularPayload(records) {
   const used = new Set();
   const columns = originalCols.map((orig, i) => {
     const values = clean.map(r => r[orig]);
-    return { original: orig, name: stellaSafeColumnName(orig, i, used), type: stellaInferColumnType(values), description: '' };
+    return { original: orig, name: stellaSafeColumnName(orig, i, used), type: stellaInferColumnType(values), description: '', ...stellaProfileColumnValues(values) };
   });
   const rows = clean.map(r => {
     const row = {};
@@ -3439,25 +3665,42 @@ function stellaNameMapFact(map) {
 function factsFromStellaCapturedContext(ctx) {
   if (!ctx || typeof ctx !== 'object') return [];
   const facts = [];
+  const push = (raw) => {
+    const text = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 280);
+    if (text.length >= 12) facts.push(text);
+  };
   for (const map of stellaCollectNameMaps(ctx)) {
-    const fact = stellaNameMapFact(map);
-    if (fact.length >= 12) facts.push(fact);
+    push(stellaNameMapFact(map));
   }
-  const notes = String(ctx.interpretation_notes || '').trim();
-  if (notes.length >= 16 && isMemoryEnrichmentFact(notes)) {
-    facts.push(notes.slice(0, 280));
-  }
+  push(ctx.interpretation_notes);
+  push(ctx.what_it_represents);
+  const period = String(ctx.time_period || '').trim();
+  if (period.length >= 8) push(`This file covers ${period}`);
+  (Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).forEach((m) => push(m));
   (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).forEach((p) => {
     const answer = String(p?.answer || '').replace(/\s+/g, ' ').trim();
-    if (answer.length >= 16 && isMemoryEnrichmentFact(answer)) {
-      facts.push(answer.slice(0, 280));
-    }
+    const question = String(p?.question || '').replace(/\s+/g, ' ').trim();
+    push(answer);
+    if (question && answer) push(`${question} ${answer}`);
+  });
+  (Array.isArray(ctx.relationships) ? ctx.relationships : []).forEach((r) => {
+    const tf = String(r?.this_field || '').trim();
+    const rf = String(r?.related_field || '').trim();
+    const other = String(r?.related_table || r?.related_file || '').trim();
+    if (tf && rf) push(`Join ${tf} to ${rf}${other ? ` on ${other}` : ''}`);
   });
   return facts;
 }
 
 function factsFromStellaFiles(files) {
-  return (Array.isArray(files) ? files : []).flatMap((f) => factsFromStellaCapturedContext(f?.capturedContext));
+  return (Array.isArray(files) ? files : []).flatMap((f) => {
+    const extra = [];
+    const name = String(f?.name || '').trim();
+    if (name.length >= 4) extra.push(`Uploaded file ${name}`);
+    const table = String(f?.tableName || '').trim();
+    if (table) extra.push(`SQL table ${table}`);
+    return [...extra, ...factsFromStellaCapturedContext(f?.capturedContext)];
+  });
 }
 
 // Human-readable rendering of the structured context_qa JSON for prompts.
@@ -4178,7 +4421,7 @@ export default function CommercialExcellenceApp() {
   const [productIntel, setProductIntel] = useState(() => readLocalProductIntelligence());
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
   const [userSettingsCloudError, setUserSettingsCloudError] = useState('');
-  const [userSettingsPane, setUserSettingsPane] = useState('general'); // general | incentives | stella
+  const [userSettingsPane, setUserSettingsPane] = useState('general'); // general | context-map | incentives | territory | stella
   const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
   const [pptxTemplateError, setPptxTemplateError] = useState('');
   const [knowledgeBase, setKnowledgeBase] = useState('');
@@ -4210,6 +4453,7 @@ export default function CommercialExcellenceApp() {
   const uploadedFileRef = useRef(uploadedFile);
   const userSettingsRef = useRef(userSettings);
   const stellaDataFilesRef = useRef(stellaDataFiles);
+  const stellaHydrateColumnProfilesRef = useRef(async () => {});
   const persistChatsTimerRef = useRef(null);
   const skipChatPersistRef = useRef(false);
   const chatsBodiesRef = useRef([]);
@@ -4467,7 +4711,8 @@ export default function CommercialExcellenceApp() {
         [{ role: 'user', content: buildBackfillExchange(blob, userSettingsRef.current.memory) }],
         800,
       );
-      const facts = filterMemoryFacts(parseMemoryFacts(raw));
+      const facts = filterMemoryFacts(parseMemoryFacts(raw))
+        .filter((f) => !isFileOrIntakeMemoryFact(f));
       if (facts.length) {
         const before = memorySignature(userSettingsRef.current.memory);
         const memory = mergeMemoryFacts(userSettingsRef.current.memory, facts);
@@ -4531,8 +4776,11 @@ export default function CommercialExcellenceApp() {
               });
             } catch { /* company-schema SQL may not be applied yet */ }
           }
+          try { await stellaHydrateColumnProfilesRef.current?.(mapped); } catch { /* profiles are best-effort */ }
+          return mapped;
         }
       } catch { /* stella_files table may not exist yet */ }
+      return [];
       };
 
       const loadProductIntel = async () => {
@@ -4710,10 +4958,10 @@ export default function CommercialExcellenceApp() {
       if (pendingHarvest) void harvestChatMemory(pendingHarvest.assistantText, pendingHarvest.userText, pendingHarvest.recentTurns);
       void ensureFullChatsLoaded()
         .then(() => runMemoryBackfillIfNeeded())
+        .then(() => sweepChatMemoryOfFileContext(factsFromStellaFiles(stellaDataFilesRef.current)))
         .catch((err) => console.warn('Chat transcripts load failed:', err?.message || err));
-      await restDone;
-      const intakeFacts = factsFromStellaFiles(stellaDataFilesRef.current);
-      if (intakeFacts.length) void persistMemoryFactsQuietly(intakeFacts, { module: 'stella' });
+      const [mappedFiles] = await restDone;
+      void sweepChatMemoryOfFileContext(factsFromStellaFiles(mappedFiles || stellaDataFilesRef.current));
     };
     loadStella();
   }, [currentUser.id]);
@@ -5260,13 +5508,18 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
         }],
         500,
       );
+      const fileFacts = factsFromStellaFiles(stellaDataFilesRef.current);
       const { facts: harvestedFacts, conflicts: harvestedConflicts } = parseMemoryHarvest(raw);
       const allowExplicit = isExplicitRememberRequest(userText);
       const existingActive = activeMemoryItems({ memory: userSettingsRef.current.memory });
       const facts = [];
       const conflicts = [];
+      const keepFact = (fact) => (
+        !isFileOrIntakeMemoryFact(fact)
+        && !fileFacts.some((k) => factsAreSimilar(k, fact))
+      );
       for (const conflict of harvestedConflicts || []) {
-        if (!conflict?.proposed || !isDurableMemoryFact(conflict.proposed, { allowExplicit })) continue;
+        if (!conflict?.proposed || !isDurableMemoryFact(conflict.proposed, { allowExplicit }) || !keepFact(conflict.proposed)) continue;
         const matched = matchConflictingMemory(existingActive, conflict);
         if (matched) {
           conflicts.push({
@@ -5279,6 +5532,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
         }
       }
       for (const fact of filterMemoryFacts(harvestedFacts, { allowExplicit })) {
+        if (!keepFact(fact)) continue;
         const matched = matchConflictingMemory(existingActive, { proposed: fact });
         if (matched) {
           if (!conflicts.some((c) => (c.existingId && c.existingId === matched.id) || factsAreSimilar(c.proposed, fact))) {
@@ -5349,21 +5603,18 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     ));
   };
 
-  const persistMemoryFactsQuietly = async (facts, { module = 'stella' } = {}) => {
+  const sweepChatMemoryOfFileContext = async (fileFacts = []) => {
     if (!userSettingsReadyRef.current) return;
-    if (!isMemoryEnabled(userSettingsRef.current)) return;
-    const incoming = (facts || []).map((f) => String(f || '').replace(/\s+/g, ' ').trim()).filter((f) => f.length >= 12);
-    if (!incoming.length) return;
-    const before = memorySignature(userSettingsRef.current.memory);
-    const memory = mergeMemoryFacts(userSettingsRef.current.memory, incoming, { module });
-    if (memorySignature(memory) === before) return;
-    await persistConfirmedMemory(memory);
+    const before = userSettingsRef.current.memory;
+    const next = stripFileIntakeFromMemory(before, fileFacts);
+    if (memorySignature(next) === memorySignature(before)) return;
+    await persistConfirmedMemory(next);
   };
 
   const applyPendingMemoryDecision = async (action, customText = '') => {
     const pending = pendingMemoryConfirmRef.current;
     if (!pending) return;
-    const extra = (pending.extraFacts || []).filter(Boolean);
+    const extra = (pending.extraFacts || []).filter((f) => f && !isFileOrIntakeMemoryFact(f));
     let next = userSettingsRef.current.memory;
     if (action === 'accept') {
       const proposed = String(pending.proposed || '').trim();
@@ -5391,6 +5642,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
   const recentChatTurnsForMemory = (list) => (
     (list || messagesRef.current || [])
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator'))
+      .filter((m) => m.kind !== 'intake' && m.kind !== 'memory-confirm')
       .slice(-8)
       .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content }))
   );
@@ -6859,7 +7111,7 @@ ${stepInstruction}`;
     };
     pendingProposalIntakeRef.current = intake;
     setPendingProposalIntake(intake);
-    setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg }]);
+    setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
     setIsLoading(false);
   };
 
@@ -6867,7 +7119,6 @@ ${stepInstruction}`;
     const intake = pendingProposalIntakeRef.current || pendingProposalIntake;
     if (!intake) return;
     const nextMessages = [...(intake.intakeMessages || []), { role: 'user', content: userText }];
-    void harvestChatMemory(intake.intakeMessages?.[intake.intakeMessages.length - 1]?.content, userText, nextMessages);
     setIsLoading(true);
     let launched = false;
     try {
@@ -6877,7 +7128,7 @@ ${stepInstruction}`;
         intakeMessages: nextMessages,
       });
       const withAssistant = [...nextMessages, { role: 'assistant', content: result.message }];
-      setMessages((prev) => [...prev, { role: 'assistant', content: result.message }]);
+      setMessages((prev) => [...prev, { role: 'assistant', content: result.message, kind: 'intake' }]);
       if (result.complete) {
         launched = true;
         await finishProposalIntakeAndLaunch({ ...intake, intakeMessages: withAssistant }, result.context_qa);
@@ -7748,8 +7999,6 @@ ${stepInstruction}`;
       }
       if (!Array.isArray(data)) return null;
       const mapped = data.map(stellaMapRegistryRow);
-      const intakeFacts = factsFromStellaFiles(mapped);
-      if (intakeFacts.length) void persistMemoryFactsQuietly(intakeFacts, { module: 'stella' });
       setStellaDataFiles(prev => {
         const prevById = new globalThis.Map(prev.filter(f => f.dbId).map(f => [f.dbId, f]));
         const merged = mapped.map(m => {
@@ -7763,6 +8012,7 @@ ${stepInstruction}`;
         const temps = prev.filter(f => !f.dbId);
         return [...merged, ...temps];
       });
+      void sweepChatMemoryOfFileContext(factsFromStellaFiles(mapped));
       return mapped;
     } catch {
       return null;
@@ -7829,9 +8079,11 @@ ${stepInstruction}`;
     if (!otherTabular.length) return '';
     const candidates = stellaGuessJoinCandidates(thisFile, otherTabular);
     const otherFilesBlob = otherTabular.map((x) => {
-      const cols = (x.columns || []).map((c) => (
-        c.original && c.original !== c.name ? `${c.name} (header "${c.original}")` : (c.name || '')
-      )).filter(Boolean).join(', ');
+      const cols = (x.columns || []).map((c) => {
+        const label = c.original && c.original !== c.name ? `${c.name} (header "${c.original}")` : (c.name || '');
+        const samples = Array.isArray(c.samples) && c.samples.length ? ` e.g. ${c.samples.slice(0, 3).join(', ')}` : '';
+        return `${label}${samples}`;
+      }).filter(Boolean).join('; ');
       return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
     }).join('\n');
     const candidateBlob = candidates.length
@@ -7841,7 +8093,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Only propose keys of the same kind (territory, product, rep, shared ID, matching date grain) with compatible types. Never join a measure/metric (revenue, qty, amount) to a key, and never join product to territory or other mismatched families. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Prefer keys whose VALUES overlap (same IDs, territory codes, product names) even when column names differ. Do not propose a join from name/type alone if the sample values look like different things. Never join a measure/metric (revenue, qty, amount) to a key. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -7854,6 +8106,34 @@ ${stepInstruction}`;
     if (!res.ok) throw new Error(data?.error?.message || `Stella request failed (${res.status})`);
     return data;
   };
+
+  const stellaHydrateColumnValueProfiles = async (files) => {
+    const list = (files || []).filter((f) => f && stellaFileNeedsValueProfile(f));
+    if (!list.length) return (stellaDataFilesRef.current || []);
+    const patched = new Map();
+    for (const f of list) {
+      try {
+        const data = await stellaTableApi({ sql: `SELECT * FROM ${f.tableName} LIMIT 400` });
+        const rows = Array.isArray(data.rows) ? data.rows : [];
+        if (!rows.length) continue;
+        const columns = stellaApplyRowSampleToColumns(f.columns, rows);
+        patched.set(f.id, columns);
+        if (f.dbId) {
+          try { await stellaUpdateRegistry(f.dbId, { columns }); } catch { /* ignore */ }
+        }
+      } catch { /* table may not be ready */ }
+    }
+    if (!patched.size) return (stellaDataFilesRef.current || []);
+    let result = stellaDataFilesRef.current || [];
+    setStellaDataFiles((prev) => {
+      const next = (prev || []).map((f) => (patched.has(f.id) ? { ...f, columns: patched.get(f.id) } : f));
+      stellaDataFilesRef.current = next;
+      result = next;
+      return next;
+    });
+    return result;
+  };
+  stellaHydrateColumnProfilesRef.current = stellaHydrateColumnValueProfiles;
 
   // Create a dynamic stella_data_* table in this company's schema and load rows in batches.
   const stellaCreateAndLoadTable = async (tableName, columns, rows) => {
@@ -7984,8 +8264,6 @@ ${stepInstruction}`;
     } catch (e) {
       setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not save captured context: ${e.message}` }]);
     }
-    const memoryFacts = factsFromStellaCapturedContext(nextCtx);
-    if (memoryFacts.length) void persistMemoryFactsQuietly(memoryFacts, { module: 'stella' });
     return nextCtx;
   };
 
@@ -8008,7 +8286,11 @@ ${stepInstruction}`;
     const rf = String(relatedField || '').trim();
     if (!tf || !rf) return;
     if (type === 'add' && !opts.force) {
-      const assess = stellaAssessJoin(from, to, tf, rf);
+      await stellaHydrateColumnValueProfiles([from, to]);
+      const latest = stellaDataFilesRef.current || [];
+      const fromNow = latest.find((f) => f.id === from.id) || from;
+      const toNow = latest.find((f) => f.id === to.id) || to;
+      const assess = stellaAssessJoin(fromNow, toNow, tf, rf);
       if (assess.verdict !== 'ok') {
         setStellaJoinPending({
           action: 'add',
@@ -8137,21 +8419,27 @@ ${stepInstruction}`;
     if (!f) return;
     const isDoc = !f.tableName;
 
-    // Other tabular datasets this file could relate to (for AI-suggested joins).
-    const otherTabular = stellaOtherTabularFiles(f.id);
-    const candidates = !isDoc ? stellaGuessJoinCandidates(f, otherTabular) : [];
+    if (!isDoc) {
+      await stellaHydrateColumnValueProfiles([f, ...stellaOtherTabularFiles(f.id)]);
+    }
+    const live = (stellaDataFilesRef.current || []).find((x) => x.id === f.id) || f;
+    const otherTabular = stellaOtherTabularFiles(live.id);
+    const candidates = !isDoc ? stellaGuessJoinCandidates(live, otherTabular) : [];
     const relationshipGuidance = (!isDoc && otherTabular.length)
-      ? stellaRelationshipIntakeHint(f, otherTabular)
+      ? stellaRelationshipIntakeHint(live, otherTabular)
       : '';
 
-    const colsBlob = Array.isArray(f.columns) && f.columns.length
-      ? f.columns.map(c => `- ${c.name}${c.original && c.original !== c.name ? ` (header "${c.original}")` : ''}${c.type ? ` [${c.type}]` : ''}${c.description ? `: ${c.description}` : ''}`).join('\n')
+    const colsBlob = Array.isArray(live.columns) && live.columns.length
+      ? live.columns.map((c) => {
+        const samples = Array.isArray(c.samples) && c.samples.length ? ` e.g. ${c.samples.slice(0, 4).join(', ')}` : '';
+        return `- ${c.name}${c.original && c.original !== c.name ? ` (header "${c.original}")` : ''}${c.type ? ` [${c.type}]` : ''}${c.kind ? ` {${c.kind}}` : ''}${c.description ? `: ${c.description}` : ''}${samples}`;
+      }).join('\n')
       : '(no columns — this is a document)';
     const system = withUserSettings(fillTemplate(getStellaPrompts().intake, {
       kind: isDoc ? 'document' : 'dataset',
       kindSubject: isDoc ? 'document contains / represents' : 'data represents',
-      relationshipBullet: (!isDoc && otherTabular.length) ? '\n- joins: whether/how it shares keys with other uploaded datasets (list every matching column in plain English)' : '',
-      dataProfile: (!isDoc && f.dataProfile) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${f.dataProfile}` : '',
+      relationshipBullet: (!isDoc && otherTabular.length) ? '\n- joins: whether/how it shares keys with other uploaded datasets (matching values, not just similar names)' : '',
+      dataProfile: (!isDoc && (live.dataProfile || f.dataProfile)) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${live.dataProfile || f.dataProfile}` : '',
       relationshipGuidance,
     }));
     const contextBlob = `FILE: "${f.name}" (type: ${f.fileType || f.type})${f.tableName ? `\nSQL TABLE: ${f.tableName}` : ''}\nSUMMARY: ${f.summary || ''}\nCOLUMNS (use these exact names in relationships.this_field):\n${colsBlob}`;
@@ -8170,18 +8458,18 @@ ${stepInstruction}`;
     const lastUserText = [...(f.intakeMessages || [])].reverse().find(m => m.role === 'user')?.content || '';
     const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
     const acceptedJoin = stellaLooksLikeJoinAccept(lastUserText);
-    let rels = stellaNormalizeStoredRelationships(parsed?.context_qa?.relationships, f, otherTabular);
+    let rels = stellaNormalizeStoredRelationships(parsed?.context_qa?.relationships, live, otherTabular);
     const askedJoin = stellaIntakeAskedJoin(f.intakeMessages);
     if (!declinedJoin && candidates.length && (acceptedJoin || askedJoin)) {
       const strong = candidates.filter((c) => c.score >= 70);
       rels = stellaDedupeRelationships([
         ...rels,
-        ...stellaNormalizeStoredRelationships(strong, f, otherTabular),
+        ...stellaNormalizeStoredRelationships(strong, live, otherTabular),
       ]);
     }
-    const priorRels = stellaNormalizeStoredRelationships(f.capturedContext?.relationships, f, otherTabular);
+    const priorRels = stellaNormalizeStoredRelationships(live.capturedContext?.relationships || f.capturedContext?.relationships, live, otherTabular);
     if (priorRels.length && !declinedJoin) rels = stellaDedupeRelationships([...priorRels, ...rels]);
-    const filteredJoins = stellaFilterJoinRels(rels, f, otherTabular);
+    const filteredJoins = stellaFilterJoinRels(rels, live, otherTabular);
     rels = filteredJoins.keep;
 
     const joinAskCount = (f.intakeMessages || []).filter(m => (
@@ -8381,9 +8669,11 @@ ${stepInstruction}`;
       );
       const otherTabular = stellaOtherTabularFiles(tempId);
       if (isTabular && otherTabular.length) {
+        await stellaHydrateColumnValueProfiles(otherTabular);
+        const othersNow = stellaOtherTabularFiles(tempId);
         const joinQ = stellaJoinQuestion(
-          stellaGuessJoinCandidates({ id: tempId, columns: mergedColumns }, otherTabular),
-          otherTabular,
+          stellaGuessJoinCandidates({ id: tempId, columns: mergedColumns }, othersNow),
+          othersNow,
         );
         const alreadyJoin = questions.some((q) => /\b(join|related|shared (id|key)|territory, product)\b/i.test(q));
         if (joinQ && !alreadyJoin) questions.push(joinQ);
@@ -9400,7 +9690,7 @@ ${stepInstruction}`;
 
     if ((pendingProposalIntakeRef.current || pendingProposalIntake) && !currentWorkflow) {
       setInput('');
-      setMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+      setMessages((prev) => [...prev, { role: 'user', content: messageContent, kind: 'intake' }]);
       await continueProposalIntake(messageContent);
       return;
     }
@@ -10866,8 +11156,8 @@ ${stepInstruction}`;
 
               {renderHubAnswerDetail()}
 
-              <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit">
-                {[['general', 'General'], ['incentives', 'Incentives'], ['territory', 'Territory'], ['stella', 'Stella Insights']].map(([id, label]) => (
+              <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit flex-wrap">
+                {[['general', 'General'], ['context-map', 'Context Map'], ['incentives', 'Incentives'], ['territory', 'Territory'], ['stella', 'Stella Insights']].map(([id, label]) => (
                   <button
                     key={id}
                     type="button"
@@ -10884,6 +11174,7 @@ ${stepInstruction}`;
                   <>
                     <p className="text-xs text-blue-300/70 mb-5">
                       Company, industry, metrics, and terminology here apply across Incentive Comp, Territory, and Stella — not duplicated per tool. Link modules on the home page to share that tool’s files and data summaries between them.
+                      {' '}The <span className="text-cyan-200 font-semibold">Context Map</span> tab shows everything captured and how it connects.
                       {' '}Account company <span className="text-cyan-200 font-semibold">{resolveUserCompany(currentUser)}</span> isolates this user’s files under
                       {' '}<code className="text-cyan-300/80">{userSettingsRemotePath(currentUser)}</code>.
                       {' '}Chat history is <code className="text-cyan-300/80">{userChatsRemotePath(currentUser)}</code>.
@@ -11004,9 +11295,9 @@ ${stepInstruction}`;
                             Remember key facts from my chats (products, competitors, territories, definitions, and anything I ask to remember). When this is off, facts are kept but not sent to the AI.
                           </span>
                         </label>
-                        <p className="text-[11px] text-blue-300/45 mb-2">
-                          Saved only on this account in settings.json. Facts are tagged by the module you were in. Another module only receives them if you link the two on the home page. If a new fact contradicts one already remembered, the assistant will ask before updating and can mark the old fact as obsolete.
-                        </p>
+                          <p className="text-[11px] text-blue-300/45 mb-2">
+                            Saved only on this account in settings.json. File intake answers, joins, and column notes stay on the file — they are not added here. Facts are tagged by the module you were in. Another module only receives them if you link the two on the home page. If a new fact contradicts one already remembered, the assistant will ask before updating and can mark the old fact as obsolete.
+                          </p>
                         {userSettings.memoryEnabled === false && (
                           <div className="text-xs text-amber-200/70 border border-amber-400/20 rounded-lg px-3 py-2 mb-2">
                             Chat memory is off — existing facts are not passed as context.
@@ -11014,7 +11305,7 @@ ${stepInstruction}`;
                         )}
                         <div className={userSettings.memoryEnabled === false ? 'opacity-40 grayscale' : ''}>
                         {(userSettings.memory || []).length === 0 ? (
-                          <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet. Key facts from conversations appear here automatically.</div>
+                          <div className="text-xs text-blue-300/40 border border-blue-400/15 rounded-lg px-3 py-2">Nothing remembered yet. Key facts from conversations appear here automatically. File intake stays on the file.</div>
                         ) : (
                           <ul className="space-y-2 max-h-72 overflow-y-auto custom-scrollbar pr-1">
                             {(userSettings.memory || []).map((item) => {
@@ -11058,6 +11349,26 @@ ${stepInstruction}`;
                       </div>
                     </div>
                   </>
+                )}
+
+                {userSettingsPane === 'context-map' && (
+                  <MessageErrorBoundary
+                    fallback={
+                      <div className="bg-red-500/10 border border-red-400/25 rounded-xl p-4">
+                        <div className="text-sm font-semibold text-red-200 mb-1">Context map could not render</div>
+                        <div className="text-xs text-red-300/70">The rest of User Settings still works. Try General or reload.</div>
+                      </div>
+                    }
+                  >
+                    <ContextMap
+                      userSettings={userSettings}
+                      stellaDataFiles={stellaDataFiles}
+                      onOpenPane={(pane, extra) => {
+                        setUserSettingsPane(pane);
+                        if (pane === 'stella' && extra?.stellaTab) setStellaSettingsTab(extra.stellaTab);
+                      }}
+                    />
+                  </MessageErrorBoundary>
                 )}
 
                 {userSettingsPane === 'incentives' && (
@@ -11220,7 +11531,7 @@ ${stepInstruction}`;
                   }}
                 />
 
-                {userSettingsPane !== 'stella' && (
+                {!['stella', 'context-map'].includes(userSettingsPane) && (
                 <div className="flex flex-wrap items-center gap-3 mt-6">
                   <button
                     onClick={() => saveUserSettings(userSettings)}
@@ -11867,6 +12178,9 @@ ${stepInstruction}`;
                 <p className="text-xs text-amber-100/90 mt-3">
                   {stellaJoinPending.assess?.thisLabel} → {stellaJoinPending.assess?.thatLabel}
                 </p>
+                {stellaJoinPending.assess?.examples ? (
+                  <p className="text-xs text-cyan-100/80 mt-2 font-mono">{stellaJoinPending.assess.examples}</p>
+                ) : null}
                 {(stellaJoinPending.assess?.warnings || []).length ? (
                   <ul className="mt-2 space-y-1 text-xs text-amber-200/85 list-disc pl-4">
                     {stellaJoinPending.assess.warnings.map((w) => <li key={w}>{w}</li>)}

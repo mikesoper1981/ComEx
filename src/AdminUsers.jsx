@@ -765,7 +765,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                       </span>
                     </label>
                     <p className="text-[11px] text-blue-300/45 mb-2">
-                      Captured from this user&apos;s own chats (not by opening this screen). You can turn memory off or delete a fact.
+                      Captured from this user&apos;s own chats (not by opening this screen). File intake answers, joins, and column notes stay on the file — they are not added here. You can turn memory off or delete a fact.
                     </p>
                     {editGeneral.memoryEnabled === false && (
                       <div className="text-xs text-amber-200/70 border border-amber-400/20 rounded-lg px-3 py-2 mb-2">

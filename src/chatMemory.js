@@ -18,12 +18,13 @@ NEVER save conversation-specific or this-session detail, including:
 - This-chat objectives, scenarios, or "increase target to X% of baseline"
 - Counts, scores, ranges, or numbers from a file or this analysis
 - Recommendations, working assumptions, or what they want to do in this conversation
+- File intake / dataset structure: column meanings, joins, grain (what one row is), uploaded file names, SQL table names, or Q&A from the intake assistant. Those live on the file, not in chat memory.
 
 When in doubt return {"facts":[],"conflicts":[]}. Prefer names and definitions over numbers. Max 2 new facts.
 
 ENRICHMENT vs REPLACEMENT (mandatory):
 - Local / UK / country names, aliases, "X is the name for Y", "map X to Y", SKU/code mappings, and "also known as" ENRICH an existing product/brand list. Put them in facts. NEVER put them in conflicts against a remembered product list — they do not replace those products.
-- File-intake interpretive context (name maps, definitions, how to read a column) is already stored. Do not emit those as conflicts.
+- File-intake interpretive context (name maps, definitions, how to read a column, joins) is already stored on the file. Do not emit those as facts or conflicts.
 - Conflicts ONLY when the user is replacing a standing identity (they no longer work on product A; the product is now B — mutually exclusive, not an extra name).
 
 If a new durable fact truly contradicts an already remembered fact (same exclusive identity, different value), do NOT put it in facts. Put it in conflicts with a short confirmation question.
@@ -293,6 +294,34 @@ export function factsShareMemoryTopic(a, b) {
   return !!(ta && ta === topic(b));
 }
 
+/** True when the text is file intake / dataset structure, not standing chat memory. */
+export function isFileOrIntakeMemoryFact(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (/\bstella_data_[a-z0-9_]+\b/i.test(t)) return true;
+  if (/\.(xlsx|xls|csv|json)\b/i.test(t)) return true;
+  if (/\b(this_field|related_field|related_table|captured context)\b/i.test(t)) return true;
+  if (/\b(join|joined|joining)\b/i.test(t) && /\b(column|field|table|dataset|file|key)\b/i.test(t)) return true;
+  if (/\b(uploaded (file|dataset)|this (file|dataset|table|spreadsheet|workbook)|each row (is|represents)|one row (is|represents)|row grain|grain of (this )?(file|table|dataset))\b/i.test(t)) return true;
+  if (/\b(intake|onboarding) (question|answer|assistant)\b/i.test(t)) return true;
+  if (/\bstored joins?\b/i.test(t)) return true;
+  if (/\b(column|field)s?\b/i.test(t) && /\b(contains?|holds?|header|sql name|what (it|they) (contain|mean))\b/i.test(t)) return true;
+  if (/\bmatches\b/i.test(t) && /\b(column|field)\b/i.test(t)) return true;
+  return false;
+}
+
+/** Drop file-intake / dataset-structure items that do not belong in chat memory. */
+export function stripFileIntakeFromMemory(memory, fileFacts = []) {
+  const known = (fileFacts || [])
+    .map((f) => String(f || '').replace(/\s+/g, ' ').trim())
+    .filter((f) => f.length >= 12);
+  return normalizeMemoryItems(memory).filter((item) => {
+    if (isFileOrIntakeMemoryFact(item.text)) return false;
+    if (known.some((k) => factsAreSimilar(k, item.text))) return false;
+    return true;
+  });
+}
+
 /** True when the text adds an alias / local name / mapping rather than replacing an identity. */
 export function isMemoryEnrichmentFact(text) {
   const t = String(text || '');
@@ -388,6 +417,7 @@ export function isDurableMemoryFact(text, { allowExplicit = false } = {}) {
   const t = String(text || '').replace(/\s+/g, ' ').trim();
   if (t.length < 16) return false;
   if (allowExplicit) return true;
+  if (isFileOrIntakeMemoryFact(t)) return false;
   if (/\b(in this (chat|session|analysis|conversation|workflow)|for this (analysis|assessment|review|chat))\b/i.test(t)) return false;
   if (/\b(last|past|previous|this|current|next) (\d+ )?(quarter|quarters|month|months|week|weeks|year|years)\b/i.test(t)) return false;
   if (/\b(ytd|year[- ]to[- ]date|trailing)\b/i.test(t)) return false;
@@ -436,7 +466,7 @@ export function chatsFromDocument(doc) {
 export function compactChatsForMemory(chats) {
   const parts = [];
   for (const chat of (chats || []).slice(0, 20)) {
-    const msgs = (chat.messages || []).filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator'));
+    const msgs = (chat.messages || []).filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator') && m.kind !== 'intake' && m.kind !== 'memory-confirm');
     const wf = chat.currentWorkflow;
     const fileName = clipTurn(chat.uploadedFile?.name, 120);
     const focused = clipTurn(wf?.focusedContext, 1400);
@@ -483,7 +513,7 @@ export function buildHarvestExchange({ assistantText = '', userText = '', recent
     .join('\n');
   const intake = (knownFileFacts || []).map((f) => String(f || '').replace(/\s+/g, ' ').trim()).filter((f) => f.length >= 8);
   const intakeBlock = intake.length
-    ? `\n\nAlready stored from file intake (interpretive context — do NOT emit as conflicts; aliases/name maps ENRICH remembered product lists, they do not replace them):\n${intake.slice(0, 20).map((f) => `- ${f}`).join('\n')}`
+    ? `\n\nAlready stored from file intake (file context only — do NOT save as chat memory facts or conflicts):\n${intake.slice(0, 20).map((f) => `- ${f}`).join('\n')}`
     : '';
   return `Recent assistant message (may be empty):\n${String(assistantText || '').slice(0, 2500)}\n\nUser said:\n${String(userText || '').slice(0, 2500)}${recent ? `\n\nEarlier turns in this chat:\n${recent.slice(0, 3500)}` : ''}${formatKnownMemory(existingMemory)}${intakeBlock}`;
 }

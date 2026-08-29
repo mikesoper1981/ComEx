@@ -358,7 +358,8 @@ export function mergeStellaPrompts(partial) {
   if (/You are the Stella Insights data intake agent/i.test(out.intake)
       && (/key metrics \/ important fields/i.test(out.intake)
         || /how the data should be interpreted/i.test(out.intake)
-        || !/name_maps/i.test(out.intake))) {
+        || !/name_maps/i.test(out.intake)
+        || !/sample VALUES overlap/i.test(out.intake))) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
   }
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)
