@@ -11041,13 +11041,29 @@ ${stepInstruction}`;
           {activeTab === 'chat' ? (
             <div className="flex gap-3 h-full min-h-0">
               {renderChatHistorySidebar()}
-              <div className="flex flex-col h-full min-w-0 flex-1">
+              <div className="flex flex-col h-full min-w-0 flex-1 overflow-hidden">
+              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-3">
+                    <DollarSign className="w-6 h-6" />
+                    <div>
+                      <h2 className="text-xl font-bold">Incentive Compensation</h2>
+                      <p className="text-cyan-100 text-xs">Design, assess and optimise sales incentive schemes</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={() => setMobileChatHistoryOpen(true)} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
+                      <History className="w-4 h-4" /> Chats
+                    </button>
+                    <button type="button" onClick={startNewChat} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
+                      <Plus className="w-4 h-4" /> New
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               {/* Quick Actions */}
               <div className="flex flex-wrap gap-2 mb-3 flex-shrink-0">
-                <button type="button" onClick={() => setMobileChatHistoryOpen(true)} className="md:hidden flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/40 rounded-lg text-xs text-blue-100 font-semibold">
-                  <History className="w-3.5 h-3.5" /> Chats{recentChats(chatSessions).length ? ` (${recentChats(chatSessions).length})` : ''}
-                </button>
-                <button type="button" onClick={startNewChat} className="md:hidden flex items-center gap-1.5 px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 border border-blue-400/40 rounded-lg text-xs text-blue-100 font-semibold"><Plus className="w-3.5 h-3.5" /> New chat</button>
                 <button onClick={() => setInput('I need to design an incentive scheme for a team of 10 AEs.')} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-300 hover:text-blue-200 transition-all"><Target className="w-3.5 h-3.5" /> Design New Scheme</button>
                 <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-300 hover:text-cyan-200 transition-all"><Upload className="w-3.5 h-3.5" /> Assess Proposal</button>
                 <button onClick={() => setInput('What are the key principles for designing effective sales incentive schemes?')} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-300 hover:text-purple-200 transition-all"><Award className="w-3.5 h-3.5" /> Best Practices</button>
@@ -11593,7 +11609,6 @@ ${stepInstruction}`;
                     <button type="button" onClick={startNewChat} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
                       <Plus className="w-4 h-4" /> New
                     </button>
-                    <button onClick={() => { setShowLanding(false); setActiveTab('user-settings'); setUserSettingsPane('stella'); setStellaSettingsTab('connections'); setStellaConnectionsTab('files'); }} className="flex items-center gap-2 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold transition-all"><Settings className="w-4 h-4" /> Manage data & context</button>
                   </div>
                 </div>
               </div>
