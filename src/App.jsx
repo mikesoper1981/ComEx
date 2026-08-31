@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense, Component } from 'react';
 import { createPortal } from 'react-dom';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Undo2 } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2 } from 'lucide-react';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
@@ -717,19 +717,28 @@ const ACTIVE_HUB_MODULES = [
   {
     id: 'incentives',
     tab: 'chat',
+    settingsPane: 'incentives',
     title: 'Incentive Compensation',
+    short: 'Incentives',
     desc: 'Design, assess and optimise sales incentive schemes.',
     Icon: DollarSign,
+    fill: '#38bdf8',
+    angle: (5 * Math.PI) / 6,
     ring: 'border-blue-400/30 hover:border-blue-400/60',
     shadow: 'hover:shadow-blue-500/10',
     iconBg: 'bg-gradient-to-br from-blue-500 to-cyan-500',
+    pptxTemplate: true,
   },
   {
     id: 'territory',
     tab: 'territory',
+    settingsPane: 'territory',
     title: 'Territory Design',
+    short: 'Territory',
     desc: 'Assess and optimise territory structures.',
     Icon: MapIcon,
+    fill: '#34d399',
+    angle: -Math.PI / 2,
     ring: 'border-emerald-400/30 hover:border-emerald-400/60',
     shadow: 'hover:shadow-emerald-500/10',
     iconBg: 'bg-gradient-to-br from-emerald-500 to-teal-500',
@@ -737,12 +746,18 @@ const ACTIVE_HUB_MODULES = [
   {
     id: 'stella',
     tab: 'stella',
+    settingsPane: 'stella',
     title: 'Stella Insights',
+    short: 'Stella',
     desc: 'Chat with your data, run analysis and generate charts.',
     Icon: Layers,
+    fill: '#22d3ee',
+    angle: Math.PI / 6,
     ring: 'border-cyan-400/30 hover:border-cyan-400/60',
     shadow: 'hover:shadow-cyan-500/10',
     iconBg: 'bg-gradient-to-br from-cyan-500 to-blue-500',
+    goalsKey: 'keyGoals',
+    dataFiles: true,
   },
 ];
 
@@ -1434,6 +1449,29 @@ function stellaApplyRowSampleToColumns(columns, rows) {
   });
 }
 
+function stellaPreviewRowsFromData(rows, limit = 5) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+  return rows.slice(0, limit).map((r) => {
+    if (r && typeof r === 'object' && !Array.isArray(r)) return r;
+    return { value: r };
+  });
+}
+
+function stellaPreviewRowsFromColumns(columns, limit = 5) {
+  const cols = Array.isArray(columns) ? columns.filter((c) => c && (c.name || c.original)) : [];
+  if (!cols.length) return [];
+  const n = Math.min(limit, Math.max(0, ...cols.map((c) => (Array.isArray(c.samples) ? c.samples.length : 0))));
+  if (!n) return [];
+  return Array.from({ length: n }, (_, i) => {
+    const row = {};
+    for (const c of cols) {
+      const key = c.name || c.original;
+      row[key] = Array.isArray(c.samples) ? (c.samples[i] ?? '') : '';
+    }
+    return row;
+  });
+}
+
 function stellaFileNeedsValueProfile(file) {
   const cols = Array.isArray(file?.columns) ? file.columns : [];
   if (!file?.tableName || !cols.length) return false;
@@ -1695,7 +1733,39 @@ function stellaAssessJoin(fromFile, toFile, thisField, relatedField) {
     thisLabel: `${thisField}${a.type ? ` [${a.type}]` : ''}${a.kind ? ` · ${a.kind}` : ''}`,
     thatLabel: `${relatedField}${b.type ? ` [${b.type}]` : ''}${b.kind ? ` · ${b.kind}` : ''}`,
     examples,
+    thisField,
+    thatField: relatedField,
+    thisFile: fromFile?.name || 'File',
+    thatFile: toFile?.name || 'File',
+    thisType: a.type || '',
+    thatType: b.type || '',
+    thisKind: a.kind || '',
+    thatKind: b.kind || '',
+    thisSamples: Array.isArray(a.samples) ? a.samples.slice(0, 8) : [],
+    thatSamples: Array.isArray(b.samples) ? b.samples.slice(0, 8) : [],
   };
+}
+
+function StellaJoinColumnPreview({ fileName, field, type, kind, samples }) {
+  const list = (samples || []).map((v) => String(v ?? '').trim()).filter(Boolean).slice(0, 6);
+  return (
+    <div className="bg-slate-950/55 border border-white/10 rounded-lg px-3 py-2.5 min-w-0">
+      <div className="text-[10px] uppercase tracking-wide text-blue-300/50 font-semibold truncate">{fileName || 'File'}</div>
+      <div className="text-xs text-white font-semibold mt-0.5 truncate" title={field}>{field}</div>
+      <div className="text-[10px] text-cyan-200/75 mt-0.5">
+        {[type, kind].filter(Boolean).join(' · ') || 'type unknown'}
+      </div>
+      {list.length ? (
+        <ul className="mt-2 space-y-0.5">
+          {list.map((v, i) => (
+            <li key={`${v}-${i}`} className="text-[11px] text-slate-200 font-mono truncate" title={v}>{v}</li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[11px] text-blue-300/45 mt-2">No sample values yet</p>
+      )}
+    </div>
+  );
 }
 
 function stellaFilterJoinRels(rels, thisFile, otherFiles) {
@@ -3988,6 +4058,7 @@ function stellaMapRegistryRow(row) {
     textStoragePath: row.storage_path ? stellaExtractedTextPath(row.storage_path) : null,
     storageBucket: null,
     columns: Array.isArray(row.columns) ? row.columns : [],
+    previewRows: stellaPreviewRowsFromColumns(Array.isArray(row.columns) ? row.columns : [], 5),
     rowCount: row.row_count ?? null,
     summary: row.summary || '',
     capturedContext: ctx,
@@ -4442,6 +4513,7 @@ export default function CommercialExcellenceApp() {
   }, [stellaJoinPending]);
   const [activeStellaDataId, setActiveStellaDataId] = useState(null);
   const [stellaIntakeInput, setStellaIntakeInput] = useState('');
+  const [stellaIntakeMinimized, setStellaIntakeMinimized] = useState(false);
   const [stellaBusinessContext, setStellaBusinessContext] = useState(() => mergeStellaBusinessContext({}));
   const [stellaBizSaveStatus, setStellaBizSaveStatus] = useState('idle'); // idle | saving | saved | error
   const [userSettings, setUserSettings] = useState(() => mergeUserSettingsFields({}));
@@ -5012,6 +5084,11 @@ export default function CommercialExcellenceApp() {
     activeChatIdRef.current = activeChatId;
     chatSessionsRef.current = chatSessions;
   });
+
+  useEffect(() => {
+    const f = (stellaDataFilesRef.current || []).find((x) => x.id === activeStellaDataId);
+    setStellaIntakeMinimized(!!(f && !f.processing && (f.capturedContext || f.intakeComplete)));
+  }, [activeStellaDataId]);
 
   useEffect(() => {
     if (!isAdmin && activeTab === 'admin') {
@@ -8265,11 +8342,19 @@ ${stepInstruction}`;
         const prevById = new globalThis.Map(prev.filter(f => f.dbId).map(f => [f.dbId, f]));
         const merged = mapped.map(m => {
           const p = prevById.get(m.dbId);
-          // Keep a live (unsaved) intake conversation if it's ahead of the DB copy.
-          if (p && !p.intakeComplete && (p.intakeMessages?.length || 0) > (m.intakeMessages?.length || 0)) {
-            return { ...m, intakeMessages: p.intakeMessages, capturedContext: p.capturedContext || m.capturedContext };
-          }
-          return m;
+          const keepLive = p && !p.intakeComplete && (p.intakeMessages?.length || 0) > (m.intakeMessages?.length || 0);
+          const next = keepLive
+            ? { ...m, intakeMessages: p.intakeMessages, capturedContext: p.capturedContext || m.capturedContext }
+            : m;
+          return {
+            ...next,
+            previewRows: (p?.previewRows?.length ? p.previewRows : next.previewRows) || [],
+            extractedText: p?.extractedText || next.extractedText || '',
+            columns: (Array.isArray(p?.columns) && p.columns.some((c) => c?.samples?.length)
+              && !(next.columns || []).some((c) => c?.samples?.length))
+              ? p.columns
+              : next.columns,
+          };
         });
         const temps = prev.filter(f => !f.dbId);
         return [...merged, ...temps];
@@ -8379,7 +8464,7 @@ ${stepInstruction}`;
         const rows = Array.isArray(data.rows) ? data.rows : [];
         if (!rows.length) continue;
         const columns = stellaApplyRowSampleToColumns(f.columns, rows);
-        patched.set(f.id, columns);
+        patched.set(f.id, { columns, previewRows: stellaPreviewRowsFromData(rows, 5) });
         if (f.dbId) {
           try { await stellaUpdateRegistry(f.dbId, { columns }); } catch { /* ignore */ }
         }
@@ -8388,7 +8473,7 @@ ${stepInstruction}`;
     if (!patched.size) return (stellaDataFilesRef.current || []);
     let result = stellaDataFilesRef.current || [];
     setStellaDataFiles((prev) => {
-      const next = (prev || []).map((f) => (patched.has(f.id) ? { ...f, columns: patched.get(f.id) } : f));
+      const next = (prev || []).map((f) => (patched.has(f.id) ? { ...f, ...patched.get(f.id) } : f));
       stellaDataFilesRef.current = next;
       result = next;
       return next;
@@ -8521,6 +8606,7 @@ ${stepInstruction}`;
     const maps = stellaCollectNameMaps(ctx, intakeMessages);
     const nextCtx = maps.length ? { ...ctx, name_maps: maps } : ctx;
     stellaPatchLocal(fileRec.id, { intakeMessages, capturedContext: nextCtx, intakeComplete: true });
+    setStellaIntakeMinimized(true);
     try {
       if (fileRec.dbId) await stellaUpdateRegistry(fileRec.dbId, { context_qa: nextCtx });
     } catch (e) {
@@ -8944,11 +9030,16 @@ ${stepInstruction}`;
       const qBlock = questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
       const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nTo interpret this correctly I need a little context:\n\n${qBlock}\n\nYou can answer them all together or one at a time.`;
 
+      const profiledColumns = isTabular
+        ? stellaApplyRowSampleToColumns(mergedColumns, records.slice(0, 400))
+        : mergedColumns;
       const finalFile = {
         id: dbId, dbId,
         name: file.name, type: kind, fileType: kind,
         size: rowCount != null ? `${rowCount} rows` : `${(file.size / 1024).toFixed(1)} KB`,
-        columns: mergedColumns, rowCount,
+        columns: profiledColumns, rowCount,
+        previewRows: isTabular ? stellaPreviewRowsFromData(records, 5) : [],
+        extractedText: isTabular ? '' : sampleText,
         summary, capturedContext: null, dataProfile,
         tableName, storagePath, storageBucket,
         textStoragePath: storagePath ? stellaExtractedTextPath(storagePath) : null,
@@ -9122,15 +9213,42 @@ ${stepInstruction}`;
 
       <div className="w-full lg:w-3/5">
         <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5">
-          <div className="text-sm font-bold text-white mb-1">Intake assistant</div>
-          <div className="text-xs text-blue-300/60 mb-4">Answer questions about this file&apos;s structure — columns, what they contain, and how it joins to other files. Not metrics or analysis.</div>
-
           {(() => {
             const f = stellaDataFiles.find(x => x.id === activeStellaDataId);
-            if (!f) return <div className="text-sm text-blue-300/60">Select a dataset on the left.</div>;
-            const intake = f.intakeMessages || [];
+            const intake = f?.intakeMessages || [];
+            const captured = !!(f && (f.capturedContext || f.intakeComplete) && !f.processing);
+            const minimized = stellaIntakeMinimized && captured;
             return (
-              <div className="space-y-3">
+              <>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-bold text-white">Intake assistant</div>
+                    {!minimized ? (
+                      <div className="text-xs text-blue-300/60 mt-1">Answer questions about this file&apos;s structure — columns, what they contain, and how it joins to other files. Not metrics or analysis.</div>
+                    ) : (
+                      <div className="text-xs text-blue-300/60 mt-1">Context captured. Expand to add or update notes for this file.</div>
+                    )}
+                  </div>
+                  {f && captured ? (
+                    <button
+                      type="button"
+                      onClick={() => setStellaIntakeMinimized((v) => !v)}
+                      className="flex-shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-cyan-200 bg-slate-900/60 border border-cyan-400/25 hover:bg-cyan-500/15 flex items-center gap-1.5"
+                    >
+                      {minimized ? <ChevronDown className="w-3.5 h-3.5" /> : <Minimize2 className="w-3.5 h-3.5" />}
+                      {minimized ? 'Update context' : 'Minimise'}
+                    </button>
+                  ) : null}
+                </div>
+
+                {minimized ? (
+                  <div className="mt-3 text-xs text-slate-300 bg-slate-900/40 border border-emerald-400/20 rounded-lg px-3 py-2">
+                    {String(f.capturedContext?.what_it_represents || f.summary || 'File context is stored. Use Update context if you need to change it.').replace(/\s+/g, ' ').trim().slice(0, 180)}
+                  </div>
+                ) : !f ? (
+                  <div className="text-sm text-blue-300/60 mt-3">Select a dataset on the left.</div>
+                ) : (
+              <div className="space-y-3 mt-4">
                 <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4 max-h-[420px] overflow-y-auto custom-scrollbar space-y-3">
                   {intake.length === 0 ? (
                     <div className="text-sm text-blue-300/60">Upload processing…</div>
@@ -9196,6 +9314,8 @@ ${stepInstruction}`;
                   </details>
                 )}
               </div>
+                )}
+              </>
             );
           })()}
         </div>
@@ -9513,16 +9633,21 @@ ${stepInstruction}`;
 
     setStellaIsLoading(true);
     if (!skipPost) {
-      setStellaMessages((prev) => [...prev, { role: 'user', content: messageContent }]);
+      setStellaMessages((prev) => {
+        const next = [...prev, { role: 'user', content: messageContent }];
+        stellaMessagesRef.current = next;
+        return next;
+      });
       setStellaInput('');
     }
 
     if (!skipHarvest && shouldHarvestChatMemory('', messageContent) && !/\?/.test(messageContent)) {
-      const priorAsk = [...stellaMessages].reverse().find((m) => m.role === 'assistant');
+      const threadNow = stellaMessagesRef.current || [];
+      const priorAsk = [...threadNow].reverse().find((m) => m.role === 'assistant');
       const harvested = await harvestChatMemory(
         priorAsk?.content,
         messageContent,
-        recentChatTurnsForMemory([...(stellaMessages || []), { role: 'user', content: messageContent }]),
+        recentChatTurnsForMemory(threadNow),
         { thread: 'stella' },
       );
       if (harvested?.conflict || memoryPendingFor('stella')) {
@@ -9612,10 +9737,11 @@ ${stepInstruction}`;
       }
 
       const cleaned = stellaStripSqlBlocks(finalText) || finalText || 'I couldn\'t find enough to answer that from the available data.';
-      setStellaMessages(prev => [...prev, { role: 'assistant', content: cleaned, steps }]);
+      const withReply = [...(stellaMessagesRef.current || []), { role: 'assistant', content: cleaned, steps }];
+      stellaMessagesRef.current = withReply;
+      setStellaMessages(withReply);
       if (!skipHarvest && shouldHarvestChatMemory(cleaned, messageContent)) {
-        const priorAsk = [...stellaMessages].reverse().find((m) => m.role === 'assistant');
-        void harvestChatMemory(priorAsk?.content, messageContent, recentChatTurnsForMemory(stellaMessages), { thread: 'stella' });
+        await harvestChatMemory(cleaned, messageContent, recentChatTurnsForMemory(withReply), { thread: 'stella' });
       }
     } catch (error) {
       setStellaMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: Unable to process request.\n\n${error?.message || 'Unknown error'}` }]);
@@ -11502,6 +11628,7 @@ ${stepInstruction}`;
                     }
                   >
                     <ContextMap
+                      hubModules={ACTIVE_HUB_MODULES}
                       userSettings={userSettings}
                       stellaDataFiles={stellaDataFiles}
                       userName={currentUser.name}
@@ -12320,7 +12447,7 @@ ${stepInstruction}`;
           onClick={() => setStellaJoinPending(null)}
         >
           <div
-            className={`w-full max-w-md bg-slate-900 rounded-2xl shadow-2xl p-5 border ${stellaJoinPending.action === 'add' ? 'border-amber-400/35' : 'border-red-400/30'}`}
+            className={`w-full max-w-xl bg-slate-900 rounded-2xl shadow-2xl p-5 border ${stellaJoinPending.action === 'add' ? 'border-amber-400/35' : 'border-red-400/30'}`}
             onClick={(e) => e.stopPropagation()}
           >
             {stellaJoinPending.action === 'add' ? (
@@ -12329,11 +12456,24 @@ ${stepInstruction}`;
                   {stellaJoinPending.assess?.verdict === 'block' ? 'This join looks wrong' : 'Check this connection'}
                 </h3>
                 <p className="text-xs text-cyan-100 mt-3 font-mono leading-relaxed">{stellaJoinActionLabel(stellaJoinPending)}</p>
-                <p className="text-xs text-amber-100/90 mt-3">
-                  {stellaJoinPending.assess?.thisLabel} → {stellaJoinPending.assess?.thatLabel}
-                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
+                  <StellaJoinColumnPreview
+                    fileName={stellaJoinPending.assess?.thisFile || stellaJoinPending.fromName}
+                    field={stellaJoinPending.assess?.thisField || stellaJoinPending.thisField}
+                    type={stellaJoinPending.assess?.thisType}
+                    kind={stellaJoinPending.assess?.thisKind}
+                    samples={stellaJoinPending.assess?.thisSamples}
+                  />
+                  <StellaJoinColumnPreview
+                    fileName={stellaJoinPending.assess?.thatFile || stellaJoinPending.toName}
+                    field={stellaJoinPending.assess?.thatField || stellaJoinPending.relatedField}
+                    type={stellaJoinPending.assess?.thatType}
+                    kind={stellaJoinPending.assess?.thatKind}
+                    samples={stellaJoinPending.assess?.thatSamples}
+                  />
+                </div>
                 {stellaJoinPending.assess?.examples ? (
-                  <p className="text-xs text-cyan-100/80 mt-2 font-mono">{stellaJoinPending.assess.examples}</p>
+                  <p className="text-xs text-cyan-100/80 mt-2 font-mono">Shared values{stellaJoinPending.assess.examples}</p>
                 ) : null}
                 {(stellaJoinPending.assess?.warnings || []).length ? (
                   <ul className="mt-2 space-y-1 text-xs text-amber-200/85 list-disc pl-4">
