@@ -20,6 +20,12 @@ function allowedUserFile(raw) {
   return 'settings.json';
 }
 
+function storedChatCount(parsed) {
+  if (!parsed || typeof parsed !== 'object') return 0;
+  const chats = parsed.chats || parsed.settings?.chats;
+  return Array.isArray(chats) ? chats.filter((c) => c && c.id).length : 0;
+}
+
 function chatHasUserContent(messages) {
   return (Array.isArray(messages) ? messages : []).some(
     (m) => m && m.role === 'user' && String(m.content || '').trim(),
@@ -173,30 +179,54 @@ module.exports = async function handler(req, res) {
     const writePath = objectPath(folderUser, file);
     if (req.method === 'GET') {
       const candidates = objectPathCandidates(folderUser, file);
+      const isChatsFile = file === 'chats.json' || file === 'chats-index.json';
       let found = null;
+      let bestCount = -1;
       for (const candidate of candidates) {
         const hit = await downloadStorageJson(supabaseUrl, serviceKey, candidate);
         if (hit.parsed && typeof hit.parsed === 'object' && hit.upstream.ok) {
-          found = { path: candidate, parsed: hit.parsed };
-          break;
+          const n = storedChatCount(hit.parsed);
+          if (!found || (isChatsFile && n > bestCount) || (!isChatsFile && bestCount < 0)) {
+            found = { path: candidate, parsed: hit.parsed };
+            bestCount = n;
+          }
+          if (!isChatsFile) break;
         }
       }
-      if (found) {
-        return res.status(200).json({ path: found.path, document: found.parsed });
-      }
-      if (file === 'chats-index.json') {
+      if (isChatsFile && (!found || bestCount === 0)) {
         for (const chatsPath of objectPathCandidates(folderUser, 'chats.json')) {
           const chats = await downloadStorageJson(supabaseUrl, serviceKey, chatsPath);
           if (chats.parsed && typeof chats.parsed === 'object' && chats.upstream.ok) {
-            const index = chatsIndexFromDocument(chats.parsed);
-            if (index) {
-              uploadStorageJson(supabaseUrl, serviceKey, writePath, index).catch(() => {});
-              return res.status(200).json({ path: writePath, document: index, derived: true });
+            const n = storedChatCount(chats.parsed);
+            if (n > (bestCount < 0 ? 0 : bestCount)) {
+              const parsed = file === 'chats-index.json'
+                ? chatsIndexFromDocument(chats.parsed)
+                : chats.parsed;
+              if (parsed) {
+                found = { path: chatsPath, parsed };
+                bestCount = n;
+              }
             }
           }
         }
       }
+      if (found) {
+        if (isChatsFile && bestCount > 0 && found.path !== writePath) {
+          uploadStorageJson(supabaseUrl, serviceKey, writePath, found.parsed).catch(() => {});
+        }
+        return res.status(200).json({ path: found.path, document: found.parsed });
+      }
       return res.status(404).json({ error: { message: `${file} not found` }, path: writePath });
+    }
+
+    if ((file === 'chats.json' || file === 'chats-index.json') && storedChatCount(document) === 0) {
+      const candidates = objectPathCandidates(folderUser, file === 'chats-index.json' ? 'chats.json' : file);
+      for (const candidate of [writePath, ...candidates]) {
+        const hit = await downloadStorageJson(supabaseUrl, serviceKey, candidate);
+        if (storedChatCount(hit.parsed) > 0) {
+          return res.status(200).json({ ok: true, path: writePath, skippedEmpty: true });
+        }
+      }
     }
 
     const upstream = await uploadStorageJson(supabaseUrl, serviceKey, writePath, document);

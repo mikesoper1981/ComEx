@@ -16,6 +16,7 @@ import {
   userChatsIndexRemotePath,
   chatsIndexLocalKey,
   userSettingsRemotePathCandidates,
+  userJsonRemotePathCandidates,
   userStorageFolder,
   userPptxTemplateRemotePath,
   userProposalRemotePath,
@@ -601,14 +602,14 @@ async function uploadUserJson(user, doc, file = 'settings.json') {
       }),
     });
     if (res.ok) return;
-    if (res.status === 404) {
+    if (res.status === 404 || res.status >= 500) {
       await uploadUserJsonDirect(user, doc, file);
       return;
     }
     const data = await res.json().catch(() => ({}));
     throw new Error(data?.error?.message || `Could not save ${file} (${res.status})`);
   } catch (err) {
-    if (err?.name === 'TypeError' || /failed to fetch/i.test(String(err?.message || ''))) {
+    if (err?.name === 'TypeError' || /failed to fetch|not reachable|502/i.test(String(err?.message || ''))) {
       await uploadUserJsonDirect(user, doc, file);
       return;
     }
@@ -617,39 +618,69 @@ async function uploadUserJson(user, doc, file = 'settings.json') {
 }
 
 async function downloadUserJsonDocument(user, file = 'settings.json') {
-  const path = userJsonRemotePath(user, file);
   const q = new URLSearchParams({
     userId: String(user?.id || ''),
     userName: String(user?.name || ''),
     file,
   });
+  const isChatsFile = file === 'chats.json' || file === 'chats-index.json';
+  let apiDoc = null;
   try {
     const res = await fetch(`/api/user-settings?${q}`);
     if (res.ok) {
       const payload = await res.json();
-      const doc = payload?.document && typeof payload.document === 'object'
+      apiDoc = payload?.document && typeof payload.document === 'object'
         ? payload.document
         : (payload && typeof payload === 'object' && !payload.error ? payload : null);
-      if (doc) return doc;
     } else if (res.status === 404) {
-      return null;
-    } else {
+      apiDoc = null;
+    } else if (res.status < 500) {
       const data = await res.json().catch(() => ({}));
       const message = data?.error?.message || `Could not load ${file} (${res.status})`;
-      if (/object not found/i.test(message)) return null;
-      throw new Error(message);
+      if (/object not found/i.test(message)) apiDoc = null;
+      else throw new Error(message);
     }
   } catch (err) {
     if (err?.message && /Could not load /i.test(err.message)) throw err;
   }
-  try {
-    const { data, error } = await supabase.storage.from('intelligence').download(path);
-    if (!error && data) {
+  if (apiDoc && (!isChatsFile || storedChatCount(apiDoc) > 0)) return apiDoc;
+
+  const pickRicher = (current, next) => {
+    if (!next || typeof next !== 'object') return current;
+    if (!current) return next;
+    return storedChatCount(next) > storedChatCount(current) ? next : current;
+  };
+
+  let best = apiDoc;
+  for (const candidate of userJsonRemotePathCandidates(user, file)) {
+    try {
+      const { data, error } = await supabase.storage.from('intelligence').download(candidate);
+      if (error || !data) continue;
       const parsed = safeJsonParse(await data.text());
-      if (parsed) return parsed;
+      if (!parsed || typeof parsed !== 'object') continue;
+      if (!isChatsFile) return parsed;
+      best = pickRicher(best, parsed);
+    } catch { /* try next path */ }
+  }
+  if (isChatsFile && file === 'chats-index.json' && storedChatCount(best) === 0) {
+    for (const candidate of userJsonRemotePathCandidates(user, 'chats.json')) {
+      try {
+        const { data, error } = await supabase.storage.from('intelligence').download(candidate);
+        if (error || !data) continue;
+        const parsed = safeJsonParse(await data.text());
+        if (storedChatCount(parsed) > storedChatCount(best)) {
+          best = buildUserChatsIndexDocument(parsed.userId, parsed);
+        }
+      } catch { /* try next path */ }
     }
-  } catch { /* missing file */ }
-  return null;
+  }
+  return best;
+}
+
+function storedChatCount(parsed) {
+  if (!parsed || typeof parsed !== 'object') return 0;
+  const chats = parsed.chats || parsed.settings?.chats;
+  return Array.isArray(chats) ? chats.filter((c) => c && c.id).length : 0;
 }
 
 const userJsonUploadSlots = new Map();
@@ -4785,7 +4816,19 @@ export default function CommercialExcellenceApp() {
 
   const applyChatIndex = (indexChats, remoteActive) => {
     skipChatPersistRef.current = true;
-    const chats = Array.isArray(indexChats) ? indexChats : [];
+    let chats = Array.isArray(indexChats) ? indexChats : [];
+    if (!chats.length) {
+      const cached = readCachedChatIndex(currentUser.id);
+      if (cached.chats.length) {
+        chats = cached.chats;
+        remoteActive = remoteActive || cached.activeChatId;
+      }
+    }
+    if (!chats.length && (chatSessionsRef.current || []).length) {
+      setChatIndexLoading(false);
+      setTimeout(() => { skipChatPersistRef.current = false; }, 0);
+      return;
+    }
     chatSessionsRef.current = chats;
     setChatSessions(chats);
     writeCachedChatIndex(currentUser.id, { chats, activeChatId: remoteActive });
@@ -4815,13 +4858,18 @@ export default function CommercialExcellenceApp() {
       const live = (chatSessionsRef.current || []).find((c) => (
         c.id === liveId && Array.isArray(c.messages) && chatHasUserContent(c.messages)
       ));
-      const merged = remoteChats.map((c) => {
+      let merged = remoteChats.map((c) => {
         if (live && c.id === live.id && (live.messages?.length || 0) >= (c.messages?.length || 0)) {
           return { ...c, ...live };
         }
         return c;
       });
       if (live && !merged.some((c) => c.id === live.id)) merged.unshift(live);
+      if (!merged.length) {
+        const existing = (chatSessionsRef.current || []).filter((c) => c?.id);
+        const cached = readCachedChatIndex(currentUser.id).chats;
+        merged = existing.length ? existing : cached;
+      }
       chatsBodiesRef.current = merged;
       chatsFullLoadedRef.current = true;
       skipChatPersistRef.current = true;
@@ -5178,6 +5226,7 @@ export default function CommercialExcellenceApp() {
       const toSave = mergeChatListForPersist(next);
       const listed = (next || []).filter(chatIsListed);
       if (listed.some((c) => !toSave.some((s) => s.id === c.id))) return;
+      if (!toSave.length && (listed.length || readCachedChatIndex(currentUser.id).chats.length)) return;
       try {
         await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
@@ -5235,6 +5284,7 @@ export default function CommercialExcellenceApp() {
       const toSave = mergeChatListForPersist(next);
       const listed = (next || []).filter(chatIsListed);
       if (listed.some((c) => !toSave.some((s) => s.id === c.id))) return;
+      if (!toSave.length && (listed.length || readCachedChatIndex(currentUser.id).chats.length)) return;
       try {
         await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
@@ -6247,7 +6297,9 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       }
       const chatsToSave = mergeChatListForPersist(chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats);
       const listedChats = (chatSessionsRef.current || liveChats || []).filter(chatIsListed);
-      if (!listedChats.some((c) => !chatsToSave.some((s) => s.id === c.id))) {
+      const knownChats = listedChats.length || readCachedChatIndex(currentUser.id).chats.length;
+      if (!listedChats.some((c) => !chatsToSave.some((s) => s.id === c.id))
+          && (chatsToSave.length || !knownChats)) {
         void queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
           {
@@ -6396,6 +6448,13 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       const chats = mergeChatListForPersist(list);
       const listed = (list || []).filter(chatIsListed);
       if (listed.some((c) => !chats.some((s) => s.id === c.id))) return;
+      if (!chats.length) {
+        const known = listed.length
+          || (chatSessionsRef.current || []).filter(chatIsListed).length
+          || readCachedChatIndex(currentUser.id).chats.length
+          || (chatsBodiesRef.current || []).filter(chatIsListed).length;
+        if (known) return;
+      }
       await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
         currentUser.id,
         {

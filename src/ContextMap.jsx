@@ -171,6 +171,32 @@ function previewRowsFromColumns(columns, limit = 5) {
   });
 }
 
+function uniqueJoinPairs(joins) {
+  const map = new Map();
+  for (const j of joins || []) {
+    if (!j?.fromId || !j?.toId || j.fromId === j.toId) continue;
+    const key = [j.fromId, j.toId].sort().join('|');
+    if (!map.has(key)) map.set(key, { fromId: j.fromId, toId: j.toId, count: 0 });
+    map.get(key).count += 1;
+  }
+  return [...map.values()];
+}
+
+function joinTouchCount(joins, fileId) {
+  return (joins || []).filter((j) => j.fromId === fileId || j.toId === fileId).length;
+}
+
+function joinEndpointNodeId(mod, fileId, nodes, nodeByFile, focus) {
+  const fileNode = nodeByFile.get(fileId);
+  if (fileNode) return fileNode;
+  const f = moduleFiles(mod).find((x) => x.id === fileId);
+  if (!f) return null;
+  const k = kindOfFile(f);
+  if (focus.kind && k === focus.kind) return null;
+  const kindNode = nodes.find((n) => n.moduleId === mod.id && n.kindKey === k && !n.fileId);
+  return kindNode?.id || null;
+}
+
 function stellaJoinEdges(files) {
   const list = (files || []).filter((f) => f && !f.processing);
   const byTable = new Map();
@@ -427,8 +453,9 @@ function placeLeaves(nodes, edges, parentId, parent, leaves, fallbackAngle, save
   });
 }
 
-function fileNodeSpec(f) {
+function fileNodeSpec(f, joins = []) {
   const kind = kindOfFile(f);
+  const n = joinTouchCount(joins, f.id);
   return {
     id: f.nodeId,
     kind: kind === 'powerpoint' ? 'pptx' : (kind === 'excel' || kind === 'csv' || kind === 'json' ? 'data' : 'file'),
@@ -436,7 +463,9 @@ function fileNodeSpec(f) {
     kindKey: kind,
     fileId: f.id,
     title: clip(f.name, 40),
-    subtitle: f.kindLabel || kindMeta(kind).title,
+    subtitle: n
+      ? `${f.kindLabel || kindMeta(kind).title} · ${n} join${n === 1 ? '' : 's'}`
+      : (f.kindLabel || kindMeta(kind).title),
     w: 188,
     h: 62,
   };
@@ -560,7 +589,7 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
         ? kinds.map((k) => {
             const kindJoins = (mod.joins || []).filter((e) => {
               const ids = new Set(k.files.map((f) => f.id));
-              return ids.has(e.fromId) && ids.has(e.toId);
+              return ids.has(e.fromId) || ids.has(e.toId);
             }).length;
             return {
               id: `${mod.id}-kind-${k.id}`,
@@ -573,7 +602,7 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
               h: 52,
             };
           })
-        : moduleFiles(mod).map(fileNodeSpec);
+        : moduleFiles(mod).map((f) => fileNodeSpec(f, mod.joins));
       placeLeaves(nodes, edges, groupNode.id, groupNode, kindLeaves, mod.angle, pos, live, hubNode);
 
       if (focus.kind) {
@@ -581,7 +610,7 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
         const kind = kinds.find((k) => k.id === focus.kind);
         const list = kind ? kind.files : moduleFiles(mod).filter((f) => kindOfFile(f) === focus.kind);
         const paged = pageSlice(list, leafPage);
-        placeLeaves(nodes, edges, kindNode.id, kindNode, paged.items.map(fileNodeSpec), mod.angle, pos, live, hubNode);
+        placeLeaves(nodes, edges, kindNode.id, kindNode, paged.items.map((f) => fileNodeSpec(f, mod.joins)), mod.angle, pos, live, hubNode);
 
         if (focus.fileId) {
           const selected = nodes.find((n) => n.fileId === focus.fileId);
@@ -592,7 +621,7 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
             if (nodes.some((n) => n.fileId === otherId)) continue;
             const other = moduleFiles(mod).find((f) => f.id === otherId);
             if (!other) continue;
-            const spec = fileNodeSpec(other);
+            const spec = fileNodeSpec(other, mod.joins);
             const placed = applySavedAndLive({
               ...spec,
               x: (selected?.x || kindNode.x) + 200,
@@ -613,15 +642,37 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
 
   const nodeByFile = new Map(nodes.filter((n) => n.fileId).map((n) => [n.fileId, n.id]));
   const joinEdges = [];
-  if (focus.fileId) {
-    for (const mod of model.modules) {
-      for (const j of mod.joins || []) {
+  for (const mod of model.modules) {
+    if (focus.moduleId && focus.moduleId !== mod.id) continue;
+    const joins = mod.joins || [];
+    if (!joins.length) continue;
+    if (focus.fileId) {
+      for (const j of joins) {
         if (j.fromId !== focus.fileId && j.toId !== focus.fileId) continue;
         const a = nodeByFile.get(j.fromId);
         const b = nodeByFile.get(j.toId);
         if (!a || !b) continue;
         joinEdges.push({ from: a, to: b, kind: 'join', label: j.label });
       }
+      continue;
+    }
+    if (focus.group !== 'files') continue;
+    const merged = new Map();
+    for (const p of uniqueJoinPairs(joins)) {
+      const a = joinEndpointNodeId(mod, p.fromId, nodes, nodeByFile, focus);
+      const b = joinEndpointNodeId(mod, p.toId, nodes, nodeByFile, focus);
+      if (!a || !b || a === b) continue;
+      const key = [a, b].sort().join('|');
+      if (!merged.has(key)) merged.set(key, { from: a, to: b, count: 0 });
+      merged.get(key).count += p.count;
+    }
+    for (const e of merged.values()) {
+      joinEdges.push({
+        from: e.from,
+        to: e.to,
+        kind: 'join',
+        label: e.count === 1 ? 'Joined' : `${e.count} joins`,
+      });
     }
   }
   const buckets = new Map();
@@ -1316,7 +1367,7 @@ export default function ContextMap({
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always passed to the AI</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-cyan-400 rounded" /> Modules sharing context</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-slate-400" /> Parent → child on the map</span>
-      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> File join (only after you click a file)</span>
+      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> File join (keys after you expand a file)</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
       {leafPageInfo && leafPageInfo.pages > 1 ? (
         <span className="inline-flex items-center gap-1.5">
@@ -1431,7 +1482,7 @@ export default function ContextMap({
           <Network className="w-4 h-4 text-cyan-400" /> Context map
         </h3>
         <p className="text-xs text-blue-300/70 leading-relaxed">
-          Click a module, then Chat memory or Files. Drag the background to pan if cards run out of room; scroll to zoom. File joins appear only after you click a file. Drag any card — including files and remembered facts.
+          Click a module, then Chat memory or Files. Drag the background to pan if cards run out of room; scroll to zoom. Joined files show a single link; click a file to see the join keys. Drag any card — including files and remembered facts.
         </p>
       </div>
 
@@ -1589,6 +1640,9 @@ export default function ContextMap({
                     <span className="block text-[10px] text-blue-300/50 mt-0.5">{k.files.length} file{k.files.length === 1 ? '' : 's'}</span>
                   </button>
                 ))}
+                {selectedModule.joins?.length ? (
+                  <p className="text-[11px] text-blue-300/45">Joined types are linked on the map. Expand a type, then a file, to see the join keys.</p>
+                ) : null}
               </div>
             )}
 
@@ -1611,7 +1665,7 @@ export default function ContextMap({
                     <span className="block text-[10px] text-blue-300/50 mt-0.5">{f.kindLabel}{f.tableName ? ` · ${f.tableName}` : ''}{f.rowCount != null ? ` · ${f.rowCount} rows` : ''}</span>
                   </button>
                 ))}
-                <p className="text-[11px] text-blue-300/45">Click a file on the map to see how it joins to others.</p>
+                <p className="text-[11px] text-blue-300/45">Joined files are linked on the map. Click a file to see the join keys.</p>
               </div>
             )}
 

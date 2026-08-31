@@ -177,13 +177,18 @@ export function chatsIndexLocalKey(userId) {
 }
 
 /** Named tenant path first, then older users/<name>/ and users/<id>/ for migration. */
-export function userSettingsRemotePathCandidates(user) {
-  const named = userSettingsRemotePath(user);
+export function userJsonRemotePathCandidates(user, file = 'settings.json') {
+  const name = String(file || 'settings.json').trim() || 'settings.json';
+  const named = `${userTenantPrefix(user)}/${name}`;
   const folder = userStorageFolder(user);
   const id = String(user?.id || '').trim();
-  const byId = id ? `users/${id}/settings.json` : '';
-  const legacy = `users/${folder}/settings.json`;
+  const byId = id ? `users/${id}/${name}` : '';
+  const legacy = `users/${folder}/${name}`;
   return uniquePaths([named, legacy, byId]);
+}
+
+export function userSettingsRemotePathCandidates(user) {
+  return userJsonRemotePathCandidates(user, 'settings.json');
 }
 
 /** Shared Admin / product intelligence (agents, workflows, prompts). Not per-user. */
