@@ -129,7 +129,7 @@ function stellaFileSummary(file) {
     ...qa.map((p) => clip(p.answer || p.question, 160)),
   ].filter(Boolean);
   const previewRows = Array.isArray(file.previewRows) && file.previewRows.length
-    ? file.previewRows.slice(0, 5)
+    ? file.previewRows.slice(0, 3)
     : previewRowsFromColumns(file.columns, 5);
   return {
     id: file.id,
@@ -250,7 +250,7 @@ function groupsFor(mod, generalMemory) {
       kind: 'leaf',
     });
   }
-  if (mod.goals) {
+  if (mod.goalsKey && mod.goals) {
     groups.push({
       id: 'goals',
       title: 'Analysis goals',
@@ -288,9 +288,9 @@ function kindsFor(mod) {
 function withMapVisuals(hubModules) {
   const list = Array.isArray(hubModules) ? hubModules.filter((m) => m && m.id) : [];
   return list.map((mod, i) => ({
-    ...mod,
-    short: mod.short || mod.title || mod.id,
+    id: mod.id,
     title: mod.title || mod.id,
+    short: mod.short || mod.title || mod.id,
     fill: mod.fill || '#38bdf8',
     iconBg: mod.iconBg || 'bg-slate-700/80',
     pane: mod.settingsPane || mod.pane || mod.id,
@@ -298,15 +298,46 @@ function withMapVisuals(hubModules) {
       ? mod.angle
       : (-Math.PI / 2 + (2 * Math.PI * i) / Math.max(list.length, 1)),
     Icon: mod.Icon || Layers,
+    pptxTemplate: !!mod.pptxTemplate,
+    goalsKey: mod.goalsKey || '',
+    dataFiles: !!mod.dataFiles,
   }));
 }
 
 function clampNode(n) {
   const pad = 8;
+  const maxX = CANVAS.w * 1.85;
+  const maxY = CANVAS.h * 1.85;
+  const minX = -CANVAS.w * 0.45;
+  const minY = -CANVAS.h * 0.45;
   return {
     ...n,
-    x: Math.min(CANVAS.w - n.w / 2 - pad, Math.max(n.w / 2 + pad, n.x)),
-    y: Math.min(CANVAS.h - n.h / 2 - pad, Math.max(n.h / 2 + pad, n.y)),
+    x: Math.min(maxX - n.w / 2 - pad, Math.max(n.w / 2 + pad + minX, n.x)),
+    y: Math.min(maxY - n.h / 2 - pad, Math.max(n.h / 2 + pad + minY, n.y)),
+  };
+}
+
+function fitCamera(nodes, pad = 64) {
+  if (!nodes?.length) return { k: 1, x: 0, y: 0 };
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x - (n.w || 0) / 2);
+    maxX = Math.max(maxX, n.x + (n.w || 0) / 2);
+    minY = Math.min(minY, n.y - (n.h || 0) / 2);
+    maxY = Math.max(maxY, n.y + (n.h || 0) / 2);
+  }
+  const bw = Math.max(maxX - minX, 160);
+  const bh = Math.max(maxY - minY, 160);
+  const k = Math.min((CANVAS.w - 2 * pad) / bw, (CANVAS.h - 2 * pad) / bh, 1.2);
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  return {
+    k,
+    x: CANVAS.cx - cx * k,
+    y: CANVAS.cy - cy * k,
   };
 }
 
@@ -320,20 +351,23 @@ function fanAngles(centerAngle, count, spread) {
   return Array.from({ length: count }, (_, i) => start + (spread * i) / (count - 1));
 }
 
-function edgePath(a, b, kind, hub) {
+function edgePath(a, b, kind, hub, offset = 0) {
   if (kind === 'share' || kind === 'join') {
     const mx = (a.x + b.x) / 2;
     const my = (a.y + b.y) / 2;
     const vx = mx - hub.x;
     const vy = my - hub.y;
     const len = Math.hypot(vx, vy) || 1;
-    const bump = kind === 'share' ? 56 : 36;
-    const qx = mx + (vx / len) * bump;
-    const qy = my + (vy / len) * bump;
+    const nx = -vy / len;
+    const ny = vx / len;
+    const bump = (kind === 'share' ? 56 : 40) + Math.abs(offset) * 10;
+    const slide = offset * 34;
+    const qx = mx + (vx / len) * bump + nx * slide;
+    const qy = my + (vy / len) * bump + ny * slide;
     return {
       d: `M ${a.x} ${a.y} Q ${qx} ${qy} ${b.x} ${b.y}`,
-      labelX: (mx + qx) / 2,
-      labelY: (my + qy) / 2,
+      labelX: (mx + qx) / 2 + nx * slide * 0.35,
+      labelY: (my + qy) / 2 + ny * slide * 0.35,
     };
   }
   return {
@@ -345,24 +379,31 @@ function edgePath(a, b, kind, hub) {
 
 function applySavedAndLive(n, saved, livePos) {
   let next = { ...n };
-  const s = saved?.[n.id];
-  if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
-    next.x = s.x * CANVAS.w;
-    next.y = s.y * CANVAS.h;
-    if (s.w) next.w = Math.max(88, s.w * CANVAS.w);
-    if (s.h) next.h = Math.max(40, s.h * CANVAS.h);
+  const persist = n.kind === 'hub' || n.kind === 'module';
+  if (persist) {
+    const s = saved?.[n.id];
+    if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
+      next.x = s.x * CANVAS.w;
+      next.y = s.y * CANVAS.h;
+      if (s.w) next.w = Math.max(88, s.w * CANVAS.w);
+      if (s.h) next.h = Math.max(40, s.h * CANVAS.h);
+    }
   }
   if (livePos?.[n.id]) next = { ...next, ...livePos[n.id] };
-  return clampNode(next);
+  return next;
 }
 
-function placeLeaves(nodes, edges, parentId, parent, leaves, angle, saved, livePos) {
+function placeLeaves(nodes, edges, parentId, parent, leaves, fallbackAngle, saved, livePos, hub) {
   if (!leaves.length || !parent) return;
-  const spread = Math.min(1.15, 0.28 * Math.max(leaves.length, 1));
+  const n = leaves.length;
   const parentHalf = Math.max(parent.w || 168, parent.h || 78) / 2;
   const leafHalf = Math.max(...leaves.map((l) => Math.max(l.w || 148, l.h || 52))) / 2;
-  const dist = parentHalf + leafHalf + 56;
-  fanAngles(angle, leaves.length, spread).forEach((ang, i) => {
+  const dist = parentHalf + leafHalf + 88;
+  const outward = hub
+    ? Math.atan2(parent.y - hub.y, parent.x - hub.x)
+    : fallbackAngle;
+  const spread = n <= 1 ? 0 : (n <= 2 ? 1.05 : Math.min(Math.PI * 1.35, 0.62 * n));
+  fanAngles(outward, n, spread).forEach((ang, i) => {
     const lp = polar(parent.x, parent.y, dist, ang);
     const leaf = applySavedAndLive({ ...leaves[i], x: lp.x, y: lp.y, moduleId: parent.moduleId || parent.id }, saved, livePos);
     nodes.push(leaf);
@@ -403,6 +444,7 @@ function layoutStar(model, focus, saved, livePos) {
     subtitle: model.hubSubtitle || 'No company set',
     caption: 'Context map passed to AI',
   }, pos, live));
+  const hubNode = nodes[0];
 
   for (const mod of model.modules) {
     const p = polar(cx, cy, moduleR, mod.angle);
@@ -435,7 +477,7 @@ function layoutStar(model, focus, saved, livePos) {
       subtitle: g.subtitle,
       w: 148,
       h: 52,
-    })), mod.angle, pos, live);
+    })), mod.angle, pos, live, hubNode);
 
     if (!focus.group) continue;
 
@@ -465,7 +507,7 @@ function layoutStar(model, focus, saved, livePos) {
             subtitle: 'Facts appear after you confirm them',
             w: 160,
             h: 52,
-          }], mod.angle, pos, live);
+          }], mod.angle, pos, live, hubNode);
       continue;
     }
 
@@ -478,7 +520,7 @@ function layoutStar(model, focus, saved, livePos) {
         subtitle: clip(mod.pptx.fileName || 'Custom', 22),
         w: 150,
         h: 50,
-      }], mod.angle, pos, live);
+      }], mod.angle, pos, live, hubNode);
       continue;
     }
 
@@ -491,7 +533,7 @@ function layoutStar(model, focus, saved, livePos) {
         subtitle: clip(mod.goals, 28),
         w: 150,
         h: 50,
-      }], mod.angle, pos, live);
+      }], mod.angle, pos, live, hubNode);
       continue;
     }
 
@@ -515,13 +557,13 @@ function layoutStar(model, focus, saved, livePos) {
             };
           })
         : moduleFiles(mod).map(fileNodeSpec);
-      placeLeaves(nodes, edges, groupNode.id, groupNode, kindLeaves, mod.angle, pos, live);
+      placeLeaves(nodes, edges, groupNode.id, groupNode, kindLeaves, mod.angle, pos, live, hubNode);
 
       if (focus.kind) {
         const kindNode = nodes.find((n) => n.id === `${mod.id}-kind-${focus.kind}`) || groupNode;
         const kind = kinds.find((k) => k.id === focus.kind);
         const list = kind ? kind.files : moduleFiles(mod).filter((f) => kindOfFile(f) === focus.kind);
-        placeLeaves(nodes, edges, kindNode.id, kindNode, list.map(fileNodeSpec), mod.angle, pos, live);
+        placeLeaves(nodes, edges, kindNode.id, kindNode, list.map(fileNodeSpec), mod.angle, pos, live, hubNode);
       }
     }
   }
@@ -531,13 +573,25 @@ function layoutStar(model, focus, saved, livePos) {
   }
 
   const nodeIds = new Set(nodes.map((n) => n.id));
+  const joinEdges = [];
   for (const mod of model.modules) {
     for (const j of mod.joins || []) {
       const a = `data-${j.fromId}`;
       const b = `data-${j.toId}`;
       if (!nodeIds.has(a) || !nodeIds.has(b)) continue;
-      edges.push({ from: a, to: b, kind: 'join', label: j.label });
+      joinEdges.push({ from: a, to: b, kind: 'join', label: j.label });
     }
+  }
+  const buckets = new Map();
+  for (const e of joinEdges) {
+    const key = [e.from, e.to].sort().join('|');
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(e);
+  }
+  for (const group of buckets.values()) {
+    group.forEach((e, i) => {
+      edges.push({ ...e, offset: i - (group.length - 1) / 2 });
+    });
   }
 
   return { nodes, edges };
@@ -551,7 +605,7 @@ function usedWhenChatting(model, moduleId) {
   if (mod.memory.length) parts.push(`${mod.memory.length} ${mod.short} remembered fact${mod.memory.length === 1 ? '' : 's'}`);
   if (mod.files.length) parts.push(`${mod.files.length} context file${mod.files.length === 1 ? '' : 's'} in this module`);
   if (mod.pptx) parts.push('PowerPoint template (export style only)');
-  if (mod.goals) parts.push('Stella analysis goals');
+  if (mod.goals) parts.push('Analysis goals');
   if (mod.stellaFiles.length) parts.push(`${mod.stellaFiles.length} data file${mod.stellaFiles.length === 1 ? '' : 's'} and intake notes`);
   if (mod.joins.length) parts.push(`${mod.joins.length} stored join${mod.joins.length === 1 ? '' : 's'} between files`);
   for (const id of mod.linked) {
@@ -560,6 +614,7 @@ function usedWhenChatting(model, moduleId) {
     const bits = [];
     if (other.files.length) bits.push(`${other.files.length} file${other.files.length === 1 ? '' : 's'}`);
     if (other.stellaFiles.length) bits.push(`${other.stellaFiles.length} dataset${other.stellaFiles.length === 1 ? '' : 's'}`);
+    if (other.joins.length) bits.push(`${other.joins.length} join${other.joins.length === 1 ? '' : 's'}`);
     if (other.memory.length) bits.push(`${other.memory.length} remembered fact${other.memory.length === 1 ? '' : 's'}`);
     parts.push(`Shared from ${other.title}${bits.length ? ` (${bits.join(', ')})` : ''}`);
   }
@@ -577,7 +632,7 @@ function nodeIcon(node, mod) {
 
 function FilePreviewBlock({ file }) {
   const kind = kindOfFile(file);
-  const rows = Array.isArray(file.previewRows) ? file.previewRows.slice(0, 5) : [];
+  const rows = Array.isArray(file.previewRows) ? file.previewRows.slice(0, 3) : [];
   const headers = rows.length
     ? Object.keys(rows[0]).slice(0, 8)
     : (file.columns || []).slice(0, 8).map((c) => c.original || c.name).filter(Boolean);
@@ -615,7 +670,7 @@ function FilePreviewBlock({ file }) {
   }
 
   if (kind === 'powerpoint') {
-    const slides = previewLines(file.structuredExtract || file.extractedText, 5);
+    const slides = previewLines(file.structuredExtract || file.extractedText, 3);
     return (
       <div className="mt-3">
         <div className="text-[10px] uppercase tracking-wide text-amber-200/80 font-semibold mb-1.5">Slide / deck preview</div>
@@ -632,7 +687,7 @@ function FilePreviewBlock({ file }) {
     );
   }
 
-  const lines = previewLines(file.extractedText || file.structuredExtract || file.visionExtract, 5);
+  const lines = previewLines(file.extractedText || file.structuredExtract || file.visionExtract, 3);
   if (!lines.length) return null;
   return (
     <div className="mt-3">
@@ -658,9 +713,19 @@ function MapCanvas({
   onNodePointerDown,
   glowId,
   shadowId,
+  cam,
 }) {
+  const camX = cam?.x || 0;
+  const camY = cam?.y || 0;
+  const camK = cam?.k || 1;
   return (
-    <>
+    <div
+      className="absolute inset-0 origin-top-left"
+      style={{
+        transform: `translate(${(camX / CANVAS.w) * 100}%, ${(camY / CANVAS.h) * 100}%) scale(${camK})`,
+        transformOrigin: '0 0',
+      }}
+    >
       <svg
         viewBox={`0 0 ${CANVAS.w} ${CANVAS.h}`}
         className="absolute inset-0 w-full h-full pointer-events-none"
@@ -681,7 +746,7 @@ function MapCanvas({
           const a = byId.get(e.from);
           const b = byId.get(e.to);
           if (!a || !b) return null;
-          const path = edgePath(a, b, e.kind, hub);
+          const path = edgePath(a, b, e.kind, hub, e.offset || 0);
           const stroke = e.kind === 'share' || e.kind === 'join'
             ? 'rgba(34,211,238,0.9)'
             : e.kind === 'spoke'
@@ -790,7 +855,7 @@ function MapCanvas({
           </button>
         );
       })}
-    </>
+    </div>
   );
 }
 
@@ -858,6 +923,13 @@ export default function ContextMap({
     [model, layout, livePos, focus],
   );
 
+  const autoCam = useMemo(() => fitCamera(graph.nodes), [graph]);
+  const [camUser, setCamUser] = useState(null);
+  useEffect(() => { setCamUser(null); }, [focus.moduleId, focus.group, focus.kind, focus.fileId, focus.factId]);
+  const cam = camUser || autoCam;
+  const camRef = useRef(cam);
+  camRef.current = cam;
+
   const byId = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n])), [graph]);
   const hub = byId.get('account') || { x: CANVAS.cx, y: CANVAS.cy };
 
@@ -868,7 +940,7 @@ export default function ContextMap({
       : {};
     const next = { nodes: { ...prev } };
     for (const n of nodes) {
-      if (!n?.id) continue;
+      if (!n?.id || (n.kind !== 'hub' && n.kind !== 'module')) continue;
       next.nodes[n.id] = {
         x: n.x / CANVAS.w,
         y: n.y / CANVAS.h,
@@ -901,10 +973,28 @@ export default function ContextMap({
     if (!box) return null;
     const r = box.getBoundingClientRect();
     if (!r.width || !r.height) return null;
+    const viewX = ((clientX - r.left) / r.width) * CANVAS.w;
+    const viewY = ((clientY - r.top) / r.height) * CANVAS.h;
+    const c = camRef.current || { k: 1, x: 0, y: 0 };
+    const k = c.k || 1;
     return {
-      x: ((clientX - r.left) / r.width) * CANVAS.w,
-      y: ((clientY - r.top) / r.height) * CANVAS.h,
+      x: (viewX - (c.x || 0)) / k,
+      y: (viewY - (c.y || 0)) / k,
     };
+  };
+
+  const zoomAt = (clientX, clientY, factor, el) => {
+    const loc = clientToCanvas(clientX, clientY, el);
+    setCamUser((prev) => {
+      const base = prev || camRef.current || { k: 1, x: 0, y: 0 };
+      const k = Math.min(2.4, Math.max(0.32, base.k * factor));
+      if (!loc) return { ...base, k };
+      return {
+        k,
+        x: base.x + loc.x * (base.k - k),
+        y: base.y + loc.y * (base.k - k),
+      };
+    });
   };
 
   const selectNode = (node) => {
@@ -1057,6 +1147,7 @@ export default function ContextMap({
 
   const resetLayout = () => {
     setLivePos({});
+    setCamUser(null);
     onLayoutChange?.({ nodes: {} });
   };
 
@@ -1117,6 +1208,7 @@ export default function ContextMap({
     selectedIsAccount,
     openFileId,
     onNodePointerDown,
+    cam,
   };
 
   const toolbar = (
@@ -1149,6 +1241,13 @@ export default function ContextMap({
         {large ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
         {large ? 'Exit full screen' : 'Full screen'}
       </button>
+      <button
+        type="button"
+        onClick={() => setCamUser(null)}
+        className="text-[10px] font-semibold text-cyan-200 hover:text-white"
+      >
+        Fit
+      </button>
       <button type="button" onClick={resetLayout} className="ml-auto text-[10px] font-semibold text-cyan-200 hover:text-white">Reset layout</button>
     </div>
   );
@@ -1180,6 +1279,10 @@ export default function ContextMap({
             ref={largeCanvasRef}
             data-ctx-canvas="large"
             className="relative w-full h-full bg-slate-950/50 border border-blue-400/15 rounded-xl overflow-hidden"
+            onWheel={(e) => {
+              e.preventDefault();
+              zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 0.9 : 1.12, e.currentTarget);
+            }}
           >
             <MapCanvas
               {...canvasProps}
@@ -1202,7 +1305,7 @@ export default function ContextMap({
           <Network className="w-4 h-4 text-cyan-400" /> Context map
         </h3>
         <p className="text-xs text-blue-300/70 leading-relaxed">
-          Click a module, then Chat memory or Files. Parent cards stay on the map as you drill in. File types (Excel, PDF, and so on) appear from what is loaded. Drag any card — including remembered facts.
+          Click a module, then Chat memory or Files. The map zooms to keep the branch in view as you drill in; scroll to zoom. Parent cards stay visible. Drag any card — including remembered facts.
         </p>
       </div>
 
@@ -1210,8 +1313,12 @@ export default function ContextMap({
         <div
           ref={canvasRef}
           data-ctx-canvas="main"
-          className="relative w-full"
+          className="relative w-full overflow-hidden"
           style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}
+          onWheel={(e) => {
+            e.preventDefault();
+            zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 0.9 : 1.12, e.currentTarget);
+          }}
         >
           <MapCanvas
             {...canvasProps}

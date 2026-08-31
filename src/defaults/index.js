@@ -2,6 +2,14 @@ import { DEFAULT_SYSTEM_PROMPT } from './systemPrompt';
 import { DEFAULT_AGENTS } from './agents';
 import { DEFAULT_TOPICS, DEFAULT_ORCHESTRATOR_PROMPTS } from './topics';
 import {
+  WORKFLOW_BUILDER_WELCOME,
+  buildWorkflowBuilderCatalog,
+  buildWorkflowBuilderSystemPrompt,
+  interpretWorkflowBuilderReply,
+  applyWorkflowBuilderDraft,
+  summarizeWorkflowDraft,
+} from './workflowBuilderAgent';
+import {
   DEFAULT_WELCOME_MESSAGES,
   DEFAULT_PPTX_CLARIFY,
   DEFAULT_SUGGESTIONS,
@@ -19,6 +27,12 @@ export {
   DEFAULT_SUGGESTIONS,
   DEFAULT_WORKFLOW_RUNTIME,
   DEFAULT_STELLA_PROMPTS,
+  WORKFLOW_BUILDER_WELCOME,
+  buildWorkflowBuilderCatalog,
+  buildWorkflowBuilderSystemPrompt,
+  interpretWorkflowBuilderReply,
+  applyWorkflowBuilderDraft,
+  summarizeWorkflowDraft,
 };
 
 /** Filenames under /knowledge (and intelligence bucket) that power the KB. */
@@ -117,6 +131,7 @@ function cloneAgents(list) {
     role: a.role || '',
     systemPrompt: a.systemPrompt != null ? String(a.systemPrompt) : '',
     knowledgeFiles: normalizeKnowledgeFiles(a.knowledgeFiles),
+    tools: Array.isArray(a.tools) ? a.tools.map((t) => String(t || '').trim()).filter(Boolean) : [],
     status: a.status || 'active',
   }));
 }

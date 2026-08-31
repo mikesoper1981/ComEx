@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense, Component } from 'react';
 import { createPortal } from 'react-dom';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2 } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles } from 'lucide-react';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
@@ -81,6 +81,12 @@ import {
   mergeKnowledgeAccess,
   knowledgeFileFlags,
   filterKnowledgeDocuments,
+  WORKFLOW_BUILDER_WELCOME,
+  buildWorkflowBuilderCatalog,
+  buildWorkflowBuilderSystemPrompt,
+  interpretWorkflowBuilderReply,
+  applyWorkflowBuilderDraft,
+  summarizeWorkflowDraft,
 } from './defaults';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import JSZip from 'jszip';
@@ -1449,7 +1455,7 @@ function stellaApplyRowSampleToColumns(columns, rows) {
   });
 }
 
-function stellaPreviewRowsFromData(rows, limit = 5) {
+function stellaPreviewRowsFromData(rows, limit = 3) {
   if (!Array.isArray(rows) || !rows.length) return [];
   return rows.slice(0, limit).map((r) => {
     if (r && typeof r === 'object' && !Array.isArray(r)) return r;
@@ -1457,7 +1463,7 @@ function stellaPreviewRowsFromData(rows, limit = 5) {
   });
 }
 
-function stellaPreviewRowsFromColumns(columns, limit = 5) {
+function stellaPreviewRowsFromColumns(columns, limit = 3) {
   const cols = Array.isArray(columns) ? columns.filter((c) => c && (c.name || c.original)) : [];
   if (!cols.length) return [];
   const n = Math.min(limit, Math.max(0, ...cols.map((c) => (Array.isArray(c.samples) ? c.samples.length : 0))));
@@ -1534,9 +1540,20 @@ function stellaFindJoinColumn(file, hint) {
 }
 
 function stellaLooksLikeMeasureCol(col) {
-  if (col?.kind === 'measure') return true;
   const blobs = [col?.name, col?.original, col?.description].map(stellaNormJoinToken).filter(Boolean);
+  if (blobs.some((b) => b === 'id' || /(id|code|key|uid)$/.test(b))) return false;
+  if (col?.kind === 'measure') return true;
   return blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b));
+}
+
+function stellaJoinKindPhrase(col, asMeasure) {
+  if (asMeasure || col?.kind === 'measure') return 'a measure (values like revenue or qty, not a join key)';
+  if (col?.kind === 'date') return 'dates';
+  if (col?.kind === 'id') return 'identifiers';
+  if (col?.kind === 'code') return 'codes';
+  if (col?.kind === 'name') return 'names / labels';
+  if (col?.kind === 'text') return 'text';
+  return col?.kind ? String(col.kind) : 'unknown values';
 }
 
 function stellaJoinKindsCompatible(aKind, bKind) {
@@ -1647,76 +1664,49 @@ function stellaScoreJoinColumns(a, b) {
   }
 
   if (aMeas && bMeas && fa !== 'date' && fb !== 'date' && a?.kind !== 'date' && b?.kind !== 'date') {
-    return {
-      score: 0,
-      reason: 'both look like measures, not join keys',
-      typeOk,
-      kindOk,
-      overlap,
-      verdict: 'block',
-      warnings: ['These look like values (revenue, qty, etc.), not keys to join on.'],
-    };
-  }
-  if (aMeas !== bMeas && !strongOverlap) {
-    warnings.push('One field looks like a measure and the other like a key.');
-    return {
-      score: Math.min(score, 20),
-      reason: 'measure vs key',
-      typeOk,
-      kindOk,
-      overlap,
-      verdict: 'block',
-      warnings,
-    };
+    warnings.push('Both columns look like measures (revenue, qty, amounts), not keys to join on.');
+    score = Math.min(score, 12);
+    if (!reason) reason = 'both look like measures, not join keys';
+  } else if (aMeas !== bMeas && !strongOverlap) {
+    warnings.push(`One column looks like ${stellaJoinKindPhrase(a, aMeas)} and the other like ${stellaJoinKindPhrase(b, bMeas)}.`);
+    score = Math.min(score, 20);
+    if (!reason) reason = 'measure vs key';
   }
   if (fa && fb && fa !== fb && !strongOverlap) {
-    warnings.push(`Keys look like different things (${fa} vs ${fb}).`);
-    return {
-      score: Math.min(score, 25),
-      reason: `different key types (${fa} vs ${fb})`,
-      typeOk,
-      kindOk,
-      overlap,
-      verdict: 'block',
-      warnings,
-    };
+    warnings.push(`These look like different business keys (${fa} vs ${fb}).`);
+    score = Math.min(score, 25);
+    if (!reason || reason === 'measure vs key') reason = `different key types (${fa} vs ${fb})`;
   }
   if (!kindOk && !strongOverlap) {
     warnings.push(`Column contents look different (${a?.kind || 'unknown'} vs ${b?.kind || 'unknown'}).`);
-    return {
-      score: Math.min(score, 25),
-      reason: 'different kinds of values',
-      typeOk,
-      kindOk,
-      overlap,
-      verdict: 'block',
-      warnings,
-    };
+    score = Math.min(score, 25);
+    if (!reason) reason = 'different kinds of values';
   }
   if (!typeOk) {
-    warnings.push(`Types look different (${a?.type || 'unknown'} vs ${b?.type || 'unknown'}).`);
+    warnings.push(`Data types look different (${a?.type || 'unknown'} vs ${b?.type || 'unknown'}).`);
     if (score < 100) score = Math.min(score, 50);
   }
-  if (overlap.compared && overlap.smaller >= 6 && overlap.hits === 0) {
-    if (lowCard) {
-      warnings.push('Sample values do not overlap — these look like different lists.');
-      return {
-        score: Math.min(score, 28),
-        reason: 'values do not overlap',
-        typeOk,
-        kindOk,
-        overlap,
-        verdict: 'block',
-        warnings,
-      };
-    }
-    warnings.push('No matching values in the sampled rows. Names can still match, but the contents do not look shared yet.');
-    if (score >= 70) score = Math.min(score, 68);
+  if (overlap.compared && overlap.hits === 0 && (overlap.smaller >= 3 || (a?.samples?.length && b?.samples?.length))) {
+    warnings.push(lowCard
+      ? 'Sample values do not overlap — these look like different lists.'
+      : 'No matching values in the sampled rows. Names can still match, but the contents do not look shared.');
+    score = Math.min(score, lowCard ? 22 : 48);
+    if (!reason || reason === 'measure vs key') reason = 'values do not overlap';
+  } else if (overlap.compared && overlap.ratio < 0.08 && overlap.smaller >= 4 && !strongOverlap) {
+    warnings.push('Almost no shared values in the sampled rows.');
+    score = Math.min(score, 52);
+  }
+
+  if (!warnings.length && !score) {
+    warnings.push('Column names, types, and sample values do not look like the same key.');
   }
 
   let verdict = 'ok';
   if (score < 40) verdict = 'block';
   else if (score < 70 || warnings.length) verdict = 'warn';
+  if (!strongOverlap && (warnings.length >= 2 || (overlap.compared && overlap.hits === 0 && overlap.smaller >= 3))) {
+    verdict = 'block';
+  }
   if (!reason) reason = score ? 'possible join key' : 'column names, types, and values do not match';
   return { score, reason, typeOk, kindOk, overlap, verdict, warnings };
 }
@@ -1741,13 +1731,13 @@ function stellaAssessJoin(fromFile, toFile, thisField, relatedField) {
     thatType: b.type || '',
     thisKind: a.kind || '',
     thatKind: b.kind || '',
-    thisSamples: Array.isArray(a.samples) ? a.samples.slice(0, 8) : [],
-    thatSamples: Array.isArray(b.samples) ? b.samples.slice(0, 8) : [],
+    thisSamples: Array.isArray(a.samples) ? a.samples.slice(0, 3) : [],
+    thatSamples: Array.isArray(b.samples) ? b.samples.slice(0, 3) : [],
   };
 }
 
 function StellaJoinColumnPreview({ fileName, field, type, kind, samples }) {
-  const list = (samples || []).map((v) => String(v ?? '').trim()).filter(Boolean).slice(0, 6);
+  const list = (samples || []).map((v) => String(v ?? '').trim()).filter(Boolean).slice(0, 3);
   return (
     <div className="bg-slate-950/55 border border-white/10 rounded-lg px-3 py-2.5 min-w-0">
       <div className="text-[10px] uppercase tracking-wide text-blue-300/50 font-semibold truncate">{fileName || 'File'}</div>
@@ -1784,7 +1774,7 @@ function stellaFilterJoinRels(rels, thisFile, otherFiles) {
     }
     const assessed = stellaAssessJoin(thisFile, other, r.this_field, r.related_field);
     if (assessed.verdict === 'block') {
-      dropped.push({ r, why: assessed.warnings[0] || assessed.reason });
+      dropped.push({ r, why: (assessed.warnings || []).filter(Boolean).join(' ') || assessed.reason });
     } else {
       keep.push(r);
     }
@@ -4058,7 +4048,7 @@ function stellaMapRegistryRow(row) {
     textStoragePath: row.storage_path ? stellaExtractedTextPath(row.storage_path) : null,
     storageBucket: null,
     columns: Array.isArray(row.columns) ? row.columns : [],
-    previewRows: stellaPreviewRowsFromColumns(Array.isArray(row.columns) ? row.columns : [], 5),
+    previewRows: stellaPreviewRowsFromColumns(Array.isArray(row.columns) ? row.columns : [], 3),
     rowCount: row.row_count ?? null,
     summary: row.summary || '',
     capturedContext: ctx,
@@ -4643,6 +4633,18 @@ export default function CommercialExcellenceApp() {
   const [editingTopicTab, setEditingTopicTab] = useState('basics'); // basics | orchestrator | steps
   const [expandedSteps, setExpandedSteps] = useState({});
   const [editingAgent, setEditingAgent] = useState(null);
+  const [wfBuilderMessages, setWfBuilderMessages] = useState(() => [
+    { role: 'assistant', content: WORKFLOW_BUILDER_WELCOME },
+  ]);
+  const [wfBuilderInput, setWfBuilderInput] = useState('');
+  const [wfBuilderLoading, setWfBuilderLoading] = useState(false);
+  const [wfBuilderDraft, setWfBuilderDraft] = useState(null);
+  const [wfBuilderReady, setWfBuilderReady] = useState(false);
+  const [wfBuilderFocusId, setWfBuilderFocusId] = useState('');
+  const [wfBuilderError, setWfBuilderError] = useState('');
+  const [wfBuilderApplying, setWfBuilderApplying] = useState(false);
+  const wfBuilderEndRef = useRef(null);
+  const wfBuilderPanelRef = useRef(null);
   const [suggestedPrompts, setSuggestedPrompts] = useState([]);
   const [suggestionsEnabled, setSuggestionsEnabled] = useState(() => readLocalProductIntelligence().suggestions.enabled);
   const [maxSuggestions, setMaxSuggestions] = useState(() => readLocalProductIntelligence().suggestions.max);
@@ -4663,6 +4665,10 @@ export default function CommercialExcellenceApp() {
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
+
+  useEffect(() => {
+    wfBuilderEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [wfBuilderMessages, wfBuilderLoading]);
 
   // ── SUPABASE: Load intelligence knowledge files on every visit ──
   useEffect(() => {
@@ -5927,6 +5933,111 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       setTimeout(() => setUserSettingsSaveStatus('idle'), 4000);
     }
     return intel;
+  };
+
+  const resetWorkflowBuilder = () => {
+    setWfBuilderFocusId('');
+    setWfBuilderMessages([{ role: 'assistant', content: WORKFLOW_BUILDER_WELCOME }]);
+    setWfBuilderInput('');
+    setWfBuilderDraft(null);
+    setWfBuilderReady(false);
+    setWfBuilderError('');
+    setWfBuilderLoading(false);
+  };
+
+  const startWorkflowBuilderEdit = (topic) => {
+    if (!topic?.id) return;
+    setWfBuilderFocusId(topic.id);
+    setWfBuilderDraft(null);
+    setWfBuilderReady(false);
+    setWfBuilderError('');
+    setWfBuilderLoading(false);
+    setWfBuilderInput('');
+    setWfBuilderMessages([{
+      role: 'assistant',
+      content: `We'll edit **${topic.name}** (id \`${topic.id}\`). Tell me what to change — purpose, steps, agents, orchestrator, triggers, or auto-advance. I'll use the current product JSON as the baseline and propose a full updated draft.`,
+    }]);
+    requestAnimationFrame(() => {
+      wfBuilderPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  };
+
+  const sendWorkflowBuilder = async (text) => {
+    const content = String(text || wfBuilderInput || '').trim();
+    if (!content || wfBuilderLoading) return;
+    setWfBuilderInput('');
+    setWfBuilderError('');
+    const history = [...wfBuilderMessages, { role: 'user', content }];
+    setWfBuilderMessages(history);
+    setWfBuilderLoading(true);
+    try {
+      const knowledgeFiles = (documents || [])
+        .filter((d) => knowledgeFileFlags(knowledgeAccessLive(), d.name).agents)
+        .map((d) => d.name);
+      const catalog = buildWorkflowBuilderCatalog({
+        topics,
+        agents,
+        knowledgeFiles,
+        focusId: wfBuilderFocusId,
+      });
+      const apiMessages = history
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .slice(-20)
+        .map((m) => ({ role: m.role, content: String(m.content || '') }));
+      const raw = await callAnthropic(buildWorkflowBuilderSystemPrompt(catalog), apiMessages, 8000);
+      const interpreted = interpretWorkflowBuilderReply(raw);
+      setWfBuilderMessages((prev) => [...prev, { role: 'assistant', content: interpreted.message || 'Draft updated.' }]);
+      setWfBuilderDraft(interpreted.draft);
+      setWfBuilderReady(!!interpreted.ready);
+    } catch (err) {
+      setWfBuilderError(err?.message || 'Workflow agent failed.');
+      setWfBuilderMessages((prev) => [...prev, {
+        role: 'assistant',
+        content: `I couldn't reach the model (${err?.message || 'unknown error'}). Try again.`,
+      }]);
+    } finally {
+      setWfBuilderLoading(false);
+    }
+  };
+
+  const applyWorkflowBuilder = async () => {
+    if (!wfBuilderDraft?.workflow || wfBuilderApplying) return;
+    setWfBuilderApplying(true);
+    setWfBuilderError('');
+    try {
+      const knowledgeNames = (documents || []).map((d) => d.name);
+      const draft = {
+        ...wfBuilderDraft,
+        mode: wfBuilderFocusId ? 'edit' : (wfBuilderDraft.mode || 'create'),
+        workflow: {
+          ...wfBuilderDraft.workflow,
+          id: wfBuilderFocusId || wfBuilderDraft.workflow.id,
+        },
+      };
+      const applied = applyWorkflowBuilderDraft({
+        topics,
+        agents,
+        draft,
+        knowledgeNames,
+      });
+      await persistIntelligenceSettings({ topics: applied.topics, agents: applied.agents });
+      const hydrated = mergeTopics(applied.topics).find((t) => t.id === applied.topic.id) || applied.topic;
+      setEditingTopic(hydrated);
+      setEditingTopicTab('steps');
+      setExpandedSteps({});
+      setWfBuilderReady(false);
+      const created = applied.createdAgentIds?.length
+        ? ` Created agents: ${applied.createdAgentIds.join(', ')}.`
+        : '';
+      setWfBuilderMessages((prev) => [...prev, {
+        role: 'assistant',
+        content: `Applied **${applied.topic.name}** to the product JSON.${created} The editor is open so you can tweak steps or prompts before you're done.`,
+      }]);
+    } catch (err) {
+      setWfBuilderError(err?.message || 'Could not apply the draft.');
+    } finally {
+      setWfBuilderApplying(false);
+    }
   };
 
   const syncKnowledgeAccessMap = (patch = {}) => {
@@ -8440,7 +8551,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Prefer keys whose VALUES overlap (same IDs, territory codes, product names) even when column names differ. Do not propose a join from name/type alone if the sample values look like different things. Never join a measure/metric (revenue, qty, amount) to a key. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Use the SAME checks as a manual join: sample values must overlap, types/kinds should match, and never join a measure/metric to a key or two unrelated keys (territory vs product, names vs IDs). Do not propose a join from name/type alone if the sample values look like different things. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -8464,7 +8575,7 @@ ${stepInstruction}`;
         const rows = Array.isArray(data.rows) ? data.rows : [];
         if (!rows.length) continue;
         const columns = stellaApplyRowSampleToColumns(f.columns, rows);
-        patched.set(f.id, { columns, previewRows: stellaPreviewRowsFromData(rows, 5) });
+        patched.set(f.id, { columns, previewRows: stellaPreviewRowsFromData(rows, 3) });
         if (f.dbId) {
           try { await stellaUpdateRegistry(f.dbId, { columns }); } catch { /* ignore */ }
         }
@@ -9038,7 +9149,7 @@ ${stepInstruction}`;
         name: file.name, type: kind, fileType: kind,
         size: rowCount != null ? `${rowCount} rows` : `${(file.size / 1024).toFixed(1)} KB`,
         columns: profiledColumns, rowCount,
-        previewRows: isTabular ? stellaPreviewRowsFromData(records, 5) : [],
+        previewRows: isTabular ? stellaPreviewRowsFromData(records, 3) : [],
         extractedText: isTabular ? '' : sampleText,
         summary, capturedContext: null, dataProfile,
         tableName, storagePath, storageBucket,
@@ -11944,7 +12055,11 @@ ${stepInstruction}`;
                     {agents.map(agent => (
                       <div key={agent.id} className="bg-slate-700/30 border border-purple-400/20 rounded-lg p-4">
                         <div className="flex items-start justify-between mb-2">
-                          <div><div className="font-semibold text-purple-300">{agent.name}</div><div className="text-xs text-blue-300/60 mt-1">{agent.role}</div></div>
+                          <div><div className="font-semibold text-purple-300">{agent.name}</div><div className="text-xs text-blue-300/60 mt-1">{agent.role}</div>
+                            {(agent.tools || []).length > 0 && (
+                              <div className="text-[10px] text-cyan-300/50 mt-1">Tools: {(agent.tools || []).join(', ')}</div>
+                            )}
+                          </div>
                           <span className={`px-2 py-1 text-xs rounded ${agent.status === 'active' ? 'bg-green-500/20 text-green-400 border border-green-400/30' : 'bg-gray-500/20 text-gray-400 border border-gray-400/30'}`}>{agent.status}</span>
                         </div>
                         <div className="flex gap-2 pt-3 border-t border-purple-400/20">
@@ -11957,6 +12072,94 @@ ${stepInstruction}`;
               )}
 
               {adminSection === 'workflows' && (
+                <div className="space-y-4">
+                <div ref={wfBuilderPanelRef} className="bg-slate-800/30 backdrop-blur-sm border border-cyan-400/25 rounded-xl p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+                    <div>
+                      <h2 className="text-xl font-bold flex items-center gap-2"><Sparkles className="w-6 h-6 text-cyan-400" />Workflow agent</h2>
+                      <p className="text-xs text-blue-300/55 mt-1 max-w-2xl">
+                        Hardcoded helper — not a live user workflow. It interviews you, then drafts steps, agents, tools, and settings in the same JSON style as Design New IC / Analyze Existing IC. Apply writes them into the product JSON.
+                      </p>
+                    </div>
+                    <button type="button" onClick={resetWorkflowBuilder} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700/50 hover:bg-slate-700 text-blue-200 border border-blue-400/20">New conversation</button>
+                  </div>
+                  <div className="mb-3">
+                    <label className="text-xs text-blue-300/70 font-semibold block mb-1">Focus</label>
+                    <select
+                      value={wfBuilderFocusId}
+                      onChange={(e) => setWfBuilderFocusId(e.target.value)}
+                      className="w-full sm:w-auto min-w-[240px] bg-slate-900 border border-blue-400/30 rounded-lg px-3 py-2 text-sm text-white"
+                    >
+                      <option value="">Create a new workflow</option>
+                      {topics.map((t) => (
+                        <option key={t.id} value={t.id}>Edit: {t.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="bg-slate-950/50 border border-blue-400/20 rounded-lg p-3 h-72 overflow-y-auto custom-scrollbar space-y-3">
+                    {wfBuilderMessages.map((m, i) => (
+                      <div key={i} className={`text-sm ${m.role === 'user' ? 'text-right' : ''}`}>
+                        <div className={`inline-block max-w-[95%] rounded-lg px-3 py-2 ${m.role === 'user' ? 'bg-cyan-500/20 text-cyan-50 text-left' : 'bg-slate-800/80 text-blue-100'}`}>
+                          {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : formatMarkdown(m.content)}
+                        </div>
+                      </div>
+                    ))}
+                    {wfBuilderLoading && <div className="text-xs text-cyan-300/70">Workflow agent is thinking…</div>}
+                    <div ref={wfBuilderEndRef} />
+                  </div>
+                  {wfBuilderError && <div className="mt-2 text-xs text-red-400">{wfBuilderError}</div>}
+                  {wfBuilderDraft?.workflow && (
+                    <div className="mt-3 bg-slate-900/70 border border-cyan-400/25 rounded-lg p-3 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-cyan-300">
+                          {wfBuilderReady ? 'Ready to apply' : 'Draft sketch'} — {wfBuilderDraft.workflow.name || wfBuilderDraft.workflow.id}
+                        </div>
+                        {!wfBuilderReady && <span className="text-[10px] text-amber-300/80">Keep chatting to finish the draft</span>}
+                      </div>
+                      <div className="text-xs text-blue-200/80 whitespace-pre-wrap">{summarizeWorkflowDraft(wfBuilderDraft)}</div>
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <button
+                          type="button"
+                          disabled={!wfBuilderReady || wfBuilderApplying}
+                          onClick={applyWorkflowBuilder}
+                          className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white text-sm font-semibold rounded-lg flex items-center gap-2"
+                        >
+                          <Save className="w-4 h-4" /> {wfBuilderApplying ? 'Applying…' : 'Apply to product JSON'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { setWfBuilderDraft(null); setWfBuilderReady(false); }}
+                          className="px-3 py-2 bg-slate-700/60 text-blue-200 text-sm rounded-lg"
+                        >
+                          Discard draft
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  <div className="mt-3 flex gap-2">
+                    <textarea
+                      value={wfBuilderInput}
+                      onChange={(e) => setWfBuilderInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          sendWorkflowBuilder();
+                        }
+                      }}
+                      rows={2}
+                      placeholder={wfBuilderFocusId ? `Describe how to change ${topics.find((t) => t.id === wfBuilderFocusId)?.name || 'this workflow'}…` : 'Describe the workflow you want to create…'}
+                      className="flex-1 bg-slate-900 border border-blue-400/30 rounded-lg px-3 py-2 text-sm text-white resize-y min-h-[44px]"
+                    />
+                    <button
+                      type="button"
+                      disabled={wfBuilderLoading || !wfBuilderInput.trim()}
+                      onClick={() => sendWorkflowBuilder()}
+                      className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 disabled:opacity-40 text-cyan-300 border border-cyan-400/30 rounded-lg"
+                    >
+                      <Send className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
                 <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
                   <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Target className="w-6 h-6 text-cyan-400" />Workflows</h2>
                   <div className="space-y-4">
@@ -11971,22 +12174,30 @@ ${stepInstruction}`;
                             <div key={idx} className="text-xs"><span className="text-cyan-400 font-medium">Step {step.step}:</span><span className="text-blue-300/80 ml-2">{step.name}</span></div>
                           ))}
                         </div>
-                        <div className="flex gap-2 mt-4 pt-4 border-t border-cyan-400/20">
+                        <div className="flex flex-wrap gap-2 mt-4 pt-4 border-t border-cyan-400/20">
                           <button onClick={async () => {
                             const next = topics.map(t => t.id === topic.id ? { ...t, status: t.status === 'active' ? 'inactive' : 'active' } : t);
                             setTopics(next);
                             await persistIntelligenceSettings({ topics: next });
-                          }} className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all ${topic.status === 'active' ? 'bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-400 border border-yellow-400/30' : 'bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-400/30'}`}>{topic.status === 'active' ? 'Disable' : 'Enable'}</button>
+                          }} className={`flex-1 min-w-[6.5rem] px-3 py-2 rounded-lg text-sm font-semibold transition-all ${topic.status === 'active' ? 'bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-400 border border-yellow-400/30' : 'bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-400/30'}`}>{topic.status === 'active' ? 'Disable' : 'Enable'}</button>
                           <button onClick={() => {
                             const hydrated = mergeTopics([topic])[0];
                             setEditingTopic(hydrated);
                             setEditingTopicTab('orchestrator');
                             setExpandedSteps({});
-                          }} className="flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-all bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 border border-cyan-400/30">Edit</button>
+                          }} className="flex-1 min-w-[6.5rem] px-3 py-2 rounded-lg text-sm font-semibold transition-all bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 border border-cyan-400/30">Edit</button>
+                          <button
+                            type="button"
+                            onClick={() => startWorkflowBuilderEdit(topic)}
+                            className="flex-1 min-w-[8rem] px-3 py-2 rounded-lg text-sm font-semibold transition-all bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 border border-purple-400/30 flex items-center justify-center gap-1.5"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" /> Edit with agent
+                          </button>
                         </div>
                       </div>
                     ))}
                   </div>
+                </div>
                 </div>
               )}
 
@@ -12223,6 +12434,20 @@ ${stepInstruction}`;
                           </div>
                           );
                         })()}
+                      </div>
+                      <div>
+                        <label className="block text-sm font-semibold mb-2">Tools</label>
+                        <p className="text-xs text-blue-300/50 mb-2">Capability labels this specialist needs (one per line). Stored in the product JSON; runtime uses the system prompt and knowledge files.</p>
+                        <textarea
+                          value={(editingAgent.tools || []).join('\n')}
+                          onChange={(e) => setEditingAgent({
+                            ...editingAgent,
+                            tools: e.target.value.split('\n').map((t) => t.trim()).filter(Boolean),
+                          })}
+                          rows={3}
+                          placeholder={"numbered clarifying questions\nproposal image extract"}
+                          className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm"
+                        />
                       </div>
                     </div>
                     <div className="border-t border-blue-400/20 p-6 flex gap-3 bg-slate-900 rounded-b-xl">
