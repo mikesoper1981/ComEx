@@ -1,16 +1,24 @@
 import { useState } from 'react';
 import { KeyRound, Lock, Mail } from 'lucide-react';
-import { SESSION_UNLOCKED_KEY, SESSION_TOKEN_KEY, setCurrentUser, setSessionToken } from './auth';
+import { SESSION_UNLOCKED_KEY, SESSION_TOKEN_KEY, setCurrentUser, setSessionToken, getHardcodedUser, isLocalDevHost } from './auth';
 
 function loginUrl() {
   if (typeof window === 'undefined') return '';
   return window.location.origin;
 }
 
+function localDevSessionReady() {
+  if (!isLocalDevHost()) return false;
+  setCurrentUser(getHardcodedUser());
+  if (!sessionStorage.getItem(SESSION_TOKEN_KEY)) setSessionToken('local-dev');
+  return true;
+}
+
 export default function PasswordGate({ children }) {
   const [unlocked, setUnlocked] = useState(
-    () => sessionStorage.getItem(SESSION_UNLOCKED_KEY) === '1'
-      && !!sessionStorage.getItem(SESSION_TOKEN_KEY)
+    () => (sessionStorage.getItem(SESSION_UNLOCKED_KEY) === '1'
+      && !!sessionStorage.getItem(SESSION_TOKEN_KEY))
+      || localDevSessionReady()
   );
   const [step, setStep] = useState('login');
   const [login, setLogin] = useState('');

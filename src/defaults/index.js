@@ -1,13 +1,16 @@
 import { DEFAULT_SYSTEM_PROMPT } from './systemPrompt';
 import { DEFAULT_AGENTS } from './agents';
-import { DEFAULT_TOPICS, DEFAULT_ORCHESTRATOR_PROMPTS } from './topics';
+import { DEFAULT_TOPICS, DEFAULT_ORCHESTRATOR_PROMPTS, normalizeTriggerMode, triggerModeLabel, workflowAllowsKeywordTrigger, workflowAllowsContextTrigger } from './topics';
 import {
   WORKFLOW_BUILDER_WELCOME,
+  WORKFLOW_BUILDER_WELCOME_AGENT,
+  WORKFLOW_BUILDER_WELCOME_EDIT,
   buildWorkflowBuilderCatalog,
   buildWorkflowBuilderSystemPrompt,
   interpretWorkflowBuilderReply,
   applyWorkflowBuilderDraft,
   summarizeWorkflowDraft,
+  slugifyId,
 } from './workflowBuilderAgent';
 import {
   DEFAULT_WELCOME_MESSAGES,
@@ -22,17 +25,24 @@ export {
   DEFAULT_AGENTS,
   DEFAULT_TOPICS,
   DEFAULT_ORCHESTRATOR_PROMPTS,
+  normalizeTriggerMode,
+  triggerModeLabel,
+  workflowAllowsKeywordTrigger,
+  workflowAllowsContextTrigger,
   DEFAULT_WELCOME_MESSAGES,
   DEFAULT_PPTX_CLARIFY,
   DEFAULT_SUGGESTIONS,
   DEFAULT_WORKFLOW_RUNTIME,
   DEFAULT_STELLA_PROMPTS,
   WORKFLOW_BUILDER_WELCOME,
+  WORKFLOW_BUILDER_WELCOME_AGENT,
+  WORKFLOW_BUILDER_WELCOME_EDIT,
   buildWorkflowBuilderCatalog,
   buildWorkflowBuilderSystemPrompt,
   interpretWorkflowBuilderReply,
   applyWorkflowBuilderDraft,
   summarizeWorkflowDraft,
+  slugifyId,
 };
 
 /** Filenames under /knowledge (and intelligence bucket) that power the KB. */
@@ -174,6 +184,7 @@ function cloneTopics(list) {
     name: t.name || '',
     description: t.description || '',
     triggerKeywords: Array.isArray(t.triggerKeywords) ? [...t.triggerKeywords] : [],
+    triggerMode: normalizeTriggerMode(t.triggerMode),
     autoAdvance: !!t.autoAdvance,
     orchestrator: cloneOrchestrator(t.orchestrator),
     workflow: Array.isArray(t.workflow)
@@ -329,6 +340,9 @@ export function mergeWorkflowRuntime(partial) {
   }
   if (!/casual questions/i.test(String(out.matchDetectorPrompt || ''))
     || /You detect if a user message matches one of these workflows/i.test(String(out.matchDetectorPrompt || ''))
+    || /Two valid match types/i.test(String(out.matchDetectorPrompt || ''))
+    || /"matched":"keyword"/i.test(String(out.matchDetectorPrompt || ''))
+    || !/CONVERSATION CONTEXT/i.test(String(out.matchDetectorPrompt || ''))
     || !/"reason"/i.test(String(out.matchDetectorPrompt || ''))) {
     out.matchDetectorPrompt = DEFAULT_WORKFLOW_RUNTIME.matchDetectorPrompt;
   }

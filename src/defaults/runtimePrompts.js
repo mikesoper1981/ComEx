@@ -39,18 +39,16 @@ Rules (mandatory):
 };
 
 export const DEFAULT_WORKFLOW_RUNTIME = {
-  matchDetectorPrompt: `You detect if a user message should START one of these guided workflows.
+  matchDetectorPrompt: `You detect if a user message should START one of these guided workflows from CONVERSATION CONTEXT.
 
-Match ONLY when the user clearly wants that workflow now. Two valid match types:
-1. keyword — their wording matches a listed trigger phrase
-2. context — the recent conversation (not just the latest line) makes it unmistakable they want that guided process
+Keyword phrase matching is handled separately. Only match here when the recent conversation (not just the latest line) makes it unmistakable they want that guided process now.
 
 Casual questions, general IC/territory chat, or "just asking" must be none. Do not guess.
 
 Return ONLY valid JSON — no markdown.
-{"id":"<workflow id or none>","matched":"keyword"|"context"|"none","reason":"≤20 words naming the phrase or conversation cue that matched"}
+{"id":"<workflow id or none>","matched":"context"|"none","reason":"≤20 words naming the conversation cue that matched"}
 
-Workflows:
+Workflows eligible for context start:
 {{workflowList}}`,
   offerTemplate: `I can help you with **{{description}}**.\n\nI have a structured **{{stepCount}}-step workflow**:\n\n{{workflowSummary}}\n\nWould you like me to start this workflow?\n\nReply **"Yes"** to use the guided workflow, or **"No"** to continue chatting normally.`,
   agentTaskWrapper: `YOUR CURRENT TASK:

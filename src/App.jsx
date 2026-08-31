@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense, Component } from 'react';
 import { createPortal } from 'react-dom';
 import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles } from 'lucide-react';
+import ExcelExportButton from './ExcelExportButton';
 import { supabase } from './supabase';
 import {
   getCurrentUser,
@@ -82,11 +83,17 @@ import {
   knowledgeFileFlags,
   filterKnowledgeDocuments,
   WORKFLOW_BUILDER_WELCOME,
+  WORKFLOW_BUILDER_WELCOME_EDIT,
   buildWorkflowBuilderCatalog,
   buildWorkflowBuilderSystemPrompt,
   interpretWorkflowBuilderReply,
   applyWorkflowBuilderDraft,
   summarizeWorkflowDraft,
+  slugifyId,
+  normalizeTriggerMode,
+  triggerModeLabel,
+  workflowAllowsKeywordTrigger,
+  workflowAllowsContextTrigger,
 } from './defaults';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import JSZip from 'jszip';
@@ -186,6 +193,23 @@ function excerptForSuggestions(text, max = 1200) {
   const head = Math.floor(max * 0.55);
   const tail = max - head - 20;
   return `${t.slice(0, head)}\n…\n${t.slice(-tail)}`;
+}
+
+function toAnthropicHistory(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    const role = m.role === 'assistant' ? 'assistant' : (m.role === 'user' ? 'user' : null);
+    if (!role) continue;
+    const content = String(m.content || '').trim();
+    if (!content) continue;
+    if (!out.length && role === 'assistant') continue;
+    if (out.length && out[out.length - 1].role === role) {
+      out[out.length - 1] = { role, content: `${out[out.length - 1].content}\n\n${content}` };
+    } else {
+      out.push({ role, content });
+    }
+  }
+  return out;
 }
 
 function anthropicMessagesPost({ system, messages, max_tokens, tools, tool_choice, thinking, signal }) {
@@ -1163,6 +1187,7 @@ function matchTopicByTriggers(topics, message) {
   if (msg.length < 8) return null;
   for (const topic of topics || []) {
     if (topic.status !== 'active') continue;
+    if (!workflowAllowsKeywordTrigger(topic)) continue;
     const kws = Array.isArray(topic.triggerKeywords) ? topic.triggerKeywords : [];
     const matchedKeywords = kws
       .map((kw) => String(kw || '').trim())
@@ -4633,18 +4658,23 @@ export default function CommercialExcellenceApp() {
   const [editingTopicTab, setEditingTopicTab] = useState('basics'); // basics | orchestrator | steps
   const [expandedSteps, setExpandedSteps] = useState({});
   const [editingAgent, setEditingAgent] = useState(null);
-  const [wfBuilderMessages, setWfBuilderMessages] = useState(() => [
-    { role: 'assistant', content: WORKFLOW_BUILDER_WELCOME },
-  ]);
+  const [wfBuilderMessages, setWfBuilderMessages] = useState([]);
   const [wfBuilderInput, setWfBuilderInput] = useState('');
   const [wfBuilderLoading, setWfBuilderLoading] = useState(false);
   const [wfBuilderDraft, setWfBuilderDraft] = useState(null);
   const [wfBuilderReady, setWfBuilderReady] = useState(false);
   const [wfBuilderFocusId, setWfBuilderFocusId] = useState('');
+  const [wfBuilderIntent, setWfBuilderIntent] = useState('create');
+  const [wfBuilderOpen, setWfBuilderOpen] = useState(false);
   const [wfBuilderError, setWfBuilderError] = useState('');
   const [wfBuilderApplying, setWfBuilderApplying] = useState(false);
+  const [wfBuilderThinking, setWfBuilderThinking] = useState('');
   const wfBuilderEndRef = useRef(null);
   const wfBuilderPanelRef = useRef(null);
+  const wfBuilderChatRef = useRef(null);
+  const wfListRef = useRef(null);
+  const wfCardRefs = useRef({});
+  const [wfSavedId, setWfSavedId] = useState('');
   const [suggestedPrompts, setSuggestedPrompts] = useState([]);
   const [suggestionsEnabled, setSuggestionsEnabled] = useState(() => readLocalProductIntelligence().suggestions.enabled);
   const [maxSuggestions, setMaxSuggestions] = useState(() => readLocalProductIntelligence().suggestions.max);
@@ -4667,8 +4697,10 @@ export default function CommercialExcellenceApp() {
   };
 
   useEffect(() => {
-    wfBuilderEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [wfBuilderMessages, wfBuilderLoading]);
+    const el = wfBuilderChatRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [wfBuilderMessages, wfBuilderLoading, wfBuilderThinking, wfBuilderDraft]);
 
   // ── SUPABASE: Load intelligence knowledge files on every visit ──
   useEffect(() => {
@@ -5347,7 +5379,19 @@ export default function CommercialExcellenceApp() {
     const yTicks = Array.from({ length: Math.floor(yMax / 50) + 1 }, (_, i) => i * 50);
     return (
       <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
-        <h3 className="text-base font-semibold text-cyan-400 mb-3">💹 Payout Curve</h3>
+        <div className="flex items-center justify-between gap-2 mb-3">
+          <h3 className="text-base font-semibold text-cyan-400">💹 Payout Curve</h3>
+          <ExcelExportButton
+            rows={curveData.map((p) => ({
+              'Performance %': p.performance,
+              'Payout %': p.payout,
+              Status: p.payout === 0 ? 'No Payout' : p.payout < 100 ? 'Below Target' : p.payout === 100 ? 'On Target' : 'Accelerator',
+            }))}
+            sheetName="Payout curve"
+            filename="payout-curve"
+            label="Export this chart to Excel"
+          />
+        </div>
         <div className="overflow-x-auto">
           <div className="bg-slate-800/50 rounded p-2 mb-4" style={{ minWidth: '500px', height: '300px' }}>
             <svg width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
@@ -5476,8 +5520,18 @@ export default function CommercialExcellenceApp() {
             const rows = el.lines.filter(l => !l.match(/^[\s\-:|]+$/)).map(l => l.split('|').map(c => c.trim()).filter(c => c.length > 0)).filter(r => r.length > 0);
             if (rows.length === 0) return null;
             const [header, ...body] = rows;
+            const exportRows = [header, ...body];
             return (
-              <div key={idx} className="overflow-x-auto my-3">
+              <div key={idx} className="my-3">
+                <div className="flex justify-end mb-1">
+                  <ExcelExportButton
+                    rows={exportRows}
+                    sheetName={header[0] || 'Table'}
+                    filename={header.filter(Boolean).slice(0, 4).join(' ') || 'table'}
+                    label="Export this table to Excel"
+                  />
+                </div>
+                <div className="overflow-x-auto">
                 <table className="min-w-full border-collapse border border-blue-400/30 rounded-lg overflow-hidden text-sm">
                   <thead className="bg-blue-500/20">
                     <tr>{header.map((h, i) => (<th key={i} className="border border-blue-400/30 px-3 py-2 text-left font-semibold text-blue-300 whitespace-nowrap" dangerouslySetInnerHTML={{ __html: inlineFormat(h) }} />))}</tr>
@@ -5490,6 +5544,7 @@ export default function CommercialExcellenceApp() {
                     ))}
                   </tbody>
                 </table>
+                </div>
               </div>
             );
           } else {
@@ -5643,7 +5698,15 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
 
   const callAnthropic = async (system, messages, maxTokens = 1000) => {
     const res = await anthropicMessagesPost({ system, messages, max_tokens: maxTokens });
-    if (!res.ok) { const errText = await res.text(); throw new Error(`API error ${res.status}: ${errText.substring(0, 200)}`); }
+    if (!res.ok) {
+      const errText = await res.text();
+      let detail = (errText || '').slice(0, 240);
+      try {
+        const parsed = JSON.parse(errText);
+        detail = parsed?.error?.message || parsed?.message || detail;
+      } catch { /* keep detail */ }
+      throw new Error(`API error ${res.status}: ${detail || 'request failed'}`);
+    }
     const data = await res.json();
     if (data.error) throw new Error(`Anthropic error: ${data.error.message || JSON.stringify(data.error)}`);
     return anthropicAssistantText(data);
@@ -5935,31 +5998,78 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     return intel;
   };
 
-  const resetWorkflowBuilder = () => {
+  const revealSavedWorkflow = (id) => {
+    const focusId = String(id || '').trim();
+    if (!focusId) return;
+    setWfSavedId(focusId);
+    requestAnimationFrame(() => {
+      const card = wfCardRefs.current[focusId];
+      if (!card) return;
+      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+    window.setTimeout(() => {
+      setWfSavedId((cur) => (cur === focusId ? '' : cur));
+    }, 2200);
+  };
+
+  const closeWorkflowBuilder = () => {
+    setWfBuilderOpen(false);
     setWfBuilderFocusId('');
-    setWfBuilderMessages([{ role: 'assistant', content: WORKFLOW_BUILDER_WELCOME }]);
+    setWfBuilderIntent('create');
+    setWfBuilderMessages([]);
     setWfBuilderInput('');
     setWfBuilderDraft(null);
     setWfBuilderReady(false);
     setWfBuilderError('');
     setWfBuilderLoading(false);
+    setWfBuilderThinking('');
+  };
+
+  const openWorkflowBuilder = (intent, topic = null) => {
+    setWfBuilderOpen(true);
+    setWfBuilderIntent(intent);
+    setWfBuilderFocusId(topic?.id || '');
+    setWfBuilderDraft(null);
+    setWfBuilderReady(false);
+    setWfBuilderError('');
+    setWfBuilderLoading(false);
+    setWfBuilderThinking('');
+    setWfBuilderInput('');
+    const kwList = Array.isArray(topic?.triggerKeywords) && topic.triggerKeywords.length
+      ? topic.triggerKeywords.join(', ')
+      : 'none yet';
+    const welcome = intent === 'edit'
+      ? `We'll edit **${topic?.name || 'this workflow'}** (\`${topic?.id || ''}\`), currently **${topic?.status === 'inactive' ? 'disabled' : 'enabled'}**. I have the full workflow — steps, goals, success criteria, orchestrator, assigned agent prompts, and triggers.\n\n**Start from chat:** ${triggerModeLabel(topic?.triggerMode)}\n**Keyword triggers now:** ${kwList}\n**Context cue now:** ${topic?.description || '(none)'}\n\n${WORKFLOW_BUILDER_WELCOME_EDIT}`
+      : WORKFLOW_BUILDER_WELCOME;
+    setWfBuilderMessages([{ role: 'assistant', content: welcome }]);
   };
 
   const startWorkflowBuilderEdit = (topic) => {
     if (!topic?.id) return;
-    setWfBuilderFocusId(topic.id);
-    setWfBuilderDraft(null);
-    setWfBuilderReady(false);
-    setWfBuilderError('');
-    setWfBuilderLoading(false);
-    setWfBuilderInput('');
-    setWfBuilderMessages([{
-      role: 'assistant',
-      content: `We'll edit **${topic.name}** (id \`${topic.id}\`). Tell me what to change — purpose, steps, agents, orchestrator, triggers, or auto-advance. I'll use the current product JSON as the baseline and propose a full updated draft.`,
-    }]);
-    requestAnimationFrame(() => {
-      wfBuilderPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    openWorkflowBuilder('edit', topic);
+  };
+
+  const openManualNewWorkflow = () => {
+    closeWorkflowBuilder();
+    const id = slugifyId('new_workflow', new Set((topics || []).map((t) => t.id)));
+    setEditingTopic({
+      id,
+      name: 'New Workflow',
+      description: '',
+      triggerKeywords: [],
+      triggerMode: 'both',
+      autoAdvance: false,
+      status: 'active',
+      orchestrator: {
+        ...DEFAULT_ORCHESTRATOR_PROMPTS,
+        role: 'You are the Workflow Orchestrator.',
+        goal: '',
+        approach: '',
+      },
+      workflow: [{ step: 1, name: 'New Step', agents: [], goal: '', successCriteria: '' }],
     });
+    setEditingTopicTab('basics');
+    setExpandedSteps({ [`${id}-0`]: true });
   };
 
   const sendWorkflowBuilder = async (text) => {
@@ -5967,6 +6077,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     if (!content || wfBuilderLoading) return;
     setWfBuilderInput('');
     setWfBuilderError('');
+    setWfBuilderThinking('');
     const history = [...wfBuilderMessages, { role: 'user', content }];
     setWfBuilderMessages(history);
     setWfBuilderLoading(true);
@@ -5978,15 +6089,44 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
         topics,
         agents,
         knowledgeFiles,
+        intent: wfBuilderIntent,
         focusId: wfBuilderFocusId,
       });
-      const apiMessages = history
-        .filter((m) => m.role === 'user' || m.role === 'assistant')
-        .slice(-20)
-        .map((m) => ({ role: m.role, content: String(m.content || '') }));
-      const raw = await callAnthropic(buildWorkflowBuilderSystemPrompt(catalog), apiMessages, 8000);
+      const apiMessages = toAnthropicHistory(history).slice(-20);
+      if (!apiMessages.length) {
+        throw new Error('Type a message for the Workflow agent.');
+      }
+      const res = await anthropicMessagesPost({
+        system: buildWorkflowBuilderSystemPrompt(catalog),
+        messages: apiMessages,
+        max_tokens: 6000,
+        thinking: { type: 'enabled', budget_tokens: 1600 },
+      });
+      const errText = !res.ok ? await res.text() : '';
+      if (!res.ok) {
+        let detail = (errText || '').slice(0, 240);
+        try {
+          const parsed = JSON.parse(errText);
+          detail = parsed?.error?.message || parsed?.message || detail;
+        } catch { /* keep detail */ }
+        throw new Error(`API error ${res.status}: ${detail || 'request failed'}`);
+      }
+      const data = await res.json();
+      if (data.error) throw new Error(`Anthropic error: ${data.error.message || JSON.stringify(data.error)}`);
+      const blocks = Array.isArray(data.content) ? data.content : [];
+      const thinkingText = blocks
+        .filter((b) => b.type === 'thinking' || b.type === 'redacted_thinking')
+        .map((b) => (b.type === 'redacted_thinking' ? '' : String(b.thinking || '').trim()))
+        .filter(Boolean)
+        .join('\n\n');
+      if (thinkingText) setWfBuilderThinking(thinkingText);
+      const raw = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n') || anthropicAssistantText(data);
       const interpreted = interpretWorkflowBuilderReply(raw);
-      setWfBuilderMessages((prev) => [...prev, { role: 'assistant', content: interpreted.message || 'Draft updated.' }]);
+      setWfBuilderMessages((prev) => [...prev, {
+        role: 'assistant',
+        content: interpreted.message || 'Draft updated.',
+        reasoning: thinkingText ? excerptForSuggestions(thinkingText, 1400) : '',
+      }]);
       setWfBuilderDraft(interpreted.draft);
       setWfBuilderReady(!!interpreted.ready);
     } catch (err) {
@@ -5997,19 +6137,22 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       }]);
     } finally {
       setWfBuilderLoading(false);
+      setWfBuilderThinking('');
     }
   };
 
   const applyWorkflowBuilder = async () => {
-    if (!wfBuilderDraft?.workflow || wfBuilderApplying) return;
+    if (!wfBuilderDraft || wfBuilderApplying) return;
+    const agentOnly = wfBuilderIntent === 'create_agent' || wfBuilderDraft.mode === 'create_agent';
+    if (!agentOnly && !wfBuilderDraft.workflow) return;
     setWfBuilderApplying(true);
     setWfBuilderError('');
     try {
       const knowledgeNames = (documents || []).map((d) => d.name);
       const draft = {
         ...wfBuilderDraft,
-        mode: wfBuilderFocusId ? 'edit' : (wfBuilderDraft.mode || 'create'),
-        workflow: {
+        mode: agentOnly ? 'create_agent' : (wfBuilderFocusId ? 'edit' : (wfBuilderDraft.mode || 'create')),
+        workflow: agentOnly ? null : {
           ...wfBuilderDraft.workflow,
           id: wfBuilderFocusId || wfBuilderDraft.workflow.id,
         },
@@ -6020,19 +6163,31 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
         draft,
         knowledgeNames,
       });
-      await persistIntelligenceSettings({ topics: applied.topics, agents: applied.agents });
-      const hydrated = mergeTopics(applied.topics).find((t) => t.id === applied.topic.id) || applied.topic;
-      setEditingTopic(hydrated);
-      setEditingTopicTab('steps');
-      setExpandedSteps({});
+      setTopics(mergeTopics(applied.topics));
+      setAgents(applied.agents);
+      setWfBuilderDraft(null);
       setWfBuilderReady(false);
-      const created = applied.createdAgentIds?.length
-        ? ` Created agents: ${applied.createdAgentIds.join(', ')}.`
-        : '';
-      setWfBuilderMessages((prev) => [...prev, {
-        role: 'assistant',
-        content: `Applied **${applied.topic.name}** to the product JSON.${created} The editor is open so you can tweak steps or prompts before you're done.`,
-      }]);
+      if (applied.mode === 'create_agent') {
+        const created = applied.createdAgents?.[0] || applied.agents.find((a) => applied.createdAgentIds?.includes(a.id));
+        setWfBuilderMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: `Saved **${created?.name || 'the agent'}** to the product JSON. It is not assigned to a workflow yet — use Edit on a workflow (or Edit with agent) to add it to a step.`,
+        }]);
+      } else {
+        if (applied.topic?.id) {
+          setWfBuilderFocusId(applied.topic.id);
+          setWfBuilderIntent('edit');
+        }
+        const created = applied.createdAgentIds?.length
+          ? ` Created agents: ${applied.createdAgentIds.join(', ')}.`
+          : '';
+        setWfBuilderMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: `Saved **${applied.topic.name}** (${applied.topic.status === 'inactive' ? 'disabled' : 'enabled'}) to the product JSON.${created} Use **Edit** on the card if you want to tweak it by hand.`,
+        }]);
+        revealSavedWorkflow(applied.topic?.id);
+      }
+      await persistIntelligenceSettings({ topics: applied.topics, agents: applied.agents });
     } catch (err) {
       setWfBuilderError(err?.message || 'Could not apply the draft.');
     } finally {
@@ -9910,7 +10065,7 @@ ${stepInstruction}`;
   };
 
   const matchTopicByConversationContext = async (messageContent) => {
-    const active = (topics || []).filter((t) => t.status === 'active');
+    const active = (topics || []).filter((t) => t.status === 'active' && workflowAllowsContextTrigger(t));
     if (!active.length) return null;
     const recent = (messagesRef.current || [])
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator'))
@@ -9919,7 +10074,7 @@ ${stepInstruction}`;
       .join('\n');
     if (!recent.trim()) return null;
     const workflowList = active.map((t) => (
-      `- id: ${t.id}\n  name: ${t.name}\n  trigger phrases: ${(t.triggerKeywords || []).join(', ') || '(none)'}\n  when: ${t.description || t.name}`
+      `- id: ${t.id}\n  name: ${t.name}\n  when: ${t.description || t.name}`
     )).join('\n');
     try {
       const raw = await callAnthropic(
@@ -12072,71 +12227,96 @@ ${stepInstruction}`;
               )}
 
               {adminSection === 'workflows' && (
-                <div className="space-y-4">
-                <div ref={wfBuilderPanelRef} className="bg-slate-800/30 backdrop-blur-sm border border-cyan-400/25 rounded-xl p-5">
-                  <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+                <div className="flex flex-col min-h-0 h-[calc(100vh-11rem)]">
+                <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 flex flex-col min-h-0 flex-1 overflow-hidden">
+                  <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+                    <h2 className="text-xl font-bold flex items-center gap-2"><Target className="w-6 h-6 text-cyan-400" />Workflows</h2>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={openManualNewWorkflow}
+                        className="px-3 py-2 rounded-lg text-sm font-semibold bg-slate-700/50 hover:bg-slate-700 text-blue-100 border border-blue-400/25 flex items-center gap-1.5"
+                      >
+                        <Plus className="w-4 h-4" /> New Workflow
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openWorkflowBuilder('create')}
+                        className="px-3 py-2 rounded-lg text-sm font-semibold bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-400/30 flex items-center gap-1.5"
+                      >
+                        <Sparkles className="w-4 h-4" /> New Workflow
+                      </button>
+                    </div>
+                  </div>
+                {wfBuilderOpen && (
+                <div ref={wfBuilderPanelRef} className="mb-4 bg-slate-950/40 border border-cyan-400/25 rounded-xl p-4 flex flex-col h-[min(28rem,46vh)] min-h-[16rem] shrink-0">
+                  <div className="flex flex-wrap items-start justify-between gap-3 mb-3 shrink-0">
                     <div>
-                      <h2 className="text-xl font-bold flex items-center gap-2"><Sparkles className="w-6 h-6 text-cyan-400" />Workflow agent</h2>
-                      <p className="text-xs text-blue-300/55 mt-1 max-w-2xl">
-                        Hardcoded helper — not a live user workflow. It interviews you, then drafts steps, agents, tools, and settings in the same JSON style as Design New IC / Analyze Existing IC. Apply writes them into the product JSON.
+                      <h3 className="text-base font-bold flex items-center gap-2"><Sparkles className="w-5 h-5 text-cyan-400" />Workflow agent</h3>
+                      <p className="text-xs text-blue-300/55 mt-1">
+                        {wfBuilderIntent === 'edit'
+                          ? `Editing ${topics.find((t) => t.id === wfBuilderFocusId)?.name || 'this workflow'} — full current JSON (including trigger mode, keywords, and context) is passed to the agent.`
+                          : 'Creating a new workflow. The agent will ask whether chat should start it from keywords only, conversation context only, or both.'}
                       </p>
                     </div>
-                    <button type="button" onClick={resetWorkflowBuilder} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700/50 hover:bg-slate-700 text-blue-200 border border-blue-400/20">New conversation</button>
+                    <button type="button" onClick={closeWorkflowBuilder} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700/50 hover:bg-slate-700 text-blue-200 border border-blue-400/20">Close</button>
                   </div>
-                  <div className="mb-3">
-                    <label className="text-xs text-blue-300/70 font-semibold block mb-1">Focus</label>
-                    <select
-                      value={wfBuilderFocusId}
-                      onChange={(e) => setWfBuilderFocusId(e.target.value)}
-                      className="w-full sm:w-auto min-w-[240px] bg-slate-900 border border-blue-400/30 rounded-lg px-3 py-2 text-sm text-white"
-                    >
-                      <option value="">Create a new workflow</option>
-                      {topics.map((t) => (
-                        <option key={t.id} value={t.id}>Edit: {t.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="bg-slate-950/50 border border-blue-400/20 rounded-lg p-3 h-72 overflow-y-auto custom-scrollbar space-y-3">
+                  <div ref={wfBuilderChatRef} className="bg-slate-950/50 border border-blue-400/20 rounded-lg p-3 flex-1 min-h-0 overflow-y-auto custom-scrollbar space-y-3">
                     {wfBuilderMessages.map((m, i) => (
                       <div key={i} className={`text-sm ${m.role === 'user' ? 'text-right' : ''}`}>
                         <div className={`inline-block max-w-[95%] rounded-lg px-3 py-2 ${m.role === 'user' ? 'bg-cyan-500/20 text-cyan-50 text-left' : 'bg-slate-800/80 text-blue-100'}`}>
                           {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : formatMarkdown(m.content)}
+                          {m.role === 'assistant' && m.reasoning && (
+                            <div className="mt-2 border-t border-blue-400/15 pt-2 text-left">
+                              <div className="text-[11px] font-semibold text-cyan-300/80">Reasoning</div>
+                              <div className="mt-1 whitespace-pre-wrap text-[11px] text-blue-200/65 leading-relaxed max-h-32 overflow-y-auto custom-scrollbar">{m.reasoning}</div>
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))}
-                    {wfBuilderLoading && <div className="text-xs text-cyan-300/70">Workflow agent is thinking…</div>}
+                    {wfBuilderLoading && (
+                      <div className="text-xs text-cyan-300/80 bg-slate-800/60 border border-cyan-400/15 rounded-lg px-3 py-2">
+                        <div className="font-semibold">Workflow agent is thinking…</div>
+                        {wfBuilderThinking ? (
+                          <div className="mt-1.5 whitespace-pre-wrap text-blue-200/70 leading-relaxed">{excerptForSuggestions(wfBuilderThinking, 900)}</div>
+                        ) : (
+                          <div className="mt-1 text-blue-300/50">Reading the workflow, triggers, steps, and assigned agents…</div>
+                        )}
+                      </div>
+                    )}
+                    {wfBuilderDraft && (wfBuilderDraft.workflow || (wfBuilderDraft.newAgents || []).length) && (
+                      <div className="bg-slate-900/70 border border-cyan-400/25 rounded-lg p-3 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="text-sm font-semibold text-cyan-300">
+                            {wfBuilderReady ? 'Ready to apply' : 'Draft sketch'} — {wfBuilderDraft.workflow?.name || wfBuilderDraft.newAgents?.[0]?.name || wfBuilderDraft.workflow?.id || 'draft'}
+                          </div>
+                          {!wfBuilderReady && <span className="text-[10px] text-amber-300/80">Keep chatting to finish the draft</span>}
+                        </div>
+                        <div className="text-xs text-blue-200/80 whitespace-pre-wrap">{summarizeWorkflowDraft(wfBuilderDraft)}</div>
+                        <div className="flex flex-wrap gap-2 pt-1">
+                          <button
+                            type="button"
+                            disabled={!wfBuilderReady || wfBuilderApplying}
+                            onClick={applyWorkflowBuilder}
+                            className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white text-sm font-semibold rounded-lg flex items-center gap-2"
+                          >
+                            <Save className="w-4 h-4" /> {wfBuilderApplying ? 'Applying…' : 'Apply to product JSON'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => { setWfBuilderDraft(null); setWfBuilderReady(false); }}
+                            className="px-3 py-2 bg-slate-700/60 text-blue-200 text-sm rounded-lg"
+                          >
+                            Discard draft
+                          </button>
+                        </div>
+                      </div>
+                    )}
                     <div ref={wfBuilderEndRef} />
                   </div>
-                  {wfBuilderError && <div className="mt-2 text-xs text-red-400">{wfBuilderError}</div>}
-                  {wfBuilderDraft?.workflow && (
-                    <div className="mt-3 bg-slate-900/70 border border-cyan-400/25 rounded-lg p-3 space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="text-sm font-semibold text-cyan-300">
-                          {wfBuilderReady ? 'Ready to apply' : 'Draft sketch'} — {wfBuilderDraft.workflow.name || wfBuilderDraft.workflow.id}
-                        </div>
-                        {!wfBuilderReady && <span className="text-[10px] text-amber-300/80">Keep chatting to finish the draft</span>}
-                      </div>
-                      <div className="text-xs text-blue-200/80 whitespace-pre-wrap">{summarizeWorkflowDraft(wfBuilderDraft)}</div>
-                      <div className="flex flex-wrap gap-2 pt-1">
-                        <button
-                          type="button"
-                          disabled={!wfBuilderReady || wfBuilderApplying}
-                          onClick={applyWorkflowBuilder}
-                          className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white text-sm font-semibold rounded-lg flex items-center gap-2"
-                        >
-                          <Save className="w-4 h-4" /> {wfBuilderApplying ? 'Applying…' : 'Apply to product JSON'}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => { setWfBuilderDraft(null); setWfBuilderReady(false); }}
-                          className="px-3 py-2 bg-slate-700/60 text-blue-200 text-sm rounded-lg"
-                        >
-                          Discard draft
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                  <div className="mt-3 flex gap-2">
+                  {wfBuilderError && <div className="mt-2 text-xs text-red-400 shrink-0">{wfBuilderError}</div>}
+                  <div className="mt-3 flex gap-2 shrink-0">
                     <textarea
                       value={wfBuilderInput}
                       onChange={(e) => setWfBuilderInput(e.target.value)}
@@ -12147,8 +12327,12 @@ ${stepInstruction}`;
                         }
                       }}
                       rows={2}
-                      placeholder={wfBuilderFocusId ? `Describe how to change ${topics.find((t) => t.id === wfBuilderFocusId)?.name || 'this workflow'}…` : 'Describe the workflow you want to create…'}
-                      className="flex-1 bg-slate-900 border border-blue-400/30 rounded-lg px-3 py-2 text-sm text-white resize-y min-h-[44px]"
+                      placeholder={
+                        wfBuilderIntent === 'edit'
+                          ? `Describe how to change ${topics.find((t) => t.id === wfBuilderFocusId)?.name || 'this workflow'} (steps, triggers, agents)…`
+                          : 'Describe the workflow and how chat should start it (keyword only, context only, or both)…'
+                      }
+                      className="flex-1 bg-slate-900 border border-blue-400/30 rounded-lg px-3 py-2 text-sm text-white resize-none min-h-[44px]"
                     />
                     <button
                       type="button"
@@ -12160,13 +12344,32 @@ ${stepInstruction}`;
                     </button>
                   </div>
                 </div>
-                <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6">
-                  <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Target className="w-6 h-6 text-cyan-400" />Workflows</h2>
-                  <div className="space-y-4">
+                )}
+                  <div ref={wfListRef} className="space-y-4 flex-1 min-h-0 overflow-y-auto custom-scrollbar">
                     {topics.map(topic => (
-                      <div key={topic.id} className="bg-slate-700/30 border border-cyan-400/20 rounded-lg p-4">
+                      <div
+                        key={topic.id}
+                        ref={(el) => {
+                          if (el) wfCardRefs.current[topic.id] = el;
+                          else delete wfCardRefs.current[topic.id];
+                        }}
+                        className={`bg-slate-700/30 border rounded-lg p-4 transition-all ${wfSavedId === topic.id ? 'border-cyan-300 bg-cyan-500/15' : 'border-cyan-400/20'}`}
+                      >
                         <div className="flex items-start justify-between mb-3">
-                          <div className="flex-1 mr-3"><div className="font-semibold text-cyan-300">{topic.name}</div><div className="text-xs text-blue-300/60 mt-1">{topic.description}</div></div>
+                          <div className="flex-1 mr-3">
+                            <div className="font-semibold text-cyan-300">{topic.name}</div>
+                            <div className="text-xs text-blue-300/60 mt-1">{topic.description}</div>
+                            <div className="text-[10px] text-cyan-300/70 mt-1.5">Starts: {triggerModeLabel(topic.triggerMode)}</div>
+                            {workflowAllowsKeywordTrigger(topic) && (topic.triggerKeywords || []).length > 0 ? (
+                              <div className="text-[10px] text-blue-300/50 mt-1">
+                                Keywords: {(topic.triggerKeywords || []).join(' · ')}
+                              </div>
+                            ) : workflowAllowsKeywordTrigger(topic) ? (
+                              <div className="text-[10px] text-amber-300/70 mt-1">No keyword phrases — chat will not start this workflow from a typed phrase</div>
+                            ) : (
+                              <div className="text-[10px] text-blue-300/45 mt-1">Keyword phrases are ignored (context only)</div>
+                            )}
+                          </div>
                           <span className={`px-2 py-1 text-xs rounded ${topic.status === 'active' ? 'bg-green-500/20 text-green-400 border border-green-400/30' : 'bg-gray-500/20 text-gray-400 border border-gray-400/30'}`}>{topic.status}</span>
                         </div>
                         <div className="space-y-1 mt-3 pl-3 border-l-2 border-cyan-400/30">
@@ -12468,7 +12671,7 @@ ${stepInstruction}`;
                   <div className="bg-slate-900 border border-cyan-400/30 rounded-xl max-w-4xl w-full my-6 shadow-2xl shadow-cyan-500/10">
                     <div className="sticky top-0 bg-slate-900 border-b border-blue-400/20 p-4 sm:p-5 z-10 rounded-t-xl space-y-3">
                       <div className="flex items-center justify-between gap-3">
-                        <h2 className="text-xl font-bold">Edit Workflow: {editingTopic.name}</h2>
+                        <h2 className="text-xl font-bold">{topics.some((t) => t.id === editingTopic.id) ? `Edit Workflow: ${editingTopic.name}` : 'New Workflow'}</h2>
                         <button type="button" onClick={() => { setEditingTopic(null); setEditingTopicTab('basics'); }} className="text-blue-300 hover:text-white transition-colors"><X className="w-6 h-6" /></button>
                       </div>
                       <div className="flex gap-2 overflow-x-auto">
@@ -12489,8 +12692,62 @@ ${stepInstruction}`;
                       {editingTopicTab === 'basics' && (
                         <>
                           <div><label className="block text-sm font-semibold mb-2">Workflow Name</label><input type="text" value={editingTopic.name} onChange={(e) => setEditingTopic({...editingTopic, name: e.target.value})} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
-                          <div><label className="block text-sm font-semibold mb-2">Description</label><textarea value={editingTopic.description} onChange={(e) => setEditingTopic({...editingTopic, description: e.target.value})} rows={3} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" /></div>
-                          <div><label className="block text-sm font-semibold mb-2">Trigger Keywords (comma-separated)</label><input type="text" value={editingTopic.triggerKeywords?.join(', ') || ''} onChange={(e) => setEditingTopic({ ...editingTopic, triggerKeywords: e.target.value.split(',').map(k => k.trim()).filter(k => k) })} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm" /></div>
+                          <div>
+                            <label className="block text-sm font-semibold mb-2">Description (context cue)</label>
+                            <textarea value={editingTopic.description} onChange={(e) => setEditingTopic({...editingTopic, description: e.target.value})} rows={3} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white" />
+                            <p className="text-[11px] text-blue-300/50 mt-1">
+                              {normalizeTriggerMode(editingTopic.triggerMode) === 'keyword'
+                                ? 'Shown as the workflow summary. Not used to start the workflow while Keyword only is selected.'
+                                : 'Used as the “when” situation for conversation-context matching.'}
+                            </p>
+                          </div>
+                          <fieldset className="space-y-2">
+                            <legend className="block text-sm font-semibold mb-1">Start from chat</legend>
+                            {[
+                              ['keyword', 'Keyword only', 'Offer this workflow only when the user message contains a trigger phrase.'],
+                              ['context', 'Context only', 'Offer this workflow only when the conversation matches the description — not from phrases.'],
+                              ['both', 'Keywords and context', 'Offer from a trigger phrase or from conversation context.'],
+                            ].map(([id, label, hint]) => (
+                              <label key={id} className="flex items-start gap-2 text-sm text-blue-100 cursor-pointer">
+                                <input
+                                  type="radio"
+                                  name="workflow-trigger-mode"
+                                  checked={normalizeTriggerMode(editingTopic.triggerMode) === id}
+                                  onChange={() => setEditingTopic({ ...editingTopic, triggerMode: id })}
+                                  className="mt-1 border-blue-400/40"
+                                />
+                                <span>
+                                  <span className="font-semibold">{label}</span>
+                                  <span className="block text-xs text-blue-300/60 mt-0.5">{hint}</span>
+                                </span>
+                              </label>
+                            ))}
+                          </fieldset>
+                          <div>
+                            <label className="block text-sm font-semibold mb-2">Trigger Keywords (comma-separated)</label>
+                            <input type="text" value={editingTopic.triggerKeywords?.join(', ') || ''} onChange={(e) => setEditingTopic({ ...editingTopic, triggerKeywords: e.target.value.split(',').map(k => k.trim()).filter(k => k) })} className="w-full bg-slate-800 border border-blue-400/30 rounded-lg px-4 py-2 text-white text-sm" />
+                            <p className="text-[11px] text-blue-300/50 mt-1">
+                              {normalizeTriggerMode(editingTopic.triggerMode) === 'context'
+                                ? 'Not used to start the workflow while Context only is selected. Keep phrases if you may switch back.'
+                                : 'Chat offers this workflow when the user message contains a phrase (4+ characters), e.g. design an incentive, assess my ic.'}
+                            </p>
+                          </div>
+                          <label className="flex items-start gap-2 text-sm text-blue-100 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={editingTopic.status !== 'inactive'}
+                              onChange={(e) => setEditingTopic({ ...editingTopic, status: e.target.checked ? 'active' : 'inactive' })}
+                              className="rounded border-blue-400/40 mt-0.5"
+                            />
+                            <span>
+                              <span className="font-semibold">Enabled</span>
+                              <span className="block text-xs text-blue-300/60 mt-0.5">
+                                {editingTopic.status === 'inactive'
+                                  ? 'Off: this workflow is not offered to users until you enable it.'
+                                  : 'On: users can trigger this workflow from chat.'}
+                              </span>
+                            </span>
+                          </label>
                           <label className="flex items-start gap-2 text-sm text-blue-100 cursor-pointer">
                             <input type="checkbox" checked={!!editingTopic.autoAdvance} onChange={(e) => setEditingTopic({ ...editingTopic, autoAdvance: e.target.checked })} className="rounded border-blue-400/40 mt-0.5" />
                             <span>
@@ -12573,10 +12830,14 @@ ${stepInstruction}`;
 
                     <div className="border-t border-blue-400/20 p-4 sm:p-5 flex gap-3 bg-slate-900 rounded-b-xl">
                       <button type="button" onClick={async () => {
-                        const next = topics.map(t => t.id === editingTopic.id ? editingTopic : t);
+                        const idx = topics.findIndex(t => t.id === editingTopic.id);
+                        const next = idx >= 0
+                          ? topics.map(t => t.id === editingTopic.id ? editingTopic : t)
+                          : [...topics, editingTopic];
                         setTopics(next);
                         setEditingTopic(null);
                         setEditingTopicTab('basics');
+                        revealSavedWorkflow(editingTopic.id);
                         await persistIntelligenceSettings({ topics: next });
                       }} className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2"><CheckCircle className="w-5 h-5" />Save Changes</button>
                       <button type="button" onClick={() => { setEditingTopic(null); setEditingTopicTab('basics'); }} className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors">Cancel</button>

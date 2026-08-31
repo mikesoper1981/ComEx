@@ -41,12 +41,36 @@ function withOrchestratorPrompts(partial) {
   };
 }
 
+/** How chat may offer this workflow: keyword phrases, conversation context, or either. */
+export function normalizeTriggerMode(value) {
+  const v = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (v === 'keyword' || v === 'keywords' || v === 'keyword_only') return 'keyword';
+  if (v === 'context' || v === 'conversation' || v === 'context_only') return 'context';
+  return 'both';
+}
+
+export function triggerModeLabel(mode) {
+  const m = normalizeTriggerMode(mode);
+  if (m === 'keyword') return 'Keyword only';
+  if (m === 'context') return 'Context only';
+  return 'Keywords and context';
+}
+
+export function workflowAllowsKeywordTrigger(topic) {
+  return normalizeTriggerMode(topic?.triggerMode) !== 'context';
+}
+
+export function workflowAllowsContextTrigger(topic) {
+  return normalizeTriggerMode(topic?.triggerMode) !== 'keyword';
+}
+
 export const DEFAULT_TOPICS = [
   {
     id: 'design_ic',
     name: 'Design New IC Scheme',
     description: 'End-to-end incentive compensation scheme creation',
     triggerKeywords: ['design scheme', 'design an incentive', 'create ic', 'new incentive', 'build scheme'],
+    triggerMode: 'both',
     orchestrator: withOrchestratorPrompts({
       role: 'You are the Workflow Orchestrator for IC scheme design.',
       goal: 'Ensure the final scheme meets all compliance rules, fairness standards, and the user\'s business requirements.',
@@ -66,6 +90,7 @@ export const DEFAULT_TOPICS = [
     name: 'Analyze Existing IC',
     description: 'Assess uploaded IC documents against best practices',
     triggerKeywords: ['analyze scheme', 'assess ic', 'assess my ic', 'review plan', 'evaluate incentive', 'assess proposal'],
+    triggerMode: 'both',
     autoAdvance: true,
     orchestrator: withOrchestratorPrompts({
       role: 'You are the Workflow Orchestrator for IC scheme analysis.',
@@ -86,6 +111,7 @@ export const DEFAULT_TOPICS = [
     name: 'Territory Assessment',
     description: 'Assess current territory structure for balance, equity and efficiency',
     triggerKeywords: ['territory assessment', 'assess territory', 'territory structure', 'territory design', 'rep coverage', 'territory review'],
+    triggerMode: 'both',
     orchestrator: withOrchestratorPrompts({
       role: 'You are the Workflow Orchestrator for territory assessment.',
       goal: 'Produce a complete territory assessment covering structure, sales performance, HCP coverage, and actionable redesign recommendations.',

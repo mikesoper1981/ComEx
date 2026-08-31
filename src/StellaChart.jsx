@@ -7,6 +7,7 @@ import {
   PieChart, Pie, Cell,
   CartesianGrid, XAxis, YAxis, Tooltip, Legend,
 } from 'recharts';
+import ExcelExportButton, { slugFilename } from './ExcelExportButton';
 
 const PALETTE = ['#22d3ee', '#60a5fa', '#34d399', '#a78bfa', '#f472b6', '#fbbf24', '#fb7185'];
 const AXIS_TICK = { fill: '#94a3b8', fontSize: 12 };
@@ -54,7 +55,15 @@ export default function StellaChart({ spec }) {
 
   const wrap = (children) => (
     <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
-      <h3 className="text-base font-semibold text-cyan-400 mb-3">{title}</h3>
+      <div className="flex items-center justify-between gap-2 mb-3">
+        <h3 className="text-base font-semibold text-cyan-400 min-w-0">{title}</h3>
+        <ExcelExportButton
+          rows={data}
+          sheetName={title}
+          filename={slugFilename(title, 'chart')}
+          label="Export this chart to Excel"
+        />
+      </div>
       <div className="w-full h-[320px]">
         <ResponsiveContainer width="100%" height="100%">
           {children}

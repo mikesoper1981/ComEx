@@ -33,10 +33,29 @@ module.exports = async function handler(req, res) {
 
   const maxTokens = typeof max_tokens === 'number' && max_tokens > 0 ? Math.min(max_tokens, 8192) : 4096;
 
+  const normalized = [];
+  for (const m of messages) {
+    const role = m?.role === 'assistant' ? 'assistant' : 'user';
+    const content = m?.content;
+    if (content == null || content === '') continue;
+    if (!normalized.length && role === 'assistant') continue;
+    if (normalized.length && normalized[normalized.length - 1].role === role) {
+      const prev = normalized[normalized.length - 1];
+      const prevText = typeof prev.content === 'string' ? prev.content : '';
+      const nextText = typeof content === 'string' ? content : '';
+      prev.content = nextText ? `${prevText}\n\n${nextText}` : prev.content;
+      continue;
+    }
+    normalized.push({ role, content });
+  }
+  if (!normalized.length) {
+    return res.status(400).json({ error: { message: 'messages must include a user turn' } });
+  }
+
   const anthropicBody = {
     model: MODEL,
     max_tokens: maxTokens,
-    messages,
+    messages: normalized,
   };
 
   if (system != null && String(system).trim() !== '') {
@@ -73,7 +92,15 @@ module.exports = async function handler(req, res) {
       body: JSON.stringify(anthropicBody),
     });
 
-    const data = await upstream.json();
+    const raw = await upstream.text();
+    let data;
+    try {
+      data = JSON.parse(raw || '{}');
+    } catch {
+      return res.status(upstream.status === 200 ? 502 : upstream.status).json({
+        error: { message: raw ? raw.slice(0, 240) : 'Upstream returned a non-JSON response' },
+      });
+    }
     return res.status(upstream.status).json(data);
   } catch (err) {
     return res.status(502).json({

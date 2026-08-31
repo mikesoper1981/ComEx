@@ -1,21 +1,32 @@
-import { DEFAULT_ORCHESTRATOR_PROMPTS } from './topics';
+import { DEFAULT_ORCHESTRATOR_PROMPTS, normalizeTriggerMode, triggerModeLabel, workflowAllowsKeywordTrigger } from './topics';
 
 /**
  * Hardcoded Admin → Workflows helper. Not a user-facing topic/agent in product JSON.
  * Actual workflows and specialists still live in topics/agents via persistIntelligenceSettings.
  */
 
-export const WORKFLOW_BUILDER_WELCOME = `I'm the **Workflow agent**. I help you set up a new consultation workflow or edit one already stored in the product JSON.
+export const WORKFLOW_BUILDER_WELCOME = `I'm the **Workflow agent**. We'll create a **new workflow** and write it into the product JSON.
 
 Tell me:
-1. **Create** a new workflow, or **edit** an existing one (you can also pick it in the dropdown above).
-2. **What it is** — name, who uses it, and the outcome you want.
-3. **Context and settings** it needs — uploaded files, knowledge, data, wait-for-answers vs auto-advance, anything the specialists must know.
-4. Agents you already want **reused**, vs gaps that need a **new** specialist.
+1. **What it is** — name, who uses it, and the outcome you want.
+2. **How it should start** — **keyword only**, **context only** (the situation in chat), or **both**. Then the phrases and/or the situation.
+3. **Settings** — files, knowledge, wait-for-answers vs auto-advance, start **enabled** or **disabled**.
+4. Specialists — I'll **reuse** existing agents when the job matches, and **create new ones** when a step needs something we don't have.
 
-I'll propose a draft in the same style as Design New IC Scheme / Analyze Existing IC: numbered steps with a name, goal, success criteria, and one specialist each. I'll also propose agents (reuse or create) with role, system prompt, knowledge files, and any tools they need.
+I'll propose steps in the same style as Design New IC / Analyze Existing IC, plus orchestrator copy and triggers. **Apply** saves the workflow and any new agents.`;
 
-We can refine the draft until you're happy. **Apply** writes the workflow and any new agents into the product JSON.`;
+export const WORKFLOW_BUILDER_WELCOME_AGENT = `I'm the **Workflow agent**. We'll create a **new specialist agent only** — not a workflow. You can assign it to a workflow later.
+
+Tell me:
+1. **Name and job** — what this specialist owns, and what is out of scope.
+2. **How it should behave** — numbered questions vs auto-advance gaps, tables, STOP when done.
+3. **Tools and knowledge** it needs (capability labels + existing knowledge files, or none).
+
+I'll draft id, role, system prompt, knowledge files, and tools. **Apply** writes the agent into the product JSON.`;
+
+export const WORKFLOW_BUILDER_WELCOME_EDIT = `We'll **edit** the workflow you picked. I have its full record (basics, status, **trigger mode**, trigger keywords, description/context cue, orchestrator, every step, assigned agents and their prompts).
+
+Tell me what to change — purpose, **how it is triggered** (keyword only, context only, or both), steps, agents, orchestrator, auto-advance, or **enable / disable**. I'll propose a complete updated draft. **Apply** overwrites that workflow in the product JSON.`;
 
 export const WORKFLOW_BUILDER_SYSTEM = `You are the ComEx Workflow agent — an admin-only helper that designs consultation workflows for the product JSON.
 
@@ -23,7 +34,7 @@ You are NOT a user-facing specialist. You never run inside a live IC/Territory/S
 
 ## What a workflow is in this product
 Each workflow (topic) has:
-- id (snake_case), name, description, triggerKeywords[], autoAdvance (boolean), status ("active"|"inactive")
+- id (snake_case), name, description, triggerKeywords[], triggerMode ("keyword"|"context"|"both"), autoAdvance (boolean), status ("active"|"inactive")
 - orchestrator: role, goal, approach, plus shared prompt fields (introFull, introFocused, briefingPrompt, wrapUpPrompt, evalFallbackMessage). Leave evaluatePrompt unchanged unless they explicitly need a custom evaluator.
 - workflow[] steps: { step, name, agents: [one agent id], goal, successCriteria }
 
@@ -51,30 +62,61 @@ Orchestrator:
 - approach: how to evaluate steps, when agentStillWorking, when workflowComplete (ONLY on the last step)
 - If autoAdvance: say specialists must not wait for clarifying answers.
 
-## Interview first
-Ask only what is still missing. Do not dump a full JSON draft on the first reply unless the admin already gave enough (purpose, outcome, create vs edit, wait vs auto-advance). Typical gaps: purpose, users, inputs/files, wait-for-answers vs pipeline, whether to reuse named agents, module (incentive vs territory).
+## Triggers (keyword only, context only, or both)
+Chat can offer a workflow in two ways. Set \`triggerMode\` to exactly one of:
+- **keyword** — only if the user's message **contains** a \`triggerKeywords[]\` phrase (case-insensitive, phrase length ≥ 4). Conversation context is ignored.
+- **context** — only if a matcher reads recent conversation plus this workflow's **name** and **description** and decides they want this guided process. Keyword phrases are ignored.
+- **both** — either path can offer it (keyword first, then context). This is the default if the admin does not choose.
 
-When you have enough, set ready=true and fill workflow + newAgents completely (every step has an agent id; every new agent has a real systemPrompt, not a stub).
+Keywords: natural phrases people would type, not single generic words like "help" or "ic". Typical: 3–6 phrases. Examples: "design an incentive", "assess my ic", "territory assessment".
+Context: write \`description\` as the *situation* that should offer this workflow (e.g. "Assess uploaded IC documents against best practices"), not a vague slogan.
+
+Rules:
+- Always ask **keyword only / context only / both** if the admin has not said. Do not assume both.
+- If triggerMode is keyword or both: collect at least two keyword phrases. Propose phrases if they are unsure.
+- If triggerMode is context or both: write a description that states when chat should offer this workflow.
+- If triggerMode is context: keywords are optional (may keep them for later). If triggerMode is keyword: still write a short description as the workflow summary.
+- Do not copy another workflow's trigger phrases (for keyword or both). If overlap is unavoidable, warn them in \`message\`.
+- File upload / UI buttons are separate start paths; still set triggerMode for chat.
+- Preserve existing triggerMode and triggerKeywords on edit unless the admin wants them changed.
+
+## Enable / disable
+Workflows have status "active" (offered to users) or "inactive" (hidden until enabled). Include status in every workflow draft. Honour "disable it" / "enable it" / "keep it off until we're ready".
+
+## Interview first
+Follow ADMIN INTENT. Ask only what is still missing. Do not dump a full JSON draft on the first reply unless the admin already gave enough.
+
+When you have enough, set ready=true:
+- create / edit: fill workflow completely (including status, triggerMode, description, and triggerKeywords when that mode needs them) and any newAgents.
+- create_agent: workflow MUST be null; newAgents has one or more complete specialists (name, role, systemPrompt, knowledgeFiles, tools). Do not invent a workflow.
+- Do **not** set ready=true until triggerMode is set (keyword | context | both) and the matching fields are settled (keywords for keyword/both; description-as-context for context/both).
 
 ## Reuse vs create
-Prefer reusing an existing agent when the role truly matches (e.g. compliance_agent for a compliance step). Create a new agent when the job is different — do not overload an existing specialist with a second unrelated job. If editing, you may propose updateAgents to tighten a prompt for this workflow; say so clearly in message.
+Prefer reusing an existing agent when the role truly matches (e.g. compliance_agent for a compliance step). Create a new agent automatically when a step needs a job that no existing specialist owns — do not wait for a separate "new agent" action, and do not overload an existing specialist with a second unrelated job. If editing, you may propose updateAgents to tighten a prompt for this workflow; say so clearly in message.
+
+## Keep edit replies small
+When mode=edit:
+- Do NOT copy unchanged agent systemPrompts into newAgents or updateAgents. Only include an agent there if you are creating it or changing its prompt/tools/knowledge.
+- Do NOT copy shared orchestrator fields (evaluatePrompt, introFull, introFocused, briefingPrompt, wrapUpPrompt, evalFallbackMessage) unless the admin asked to change them. Role/goal/approach are enough.
+- Preserve unspecified fields from WORKFLOW UNDER EDIT (id, status, steps not mentioned, assigned agents).
 
 ## Tools and knowledge
 - knowledgeFiles: only names listed in the catalog, or "*".
 - tools: 1–6 short labels of capabilities the specialist needs (clarifying questions, document extract, tables, payout curves, territory metrics, etc.).
-- Mention any Admin settings the workflow depends on (knowledge files, autoAdvance, trigger phrases).
+- Mention any Admin settings the workflow depends on (knowledge files, autoAdvance, **triggerMode, trigger phrases, context/description**).
 
 ## Output format (mandatory)
 Reply with a single JSON object, no markdown fence, no text outside JSON:
 {
   "message": "markdown shown to the admin (questions, or a readable draft summary)",
   "ready": false,
-  "mode": "create" | "edit",
+  "mode": "create" | "edit" | "create_agent",
   "workflow": null | {
     "id": "snake_case",
     "name": "",
     "description": "",
     "triggerKeywords": [],
+    "triggerMode": "both",
     "autoAdvance": false,
     "status": "active",
     "orchestrator": {
@@ -107,13 +149,15 @@ Reply with a single JSON object, no markdown fence, no text outside JSON:
 }
 
 Rules:
-- message is always required and user-facing. Summarise the draft in message when ready (steps, agents, settings). Do not paste the raw JSON in message.
-- ready=true only when workflow is complete (name, description, triggers, orchestrator role/goal/approach, every step name/goal/successCriteria/agent, and every referenced new agent fully specified).
-- mode=edit must keep the existing workflow id from ADMIN FOCUS / catalog.
+- message is always required and user-facing. Summarise the draft in message when ready. Do not paste the raw JSON in message.
+- ready=true for create/edit only when workflow is complete (name, description, status, **triggerMode**, keywords if mode is keyword or both, description-as-context if mode is context or both, orchestrator role/goal/approach, every step name/goal/successCriteria/agent, and every referenced NEW agent fully specified). Existing assigned agents need not be restated.
+- ready=true for create_agent when each newAgents entry has id, name, role, and a real systemPrompt (not a stub). workflow must be null.
+- mode=edit must keep the existing workflow id from ADMIN INTENT / WORKFLOW UNDER EDIT. Preserve unspecified fields from that dump. Omit unchanged prompts from the JSON.
 - mode=create must pick a new snake_case id that is not already in the catalog.
+- mode=create_agent never writes a workflow.
 - newAgents ids must not collide with existing agents unless you intend updateAgents instead.
 - Step agents[] must list exactly one id that is either existing or in newAgents.
-- If not ready, still you MAY include a partial workflow sketch (ready=false) so the admin can see the direction.
+- If not ready, you MAY include a partial sketch (ready=false).
 - Never invent knowledge filenames that are not in the catalog.`;
 
 function parseJsonObject(text) {
@@ -186,20 +230,84 @@ function asStringArray(value) {
     .filter(Boolean);
 }
 
+function usableTriggerKeywords(value) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of asStringArray(value)) {
+    const key = raw.toLowerCase();
+    if (raw.length < 4 || seen.has(key)) continue;
+    seen.add(key);
+    out.push(raw);
+  }
+  return out;
+}
+
+function workflowTriggersSettled(wf, mode) {
+  if (!wf || typeof wf !== 'object') return false;
+  const isEdit = mode === 'edit';
+  const triggerMode = normalizeTriggerMode(wf.triggerMode);
+  const desc = String(wf.description || '').trim();
+  const hasKwField = Object.prototype.hasOwnProperty.call(wf, 'triggerKeywords');
+  const kws = usableTriggerKeywords(wf.triggerKeywords);
+  const needsKw = triggerMode === 'keyword' || triggerMode === 'both';
+  const needsDesc = triggerMode === 'context' || triggerMode === 'both';
+  const descOk = needsDesc
+    ? (isEdit ? (wf.description == null || desc.length >= 8) : desc.length >= 8)
+    : true;
+  const kwOk = needsKw
+    ? (isEdit ? (!hasKwField || kws.length >= 2) : kws.length >= 2)
+    : true;
+  return descOk && kwOk;
+}
+
+function triggerOverlapLines(topics) {
+  const byPhrase = new Map();
+  for (const t of topics || []) {
+    if (!workflowAllowsKeywordTrigger(t)) continue;
+    for (const kw of usableTriggerKeywords(t.triggerKeywords)) {
+      const key = kw.toLowerCase();
+      if (!byPhrase.has(key)) byPhrase.set(key, []);
+      byPhrase.get(key).push(t.id);
+    }
+  }
+  const lines = [];
+  for (const [phrase, ids] of byPhrase) {
+    if (ids.length > 1) lines.push(`  "${phrase}" → ${ids.join(', ')}`);
+  }
+  return lines;
+}
+
 export function summarizeWorkflowDraft(parsed) {
+  const newAgents = Array.isArray(parsed?.newAgents) ? parsed.newAgents : [];
+  const updateAgents = Array.isArray(parsed?.updateAgents) ? parsed.updateAgents : [];
+  const reuse = Array.isArray(parsed?.reuseAgents) ? parsed.reuseAgents : [];
   const w = parsed?.workflow;
-  if (!w) return '';
+  if (!w) {
+    if (!newAgents.length && !updateAgents.length) return '';
+    const lines = newAgents.map((a) => {
+      const tools = asStringArray(a.tools);
+      return `- **${a.name || a.id}** — ${a.role || ''}${tools.length ? ` (tools: ${tools.join(', ')})` : ''}`;
+    });
+    return [`**New specialist agent${newAgents.length === 1 ? '' : 's'}**`, ...lines].join('\n');
+  }
   const steps = Array.isArray(w.workflow) ? w.workflow : (Array.isArray(w.steps) ? w.steps : []);
-  const newAgents = Array.isArray(parsed.newAgents) ? parsed.newAgents : [];
-  const updateAgents = Array.isArray(parsed.updateAgents) ? parsed.updateAgents : [];
-  const reuse = Array.isArray(parsed.reuseAgents) ? parsed.reuseAgents : [];
   const stepLines = steps.map((s) => {
     const agent = Array.isArray(s.agents) && s.agents[0] ? s.agents[0] : '(unassigned)';
     return `- **Step ${s.step}: ${s.name}** — ${s.goal || ''} (${agent})`;
   });
+  const kws = usableTriggerKeywords(w.triggerKeywords);
   const parts = [
     parsed.mode === 'edit' ? `**Edit** \`${w.id || ''}\`: ${w.name || ''}` : `**New workflow:** ${w.name || w.id || ''}`,
-    w.description ? w.description : '',
+    `**Start from chat:** ${triggerModeLabel(w.triggerMode)}`,
+    w.description ? `**Context (when chat should offer it):** ${w.description}` : '',
+    kws.length
+      ? `**Keyword triggers:** ${kws.join(' · ')}`
+      : (parsed.mode === 'edit' && w.triggerKeywords == null
+        ? ''
+        : (normalizeTriggerMode(w.triggerMode) === 'context'
+          ? '**Keyword triggers:** none (context only)'
+          : '**Keyword triggers:** (none yet — ask the admin for phrases users would type)')),
+    `Status: ${w.status === 'inactive' ? 'disabled (inactive)' : 'enabled (active)'}`,
     w.autoAdvance ? 'Auto-advance: on' : 'Auto-advance: off (wait for answers)',
     stepLines.length ? `**Steps**\n${stepLines.join('\n')}` : '',
     reuse.length ? `**Reuse:** ${reuse.map((a) => a.id).filter(Boolean).join(', ')}` : '',
@@ -209,6 +317,11 @@ export function summarizeWorkflowDraft(parsed) {
   return parts.filter(Boolean).join('\n\n');
 }
 
+function agentDraftComplete(agent) {
+  if (!agent || typeof agent !== 'object') return false;
+  return !!(String(agent.name || '').trim() && String(agent.systemPrompt || '').trim());
+}
+
 export function interpretWorkflowBuilderReply(text) {
   const parsed = parseJsonObject(text);
   if (!parsed) {
@@ -216,50 +329,126 @@ export function interpretWorkflowBuilderReply(text) {
     return { message, ready: false, draft: null };
   }
   const workflow = parsed.workflow && typeof parsed.workflow === 'object' ? parsed.workflow : null;
-  const ready = !!parsed.ready && !!workflow;
-  const message = String(parsed.message || '').trim() || (workflow ? summarizeWorkflowDraft(parsed) : String(text || '').trim());
+  const newAgents = Array.isArray(parsed.newAgents) ? parsed.newAgents : [];
+  const agentOnly = parsed.mode === 'create_agent' || (!workflow && newAgents.length > 0);
+  const ready = !!parsed.ready && (agentOnly
+    ? newAgents.some(agentDraftComplete)
+    : (!!workflow && workflowTriggersSettled(workflow, parsed.mode)));
+  const message = String(parsed.message || '').trim() || ((workflow || agentOnly) ? summarizeWorkflowDraft(parsed) : String(text || '').trim());
   return {
     message,
     ready,
-    draft: workflow ? parsed : null,
+    draft: (workflow || agentOnly) ? parsed : null,
   };
 }
 
-export function buildWorkflowBuilderCatalog({ topics = [], agents = [], knowledgeFiles = [], focusId = '' } = {}) {
-  const topicLines = (topics || []).map((t) => {
-    const steps = (t.workflow || []).map((s) => {
-      const agent = Array.isArray(s.agents) && s.agents[0] ? s.agents[0] : '';
-      return `    ${s.step}. ${s.name} [${agent}] goal=${s.goal || ''} | success=${s.successCriteria || ''}`;
-    }).join('\n');
-    const orch = t.orchestrator || {};
-    return [
-      `- id=${t.id} | ${t.name} | status=${t.status || 'active'} | autoAdvance=${!!t.autoAdvance}`,
-      `  description: ${t.description || ''}`,
-      `  triggers: ${(t.triggerKeywords || []).join(', ')}`,
-      `  orchestrator.role: ${orch.role || ''}`,
-      `  orchestrator.goal: ${orch.goal || ''}`,
-      `  steps:\n${steps || '    (none)'}`,
-    ].join('\n');
+const SHARED_ORCHESTRATOR_KEYS = [
+  'introFull', 'introFocused', 'briefingPrompt', 'wrapUpPrompt', 'evalFallbackMessage', 'evaluatePrompt',
+];
+
+function compactOrchestrator(orch) {
+  const o = orch && typeof orch === 'object' ? orch : {};
+  const out = {
+    role: String(o.role || ''),
+    goal: String(o.goal || ''),
+    approach: String(o.approach || ''),
+  };
+  const customShared = {};
+  for (const key of SHARED_ORCHESTRATOR_KEYS) {
+    const val = o[key] != null ? String(o[key]) : '';
+    const def = DEFAULT_ORCHESTRATOR_PROMPTS[key] != null ? String(DEFAULT_ORCHESTRATOR_PROMPTS[key]) : '';
+    if (val && val !== def) customShared[key] = val;
+  }
+  if (Object.keys(customShared).length) out.customSharedPrompts = customShared;
+  return out;
+}
+
+export function dumpWorkflowForEdit(topic, agents = []) {
+  if (!topic) return '';
+  const orch = topic.orchestrator && typeof topic.orchestrator === 'object' ? topic.orchestrator : {};
+  const steps = (topic.workflow || []).map((s) => ({
+    step: s.step,
+    name: s.name || '',
+    goal: s.goal || '',
+    successCriteria: s.successCriteria || '',
+    agents: Array.isArray(s.agents) ? [...s.agents] : [],
+  }));
+  const agentIds = [...new Set(steps.flatMap((s) => s.agents))];
+  const assignedAgents = agentIds.map((id) => {
+    const a = (agents || []).find((x) => x.id === id);
+    if (!a) return { id, missing: true };
+    return {
+      id: a.id,
+      name: a.name || '',
+      role: a.role || '',
+      status: a.status || 'active',
+      knowledgeFiles: Array.isArray(a.knowledgeFiles) ? a.knowledgeFiles : [],
+      tools: asStringArray(a.tools),
+      systemPrompt: String(a.systemPrompt || ''),
+    };
   });
+  return JSON.stringify({
+    id: topic.id,
+    name: topic.name || '',
+    description: topic.description || '',
+    status: topic.status || 'active',
+    autoAdvance: !!topic.autoAdvance,
+    triggerKeywords: Array.isArray(topic.triggerKeywords) ? topic.triggerKeywords : [],
+    triggerMode: normalizeTriggerMode(topic.triggerMode),
+    triggerNote: 'triggerMode is keyword | context | both. keyword = user message contains a phrase (≥4 chars). context = conversation matcher uses name + description. both = either (keyword first). File/UI starts are separate.',
+    orchestrator: compactOrchestrator(orch),
+    steps,
+    assignedAgents,
+  }, null, 2);
+}
+
+export function buildWorkflowBuilderCatalog({ topics = [], agents = [], knowledgeFiles = [], intent = 'create', focusId = '' } = {}) {
+  const topicLines = (topics || [])
+    .filter((t) => !(intent === 'edit' && focusId && t.id === focusId))
+    .map((t) => {
+      const steps = (t.workflow || []).map((s) => {
+        const agent = Array.isArray(s.agents) && s.agents[0] ? s.agents[0] : '';
+        return `    ${s.step}. ${s.name} [${agent}]`;
+      }).join('\n');
+      const kws = usableTriggerKeywords(t.triggerKeywords);
+      return [
+        `- id=${t.id} | ${t.name} | status=${t.status || 'active'} | autoAdvance=${!!t.autoAdvance} | triggerMode=${normalizeTriggerMode(t.triggerMode)}`,
+        `  context: ${t.description || '(none)'}`,
+        `  keywords: ${kws.join(', ') || '(none)'}`,
+        `  steps:\n${steps || '    (none)'}`,
+      ].join('\n');
+    });
   const agentLines = (agents || []).map((a) => {
     const tools = asStringArray(a.tools);
-    return `- id=${a.id} | ${a.name} | ${a.role || ''} | knowledge=${(a.knowledgeFiles || []).join(', ') || '(none)'} | tools=${tools.join(', ') || '(none)'}\n  prompt: ${String(a.systemPrompt || '').slice(0, 280)}`;
+    return `- id=${a.id} | ${a.name} | ${a.role || ''} | knowledge=${(a.knowledgeFiles || []).join(', ') || '(none)'} | tools=${tools.join(', ') || '(none)'}`;
   });
-  const focus = focusId
-    ? `ADMIN FOCUS: edit existing workflow id=${focusId}. Keep that id. Propose a full replacement draft (basics, orchestrator, steps, agents).`
-    : 'ADMIN FOCUS: create a new workflow with a unique id not in the catalog.';
-  return `${focus}
+  const intentLine = intent === 'create_agent'
+    ? 'ADMIN INTENT: create_agent — draft specialist agent(s) only. Do not create or edit a workflow. mode=create_agent, workflow=null.'
+    : intent === 'edit'
+      ? `ADMIN INTENT: edit existing workflow id=${focusId}. Keep that id. Propose a full replacement draft including status (active/inactive) and triggerMode (keyword | context | both) plus the matching phrases and/or context description. Ask if how it starts should change.`
+      : 'ADMIN INTENT: create a new workflow with a unique id not in the catalog. Include status (default active unless the admin wants it disabled). You MUST interview for triggerMode (keyword only, context only, or both) and the matching keywords/description before ready=true.';
+  const overlap = triggerOverlapLines(topics);
+  const overlapBlock = overlap.length
+    ? `\n\nKEYWORD OVERLAPS (do not copy these collisions onto a new workflow):\n${overlap.join('\n')}`
+    : '';
+  const focusTopic = focusId ? (topics || []).find((t) => t.id === focusId) : null;
+  const dump = (intent === 'edit' && focusTopic)
+    ? `\n\nWORKFLOW UNDER EDIT (complete current record — preserve ids and any field the admin does not change):\n${dumpWorkflowForEdit(focusTopic, agents)}`
+    : '';
+  return `${intentLine}
 
-EXISTING WORKFLOWS:
-${topicLines.join('\n') || '(none)'}
+TRIGGER MODEL: triggerMode is keyword | context | both. keyword = the user message contains a triggerKeywords phrase (case-insensitive, phrase length ≥ 4). context = a matcher reads recent conversation plus name and description (the "when" / situation line). both = either path (keyword first). File upload and UI start are separate. Do not reuse another keyword-enabled workflow's phrases.
 
-EXISTING AGENTS:
+EXISTING WORKFLOWS (compact):
+${topicLines.join('\n') || '(none)'}${overlapBlock}
+
+EXISTING AGENTS (compact):
 ${agentLines.join('\n') || '(none)'}
 
 AGENT-ELIGIBLE KNOWLEDGE FILES:
 ${(knowledgeFiles || []).length ? knowledgeFiles.join(', ') : '(none — leave knowledgeFiles empty or use * only if the admin will tick Agents on files later)'}
 
-Shared orchestrator defaults (copy unless customising): introFull / introFocused / briefingPrompt / wrapUpPrompt / evalFallbackMessage already exist in the product; you may override intro/approach for this workflow.`;
+Shared orchestrator defaults (copy unless customising): introFull / introFocused / briefingPrompt / wrapUpPrompt / evalFallbackMessage already exist in the product; you may override intro/approach for this workflow.${dump}`;
 }
 
 export function buildWorkflowBuilderSystemPrompt(catalog) {
@@ -333,7 +522,7 @@ function normalizeSteps(rawSteps, agentIdMap) {
  * Does not persist — caller should persistIntelligenceSettings.
  */
 export function applyWorkflowBuilderDraft({ topics = [], agents = [], draft, knowledgeNames = [] } = {}) {
-  if (!draft || !draft.workflow || typeof draft.workflow !== 'object') {
+  if (!draft || typeof draft !== 'object') {
     throw new Error('The draft is not ready to apply.');
   }
   const knowledgeSet = new Set(Array.isArray(knowledgeNames) ? knowledgeNames : []);
@@ -375,11 +564,29 @@ export function applyWorkflowBuilderDraft({ topics = [], agents = [], draft, kno
     created.push(createdAgent.id);
   }
 
+  const agentOnly = draft.mode === 'create_agent';
+  if (agentOnly) {
+    if (!created.length && !updates.length) {
+      throw new Error('The agent draft is not ready to apply.');
+    }
+    const createdAgents = created.map((id) => nextAgents.find((a) => a.id === id)).filter(Boolean);
+    return {
+      topics: [...(topics || [])],
+      agents: nextAgents,
+      topic: null,
+      createdAgentIds: created,
+      createdAgents,
+      mode: 'create_agent',
+    };
+  }
+
   const wf = draft.workflow;
+  if (!wf || typeof wf !== 'object') {
+    throw new Error('The draft is not ready to apply.');
+  }
   const rawSteps = Array.isArray(wf.workflow) ? wf.workflow : (Array.isArray(wf.steps) ? wf.steps : []);
   const steps = normalizeSteps(rawSteps, agentIdMap);
 
-  // Stub any step agent that still is not in the list
   for (const step of steps) {
     const aid = step.agents[0];
     if (!aid) continue;
@@ -412,18 +619,33 @@ export function applyWorkflowBuilderDraft({ topics = [], agents = [], draft, kno
       : slugifyId(requestedTopicId || wf.name || 'workflow', usedTopicIds);
   }
 
+  const existingIdx = (topics || []).findIndex((t) => t.id === topicId);
+  const existing = existingIdx >= 0 ? topics[existingIdx] : null;
   const topic = {
     id: topicId,
-    name: String(wf.name || topicId).trim() || topicId,
-    description: String(wf.description || '').trim(),
-    triggerKeywords: asStringArray(wf.triggerKeywords),
-    autoAdvance: !!wf.autoAdvance,
-    orchestrator: mergeOrchestrator(wf.orchestrator),
-    workflow: steps,
-    status: wf.status === 'inactive' ? 'inactive' : 'active',
+    name: String(wf.name || existing?.name || topicId).trim() || topicId,
+    description: wf.description != null ? String(wf.description).trim() : String(existing?.description || ''),
+    triggerKeywords: wf.triggerKeywords != null ? usableTriggerKeywords(wf.triggerKeywords) : [...(existing?.triggerKeywords || [])],
+    triggerMode: wf.triggerMode != null ? normalizeTriggerMode(wf.triggerMode) : normalizeTriggerMode(existing?.triggerMode),
+    autoAdvance: wf.autoAdvance != null ? !!wf.autoAdvance : !!existing?.autoAdvance,
+    orchestrator: mergeOrchestrator({
+      ...(existing?.orchestrator || {}),
+      ...(wf.orchestrator || {}),
+    }),
+    workflow: steps.length
+      ? steps
+      : (existing?.workflow || []).map((s) => ({
+          step: s.step,
+          name: s.name || '',
+          goal: s.goal || '',
+          successCriteria: s.successCriteria || '',
+          agents: Array.isArray(s.agents) ? [...s.agents] : [],
+        })),
+    status: wf.status != null
+      ? (wf.status === 'inactive' ? 'inactive' : 'active')
+      : (existing?.status || 'active'),
   };
 
-  const existingIdx = (topics || []).findIndex((t) => t.id === topicId);
   const nextTopics = [...(topics || [])];
   if (existingIdx >= 0) nextTopics[existingIdx] = topic;
   else nextTopics.push(topic);
@@ -433,6 +655,7 @@ export function applyWorkflowBuilderDraft({ topics = [], agents = [], draft, kno
     agents: nextAgents,
     topic,
     createdAgentIds: created,
+    createdAgents: created.map((id) => nextAgents.find((a) => a.id === id)).filter(Boolean),
     mode: existingIdx >= 0 ? 'edit' : 'create',
   };
 }

@@ -12,6 +12,13 @@ export const SESSION_UNLOCKED_KEY = 'comex_app_unlocked';
 export const SESSION_USER_KEY = 'comex_current_user';
 export const SESSION_TOKEN_KEY = 'comex_auth_token';
 
+/** Skip the password gate when developing on this machine. */
+export function isLocalDevHost() {
+  if (typeof window === 'undefined') return false;
+  const h = String(window.location.hostname || '').toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '[::1]';
+}
+
 function envStr(key, fallback) {
   const v = String(import.meta.env[key] ?? '').trim();
   return v || fallback;

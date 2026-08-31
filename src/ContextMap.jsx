@@ -13,7 +13,7 @@ import {
   UserCog,
   X,
 } from 'lucide-react';
-import { activeMemoryItems, formatMemoryStamp } from './chatMemory';
+import { activeMemoryItems, formatMemoryStamp, MEMORY_CAP } from './chatMemory';
 import {
   connectedModuleIds,
   listModuleContextBlocks,
@@ -42,7 +42,7 @@ const KIND_META = {
 };
 
 const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 250, leafR: 210 };
-
+const LEAF_PAGE_SIZE = 24;
 const EMPTY_FOCUS = { moduleId: '', group: '', kind: '', fileId: '', factId: '' };
 
 function clip(text, max = 140) {
@@ -227,7 +227,7 @@ function groupsFor(mod, generalMemory) {
     id: 'memory',
     title: 'Chat memory',
     subtitle: tagged.length
-      ? `${tagged.length} tagged to ${mod.short}`
+      ? `${tagged.length + generalMemory.length} fact${(tagged.length + generalMemory.length) === 1 ? '' : 's'} (cap ${MEMORY_CAP})`
       : (generalMemory.length ? `${generalMemory.length} passed from centre` : 'None yet'),
     count: tagged.length + generalMemory.length,
     kind: 'memory',
@@ -306,10 +306,10 @@ function withMapVisuals(hubModules) {
 
 function clampNode(n) {
   const pad = 8;
-  const maxX = CANVAS.w * 1.85;
-  const maxY = CANVAS.h * 1.85;
-  const minX = -CANVAS.w * 0.45;
-  const minY = -CANVAS.h * 0.45;
+  const maxX = CANVAS.w * 3.2;
+  const maxY = CANVAS.h * 3.2;
+  const minX = -CANVAS.w * 1.2;
+  const minY = -CANVAS.h * 1.2;
   return {
     ...n,
     x: Math.min(maxX - n.w / 2 - pad, Math.max(n.w / 2 + pad + minX, n.x)),
@@ -317,7 +317,7 @@ function clampNode(n) {
   };
 }
 
-function fitCamera(nodes, pad = 64) {
+function fitCamera(nodes, pad = 72) {
   if (!nodes?.length) return { k: 1, x: 0, y: 0 };
   let minX = Infinity;
   let minY = Infinity;
@@ -331,11 +331,11 @@ function fitCamera(nodes, pad = 64) {
   }
   const bw = Math.max(maxX - minX, 160);
   const bh = Math.max(maxY - minY, 160);
-  const k = Math.min((CANVAS.w - 2 * pad) / bw, (CANVAS.h - 2 * pad) / bh, 1.2);
+  const k = Math.min((CANVAS.w - 2 * pad) / bw, (CANVAS.h - 2 * pad) / bh, 1.35);
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
   return {
-    k,
+    k: Math.max(0.18, k),
     x: CANVAS.cx - cx * k,
     y: CANVAS.cy - cy * k,
   };
@@ -343,12 +343,6 @@ function fitCamera(nodes, pad = 64) {
 
 function polar(cx, cy, r, angle) {
   return { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
-}
-
-function fanAngles(centerAngle, count, spread) {
-  if (count <= 1) return [centerAngle];
-  const start = centerAngle - spread / 2;
-  return Array.from({ length: count }, (_, i) => start + (spread * i) / (count - 1));
 }
 
 function edgePath(a, b, kind, hub, offset = 0) {
@@ -360,8 +354,8 @@ function edgePath(a, b, kind, hub, offset = 0) {
     const len = Math.hypot(vx, vy) || 1;
     const nx = -vy / len;
     const ny = vx / len;
-    const bump = (kind === 'share' ? 56 : 40) + Math.abs(offset) * 10;
-    const slide = offset * 34;
+    const bump = (kind === 'share' ? 56 : 72) + Math.abs(offset) * 16;
+    const slide = offset * 40;
     const qx = mx + (vx / len) * bump + nx * slide;
     const qy = my + (vy / len) * bump + ny * slide;
     return {
@@ -379,34 +373,56 @@ function edgePath(a, b, kind, hub, offset = 0) {
 
 function applySavedAndLive(n, saved, livePos) {
   let next = { ...n };
-  const persist = n.kind === 'hub' || n.kind === 'module';
-  if (persist) {
-    const s = saved?.[n.id];
-    if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
-      next.x = s.x * CANVAS.w;
-      next.y = s.y * CANVAS.h;
-      if (s.w) next.w = Math.max(88, s.w * CANVAS.w);
-      if (s.h) next.h = Math.max(40, s.h * CANVAS.h);
-    }
+  const s = saved?.[n.id];
+  if (s && Number.isFinite(s.x) && Number.isFinite(s.y)) {
+    next.x = s.x * CANVAS.w;
+    next.y = s.y * CANVAS.h;
+    if (s.w) next.w = Math.max(88, s.w * CANVAS.w);
+    if (s.h) next.h = Math.max(40, s.h * CANVAS.h);
   }
   if (livePos?.[n.id]) next = { ...next, ...livePos[n.id] };
   return next;
 }
 
+function pageSlice(list, page, size = LEAF_PAGE_SIZE) {
+  const items = Array.isArray(list) ? list : [];
+  const pages = Math.max(1, Math.ceil(items.length / size));
+  const p = Math.min(Math.max(0, page || 0), pages - 1);
+  return {
+    items: items.slice(p * size, p * size + size),
+    page: p,
+    pages,
+    total: items.length,
+    from: items.length ? p * size + 1 : 0,
+    to: Math.min(items.length, (p + 1) * size),
+  };
+}
+
 function placeLeaves(nodes, edges, parentId, parent, leaves, fallbackAngle, saved, livePos, hub) {
   if (!leaves.length || !parent) return;
   const n = leaves.length;
-  const parentHalf = Math.max(parent.w || 168, parent.h || 78) / 2;
-  const leafHalf = Math.max(...leaves.map((l) => Math.max(l.w || 148, l.h || 52))) / 2;
-  const dist = parentHalf + leafHalf + 88;
   const outward = hub
     ? Math.atan2(parent.y - hub.y, parent.x - hub.x)
     : fallbackAngle;
-  const spread = n <= 1 ? 0 : (n <= 2 ? 1.05 : Math.min(Math.PI * 1.35, 0.62 * n));
-  fanAngles(outward, n, spread).forEach((ang, i) => {
-    const lp = polar(parent.x, parent.y, dist, ang);
-    const leaf = applySavedAndLive({ ...leaves[i], x: lp.x, y: lp.y, moduleId: parent.moduleId || parent.id }, saved, livePos);
-    nodes.push(leaf);
+  const cols = Math.min(5, Math.max(1, n <= 4 ? n : Math.ceil(Math.sqrt(n))));
+  const rows = Math.ceil(n / cols);
+  const cellW = 204;
+  const cellH = 92;
+  const parentHalf = Math.max(parent.w || 168, parent.h || 78) / 2;
+  const dist = parentHalf + (cols * cellW) / 2 + 64;
+  const origin = polar(parent.x, parent.y, dist, outward);
+  const x0 = origin.x - ((cols - 1) * cellW) / 2;
+  const y0 = origin.y - ((rows - 1) * cellH) / 2;
+  leaves.forEach((leaf, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const placed = applySavedAndLive({
+      ...leaf,
+      x: x0 + col * cellW,
+      y: y0 + row * cellH,
+      moduleId: parent.moduleId || parent.id,
+    }, saved, livePos);
+    nodes.push(placed);
     edges.push({ from: parentId, to: leaf.id, kind: 'leaf' });
   });
 }
@@ -419,14 +435,14 @@ function fileNodeSpec(f) {
     groupId: 'files',
     kindKey: kind,
     fileId: f.id,
-    title: clip(f.name, 22),
+    title: clip(f.name, 40),
     subtitle: f.kindLabel || kindMeta(kind).title,
-    w: 150,
-    h: 52,
+    w: 188,
+    h: 62,
   };
 }
 
-function layoutStar(model, focus, saved, livePos) {
+function layoutStar(model, focus, saved, livePos, leafPage = 0) {
   const nodes = [];
   const edges = [];
   const { cx, cy, moduleR } = CANVAS;
@@ -489,24 +505,25 @@ function layoutStar(model, focus, saved, livePos) {
       const facts = [
         ...tagged.map((m) => ({ ...m, origin: 'tagged' })),
         ...centre.map((m) => ({ ...m, origin: 'centre' })),
-      ].slice(0, 10);
-      placeLeaves(nodes, edges, groupNode.id, groupNode, facts.length
-        ? facts.map((m) => ({
+      ];
+      const paged = pageSlice(facts, leafPage);
+      placeLeaves(nodes, edges, groupNode.id, groupNode, paged.items.length
+        ? paged.items.map((m) => ({
             id: `${mod.id}-fact-${m.id}`,
             kind: 'memory',
             factId: m.id,
-            title: clip(m.text, 28),
+            title: clip(m.text, 48),
             subtitle: m.origin === 'centre' ? 'From centre (always passed)' : `Tagged to ${mod.short}`,
-            w: 150,
-            h: 50,
+            w: 188,
+            h: 62,
           }))
         : [{
             id: `${mod.id}-mem-empty`,
             kind: 'empty',
             title: 'No chat memory yet',
             subtitle: 'Facts appear after you confirm them',
-            w: 160,
-            h: 52,
+            w: 200,
+            h: 64,
           }], mod.angle, pos, live, hubNode);
       continue;
     }
@@ -563,7 +580,29 @@ function layoutStar(model, focus, saved, livePos) {
         const kindNode = nodes.find((n) => n.id === `${mod.id}-kind-${focus.kind}`) || groupNode;
         const kind = kinds.find((k) => k.id === focus.kind);
         const list = kind ? kind.files : moduleFiles(mod).filter((f) => kindOfFile(f) === focus.kind);
-        placeLeaves(nodes, edges, kindNode.id, kindNode, list.map(fileNodeSpec), mod.angle, pos, live, hubNode);
+        const paged = pageSlice(list, leafPage);
+        placeLeaves(nodes, edges, kindNode.id, kindNode, paged.items.map(fileNodeSpec), mod.angle, pos, live, hubNode);
+
+        if (focus.fileId) {
+          const selected = nodes.find((n) => n.fileId === focus.fileId);
+          const related = (mod.joins || []).filter((j) => j.fromId === focus.fileId || j.toId === focus.fileId);
+          let partnerIndex = 0;
+          for (const j of related) {
+            const otherId = j.fromId === focus.fileId ? j.toId : j.fromId;
+            if (nodes.some((n) => n.fileId === otherId)) continue;
+            const other = moduleFiles(mod).find((f) => f.id === otherId);
+            if (!other) continue;
+            const spec = fileNodeSpec(other);
+            const placed = applySavedAndLive({
+              ...spec,
+              x: (selected?.x || kindNode.x) + 200,
+              y: (selected?.y || kindNode.y) + partnerIndex * 78,
+              moduleId: mod.id,
+            }, pos, live);
+            nodes.push(placed);
+            partnerIndex += 1;
+          }
+        }
       }
     }
   }
@@ -572,14 +611,17 @@ function layoutStar(model, focus, saved, livePos) {
     edges.push({ from: c.a, to: c.b, kind: 'share', label: 'sharing context' });
   }
 
-  const nodeIds = new Set(nodes.map((n) => n.id));
+  const nodeByFile = new Map(nodes.filter((n) => n.fileId).map((n) => [n.fileId, n.id]));
   const joinEdges = [];
-  for (const mod of model.modules) {
-    for (const j of mod.joins || []) {
-      const a = `data-${j.fromId}`;
-      const b = `data-${j.toId}`;
-      if (!nodeIds.has(a) || !nodeIds.has(b)) continue;
-      joinEdges.push({ from: a, to: b, kind: 'join', label: j.label });
+  if (focus.fileId) {
+    for (const mod of model.modules) {
+      for (const j of mod.joins || []) {
+        if (j.fromId !== focus.fileId && j.toId !== focus.fileId) continue;
+        const a = nodeByFile.get(j.fromId);
+        const b = nodeByFile.get(j.toId);
+        if (!a || !b) continue;
+        joinEdges.push({ from: a, to: b, kind: 'join', label: j.label });
+      }
     }
   }
   const buckets = new Map();
@@ -720,7 +762,7 @@ function MapCanvas({
   const camK = cam?.k || 1;
   return (
     <div
-      className="absolute inset-0 origin-top-left"
+      className="absolute inset-0 origin-top-left overflow-visible"
       style={{
         transform: `translate(${(camX / CANVAS.w) * 100}%, ${(camY / CANVAS.h) * 100}%) scale(${camK})`,
         transformOrigin: '0 0',
@@ -728,7 +770,8 @@ function MapCanvas({
     >
       <svg
         viewBox={`0 0 ${CANVAS.w} ${CANVAS.h}`}
-        className="absolute inset-0 w-full h-full pointer-events-none"
+        className="absolute inset-0 w-full h-full pointer-events-none overflow-visible"
+        overflow="visible"
         role="img"
         aria-label="Star schema of captured context"
       >
@@ -770,7 +813,7 @@ function MapCanvas({
                 strokeLinecap="round"
                 opacity={related ? 1 : 0.55}
               />
-              {e.label ? (
+              {e.label && e.kind !== 'join' ? (
                 <g filter={`url(#${shadowId})`}>
                   <rect
                     x={path.labelX - labelW / 2}
@@ -798,6 +841,25 @@ function MapCanvas({
           );
         })}
       </svg>
+      {graph.edges.filter((e) => e.kind === 'join' && e.label).map((e) => {
+        const a = byId.get(e.from);
+        const b = byId.get(e.to);
+        if (!a || !b) return null;
+        const path = edgePath(a, b, e.kind, hub, e.offset || 0);
+        return (
+          <div
+            key={`join-label|${e.from}|${e.to}|${e.label}`}
+            className="absolute -translate-x-1/2 -translate-y-1/2 z-40 pointer-events-none px-2 py-1 rounded-md bg-cyan-950 border-2 border-cyan-300 text-[11px] font-bold text-cyan-50 whitespace-nowrap shadow-lg max-w-[220px] truncate"
+            style={{
+              left: `${(path.labelX / CANVAS.w) * 100}%`,
+              top: `${(path.labelY / CANVAS.h) * 100}%`,
+            }}
+            title={e.label}
+          >
+            {e.label}
+          </div>
+        );
+      })}
       {graph.nodes.map((node) => {
         const mod = (modules || []).find((m) => m.id === node.moduleId || m.id === node.id) || selectedModule;
         const Icon = nodeIcon(node, mod);
@@ -808,7 +870,7 @@ function MapCanvas({
             key={node.id}
             type="button"
             onPointerDown={(ev) => onNodePointerDown(ev, node, 'move')}
-            className={`absolute -translate-x-1/2 -translate-y-1/2 text-left rounded-xl border shadow-lg transition-shadow cursor-grab active:cursor-grabbing touch-none ${
+            className={`absolute -translate-x-1/2 -translate-y-1/2 text-left rounded-xl border shadow-lg transition-shadow cursor-grab active:cursor-grabbing touch-none overflow-visible ${
               node.kind === 'hub'
                 ? 'bg-violet-600/90 border-violet-200/40 text-white'
                 : node.kind === 'module'
@@ -837,9 +899,9 @@ function MapCanvas({
                 <Icon className="w-3 h-3 text-white" />
               </span>
               <span className="min-w-0 leading-tight">
-                <span className="block text-[11px] font-bold truncate">{node.title}</span>
+                <span className="block text-[11px] font-bold break-words [overflow-wrap:anywhere]">{node.title}</span>
                 {node.subtitle ? (
-                  <span className="block text-[9px] text-blue-100/70 truncate mt-0.5">{node.subtitle}</span>
+                  <span className="block text-[9px] text-blue-100/80 mt-0.5 break-words [overflow-wrap:anywhere]">{node.subtitle}</span>
                 ) : null}
                 {node.caption ? (
                   <span className="block text-[9px] text-amber-200 font-semibold mt-0.5">{node.caption}</span>
@@ -874,6 +936,7 @@ export default function ContextMap({
   const [openFileId, setOpenFileId] = useState('');
   const [livePos, setLivePos] = useState({});
   const [large, setLarge] = useState(false);
+  const [leafPage, setLeafPage] = useState(0);
   const canvasRef = useRef(null);
   const largeCanvasRef = useRef(null);
   const focusRef = useRef(focus);
@@ -883,6 +946,7 @@ export default function ContextMap({
   const layoutRef = useRef(layout);
   focusRef.current = focus;
   layoutRef.current = layout;
+  useEffect(() => { setLeafPage(0); }, [focus.moduleId, focus.group, focus.kind]);
 
   const catalog = useMemo(() => withMapVisuals(hubModules), [hubModules]);
 
@@ -919,13 +983,13 @@ export default function ContextMap({
   }, [catalog, userSettings, stellaDataFiles, userName, companyName]);
 
   const graph = useMemo(
-    () => layoutStar(model, focus, layout?.nodes, livePos),
-    [model, layout, livePos, focus],
+    () => layoutStar(model, focus, layout?.nodes, livePos, leafPage),
+    [model, layout, livePos, focus, leafPage],
   );
 
   const autoCam = useMemo(() => fitCamera(graph.nodes), [graph]);
   const [camUser, setCamUser] = useState(null);
-  useEffect(() => { setCamUser(null); }, [focus.moduleId, focus.group, focus.kind, focus.fileId, focus.factId]);
+  useEffect(() => { setCamUser(null); }, [focus.moduleId, focus.group, focus.kind, leafPage]);
   const cam = camUser || autoCam;
   const camRef = useRef(cam);
   camRef.current = cam;
@@ -940,7 +1004,7 @@ export default function ContextMap({
       : {};
     const next = { nodes: { ...prev } };
     for (const n of nodes) {
-      if (!n?.id || (n.kind !== 'hub' && n.kind !== 'module')) continue;
+      if (!n?.id) continue;
       next.nodes[n.id] = {
         x: n.x / CANVAS.w,
         y: n.y / CANVAS.h,
@@ -987,7 +1051,7 @@ export default function ContextMap({
     const loc = clientToCanvas(clientX, clientY, el);
     setCamUser((prev) => {
       const base = prev || camRef.current || { k: 1, x: 0, y: 0 };
-      const k = Math.min(2.4, Math.max(0.32, base.k * factor));
+      const k = Math.min(2.8, Math.max(0.18, base.k * factor));
       if (!loc) return { ...base, k };
       return {
         k,
@@ -995,6 +1059,37 @@ export default function ContextMap({
         y: base.y + loc.y * (base.k - k),
       };
     });
+  };
+
+  const onCanvasPointerDown = (ev) => {
+    if (ev.button !== 0) return;
+    if (ev.target?.closest?.('button')) return;
+    ev.preventDefault();
+    const pointerId = ev.pointerId;
+    const surface = ev.currentTarget;
+    const startX = ev.clientX;
+    const startY = ev.clientY;
+    const origin = { ...(camRef.current || { k: 1, x: 0, y: 0 }) };
+    let moved = false;
+    const onMove = (e) => {
+      if (e.pointerId !== pointerId) return;
+      const r = surface.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      if (Math.hypot(e.clientX - startX, e.clientY - startY) > 5) moved = true;
+      if (!moved) return;
+      const dx = ((e.clientX - startX) / r.width) * CANVAS.w;
+      const dy = ((e.clientY - startY) / r.height) * CANVAS.h;
+      setCamUser({ k: origin.k || 1, x: origin.x + dx, y: origin.y + dy });
+    };
+    const onUp = (e) => {
+      if (e.pointerId !== pointerId) return;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
   const selectNode = (node) => {
@@ -1162,6 +1257,11 @@ export default function ContextMap({
         ...(model.generalMemory || []).map((m) => ({ ...m, origin: 'centre' })),
       ]
     : [];
+  const leafPageInfo = focus.group === 'memory'
+    ? pageSlice(memoryFacts, leafPage)
+    : (focus.group === 'files' && focus.kind
+      ? pageSlice(moduleFiles(selectedModule || { files: [], stellaFiles: [] }).filter((f) => kindOfFile(f) === focus.kind), leafPage)
+      : null);
   const visibleFacts = focus.factId
     ? memoryFacts.filter((m) => m.id === focus.factId)
     : memoryFacts;
@@ -1215,8 +1315,33 @@ export default function ContextMap({
     <div className="flex flex-wrap gap-x-4 gap-y-1 px-4 py-2.5 border-t border-blue-400/15 text-[10px] text-blue-200/70 bg-slate-900/40">
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always passed to the AI</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-cyan-400 rounded" /> Modules sharing context</span>
-      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Stored file join</span>
+      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-slate-400" /> Parent → child on the map</span>
+      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> File join (only after you click a file)</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
+      {leafPageInfo && leafPageInfo.pages > 1 ? (
+        <span className="inline-flex items-center gap-1.5">
+          <button
+            type="button"
+            disabled={leafPageInfo.page <= 0}
+            onClick={() => setLeafPage((p) => Math.max(0, p - 1))}
+            className="text-[10px] font-semibold text-cyan-200 hover:text-white disabled:text-blue-300/30"
+          >
+            Prev
+          </button>
+          <span className="text-blue-100/80">
+            {leafPageInfo.from}–{leafPageInfo.to} of {leafPageInfo.total}
+            {focus.group === 'memory' ? ` (cap ${MEMORY_CAP})` : ''}
+          </span>
+          <button
+            type="button"
+            disabled={leafPageInfo.page >= leafPageInfo.pages - 1}
+            onClick={() => setLeafPage((p) => p + 1)}
+            className="text-[10px] font-semibold text-cyan-200 hover:text-white disabled:text-blue-300/30"
+          >
+            Next
+          </button>
+        </span>
+      ) : null}
       <button
         type="button"
         onClick={collapseOne}
@@ -1264,7 +1389,7 @@ export default function ContextMap({
         <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
           <div className="text-sm font-bold text-white flex items-center gap-2">
             <Network className="w-4 h-4 text-cyan-300" /> Context map
-            <span className="text-xs font-normal text-blue-300/60">Click to drill in · drag any card, including remembered facts</span>
+            <span className="text-xs font-normal text-blue-300/60">Drag the background to pan · drag any card · scroll to zoom</span>
           </div>
           <button
             type="button"
@@ -1278,7 +1403,8 @@ export default function ContextMap({
           <div
             ref={largeCanvasRef}
             data-ctx-canvas="large"
-            className="relative w-full h-full bg-slate-950/50 border border-blue-400/15 rounded-xl overflow-hidden"
+            className="relative w-full h-full bg-slate-950/50 border border-blue-400/15 rounded-xl overflow-hidden cursor-grab active:cursor-grabbing touch-none"
+            onPointerDown={onCanvasPointerDown}
             onWheel={(e) => {
               e.preventDefault();
               zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 0.9 : 1.12, e.currentTarget);
@@ -1305,7 +1431,7 @@ export default function ContextMap({
           <Network className="w-4 h-4 text-cyan-400" /> Context map
         </h3>
         <p className="text-xs text-blue-300/70 leading-relaxed">
-          Click a module, then Chat memory or Files. The map zooms to keep the branch in view as you drill in; scroll to zoom. Parent cards stay visible. Drag any card — including remembered facts.
+          Click a module, then Chat memory or Files. Drag the background to pan if cards run out of room; scroll to zoom. File joins appear only after you click a file. Drag any card — including files and remembered facts.
         </p>
       </div>
 
@@ -1313,8 +1439,9 @@ export default function ContextMap({
         <div
           ref={canvasRef}
           data-ctx-canvas="main"
-          className="relative w-full overflow-hidden"
+          className="relative w-full overflow-hidden cursor-grab active:cursor-grabbing touch-none"
           style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}
+          onPointerDown={onCanvasPointerDown}
           onWheel={(e) => {
             e.preventDefault();
             zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 0.9 : 1.12, e.currentTarget);
@@ -1414,10 +1541,10 @@ export default function ContextMap({
             {focus.group === 'memory' && (
               <div className="space-y-3">
                 <div className="text-xs font-semibold text-blue-200">
-                  {focus.factId ? 'Selected remembered fact' : `Chat memory for ${selectedModule.short}`}
+                  {focus.factId ? 'Selected remembered fact' : `Chat memory for ${selectedModule.short} (${memoryFacts.length} of up to ${MEMORY_CAP})`}
                 </div>
                 {visibleFacts.length ? (
-                  <ul className="space-y-1.5">
+                  <ul className="space-y-1.5 max-h-72 overflow-y-auto custom-scrollbar pr-1">
                     {visibleFacts.map((m) => (
                       <li key={m.id} className={`text-xs text-slate-200 bg-slate-900/40 border rounded-lg px-3 py-2 ${m.origin === 'tagged' ? 'border-violet-400/20' : 'border-blue-400/10'}`}>
                         <div>{m.text}</div>
@@ -1462,7 +1589,6 @@ export default function ContextMap({
                     <span className="block text-[10px] text-blue-300/50 mt-0.5">{k.files.length} file{k.files.length === 1 ? '' : 's'}</span>
                   </button>
                 ))}
-                {renderJoins(selectedModule.joins)}
               </div>
             )}
 
@@ -1485,10 +1611,7 @@ export default function ContextMap({
                     <span className="block text-[10px] text-blue-300/50 mt-0.5">{f.kindLabel}{f.tableName ? ` · ${f.tableName}` : ''}{f.rowCount != null ? ` · ${f.rowCount} rows` : ''}</span>
                   </button>
                 ))}
-                {renderJoins(selectedModule.joins.filter((e) => {
-                  const ids = new Set(moduleFiles(selectedModule).filter((f) => kindOfFile(f) === focus.kind).map((f) => f.id));
-                  return ids.has(e.fromId) && ids.has(e.toId);
-                }))}
+                <p className="text-[11px] text-blue-300/45">Click a file on the map to see how it joins to others.</p>
               </div>
             )}
 
@@ -1511,6 +1634,7 @@ export default function ContextMap({
                   <div key={`${focusedFile.id}-h-${i}`}>• {h}</div>
                 ))}
                 <FilePreviewBlock file={focusedFile} />
+                {renderJoins(selectedModule.joins.filter((e) => e.fromId === focusedFile.id || e.toId === focusedFile.id))}
                 {!focusedFile.represents && !focusedFile.period && !(focusedFile.metrics || []).length && !(focusedFile.highlights || []).length && !focusedFile.previewRows?.length && !focusedFile.extractedText && (
                   <div className="text-blue-300/45">No interpretive notes yet — finish intake on Connections.</div>
                 )}
