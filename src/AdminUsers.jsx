@@ -414,7 +414,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
             <History className="w-6 h-6 text-cyan-400" /> Login history
           </h2>
           <p className="text-sm text-blue-300/70 mb-5">
-            {historyUser.name}{historyUser.email ? ` · ${historyUser.email}` : ''} — last 10 login days, with chat volume and workflow triggers
+            {historyUser.name}{historyUser.email ? ` · ${historyUser.email}` : ''} — last 10 days with a login or chat activity, including volume and workflow triggers
           </p>
           {error && (
             <div className="mb-4 text-sm text-red-300 flex items-center gap-2">
@@ -440,7 +440,7 @@ export default function AdminUsers({ currentUserId, onGeneralSettingsSaved }) {
                 )}
                 {historyStatus === 'ready' && historyDays.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="py-6 text-blue-300/50">No logins recorded yet.</td>
+                    <td colSpan={5} className="py-6 text-blue-300/50">No login or chat activity recorded yet.</td>
                   </tr>
                 )}
                 {historyDays.map((row) => {

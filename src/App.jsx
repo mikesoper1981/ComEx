@@ -971,12 +971,15 @@ function sanitizeMessageForStorage(m, { stampNow = false } = {}) {
   return out;
 }
 
-function serializeChatSnapshot({ id, title, updatedAt, createdAt, messages, currentWorkflow, pendingWorkflow, uploadedFile, module, workflowRuns }) {
+function serializeChatSnapshot({ id, title, updatedAt, createdAt, messages, currentWorkflow, pendingWorkflow, uploadedFile, module, workflowRuns, previousMessages }) {
   const cid = id || newChatId();
   const now = new Date().toISOString();
   const list = messages || [];
-  const safeMessages = list.slice(-MAX_STORED_MESSAGES).map((m, i, arr) => (
-    sanitizeMessageForStorage(m, { stampNow: i === arr.length - 1 && !m?.at })
+  const prevLen = Array.isArray(previousMessages) ? previousMessages.length : 0;
+  const sliced = list.slice(-MAX_STORED_MESSAGES);
+  const slicedOffset = Math.max(0, list.length - sliced.length);
+  const safeMessages = sliced.map((m, i) => (
+    sanitizeMessageForStorage(m, { stampNow: !m?.at && (slicedOffset + i) >= prevLen })
   )).filter(Boolean);
   return {
     id: cid,
@@ -5363,6 +5366,7 @@ export default function CommercialExcellenceApp() {
         createdAt: existing?.createdAt,
         updatedAt: sameThread ? existing.updatedAt : undefined,
         workflowRuns: existing?.workflowRuns,
+        previousMessages: existing?.messages,
       });
       const next = upsertChatInPlace(unionChats(chatSessionsRef.current, chatsBodiesRef.current), snap);
       chatSessionsRef.current = next;
@@ -5419,6 +5423,7 @@ export default function CommercialExcellenceApp() {
         createdAt: existing?.createdAt,
         updatedAt: sameThread ? existing.updatedAt : undefined,
         workflowRuns: existing?.workflowRuns,
+        previousMessages: existing?.messages,
       });
       const next = upsertChatInPlace(unionChats(chatSessionsRef.current, chatsBodiesRef.current), snap);
       chatSessionsRef.current = next;
@@ -5488,6 +5493,7 @@ export default function CommercialExcellenceApp() {
       module: existing?.module,
       createdAt: existing?.createdAt,
       workflowRuns: runs.slice(0, 20),
+      previousMessages: existing?.messages,
     });
     const next = upsertChatInPlace(chatSessionsRef.current, snap);
     chatSessionsRef.current = next;
@@ -6345,6 +6351,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       module: liveModule,
       createdAt: (liveExisting && existingIsStella === liveIsStella) ? liveExisting.createdAt : undefined,
       workflowRuns: (liveExisting && existingIsStella === liveIsStella) ? liveExisting.workflowRuns : undefined,
+      previousMessages: (liveExisting && existingIsStella === liveIsStella) ? liveExisting.messages : undefined,
     });
     const liveChats = chatHasUserContent(liveSnap.messages)
       ? upsertChatInPlace(unionChats(chatSessionsRef.current, chatsBodiesRef.current), liveSnap)
@@ -6549,6 +6556,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       createdAt: existing?.createdAt,
       updatedAt: preserveUpdatedAt ? existing?.updatedAt : undefined,
       workflowRuns: existing?.workflowRuns,
+      previousMessages: existing?.messages,
     });
     const base = unionChats(chatSessionsRef.current, chatsBodiesRef.current);
     let next;

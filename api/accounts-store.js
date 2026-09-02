@@ -502,6 +502,13 @@ function usageForCalendarDay(doc, dayKey) {
       const t = messageTime(m, chat, i);
       if (t && dayKeyLondon(t) === dayKey) questionsThisChat += 1;
     });
+    if (questionsThisChat === 0) {
+      const updated = Date.parse(chat?.updatedAt || '');
+      const hasUser = msgs.some((m) => m?.role === 'user');
+      if (hasUser && Number.isFinite(updated) && dayKeyLondon(updated) === dayKey) {
+        questionsThisChat = 1;
+      }
+    }
     if (questionsThisChat > 0) {
       conversations += 1;
       questions += questionsThisChat;
@@ -637,6 +644,27 @@ function recordLogin(user) {
   user.loginHistory = hist.slice(-40);
 }
 
+function activityDaysFromChats(doc) {
+  const chats = Array.isArray(doc?.chats) ? doc.chats : [];
+  const byDay = new Map();
+  const bump = (ms) => {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    const key = dayKeyLondon(ms);
+    const prev = byDay.get(key);
+    if (!prev || ms > prev.t) byDay.set(key, { at: new Date(ms).toISOString(), t: ms, dayKey: key });
+  };
+  for (const chat of chats) {
+    bump(Date.parse(chat?.updatedAt || ''));
+    bump(Date.parse(chat?.createdAt || '') || createdAtFromChatId(chat?.id));
+    const msgs = Array.isArray(chat.messages) ? chat.messages : [];
+    msgs.forEach((m, i) => {
+      if (m?.role !== 'user') return;
+      bump(messageTime(m, chat, i));
+    });
+  }
+  return byDay;
+}
+
 function buildLoginHistory(user, chatsDoc) {
   const hist = normalizeLoginHistory(user.loginHistory, user.lastLoginAt);
   const byDay = new Map();
@@ -646,6 +674,11 @@ function buildLoginHistory(user, chatsDoc) {
     const key = dayKeyLondon(t);
     const prev = byDay.get(key);
     if (!prev || t > prev.t) byDay.set(key, { at: entry.at, t, dayKey: key });
+  }
+  for (const [key, row] of activityDaysFromChats(chatsDoc)) {
+    const prev = byDay.get(key);
+    if (!prev) byDay.set(key, row);
+    else if (row.t > prev.t) byDay.set(key, { ...row });
   }
   return [...byDay.values()]
     .sort((a, b) => b.t - a.t)
@@ -702,6 +735,12 @@ function usageFromChatsDocument(doc) {
     if (questionsThisChat > 0) {
       conversationsLast7Days += 1;
       messagesLast7Days += questionsThisChat;
+    } else if (msgs.some((m) => m?.role === 'user')) {
+      const updated = Date.parse(chat.updatedAt || '');
+      if (Number.isFinite(updated) && updated >= since) {
+        conversationsLast7Days += 1;
+        messagesLast7Days += 1;
+      }
     }
   }
   return { messagesLast7Days, conversationsLast7Days };
