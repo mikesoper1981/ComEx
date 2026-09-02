@@ -112,8 +112,6 @@ import {
   patchModuleContextFile,
   removeModuleContextFile,
   formatLinkedModulesPromptBlock,
-  formatLinkedModulesIntakeHint,
-  stellaLinkedModuleQuestion,
   mergeModuleConnections,
   toggleModuleConnection,
   connectedModuleIds,
@@ -1507,7 +1505,7 @@ function stellaDefaultIntakeQuestions({ isTabular, columns = [] } = {}) {
 function stellaIntakeQuestionLooksIrrelevant(q) {
   const t = String(q || '').toLowerCase();
   if (!t) return true;
-  return /\b(kpi|key metrics?|performance|business goals?|incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|what filters|caveats?)\b/i.test(t);
+  return /\b(kpi|key metrics?|performance|business goals?|incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|what filters|caveats?|linked to (other )?modules?|connected modules?|stay independent|connect(ed)? to those modules)\b/i.test(t);
 }
 
 function pickStellaIntakeQuestions(onboarding, fallbacks) {
@@ -9987,12 +9985,11 @@ ${stepInstruction}`;
     const system = withUserSettings(getStellaPrompts().contentSummary, { moduleContext: false, applyResponseLength: false });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
-    const linkHint = formatLinkedModulesIntakeHint(userSettingsRef.current || userSettings, 'stella');
     const others = (stellaDataFilesRef.current || []).filter((f) => f && f.tableName && !f.processing);
     const otherHint = others.length
       ? `\n\nOTHER STELLA DATASETS already loaded:\n${others.map((f) => `- ${f.name}${f.tableName ? ` (table ${f.tableName})` : ''}: ${(f.columns || []).slice(0, 10).map((c) => c.name || c).filter(Boolean).join(', ')}`).join('\n')}`
       : '';
-    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}${otherHint}${linkHint}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions must be structure-only (grain, ambiguous columns, join keys, links to other datasets or connected modules). Prefer [] when the extract is already clear. Do not ask about metrics, KPIs, schemes, or interpretation.`;
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}${otherHint}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions must be structure-only (grain, ambiguous columns, join keys to other Stella datasets). Prefer [] when the extract is already clear. Do not ask about metrics, KPIs, schemes, other hub modules, or interpretation.`;
     const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1400);
     const parsed = extractJsonObject(raw);
     if (!(parsed && typeof parsed === 'object')) {
@@ -10032,7 +10029,7 @@ ${stepInstruction}`;
       kindSubject: isDoc ? 'document contains / represents' : 'data represents',
       relationshipBullet: (!isDoc && otherTabular.length) ? '\n- joins: whether/how it shares keys with other uploaded datasets (matching values, not just similar names)' : '',
       dataProfile: (!isDoc && (live.dataProfile || f.dataProfile)) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${live.dataProfile || f.dataProfile}` : '',
-      relationshipGuidance: `${relationshipGuidance || ''}${formatLinkedModulesIntakeHint(userSettingsRef.current || userSettings, 'stella')}`,
+      relationshipGuidance: relationshipGuidance || '',
     }), { moduleContext: false, applyResponseLength: false });
     const contextBlob = `FILE: "${f.name}" (type: ${f.fileType || f.type})${f.tableName ? `\nSQL TABLE: ${f.tableName}` : ''}\nSUMMARY: ${f.summary || ''}\nCOLUMNS (use these exact names in relationships.this_field):\n${colsBlob}`;
     const convo = [
@@ -10207,26 +10204,21 @@ ${stepInstruction}`;
       if (!joinQ) return true;
       return !/\b(join|related|shared (id|key)|territory, product)\b/i.test(q);
     });
-    const linkQ = stellaLinkedModuleQuestion(userSettingsRef.current || userSettings, 'stella');
     const confirmQ = requireConfirm
       ? 'This file was refreshed from the inbox with different columns. Does the existing context still apply, or should we update it?'
       : '';
     const questions = [
       ...(confirmQ ? [confirmQ] : []),
       ...(joinQ ? [joinQ] : []),
-      ...(linkQ && !joinQ ? [linkQ] : []),
-      ...modelQuestions.filter((q) => !linkQ || !/\b(linked to|connected module|stay independent)\b/i.test(q)),
+      ...modelQuestions,
     ];
     const colLine = profiledColumns.length ? `\n\n**Columns:** ${profiledColumns.map((c) => c.name).join(', ')}` : '';
     const needsUser = questions.length > 0;
     const qBlock = formatStellaIntakeQuestionList(questions);
-    const linkNote = linkQ && joinQ
-      ? `\n\nThis workspace is also linked to other modules — confirm whether this file should connect there as well.`
-      : '';
     const assistantMsg = needsUser
       ? (questions.length === 1
-        ? `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents${joinQ ? ' and found likely connections' : ''}:\n\n${questions[0]}${linkNote}`
-        : `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents.${joinQ || linkQ || confirmQ ? ' Proposed connections are below.' : ''}\n\n${qBlock}`)
+        ? `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents${joinQ ? ' and found likely connections' : ''}:\n\n${questions[0]}`
+        : `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents.${joinQ || confirmQ ? ' Proposed connections are below.' : ''}\n\n${qBlock}`)
       : `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI've assessed this file from its contents — that's enough to query it. Ask me anything in Stella Insights.`;
     const autoCtx = needsUser ? null : {
       what_it_represents: summary,

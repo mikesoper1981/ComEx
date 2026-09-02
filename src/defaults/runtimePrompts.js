@@ -224,7 +224,7 @@ Schema:
 
 If column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. Empty fields must be empty strings.
 
-Ask only about file structure: grain (what one row/record is), ambiguous columns and the values they contain, codes/IDs, and how this file might join to other datasets or to linked modules. Do NOT ask about metrics, KPIs, performance, incentive schemes, quotas, payouts, business goals, filters, caveats, or how an analyst should interpret the numbers.
+Ask only about file structure: grain (what one row/record is), ambiguous columns and the values they contain, codes/IDs, and how this file might join to other Stella datasets. Do NOT ask about linking this file to other hub modules (Incentive Compensation, Territory Design) — module links are defined on the home page. Do NOT ask about metrics, KPIs, performance, incentive schemes, quotas, payouts, business goals, filters, caveats, or how an analyst should interpret the numbers.
 
 If the extract already makes the grain and columns clear, return suggestedQuestions as []. Prefer an empty list over padding. Only ask when a column's contents, the grain, or a possible join is still unclear.
 
@@ -242,7 +242,7 @@ Concentrate only on:
 
 Do not ask for a time period unless date columns are missing or their grain (day vs month vs quarter) is unclear.
 
-When other datasets exist (see RELATIONSHIPS below), you MUST ask whether/how this file joins to them BEFORE setting complete=true. Only propose joins that would exist in a real database: entity keys (territory, HCP/account, product, rep, IDs). Prefer keys whose sample VALUES overlap even if column names differ. Do not propose a join from name or type alone. Never join measures such as units, qty, revenue, or scores even if the values look similar. List every matching key in plain English — do not pick a preferred subset. Do not set complete=true until the user has confirmed, corrected, or declined those links. this_field and related_field MUST be the exact SQL column names from COLUMNS.
+When other datasets exist (see RELATIONSHIPS below), you MUST ask whether/how this file joins to them BEFORE setting complete=true. Only propose joins to other Stella datasets, not to other hub modules (Incentive Compensation, Territory Design) — those links are set on the home page. Only propose joins that would exist in a real database: entity keys (territory, HCP/account, product, rep). Prefer keys whose sample VALUES overlap even if column names differ. Do not propose a join from name or type alone. Never join measures such as units, qty, revenue, or scores even if the values look similar. List every matching key in plain English — do not pick a preferred subset. Do not set complete=true until the user has confirmed, corrected, or declined those links. this_field and related_field MUST be the exact SQL column names from COLUMNS.
 
 If "message" asks more than one question, number them 1. 2. 3. so the user can reply 1= … 2= ….
 
