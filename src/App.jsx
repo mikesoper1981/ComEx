@@ -11228,7 +11228,7 @@ ${stepInstruction}`;
     <div className={`bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 text-white ${showLanding ? 'min-h-dvh' : 'h-dvh max-h-dvh overflow-hidden flex flex-col'}`}>
       {/* Header */}
       <header className="border-b border-blue-400/30 bg-slate-900/80 backdrop-blur-sm flex-shrink-0">
-        <div className={`max-w-7xl mx-auto px-4 sm:px-6 ${showLanding ? 'py-3 sm:py-4' : 'py-1.5 sm:py-2'}`}>
+        <div className={`${showLanding ? 'max-w-7xl' : 'max-w-[96rem]'} mx-auto px-4 sm:px-6 ${showLanding ? 'py-3 sm:py-4' : 'py-1.5 sm:py-2'}`}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 sm:gap-3">
               <button onClick={() => setShowLanding(true)} className={`${showLanding ? 'w-8 h-8 sm:w-10 sm:h-10' : 'w-8 h-8 sm:w-9 sm:h-9'} bg-gradient-to-br from-blue-400 to-cyan-400 rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity`}>
@@ -11449,7 +11449,7 @@ ${stepInstruction}`;
           )}
         </div>
       ) : (
-        <div className="flex-1 min-h-0 max-w-7xl mx-auto w-full px-4 sm:px-6 py-2 sm:py-3 overflow-hidden flex flex-col">
+        <div className="flex-1 min-h-0 max-w-[96rem] mx-auto w-full px-3 sm:px-4 py-2 sm:py-3 overflow-hidden flex flex-col">
           <MessageErrorBoundary key={activeTab} fallback={
             <div className="h-full flex items-center justify-center">
               <div className="max-w-md text-center bg-red-500/10 border border-red-400/25 rounded-xl p-6">
