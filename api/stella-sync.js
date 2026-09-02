@@ -4,8 +4,9 @@
  * POST  session (authHeaders)  — Run now for the signed-in user
  * GET/POST  Authorization: Bearer CRON_SECRET  — walk enabled schedules
  *
- * Inbox: companies/<slug>/users/<display>/stella/inbox/
- * After import: stella/processed/YYYY-MM-DD/
+ * Inbox: company drop folder (matched by company name/slug), e.g.
+ * companies/<slug>/stella/inbox or a folder named after the company.
+ * After import: companies/<slug>/stella/processed/YYYY-MM-DD/
  *
  * Same file_name → replace rows, keep context_qa. New name → new table + intake pending.
  */
@@ -20,7 +21,7 @@ const {
   storageFolder,
   isEmail,
 } = require('./accounts-store');
-const { userObjectPrefix } = require('./company');
+const { userObjectPrefix, companyInboxPrefixes, companyProcessedPrefix } = require('./company');
 const stellaQuery = require('./stella-query');
 const stellaFiles = require('./stella-files');
 const { sendEmail, stellaIntakeEmail, stellaIntakeUrl, appLoginUrl } = require('./mail');
@@ -160,13 +161,8 @@ function scheduleIsDue(schedule, now, { force } = {}) {
   return elapsed >= 20 * 60 * 60 * 1000;
 }
 
-function inboxPrefix(user) {
-  return `${userObjectPrefix(user)}/stella/inbox`;
-}
-
 function processedPrefix(user, dayIso) {
-  const day = String(dayIso || new Date().toISOString()).slice(0, 10);
-  return `${userObjectPrefix(user)}/stella/processed/${day}`;
+  return companyProcessedPrefix(user, dayIso);
 }
 
 function fileKind(name) {
@@ -345,26 +341,25 @@ async function listBucketPrefix(bucket, prefix) {
 }
 
 async function listInboxFiles(user) {
-  const prefix = inboxPrefix(user);
   const found = [];
   const seen = new Set();
-  for (const bucket of STORAGE_BUCKETS) {
-    const items = await listBucketPrefix(bucket, prefix);
-    for (const item of items) {
-      const name = String(item?.name || '');
-      if (!name || name === '.emptyFolderPlaceholder') continue;
-      if (item.id == null && !TABULAR_EXT.test(name)) continue;
-      if (!TABULAR_EXT.test(name)) continue;
-      const full = `${prefix}/${basenameOf(name)}`.replace(/\/+/g, '/');
-      if (seen.has(full.toLowerCase())) continue;
-      seen.add(full.toLowerCase());
-      found.push({
-        bucket,
-        path: full,
-        name: basenameOf(name),
-        updatedAt: item.updated_at || item.created_at || '',
-        key,
-      });
+  for (const prefix of companyInboxPrefixes(user)) {
+    for (const bucket of STORAGE_BUCKETS) {
+      const items = await listBucketPrefix(bucket, prefix);
+      for (const item of items) {
+        const name = String(item?.name || '');
+        if (!name || name === '.emptyFolderPlaceholder') continue;
+        if (!TABULAR_EXT.test(name)) continue;
+        const full = `${prefix}/${basenameOf(name)}`.replace(/\/+/g, '/');
+        if (seen.has(full.toLowerCase())) continue;
+        seen.add(full.toLowerCase());
+        found.push({
+          bucket,
+          path: full,
+          name: basenameOf(name),
+          updatedAt: item.updated_at || item.created_at || '',
+        });
+      }
     }
   }
   found.sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)));

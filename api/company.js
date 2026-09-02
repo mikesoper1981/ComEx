@@ -53,6 +53,26 @@ function userObjectPrefix(user) {
   return `companies/${company}/users/${folder}`;
 }
 
+/** Company drop folder for scheduled Stella imports. Matched by company name/slug. */
+function companyInboxPrefixes(user) {
+  const company = resolveUserCompany(user);
+  const slug = companySlug(company);
+  const raw = String(company || '').trim();
+  const prefixes = [
+    `companies/${slug}/stella/inbox`,
+    `companies/${slug}`,
+    slug,
+  ];
+  if (raw && raw !== slug) prefixes.push(raw);
+  prefixes.push(`${userObjectPrefix(user)}/stella/inbox`);
+  return [...new Set(prefixes.map((p) => String(p || '').replace(/^\/+|\/+$/g, '')).filter(Boolean))];
+}
+
+function companyProcessedPrefix(user, dayIso) {
+  const day = String(dayIso || new Date().toISOString()).slice(0, 10);
+  return `companies/${companySlug(resolveUserCompany(user))}/stella/processed/${day}`;
+}
+
 module.exports = {
   DEFAULT_TENANT_COMPANY,
   ADMIN_TENANT_COMPANY,
@@ -65,4 +85,6 @@ module.exports = {
   ensureCompanyPgSchema,
   ensureAllCompanySchemas,
   userObjectPrefix,
+  companyInboxPrefixes,
+  companyProcessedPrefix,
 };

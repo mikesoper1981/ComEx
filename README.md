@@ -56,13 +56,16 @@ Dataset tables and the file registry live in the company schema
 (`c_comex.stella_data_*`, `c_comex.stella_files`). `public.stella_files` may
 still hold older rows until they are copied across.
 
-Scheduled CSV/Excel/JSON imports use a per-user drop folder in the
-`intelligence` bucket (S3-compatible Supabase Storage):
+Scheduled CSV/Excel/JSON imports use a **company** drop folder in the
+`intelligence` bucket (S3-compatible Supabase Storage). Admins place files
+in the folder that matches the company name. The app looks in:
 
-`companies/<slug>/users/<display>/stella/inbox/`
+`companies/<slug>/stella/inbox/`, `companies/<slug>/`, or a top-level folder
+named after the company.
 
-Files → **Schedule refresh** shows that path and has **Enable schedule**, frequency, and **Run now**. After a successful import the object is moved to
-`stella/processed/YYYY-MM-DD/`. Same filename refreshes the existing dataset;
+Files → **Schedule refresh** has **Enable schedule**, frequency, and **Run now**.
+Users do not copy a storage path. After a successful import the object is moved to
+`companies/<slug>/stella/processed/YYYY-MM-DD/`. Same filename refreshes the existing dataset;
 a new name or a column change leaves **Intake pending**. Cron emails the
 account (if an email is on file) with a link that opens Settings → Stella
 Insights → Files on that dataset. Set `CRON_SECRET` in Vercel so the daily

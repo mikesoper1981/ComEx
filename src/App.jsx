@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense, Component } from 'react';
 import { createPortal } from 'react-dom';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles, Clock, Copy, Play } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles, Clock, Play } from 'lucide-react';
 import ExcelExportButton from './ExcelExportButton';
 import { supabase } from './supabase';
 import {
@@ -37,7 +37,6 @@ import {
   liftStellaGenericIntoUserSettings,
   stellaOrgIdForUser,
   stellaOrgIdCandidates,
-  stellaInboxStoragePrefix,
   stellaInboxSchedule,
 } from './stellaUserSettings';
 import {
@@ -1722,9 +1721,21 @@ const STELLA_DIM_FILE_HINTS = new Set([
   'directory', 'roster', 'catalog', 'catalogue',
 ]);
 const STELLA_FACT_GRAIN_STEMS = new Set([
-  'transaction', 'txn', 'trans', 'invoice', 'sale', 'order',
-  'call', 'activity', 'visit', 'shipment', 'claim', 'receipt',
+  'transaction', 'txn', 'trans', 'invoice', 'sale', 'sales', 'order', 'orders',
+  'call', 'activity', 'visit', 'shipment', 'claim', 'receipt', 'line', 'record',
 ]);
+const STELLA_FACT_KIND_STEMS = new Set(
+  STELLA_FACT_FILE_KINDS.flatMap((k) => k.tokens.map((t) => stellaNormJoinToken(t)).filter((t) => t.length >= 3))
+);
+
+function stellaLooksLikePeriodToken(t) {
+  const s = String(t || '').toLowerCase();
+  if (/^(20\d{2}|19\d{2})$/.test(s)) return true;
+  if (/^2[0-9]$/.test(s)) return true;
+  if (/^(fy|cy|ye)(20|21|22|23|24|25|26|27|28|29|\d{2})$/.test(s)) return true;
+  if (/^q[1-4]$/.test(s) || /^h[12]$/.test(s)) return true;
+  return /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|ytd|mtd)$/.test(s);
+}
 
 function stellaJoinFamily(col) {
   const blobs = [col?.name, col?.original, col?.description].map(stellaNormJoinToken).filter(Boolean);
@@ -1768,12 +1779,20 @@ function stellaLooksLikeGenericRowId(col) {
   return STELLA_GENERIC_ID_STEMS.has(stellaIdStem(col));
 }
 
-/** Transaction/document grain IDs (transaction_id, invoice_id, sale_id) plus generic row IDs. Entity FKs like product_id are excluded. */
-function stellaLooksLikeFactGrainId(col) {
+/** Transaction/document grain IDs (transaction_id, invoice_id, sale_id, sales_id) plus generic row IDs. Entity FKs like product_id are excluded. */
+function stellaLooksLikeFactGrainId(col, file) {
   if (stellaJoinFamily(col)) return false;
   if (stellaLooksLikeGenericRowId(col)) return true;
   const stem = stellaIdStem(col);
-  return !!(stem && STELLA_FACT_GRAIN_STEMS.has(stem));
+  if (stem && (STELLA_FACT_GRAIN_STEMS.has(stem) || STELLA_FACT_KIND_STEMS.has(stem))) return true;
+  const n = stellaNormJoinToken(col?.name || col?.original || (typeof col === 'string' ? col : ''));
+  if (n && STELLA_FACT_KIND_STEMS.has(n)) return true;
+  if (file) {
+    const kind = stellaFileJoinRole(file).kind;
+    const kindN = stellaNormJoinToken(kind);
+    if (kindN && (stem === kindN || stem === `${kindN}s` || n === `${kindN}id` || n === `${kindN}sid`)) return true;
+  }
+  return false;
 }
 
 function stellaFileJoinTokens(file, namesOnly = false) {
@@ -1830,15 +1849,18 @@ function stellaFileJoinRole(file) {
   const nameKind = stellaMatchJoinFamilyId(nameTokens, STELLA_FACT_FILE_KINDS);
   const kind = nameKind || (nameFamily ? null : stellaMatchJoinFamilyId(allTokens, STELLA_FACT_FILE_KINDS));
   const dimHint = nameTokens.some((t) => STELLA_DIM_FILE_HINTS.has(t));
+  const periodHint = nameTokens.some(stellaLooksLikePeriodToken);
   const cols = Array.isArray(file.columns) ? file.columns : [];
   const measureCount = cols.filter((c) => stellaLooksLikeMeasureCol(c)).length;
   if (dimHint && family && !nameKind) return { role: 'dimension', family, kind: null };
   if (dimHint && family) return { role: 'dimension', family, kind };
   if (kind) return { role: 'fact', family, kind };
+  if (periodHint && measureCount >= 1) return { role: 'fact', family, kind: kind || 'sales' };
   if (family) {
-    if (measureCount >= 2 && !nameFamily) return { role: 'fact', family, kind: null };
+    if (measureCount >= 1 && !nameFamily) return { role: 'fact', family, kind: null };
     return { role: 'dimension', family, kind: null };
   }
+  if (measureCount >= 1 && periodHint) return { role: 'fact', family: null, kind: 'sales' };
   if (measureCount >= 2) return { role: 'fact', family: null, kind: null };
   return { role: 'unknown', family: null, kind: null };
 }
@@ -1892,16 +1914,38 @@ function stellaLooksLikePkFkPair(a, b, fileA, fileB) {
   return { family: fkFam || fkStem, stem: fkStem || fkFam };
 }
 
+function stellaFilesLookLikeSameFactSeries(fileA, fileB) {
+  if (!fileA || !fileB) return false;
+  if (stellaFilesBothFactLike(fileA, fileB)) return true;
+  const aTok = stellaFileJoinTokens(fileA, true);
+  const bTok = stellaFileJoinTokens(fileB, true);
+  const aPeriod = aTok.some(stellaLooksLikePeriodToken);
+  const bPeriod = bTok.some(stellaLooksLikePeriodToken);
+  if (!aPeriod || !bPeriod) return false;
+  const core = (tokens) => tokens.filter((t) => !stellaLooksLikePeriodToken(t) && !/^\d+$/.test(t)).sort().join('|');
+  const aCore = core(aTok);
+  const bCore = core(bTok);
+  if (aCore && aCore === bCore) return true;
+  const roleA = stellaFileJoinRole(fileA);
+  const roleB = stellaFileJoinRole(fileB);
+  if (roleA.kind && roleA.kind === roleB.kind) return true;
+  return roleA.role === 'fact' || roleB.role === 'fact';
+}
+
 function stellaShouldBlockFactGrainJoin(a, b, fileA, fileB) {
   if (stellaLooksLikePkFkPair(a, b, fileA, fileB)) return false;
-  const aGrain = stellaLooksLikeFactGrainId(a);
-  const bGrain = stellaLooksLikeFactGrainId(b);
+  const aGrain = stellaLooksLikeFactGrainId(a, fileA);
+  const bGrain = stellaLooksLikeFactGrainId(b, fileB);
   if (!aGrain && !bGrain) return false;
-  if (!fileA && !fileB) {
-    return stellaLooksLikeGenericRowId(a) && stellaLooksLikeGenericRowId(b);
-  }
-  if (!stellaFilesBothFactLike(fileA, fileB)) return false;
-  return true;
+  const roleA = stellaFileJoinRole(fileA);
+  const roleB = stellaFileJoinRole(fileB);
+  const bothDimSameFamily = roleA.role === 'dimension' && roleB.role === 'dimension'
+    && roleA.family && roleA.family === roleB.family;
+  if (bothDimSameFamily && stellaLooksLikeGenericRowId(a) && stellaLooksLikeGenericRowId(b)) return false;
+  if (aGrain && bGrain) return true;
+  if (stellaFilesLookLikeSameFactSeries(fileA, fileB) || stellaFilesBothFactLike(fileA, fileB)) return true;
+  if (!fileA && !fileB) return stellaLooksLikeGenericRowId(a) && stellaLooksLikeGenericRowId(b);
+  return false;
 }
 
 function stellaFindJoinColumn(file, hint) {
@@ -1931,15 +1975,17 @@ function stellaLooksLikeJoinKeyCol(col, file) {
   if (stellaLooksLikeGenericRowId(col)) {
     if (role?.role === 'fact') return false;
     if (role?.role === 'dimension') return true;
-    return !file;
+    return false;
   }
-  if (stellaLooksLikeFactGrainId(col)) {
-    if (role?.role === 'fact') return false;
+  if (stellaLooksLikeFactGrainId(col, file)) {
     return role?.role === 'dimension';
   }
   const n = stellaNormJoinToken(col?.name || col?.original);
   if (!n) return false;
-  if (/(uuid|guid|key|code|id)$/.test(n)) return true;
+  if (/(uuid|guid|key|code|id)$/.test(n)) {
+    if (role?.role === 'fact') return false;
+    return true;
+  }
   return col?.kind === 'id';
 }
 
@@ -2033,6 +2079,7 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
   const roleB = stellaFileJoinRole(fileB);
   const bothDimSameFamily = roleA.role === 'dimension' && roleB.role === 'dimension'
     && roleA.family && roleA.family === roleB.family;
+  const sharedEntity = !!(fa && fb && fa === fb && STELLA_ENTITY_JOIN_FAMILIES.has(fa));
 
   let score = 0;
   let reason = '';
@@ -2044,14 +2091,17 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
     reason = 'some matching values';
   }
   if (aN && aN === bN) {
-    if (!score) { score = 100; reason = 'same column name'; }
+    if (!score) { score = 100; reason = sharedEntity ? `shared ${fa} key` : 'same column name'; }
     else score = Math.max(score, 88);
+    if (sharedEntity) reason = `shared ${fa} key`;
   } else if (aO && bO && aO === bO) {
-    if (!score) { score = 90; reason = 'same source header'; }
+    if (!score) { score = 90; reason = sharedEntity ? `shared ${fa} key` : 'same source header'; }
     else score = Math.max(score, 86);
+    if (sharedEntity) reason = `shared ${fa} key`;
   } else if (fa && fb && fa === fb) {
     if (!score) { score = 70; reason = `shared ${fa} key`; }
     else score = Math.max(score, 70);
+    if (STELLA_ENTITY_JOIN_FAMILIES.has(fa)) reason = `shared ${fa} key`;
   } else if (pkfk) {
     if (!score) { score = 84; reason = `dimension ${pkfk.family} key`; }
     else score = Math.max(score, 84);
@@ -2059,8 +2109,9 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
   } else if (!score) {
     const sa = stellaIdStem(a);
     const sb = stellaIdStem(b);
-    const grainStem = stellaLooksLikeFactGrainId(a) || stellaLooksLikeFactGrainId(b)
-      || STELLA_FACT_GRAIN_STEMS.has(sa) || STELLA_FACT_GRAIN_STEMS.has(sb);
+    const grainStem = stellaLooksLikeFactGrainId(a, fileA) || stellaLooksLikeFactGrainId(b, fileB)
+      || STELLA_FACT_GRAIN_STEMS.has(sa) || STELLA_FACT_GRAIN_STEMS.has(sb)
+      || STELLA_FACT_KIND_STEMS.has(sa) || STELLA_FACT_KIND_STEMS.has(sb);
     const genericStem = stellaLooksLikeGenericRowId(a) || stellaLooksLikeGenericRowId(b)
       || STELLA_GENERIC_ID_STEMS.has(sa) || STELLA_GENERIC_ID_STEMS.has(sb);
     const aId = /id$/.test(aN) || aN === 'id' || /id$/.test(aO);
@@ -2121,12 +2172,16 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
     if (score < 100) score = Math.min(score, 50);
   }
   if (overlap.compared && overlap.hits === 0 && (overlap.smaller >= 3 || (a?.samples?.length && b?.samples?.length))) {
-    warnings.push(lowCard
-      ? 'Sample values do not overlap — these look like different lists.'
-      : 'No matching values in the sampled rows. Names can still match, but the contents do not look shared.');
-    score = Math.min(score, lowCard ? 22 : 48);
-    if (!reason || reason === 'measure vs key') reason = 'values do not overlap';
-  } else if (overlap.compared && overlap.ratio < 0.08 && overlap.smaller >= 4 && !strongOverlap) {
+    if (sharedEntity) {
+      warnings.push('Sampled rows do not overlap yet — the key names still match, so these can be used to group or compare (e.g. territory across years).');
+    } else {
+      warnings.push(lowCard
+        ? 'Sample values do not overlap — these look like different lists.'
+        : 'No matching values in the sampled rows. Names can still match, but the contents do not look shared.');
+      score = Math.min(score, lowCard ? 22 : 48);
+      if (!reason || reason === 'measure vs key') reason = 'values do not overlap';
+    }
+  } else if (overlap.compared && overlap.ratio < 0.08 && overlap.smaller >= 4 && !strongOverlap && !sharedEntity) {
     warnings.push('Almost no shared values in the sampled rows.');
     score = Math.min(score, 52);
   }
@@ -2137,8 +2192,9 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
 
   let verdict = 'ok';
   if (score < 40) verdict = 'block';
-  else if (score < 70 || warnings.length) verdict = 'warn';
-  if (!strongOverlap && (warnings.length >= 2 || (overlap.compared && overlap.hits === 0 && overlap.smaller >= 3))) {
+  else if (score < 70 || (warnings.length && !sharedEntity)) verdict = 'warn';
+  else if (warnings.length && sharedEntity && score >= 70) verdict = 'ok';
+  if (!sharedEntity && !strongOverlap && (warnings.length >= 2 || (overlap.compared && overlap.hits === 0 && overlap.smaller >= 3))) {
     verdict = 'block';
   }
   if (!reason) reason = score ? 'possible join key' : 'column names, types, and values do not match';
@@ -2207,7 +2263,12 @@ function stellaFilterJoinRels(rels, thisFile, otherFiles) {
       continue;
     }
     const assessed = stellaAssessJoin(thisFile, other, r.this_field, r.related_field);
-    if (assessed.verdict === 'block') {
+    if (assessed.verdict === 'block' || stellaShouldBlockFactGrainJoin(
+      stellaFindJoinColumn(thisFile, r.this_field),
+      stellaFindJoinColumn(other, r.related_field),
+      thisFile,
+      other,
+    )) {
       dropped.push({ r, why: (assessed.warnings || []).filter(Boolean).join(' ') || assessed.reason });
     } else {
       keep.push(r);
@@ -2217,16 +2278,37 @@ function stellaFilterJoinRels(rels, thisFile, otherFiles) {
 }
 
 function stellaGuessJoinCandidates(thisFile, otherFiles) {
+  const others = (otherFiles || []).filter((f) => f && f.id !== thisFile?.id && f.tableName);
+  const dimByFamily = new Map();
+  for (const f of others) {
+    const role = stellaFileJoinRole(f);
+    if (role.role === 'dimension' && role.family) dimByFamily.set(role.family, f.id);
+  }
+  const thisRole = stellaFileJoinRole(thisFile);
+  if (thisRole.role === 'dimension' && thisRole.family && !dimByFamily.has(thisRole.family)) {
+    dimByFamily.set(thisRole.family, thisFile.id);
+  }
   const thisCols = (thisFile?.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
   const ranked = [];
-  for (const other of (otherFiles || []).filter((f) => f && f.id !== thisFile?.id && f.tableName)) {
+  for (const other of others) {
     const otherCols = (other.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
     for (const a of thisCols) {
       for (const b of otherCols) {
         const scored = stellaScoreJoinColumns(a, b, thisFile, other);
-        if (scored.verdict !== 'ok') continue;
+        const fam = stellaJoinFamily(a);
+        const sharedEntity = fam && fam === stellaJoinFamily(b) && STELLA_ENTITY_JOIN_FAMILIES.has(fam);
+        if (scored.verdict === 'block') continue;
+        if (scored.verdict !== 'ok' && !sharedEntity) continue;
+        if (stellaShouldBlockFactGrainJoin(a, b, thisFile, other)) continue;
         const pkfk = stellaLooksLikePkFkPair(a, b, thisFile, other);
         if (!pkfk && (!stellaLooksLikeJoinKeyCol(a, thisFile) || !stellaLooksLikeJoinKeyCol(b, other))) continue;
+        const otherRole = stellaFileJoinRole(other);
+        if (
+          fam
+          && dimByFamily.has(fam)
+          && thisRole.role === 'fact'
+          && otherRole.role === 'fact'
+        ) continue;
         ranked.push({
           related_file: other.name,
           related_table: other.tableName,
@@ -2236,7 +2318,7 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
           this_header: a.original || a.name,
           related_header: b.original || b.name,
           reason: scored.reason,
-          score: scored.score,
+          score: scored.score + (otherRole.role === 'dimension' && fam && dimByFamily.get(fam) === other.id ? 8 : 0),
           overlapHits: scored.overlap?.hits || 0,
         });
       }
@@ -2261,10 +2343,10 @@ function stellaJoinQuestion(candidates, otherFiles) {
     const lines = candidates.map((c) => (
       `- **${c.related_file}**: this \`${c.this_field}\`${c.this_header && c.this_header !== c.this_field ? ` (“${c.this_header}”)` : ''} ↔ their \`${c.related_field}\`${c.related_header && c.related_header !== c.related_field ? ` (“${c.related_header}”)` : ''} (${c.reason})`
     ));
-    return `It looks like this file can be joined to other uploaded data on every key below:\n${lines.join('\n')}\nConfirm those links, add any I missed, or say they should not be joined.`;
+    return `It looks like this file can be joined to other uploaded data on every key below:\n${lines.join('\n')}\nTerritory, product, and HCP/account keys can be shared across two sales files so you can compare by that key. If a territory (or product) list is uploaded, joining both sales files to that list is cleaner than joining the two sales files to each other. Confirm those links, add any I missed, or say they should not be joined.`;
   }
   const names = others.map((f) => `**${f.name}**`).join(', ');
-  return `Does this file share an ID, territory, product, or other key with ${names} so Stella can join them in queries? If yes, which fields match? If not, say they are unrelated.`;
+  return `Does this file share a product, territory, HCP/account, or other entity key with ${names} so Stella can join them in queries? Do not join on each file's own sales/transaction/row ID (those are independent, e.g. 2024 sales ID vs 2025 sales ID). If yes, which fields match? If not, say they are unrelated.`;
 }
 
 function stellaLooksLikeJoinDecline(text) {
@@ -5305,7 +5387,6 @@ export default function CommercialExcellenceApp() {
   const territoryFileInputRef = useRef(null);
   const stellaDataFileInputRef = useRef(null);
   const [stellaSyncBusy, setStellaSyncBusy] = useState(false);
-  const [stellaInboxCopied, setStellaInboxCopied] = useState(false);
   const stellaIntakeDeepLinkRef = useRef(readStellaIntakeDeepLink());
   const stellaOpeningIntakeBusyRef = useRef(new Set());
   const pptxTemplateInputRef = useRef(null);
@@ -9582,13 +9663,19 @@ ${stepInstruction}`;
       return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
     }).join('\n');
     const candidateBlob = candidates.length
-      ? `\n\nMATCHING JOIN KEYS (include every one that makes sense — dates, territory, product, rep, IDs — not a subset):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
+      ? `\n\nMATCHING JOIN KEYS (entity keys only — product, territory, HCP/account, rep, dates — not sales/transaction/row IDs):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
+      : '\n\nMATCHING JOIN KEYS: none. Do not invent joins on id, sales_id, record_id, or transaction_id.';
+    const grainCols = [thisFile, ...otherTabular].flatMap((f) => (
+      (f?.columns || []).filter((c) => stellaLooksLikeFactGrainId(c, f)).map((c) => `${f.name}.${c.name || c.original}`)
+    )).filter(Boolean);
+    const grainBlob = grainCols.length
+      ? `\n\nNOT JOIN KEYS (independent per file/year — never propose these): ${grainCols.join(', ')}`
       : '';
     const knownJoins = stellaFormatConfirmedJoins(otherTabular);
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Use the SAME checks as a manual join: only propose entity keys you would join in a real database (territory, HCP/account, product, rep, IDs, dates). Dimension primary keys to matching foreign keys are valid (products.id to sales.product_id). Do not join two sales/transaction files on their own row or transaction IDs (id, record_id, transaction_id, invoice_id, sale_id). Still propose shared entity keys (product_id, territory_id, hcp_id) between two sales files. Sample values must overlap. Never join measures (units, qty, revenue, scores) even if the numbers look similar. Never join from name or type alone. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Only propose entity keys you would join in a real database (territory, HCP/account, product, rep, dates). Dimension primary keys to matching foreign keys are valid (products.id to sales.product_id). NEVER join two sales/transaction extracts on their own row or transaction IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id). A 2024 sales ID does not match a 2025 sales ID. DO propose shared entity keys between two sales files (territory_id, product_id, hcp_id) so analysis can group or compare by that key — unless a territory/product/HCP list is also uploaded, in which case join each sales file to that list instead of to each other. Sample overlap is helpful but not required when the column is clearly the same entity key. Never join measures. Never join from name or type alone. List matching keys in plain English. Store only those keys in context_qa.relationships unless the user says the files are unrelated (empty array) or they reject a key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -10482,7 +10569,7 @@ ${stepInstruction}`;
             </div>
             <div className="text-xs text-blue-300/60 mt-2">
               {scheduleOpen
-                ? 'Drop files in this account’s inbox folder to import on a schedule. Same filename refreshes the existing dataset; a new name starts intake. Use Upload on the Files tab to load a file immediately.'
+                ? 'Scheduled imports pull CSV, Excel, or JSON from this company’s drop folder (matched by company name). Same filename refreshes the existing dataset; a new name starts intake. Use Upload on the Files tab to load a file immediately.'
                 : 'Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions. Files are stored for your account only.'}
             </div>
             {!scheduleOpen && stellaTenantSchema?.name ? (
@@ -10756,7 +10843,6 @@ ${stepInstruction}`;
 
   const renderStellaScheduleCard = () => {
     const schedule = stellaInboxSchedule(userSettings.stellaConnections);
-    const inboxPath = `intelligence/${stellaInboxStoragePrefix(currentUser)}`;
     const lastRun = schedule.lastRunAt
       ? new Date(schedule.lastRunAt).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
       : 'Never';
@@ -10767,24 +10853,8 @@ ${stepInstruction}`;
             <Clock className="w-4 h-4 text-cyan-400" /> Inbox schedule
           </div>
           <p className="text-xs text-blue-300/60 mt-2">
-            Tick <span className="text-blue-100 font-semibold">Enable schedule</span> to import files dropped in this account&apos;s inbox folder (Supabase Storage / S3). Same filename refreshes the existing dataset; a new name starts intake.
+            Tick <span className="text-blue-100 font-semibold">Enable schedule</span> to import files from this company&apos;s drop folder. Admins place files in the folder that matches the company name. Same filename refreshes the existing dataset; a new name starts intake.
           </p>
-        </div>
-        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-          <code className="flex-1 text-[11px] text-cyan-200/90 bg-slate-900/50 border border-blue-400/20 rounded-lg px-3 py-2 break-all">{inboxPath}</code>
-          <button
-            type="button"
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(inboxPath);
-                setStellaInboxCopied(true);
-                setTimeout(() => setStellaInboxCopied(false), 2000);
-              } catch { /* ignore */ }
-            }}
-            className="px-3 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-100 border border-cyan-400/30 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 flex-shrink-0"
-          >
-            <Copy className="w-3.5 h-3.5" /> {stellaInboxCopied ? 'Copied' : 'Copy path'}
-          </button>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <label className="block">

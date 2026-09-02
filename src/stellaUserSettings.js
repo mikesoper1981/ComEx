@@ -140,22 +140,14 @@ export function stellaInboxSchedule(connections) {
   return list.find((s) => s.id === 'inbox' || s.source === 'inbox') || defaultStellaInboxSchedule();
 }
 
-/** Drop folder for scheduled CSV/Excel/JSON: companies/<slug>/users/<display>/stella/inbox/ */
+/** Drop folder for scheduled CSV/Excel/JSON, matched by company name. */
 export function stellaInboxStoragePrefix(userOrName) {
-  const raw = userOrName && typeof userOrName === 'object'
-    ? (userOrName.name || userOrName.id)
-    : userOrName;
-  const folder = String(raw || '')
-    .replace(/[\\/:*?"<>|]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 80) || 'user';
   const company = companySlug(
     userOrName && typeof userOrName === 'object'
       ? resolveUserCompany(userOrName)
-      : '',
+      : userOrName,
   );
-  return `companies/${company}/users/${folder}/stella/inbox/`;
+  return `companies/${company}/stella/inbox/`;
 }
 
 export function stellaProcessedStoragePrefix(userOrName, dayIso) {
