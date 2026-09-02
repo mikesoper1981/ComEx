@@ -4783,6 +4783,17 @@ export default function CommercialExcellenceApp() {
       return next;
     });
   };
+  const [chatToolsCollapsed, setChatToolsCollapsed] = useState(() => {
+    try { return localStorage.getItem('comex-chat-tools-collapsed') === '1'; } catch { return false; }
+  });
+  const [mobileChatToolsOpen, setMobileChatToolsOpen] = useState(false);
+  const toggleChatToolsCollapsed = () => {
+    setChatToolsCollapsed((prev) => {
+      const next = !prev;
+      try { localStorage.setItem('comex-chat-tools-collapsed', next ? '1' : '0'); } catch { /* ignore */ }
+      return next;
+    });
+  };
   const [agents, setAgents] = useState(() => readLocalProductIntelligence().agents);
 
   const [topics, setTopics] = useState(() => readLocalProductIntelligence().topics);
@@ -6801,6 +6812,214 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       </>
     );
   };
+
+  const revealChatTools = () => {
+    setChatToolsCollapsed(false);
+    try { localStorage.setItem('comex-chat-tools-collapsed', '0'); } catch { /* ignore */ }
+    setMobileChatToolsOpen(true);
+  };
+
+  const renderChatModuleBanner = (kind) => {
+    const isStella = kind === 'stella';
+    const Icon = isStella ? Layers : DollarSign;
+    const title = isStella ? 'Stella Insights' : 'Incentive Compensation';
+    const subtitle = isStella
+      ? 'Chat with your data — analyse trends and chart insights'
+      : 'Design, assess and optimise sales incentive schemes';
+    return (
+      <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl px-3 py-1 text-white shadow-md flex-shrink-0 mb-2">
+        <div className="flex items-center justify-between gap-3 min-h-[1.5rem]">
+          <div className="flex items-center gap-2 min-w-0">
+            <Icon className="w-3.5 h-3.5 shrink-0" />
+            <h2 className="text-[13px] font-bold leading-none truncate">{title}</h2>
+            <span className="hidden sm:inline text-[11px] text-cyan-100/85 truncate">· {subtitle}</span>
+          </div>
+          {renderMobileChatChrome()}
+        </div>
+      </div>
+    );
+  };
+
+  const renderChatToolsBody = (kind) => {
+    const isStella = kind === 'stella';
+    const showQuick = !isStella && !waitingForPptxChoice && !messages.some((m) => m.role === 'user');
+    const pptxClarifyOptions = !isStella && waitingForPptxChoice ? (getPptxClarify().options || []) : [];
+    const canExportPptx = !isStella
+      && !currentWorkflow
+      && !pptxOffers
+      && !pptxGenerating
+      && !waitingForPptxChoice
+      && messages.filter((m) => m.role === 'assistant' || m.role === 'orchestrator').length > 0;
+    return (
+      <div className="flex-1 overflow-y-auto custom-scrollbar">
+          {showQuick && (
+            <div className="p-3 space-y-2 border-b border-blue-400/15">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">Start</div>
+              <button type="button" onClick={() => { setInput('I need to design an incentive scheme for a team of 10 AEs.'); setMobileChatToolsOpen(false); }} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 text-left"><Target className="w-3.5 h-3.5 shrink-0" /> Design New Scheme</button>
+              <button type="button" onClick={() => { fileInputRef.current?.click(); setMobileChatToolsOpen(false); }} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"><Upload className="w-3.5 h-3.5 shrink-0" /> Assess Proposal</button>
+              <button type="button" onClick={() => { setInput('What are the key principles for designing effective sales incentive schemes?'); setMobileChatToolsOpen(false); }} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-200 text-left"><Award className="w-3.5 h-3.5 shrink-0" /> Best Practices</button>
+            </div>
+          )}
+          {!isStella && (
+            <div className="p-3 space-y-2 border-b border-blue-400/15">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">Export</div>
+              {pptxGenerating && (
+                <div className="px-2.5 py-2 bg-violet-900/30 border border-violet-400/30 rounded-lg flex items-center gap-2 text-xs text-violet-300">
+                  <div className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-violet-400 rounded-full animate-spin flex-shrink-0" />
+                  Generating PowerPoint…
+                </div>
+              )}
+              {pptxOffers && !currentWorkflow && !pptxGenerating && (
+                <div className="bg-slate-800/60 border border-violet-400/25 rounded-lg overflow-hidden">
+                  <div className="px-2.5 py-1.5 border-b border-violet-400/15 flex items-center justify-between">
+                    <div className="flex items-center gap-1.5 text-[11px] text-violet-300/80 font-semibold">Export as PowerPoint</div>
+                    <button type="button" onClick={() => setPptxOffers(null)} className="text-slate-500 hover:text-slate-300"><X className="w-3.5 h-3.5" /></button>
+                  </div>
+                  <div className="divide-y divide-violet-400/15">
+                    {pptxOffers.summary && (
+                      <div className="p-2.5 flex flex-col gap-1.5">
+                        <div className="text-xs font-semibold text-violet-200">Session Summary</div>
+                        <div className="text-[11px] text-slate-400">{pptxOffers.summary.title}</div>
+                        <button type="button" onClick={() => handleGeneratePptx(pptxOffers.summary, 'summary')} className="mt-1 px-2.5 py-1.5 bg-violet-500/20 hover:bg-violet-500/35 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold">Generate</button>
+                      </div>
+                    )}
+                    {pptxOffers.produced && (
+                      <div className="p-2.5 flex flex-col gap-1.5">
+                        <div className="text-xs font-semibold text-emerald-300">Working Document</div>
+                        <div className="text-[11px] text-slate-400">{pptxOffers.produced.title}</div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const dt = pptxOffers.produced.deckType;
+                            if (!dt || dt === 'general') askPptxClarification();
+                            else handleGeneratePptx(pptxOffers.produced, 'produced');
+                          }}
+                          className="mt-1 px-2.5 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/30 rounded-lg text-xs text-emerald-200 font-semibold"
+                        >
+                          Generate
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+              {pptxClarifyOptions.length > 0 && !pptxGenerating && (
+                <div className="space-y-1.5">
+                  <div className="text-[11px] text-blue-300/70 leading-relaxed">Choose a deck type:</div>
+                  {pptxClarifyOptions.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={(e) => { e.preventDefault(); setMobileChatToolsOpen(false); handleSubmit(e, opt.value); }}
+                      className="w-full px-2.5 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/35 hover:border-cyan-400/55 rounded-lg text-xs text-cyan-100 font-semibold transition-all text-left leading-snug"
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {canExportPptx && (
+                <button type="button" onClick={startPptxExportFromUi} className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-400/25 hover:border-violet-400/40 rounded-lg text-xs text-violet-200 font-semibold">
+                  Export as PowerPoint
+                </button>
+              )}
+              {!canExportPptx && !pptxOffers && !pptxGenerating && !waitingForPptxChoice && (
+                <div className="text-[11px] text-blue-300/50 leading-relaxed">
+                  {currentWorkflow
+                    ? 'Export is paused while a workflow is in progress.'
+                    : 'PowerPoint export is available after the assistant replies.'}
+                </div>
+              )}
+            </div>
+          )}
+          {!isStella && (
+            <div className="p-3">
+              {renderSuggestedPrompts('panel')}
+            </div>
+          )}
+          {isStella && (
+            <div className="p-3 text-[11px] text-blue-300/55 leading-relaxed">
+              Upload datasets in User Settings → Stella Insights, then ask questions in this chat. Tables and charts in replies have their own Excel export.
+            </div>
+          )}
+      </div>
+    );
+  };
+
+  const renderChatToolsPanel = (kind) => (
+    <>
+      {mobileChatToolsOpen && (
+        <div className="md:hidden fixed inset-0 z-50">
+          <button
+            type="button"
+            className="absolute inset-0 bg-slate-950/70"
+            aria-label="Close tools"
+            onClick={() => setMobileChatToolsOpen(false)}
+          />
+          <aside className="absolute inset-y-0 right-0 w-[min(20rem,88vw)] bg-slate-900 border-l border-blue-400/25 flex flex-col shadow-2xl">
+            <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
+                <Sparkles className="w-3.5 h-3.5" /> Tools
+              </div>
+              <button
+                type="button"
+                title="Close"
+                onClick={() => setMobileChatToolsOpen(false)}
+                className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            {renderChatToolsBody(kind)}
+          </aside>
+        </div>
+      )}
+      {chatToolsCollapsed ? (
+        <aside className="hidden md:flex w-10 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
+          <button
+            type="button"
+            title="Show tools"
+            onClick={toggleChatToolsCollapsed}
+            className="flex-1 flex flex-col items-center gap-2 py-3 text-blue-200 hover:bg-slate-700/40"
+          >
+            <Sparkles className="w-4 h-4" />
+            <ChevronDown className="w-4 h-4 rotate-90" />
+          </button>
+        </aside>
+      ) : (
+        <aside className="hidden md:flex w-56 lg:w-64 flex-col flex-shrink-0 bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
+          <div className="p-3 border-b border-blue-400/15 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-200">
+              <Sparkles className="w-3.5 h-3.5" /> Tools
+            </div>
+            <button
+              type="button"
+              title="Collapse tools"
+              onClick={toggleChatToolsCollapsed}
+              className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
+            >
+              <ChevronDown className="w-3.5 h-3.5 rotate-90" />
+            </button>
+          </div>
+          {renderChatToolsBody(kind)}
+        </aside>
+      )}
+    </>
+  );
+
+  const renderMobileChatChrome = () => (
+    <div className="md:hidden flex items-center gap-1.5 shrink-0">
+      <button type="button" onClick={() => setMobileChatHistoryOpen(true)} className="flex items-center gap-1 px-2 py-1 bg-white/15 hover:bg-white/25 rounded-md text-[11px] font-semibold">
+        <History className="w-3.5 h-3.5" /> Chats
+      </button>
+      <button type="button" onClick={startNewChat} className="flex items-center gap-1 px-2 py-1 bg-white/15 hover:bg-white/25 rounded-md text-[11px] font-semibold">
+        <Plus className="w-3.5 h-3.5" /> New
+      </button>
+      <button type="button" onClick={() => setMobileChatToolsOpen(true)} className="flex items-center gap-1 px-2 py-1 bg-white/15 hover:bg-white/25 rounded-md text-[11px] font-semibold">
+        <Sparkles className="w-3.5 h-3.5" /> Tools
+      </button>
+    </div>
+  );
 
   const handlePptxTemplateUpload = async (event) => {
     const file = event.target.files?.[0];
@@ -10134,7 +10353,24 @@ ${stepInstruction}`;
     setPptxOffers(null);
     setSuggestedPrompts([]);
     setMessages(prev => [...prev, { role: 'assistant', content: getPptxClarify().prompt }]);
+    revealChatTools();
   };
+
+  const isPptxClarifyContent = (content) => {
+    const text = String(content || '');
+    if (!text) return false;
+    const prompt = String(getPptxClarify()?.prompt || '').replace(/\s+/g, ' ').trim();
+    const compact = text.replace(/\s+/g, ' ');
+    if (prompt && compact.includes(prompt.slice(0, 48))) return true;
+    return /export a PowerPoint/i.test(text) && /Session summary/i.test(text) && /one-pager/i.test(text);
+  };
+
+  const waitingForPptxChoice = useMemo(() => {
+    if (currentWorkflow || pptxGenerating) return false;
+    if (pptxClarifyPending) return true;
+    const last = lastConversationalMessage(messages);
+    return last?.role === 'assistant' && isPptxClarifyContent(last.content);
+  }, [messages, pptxClarifyPending, pptxGenerating, currentWorkflow, productIntel]);
 
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
@@ -10546,7 +10782,7 @@ ${stepInstruction}`;
     setPendingButtonAction(null);
 
     // Resolve pending PPT export clarification before normal chat routing.
-    if (pptxClarifyPending && !currentWorkflow) {
+    if (waitingForPptxChoice && !currentWorkflow) {
       setMessages(prev => [...prev, { role: 'user', content: messageContent }]);
       const lower = messageContent.toLowerCase();
       if (/\b(cancel|never mind|no thanks|forget it)\b/.test(lower)) {
@@ -10913,13 +11149,41 @@ ${stepInstruction}`;
     );
   };
 
-  const renderSuggestedPrompts = () => {
+  const renderSuggestedPrompts = (variant = 'composer') => {
     const show = suggestionsEnabled && suggestedPrompts.length > 0
       && !pendingWorkflow && !memoryPendingFor('chat') && !currentWorkflow
       && !pendingImageReview && !pendingProposalIntake && !isLoading
       && !choiceButtons?.length && !clarifyingReplyHint;
-    if (!show) return null;
+    if (!show) {
+      if (variant === 'panel') {
+        return <div className="text-[11px] text-blue-300/50 leading-relaxed">Next-step suggestions appear here after a reply.</div>;
+      }
+      return null;
+    }
     const n = suggestedPrompts.length;
+    if (variant === 'panel') {
+      return (
+        <div className="space-y-2">
+          <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">
+            <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+            Suggestions
+            <span className="min-w-[1.1rem] h-4 px-1 rounded-full bg-cyan-400 text-slate-900 text-[10px] font-bold leading-4 text-center">{n}</span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {suggestedPrompts.map((prompt, idx) => (
+              <button
+                key={idx}
+                type="button"
+                onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); setMobileChatToolsOpen(false); handleSubmit(e, prompt); }}
+                className="px-2.5 py-2 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-400/30 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 hover:text-blue-100 transition-all text-left leading-snug"
+              >
+                {prompt}
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="mb-2 w-full min-w-0">
         <button
@@ -11196,37 +11460,11 @@ ${stepInstruction}`;
             </div>
           }>
           {activeTab === 'chat' ? (
-            <div className="flex gap-3 h-full min-h-0">
+            <div className="flex flex-col h-full min-h-0">
+            {renderChatModuleBanner('incentives')}
+            <div className="flex gap-3 flex-1 min-h-0">
               {renderChatHistorySidebar()}
               <div className="flex flex-col h-full min-w-0 flex-1 overflow-hidden">
-              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl px-3 py-2 sm:px-4 sm:py-2.5 text-white shadow-xl flex-shrink-0 mb-2">
-                <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <div className="flex items-center gap-2.5">
-                    <DollarSign className="w-5 h-5 sm:w-6 sm:h-6" />
-                    <div>
-                      <h2 className="text-base sm:text-lg font-bold leading-tight">Incentive Compensation</h2>
-                      <p className="text-cyan-100 text-[11px] hidden sm:block">Design, assess and optimise sales incentive schemes</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button type="button" onClick={() => setMobileChatHistoryOpen(true)} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
-                      <History className="w-4 h-4" /> Chats
-                    </button>
-                    <button type="button" onClick={startNewChat} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
-                      <Plus className="w-4 h-4" /> New
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Quick Actions — hide once the conversation has started so the chat keeps height */}
-              {!messages.some((m) => m.role === 'user') && (
-              <div className="flex flex-nowrap gap-2 mb-2 flex-shrink-0 overflow-x-auto custom-scrollbar">
-                <button onClick={() => setInput('I need to design an incentive scheme for a team of 10 AEs.')} className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-300 hover:text-blue-200 transition-all whitespace-nowrap"><Target className="w-3.5 h-3.5" /> Design New Scheme</button>
-                <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-300 hover:text-cyan-200 transition-all whitespace-nowrap"><Upload className="w-3.5 h-3.5" /> Assess Proposal</button>
-                <button onClick={() => setInput('What are the key principles for designing effective sales incentive schemes?')} className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-300 hover:text-purple-200 transition-all whitespace-nowrap"><Award className="w-3.5 h-3.5" /> Best Practices</button>
-              </div>
-              )}
 
               {/* Activity Log */}
               {activityLog.length > 0 && (
@@ -11462,56 +11700,9 @@ ${stepInstruction}`;
                 )}
 
                 {pptxGenerating && (
-                  <div className="mb-3 px-3 py-2 bg-violet-900/30 border border-violet-400/30 rounded-xl flex items-center gap-3 text-sm text-violet-300">
+                  <div className="mb-3 px-3 py-2 bg-violet-900/30 border border-violet-400/30 rounded-xl flex items-center gap-3 text-sm text-violet-300 md:hidden">
                     <div className="w-4 h-4 border-2 border-violet-400/40 border-t-violet-400 rounded-full animate-spin flex-shrink-0" />
                     Generating PowerPoint…
-                  </div>
-                )}
-
-                {pptxOffers && !currentWorkflow && !pptxGenerating && (
-                  <div className="mb-3 bg-slate-800/60 border border-violet-400/25 rounded-xl overflow-hidden">
-                    <div className="px-3 py-2 border-b border-violet-400/15 flex items-center justify-between">
-                      <div className="flex items-center gap-2 text-xs text-violet-300/70 font-semibold"><span>📊</span> Export as PowerPoint</div>
-                      <button onClick={() => setPptxOffers(null)} className="text-slate-500 hover:text-slate-300 transition-all"><X className="w-3.5 h-3.5" /></button>
-                    </div>
-                    <div className="grid grid-cols-2 divide-x divide-violet-400/15">
-                      {pptxOffers.summary && (
-                        <div className="p-3 flex flex-col gap-2">
-                          <div className="text-xs font-semibold text-violet-200">📋 Session Summary</div>
-                          <div className="text-xs text-slate-400 flex-1">{pptxOffers.summary.title}</div>
-                          <div className="text-[10px] text-slate-500">Facts from this chat only</div>
-                          <button onClick={() => handleGeneratePptx(pptxOffers.summary, 'summary')} className="mt-1 px-3 py-1.5 bg-violet-500/20 hover:bg-violet-500/35 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold transition-all">✨ Generate</button>
-                        </div>
-                      )}
-                      {pptxOffers.produced && (
-                        <div className="p-3 flex flex-col gap-2">
-                          <div className="text-xs font-semibold text-emerald-300">📄 Working Document</div>
-                          <div className="text-xs text-slate-400 flex-1">{pptxOffers.produced.title}</div>
-                          <div className="text-[10px] text-slate-500">{pptxOffers.produced.deckType === 'ic_one_pager' ? 'One-pager' : pptxOffers.produced.deckType === 'ic_doc_pack' ? 'Full IC pack' : 'Based on this conversation'}</div>
-                          <button
-                            onClick={() => {
-                              const dt = pptxOffers.produced.deckType;
-                              if (!dt || dt === 'general') {
-                                askPptxClarification();
-                              } else {
-                                handleGeneratePptx(pptxOffers.produced, 'produced');
-                              }
-                            }}
-                            className="mt-1 px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/30 rounded-lg text-xs text-emerald-200 font-semibold transition-all"
-                          >
-                            ✨ Generate
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {!currentWorkflow && !pptxOffers && !pptxGenerating && !pptxClarifyPending && messages.filter(m => m.role === 'assistant' || m.role === 'orchestrator').length > 0 && (
-                  <div className="mb-3 flex justify-end">
-                    <button onClick={startPptxExportFromUi} className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-400/20 hover:border-violet-400/40 rounded-lg text-xs text-violet-300/60 hover:text-violet-300 transition-all">
-                      📊 Export as PowerPoint
-                    </button>
                   </div>
                 )}
 
@@ -11528,7 +11719,7 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {choiceButtons && choiceButtons.length > 0 && !isLoading && !pptxGenerating && (
+                {choiceButtons && choiceButtons.length > 0 && !waitingForPptxChoice && !isLoading && !pptxGenerating && (
                   <div className="mb-3">
                     <div className="text-xs text-blue-300/70 mb-2">Choose an option (or type your own):</div>
                     <div className="flex flex-wrap gap-2">
@@ -11546,8 +11737,6 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {renderSuggestedPrompts()}
-
                 <form onSubmit={handleSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-2 sm:p-3">
                   <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
                     <div className="flex-1">
@@ -11561,6 +11750,8 @@ ${stepInstruction}`;
                 </form>
               </div>
               <input ref={fileInputRef} type="file" accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md" onChange={handleFileUpload} className="hidden" />
+            </div>
+            {renderChatToolsPanel('incentives')}
             </div>
             </div>
 
@@ -11740,28 +11931,11 @@ ${stepInstruction}`;
             </div>
 
           ) : activeTab === 'stella' ? (
-            <div className="flex gap-3 h-full min-h-0">
+            <div className="flex flex-col h-full min-h-0">
+            {renderChatModuleBanner('stella')}
+            <div className="flex gap-3 flex-1 min-h-0">
               {renderChatHistorySidebar()}
               <div className="flex flex-col h-full min-w-0 flex-1 overflow-hidden">
-              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl px-3 py-2 sm:px-4 sm:py-2.5 text-white shadow-xl flex-shrink-0 mb-2">
-                <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <div className="flex items-center gap-2.5">
-                    <Layers className="w-5 h-5 sm:w-6 sm:h-6" />
-                    <div>
-                      <h2 className="text-base sm:text-lg font-bold leading-tight">Stella Insights</h2>
-                      <p className="text-cyan-100 text-[11px] hidden sm:block">Chat with your data — analyse trends and chart insights</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button type="button" onClick={() => setMobileChatHistoryOpen(true)} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
-                      <History className="w-4 h-4" /> Chats
-                    </button>
-                    <button type="button" onClick={startNewChat} className="md:hidden flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-xs font-semibold">
-                      <Plus className="w-4 h-4" /> New
-                    </button>
-                  </div>
-                </div>
-              </div>
 
               <div className="flex flex-col flex-1 min-h-0">
                 <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-5 overflow-y-auto space-y-4 custom-scrollbar mb-2 min-h-0">
@@ -11823,6 +11997,8 @@ ${stepInstruction}`;
                 </form>
               </div>
               </div>
+              {renderChatToolsPanel('stella')}
+            </div>
             </div>
 
           ) : activeTab === 'user-settings' ? (
