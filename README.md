@@ -21,11 +21,12 @@ Set these in your local `.env` and in your Vercel project settings:
 | `VITE_APP_USER2_EMAIL` | Seed | Optional email for the seeded standard user. |
 | `VITE_APP_USER3_EMAIL` | Seed | Optional email for the seeded Oscar user. |
 | `AUTH_SECRET` | Server (`api/users.js`) | Optional HMAC secret for login tokens. Falls back to `SUPABASE_SERVICE_KEY`. |
+| `CRON_SECRET` | Server (`api/stella-sync.js`) | Shared secret for Vercel Cron. Vercel sends `Authorization: Bearer <CRON_SECRET>` to `GET /api/stella-sync` daily (06:00 UTC). Generate a long random string and set the same value in the Vercel project. Without it, scheduled inbox imports will not run (Run now still works while signed in). Hobby plans allow one run per day; on Pro you can change `vercel.json` to `0 * * * *` for hourly. |
 | `SMTP_USER` | Server (`api/mail.js`) | Gmail address that sends welcome and reset emails, e.g. `you@gmail.com`. |
 | `SMTP_PASS` | Server (`api/mail.js`) | Gmail **app password** (16 characters). Not your normal Gmail password. |
 | `EMAIL_FROM` | Server (`api/mail.js`) | From address, e.g. `ComEx <you@gmail.com>`. Must match `SMTP_USER` for Gmail. |
 | `RESEND_API_KEY` | Server (`api/mail.js`) | Optional. Used only if Gmail SMTP is not set. |
-| `APP_URL` | Server (`api/mail.js`) | Public login URL included in emails (falls back to the request origin). |
+| `APP_URL` | Server (`api/mail.js`, `api/stella-sync.js`) | Public app URL used in welcome, reset, and Stella intake emails (falls back to the request origin for login mail). Required for scheduled-import intake links, e.g. `https://your-app.vercel.app`. |
 | `ANTHROPIC_API_KEY` | Server (`api/chat.js`) | Anthropic API key for all AI calls |
 | `SUPABASE_URL` | Server (`api/stella-query.js`, `api/user-settings.js`) | Supabase URL (falls back to `VITE_SUPABASE_URL`) |
 | `SUPABASE_SERVICE_KEY` | Server (`api/stella-query.js`, `api/user-settings.js`, `api/users.js`) | Supabase **service_role** key. Server-side only — must NEVER be exposed to the browser. Used for Stella Insights, user JSON, and the account registry (`intelligence/accounts.json`) with hashed passwords. |
@@ -54,6 +55,18 @@ run in the SQL editor.
 Dataset tables and the file registry live in the company schema
 (`c_comex.stella_data_*`, `c_comex.stella_files`). `public.stella_files` may
 still hold older rows until they are copied across.
+
+Scheduled CSV/Excel/JSON imports use a per-user drop folder in the
+`intelligence` bucket (S3-compatible Supabase Storage):
+
+`companies/<slug>/users/<display>/stella/inbox/`
+
+Files → **Schedule refresh** shows that path and has **Enable schedule**, frequency, and **Run now**. After a successful import the object is moved to
+`stella/processed/YYYY-MM-DD/`. Same filename refreshes the existing dataset;
+a new name or a column change leaves **Intake pending**. Cron emails the
+account (if an email is on file) with a link that opens Settings → Stella
+Insights → Files on that dataset. Set `CRON_SECRET` in Vercel so the daily
+cron can walk enabled schedules. Do not put AWS keys in ComEx for this.
 
 If schemas are not appearing, set `DATABASE_URL` to the **session pooler**
 URI (Connect → Session pooler, host `*.pooler.supabase.com`) or set

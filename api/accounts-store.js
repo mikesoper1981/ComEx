@@ -876,6 +876,8 @@ module.exports = {
   deleteUserFolder,
   deleteUserStellaData,
   isMissingStorageObject,
+  downloadObject,
+  uploadObject,
   recordLogin,
   loginHistoryForUser,
 };

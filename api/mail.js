@@ -114,6 +114,45 @@ function welcomeEmail({ name, username, password, loginUrl }) {
   };
 }
 
+function stellaIntakeUrl({ fileId, fileName, loginUrl } = {}) {
+  const base = String(loginUrl || appLoginUrl() || '').replace(/\/$/, '');
+  if (!base) return '';
+  const q = new URLSearchParams({ open: 'stella-intake' });
+  if (fileId) q.set('file', String(fileId));
+  if (fileName) q.set('fileName', String(fileName));
+  return `${base}/?${q.toString()}`;
+}
+
+function stellaIntakeEmail({ name, files, intakeUrl }) {
+  const list = (Array.isArray(files) ? files : []).filter((f) => f && (f.file || f.name));
+  const items = list.map((f) => {
+    const reason = f.action === 'replaced_schema'
+      ? 'columns changed — confirm the stored context still applies'
+      : 'new file — answer intake questions, including any joins';
+    return `<li style="margin:0 0 8px;color:#e2e8f0;font-size:14px;line-height:1.45;">${escapeHtml(f.file || f.name)} — ${escapeHtml(reason)}</li>`;
+  }).join('');
+  const url = intakeUrl || stellaIntakeUrl(list[0] || {});
+  const bodyHtml = `
+    <p style="margin:0 0 12px;color:#ffffff;font-size:18px;font-weight:700;font-family:Arial,Helvetica,sans-serif;">Stella intake needed</p>
+    <p style="margin:0 0 16px;color:#cbd5e1;font-size:14px;line-height:1.55;font-family:Arial,Helvetica,sans-serif;">
+      Hi ${escapeHtml(name || 'there')}, a scheduled import is waiting for you in Stella Insights. Open the intake assistant to answer the questions for:
+    </p>
+    <ul style="margin:0 0 22px;padding-left:20px;font-family:Arial,Helvetica,sans-serif;">${items}</ul>
+    ${url ? ctaButton(url, 'Open intake assistant') : '<p style="color:#cbd5e1;font-size:14px;">Sign in to ComEx → Settings → Stella Insights → Files.</p>'}
+  `;
+  const first = list[0]?.file || list[0]?.name || 'a Stella file';
+  return {
+    subject: list.length > 1
+      ? `Stella intake needed (${list.length} files)`
+      : `Stella intake needed: ${first}`,
+    html: wrapEmail({
+      title: 'Stella intake needed',
+      preheader: `Answer intake questions for ${first}.`,
+      bodyHtml,
+    }),
+  };
+}
+
 function resetEmail({ name, username, password, loginUrl }) {
   const url = loginUrl || appLoginUrl();
   const bodyHtml = `
@@ -283,5 +322,7 @@ module.exports = {
   appLoginUrl,
   welcomeEmail,
   resetEmail,
+  stellaIntakeEmail,
+  stellaIntakeUrl,
   sendEmail,
 };

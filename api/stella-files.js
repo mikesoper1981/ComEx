@@ -16,7 +16,7 @@ const { getLastEnsureError, withPg, quoteIdent } = require('./stella-db');
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_FIELDS = [
   'file_name', 'file_type', 'storage_path', 'table_name',
-  'columns', 'row_count', 'summary', 'context_qa',
+  'columns', 'row_count', 'summary', 'context_qa', 'uploaded_at',
 ];
 
 function supabaseConfig() {
@@ -148,7 +148,113 @@ async function deletePg(schema, id, orgId) {
   return true;
 }
 
-module.exports = async function handler(req, res) {
+async function listFilesForUser(user) {
+  const slug = companySlug(resolveUserCompany(user));
+  const userOrg = orgIdForUser(user);
+  const schema = companyPgSchema(resolveUserCompany(user));
+  const schemaReady = await companySchemaPresent(schema);
+
+  if (user.role === 'admin') {
+    const own = await listByOrg(userOrg);
+    if (own.error) return { error: own.error, status: own.status || 502 };
+    if (!own.rows.length) {
+      const legacy = await listByOrg('default');
+      if (!legacy.error && legacy.rows.length) {
+        await patchByFilter(
+          `org_id=eq.${encodeURIComponent('default')}`,
+          { org_id: userOrg, company_slug: slug },
+        );
+      }
+    }
+  }
+
+  let rows = [];
+  let sourceOrg = '';
+  for (const org of orgCandidates(user)) {
+    let listed = { rows: [] };
+    if (schemaReady) {
+      try {
+        listed = { rows: await listByOrgPg(schema, org) };
+      } catch {
+        listed = await listByOrg(org);
+      }
+    } else {
+      listed = await listByOrg(org);
+    }
+    if (listed.error) return { error: listed.error, status: listed.status || 502 };
+    if (listed.rows.length) {
+      rows = listed.rows;
+      sourceOrg = org;
+      break;
+    }
+  }
+  if (sourceOrg && sourceOrg !== userOrg) {
+    await patchByFilter(
+      `org_id=eq.${encodeURIComponent(sourceOrg)}`,
+      { org_id: userOrg, company_slug: slug },
+    );
+    rows = rows.map((row) => ({ ...row, org_id: userOrg, company_slug: slug }));
+  }
+  return { files: rows, schema, schemaReady: !!schemaReady };
+}
+
+async function insertFileForUser(user, recordInput) {
+  const slug = companySlug(resolveUserCompany(user));
+  const userOrg = orgIdForUser(user);
+  const schema = companyPgSchema(resolveUserCompany(user));
+  const schemaReady = await ensureCompanyPgSchema(schema);
+  const record = pickRecord(recordInput, { includeOrg: { org_id: userOrg, company_slug: slug } });
+  if (!record.file_name) {
+    return { error: 'file_name is required', status: 400 };
+  }
+  if (schemaReady) {
+    try {
+      const row = await insertPg(schema, record);
+      if (row) return { file: row };
+    } catch (err) {
+      console.warn('Company registry insert failed, trying public', err?.message || err);
+    }
+  }
+  let result = await restJson('POST', 'stella_files', { body: record });
+  if (!result.ok && /company_slug/i.test(JSON.stringify(result.data || {}))) {
+    const { company_slug: _slug, ...withoutSlug } = record;
+    result = await restJson('POST', 'stella_files', { body: withoutSlug });
+  }
+  if (!result.ok) {
+    return { error: result.data?.message || result.data?.hint || 'Registry insert failed', status: result.status };
+  }
+  const row = Array.isArray(result.data) ? result.data[0] : result.data;
+  return { file: row };
+}
+
+async function updateFileForUser(user, id, patchInput) {
+  const userOrg = orgIdForUser(user);
+  const schema = companyPgSchema(resolveUserCompany(user));
+  const schemaReady = await companySchemaPresent(schema);
+  if (!UUID_RE.test(String(id || '').trim())) {
+    return { error: 'Invalid file id', status: 400 };
+  }
+  const patch = pickRecord(patchInput);
+  if (!Object.keys(patch).length) {
+    return { error: 'Nothing to update', status: 400 };
+  }
+  const filter = `id=eq.${encodeURIComponent(id)}&org_id=eq.${encodeURIComponent(userOrg)}`;
+  if (schemaReady) {
+    try {
+      await updatePg(schema, id, userOrg, patch);
+      return { ok: true };
+    } catch (err) {
+      console.warn('Company registry update failed, trying public', err?.message || err);
+    }
+  }
+  const result = await patchByFilter(filter, patch);
+  if (!result.ok) {
+    return { error: result.data?.message || result.data?.hint || 'Registry update failed', status: result.status };
+  }
+  return { ok: true };
+}
+
+async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'no-store');
 
@@ -178,53 +284,16 @@ module.exports = async function handler(req, res) {
 
   try {
     if (req.method === 'GET' || action === 'list') {
-      if (user.role === 'admin') {
-        const own = await listByOrg(userOrg);
-        if (own.error) return res.status(own.status || 502).json({ error: { message: own.error } });
-        if (!own.rows.length) {
-          const legacy = await listByOrg('default');
-          if (!legacy.error && legacy.rows.length) {
-            await patchByFilter(
-              `org_id=eq.${encodeURIComponent('default')}`,
-              { org_id: userOrg, company_slug: slug },
-            );
-          }
-        }
-      }
-
-      let rows = [];
-      let sourceOrg = '';
-      for (const org of orgCandidates(user)) {
-        let listed = { rows: [] };
-        if (schemaReady) {
-          try {
-            listed = { rows: await listByOrgPg(schema, org) };
-          } catch {
-            listed = await listByOrg(org);
-          }
-        } else {
-          listed = await listByOrg(org);
-        }
-        if (listed.error) return res.status(listed.status || 502).json({ error: { message: listed.error } });
-        if (listed.rows.length) {
-          rows = listed.rows;
-          sourceOrg = org;
-          break;
-        }
-      }
-      if (sourceOrg && sourceOrg !== userOrg) {
-        await patchByFilter(
-          `org_id=eq.${encodeURIComponent(sourceOrg)}`,
-          { org_id: userOrg, company_slug: slug },
-        );
-        rows = rows.map((row) => ({ ...row, org_id: userOrg, company_slug: slug }));
+      const listed = await listFilesForUser(user);
+      if (listed.error) {
+        return res.status(listed.status || 502).json({ error: { message: listed.error } });
       }
       return res.status(200).json({
-        files: rows,
-        schema,
+        files: listed.files || [],
+        schema: listed.schema || schema,
         company: slug,
-        schemaReady: !!schemaReady,
-        schemaError: schemaReady ? '' : (getLastEnsureError() || ''),
+        schemaReady: !!listed.schemaReady,
+        schemaError: listed.schemaReady ? '' : (getLastEnsureError() || ''),
       });
     }
 
@@ -234,55 +303,17 @@ module.exports = async function handler(req, res) {
     }
 
     if (action === 'insert') {
-      const record = pickRecord(body.record, { includeOrg: { org_id: userOrg, company_slug: slug } });
-      if (!record.file_name) {
-        return res.status(400).json({ error: { message: 'file_name is required' } });
+      const inserted = await insertFileForUser(user, body.record);
+      if (inserted.error) {
+        return res.status(inserted.status || 502).json({ error: { message: inserted.error } });
       }
-      if (schemaReady) {
-        try {
-          const row = await insertPg(schema, record);
-          if (row) return res.status(200).json({ file: row });
-        } catch (err) {
-          console.warn('Company registry insert failed, trying public', err?.message || err);
-        }
-      }
-      let result = await restJson('POST', 'stella_files', { body: record });
-      if (!result.ok && /company_slug/i.test(JSON.stringify(result.data || {}))) {
-        const { company_slug: _slug, ...withoutSlug } = record;
-        result = await restJson('POST', 'stella_files', { body: withoutSlug });
-      }
-      if (!result.ok) {
-        return res.status(result.status).json({
-          error: { message: result.data?.message || result.data?.hint || 'Registry insert failed' },
-        });
-      }
-      const row = Array.isArray(result.data) ? result.data[0] : result.data;
-      return res.status(200).json({ file: row });
+      return res.status(200).json({ file: inserted.file });
     }
 
     if (action === 'update') {
-      const id = String(body.id || '').trim();
-      if (!UUID_RE.test(id)) {
-        return res.status(400).json({ error: { message: 'Invalid file id' } });
-      }
-      const patch = pickRecord(body.patch);
-      if (!Object.keys(patch).length) {
-        return res.status(400).json({ error: { message: 'Nothing to update' } });
-      }
-      const filter = `id=eq.${encodeURIComponent(id)}&org_id=eq.${encodeURIComponent(userOrg)}`;
-      if (schemaReady) {
-        try {
-          await updatePg(schema, id, userOrg, patch);
-          return res.status(200).json({ ok: true });
-        } catch (err) {
-          console.warn('Company registry update failed, trying public', err?.message || err);
-        }
-      }
-      const result = await patchByFilter(filter, patch);
-      if (!result.ok) {
-        return res.status(result.status).json({
-          error: { message: result.data?.message || result.data?.hint || 'Registry update failed' },
-        });
+      const updated = await updateFileForUser(user, body.id, body.patch);
+      if (updated.error) {
+        return res.status(updated.status || 502).json({ error: { message: updated.error } });
       }
       return res.status(200).json({ ok: true });
     }
@@ -318,4 +349,9 @@ module.exports = async function handler(req, res) {
       error: { message: err instanceof Error ? err.message : 'Upstream request failed' },
     });
   }
-};
+}
+
+handler.listFilesForUser = listFilesForUser;
+handler.insertFileForUser = insertFileForUser;
+handler.updateFileForUser = updateFileForUser;
+module.exports = handler;

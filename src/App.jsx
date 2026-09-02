@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense, Component } from 'react';
 import { createPortal } from 'react-dom';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles, Clock } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles, Clock, Copy, Play } from 'lucide-react';
 import ExcelExportButton from './ExcelExportButton';
 import { supabase } from './supabase';
 import {
@@ -30,11 +30,15 @@ import {
 } from './company';
 import {
   STELLA_CONNECTORS,
+  STELLA_SCHEDULE_FREQUENCIES,
   mergeStellaBusinessContext,
+  mergeStellaConnections,
   stellaBusinessContextIsEmpty,
   liftStellaGenericIntoUserSettings,
   stellaOrgIdForUser,
   stellaOrgIdCandidates,
+  stellaInboxStoragePrefix,
+  stellaInboxSchedule,
 } from './stellaUserSettings';
 import {
   MEMORY_HARVEST_SYSTEM,
@@ -130,6 +134,7 @@ const MANAGER_COLOURS = ['#34d399', '#60a5fa', '#a78bfa'];
 
 const STELLA_QUERY_API_PATH = '/api/stella-query';
 const STELLA_FILES_API_PATH = '/api/stella-files';
+const STELLA_SYNC_API_PATH = '/api/stella-sync';
 const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
 
 const CHAT_API_PATH = '/api/chat';
@@ -466,7 +471,7 @@ const DEFAULT_USER_SETTINGS = {
   // { fileName, uploadedAt, storagePath, theme: { schemeName, colors, fonts, ... } } — content ignored; style only
   pptxTemplate: null,
   stellaBusinessContext: mergeStellaBusinessContext({}),
-  stellaConnections: {},
+  stellaConnections: mergeStellaConnections({}),
   contextMapLayout: { nodes: {} },
 };
 
@@ -507,9 +512,7 @@ function mergeUserSettingsFields(raw = {}) {
     moduleConnections: mergeModuleConnections(src.moduleConnections),
     pptxTemplate: src.pptxTemplate || null,
     stellaBusinessContext: mergeStellaBusinessContext(src.stellaBusinessContext),
-    stellaConnections: (src.stellaConnections && typeof src.stellaConnections === 'object')
-      ? src.stellaConnections
-      : {},
+    stellaConnections: mergeStellaConnections(src.stellaConnections),
     contextMapLayout: (src.contextMapLayout && typeof src.contextMapLayout === 'object')
       ? { nodes: src.contextMapLayout.nodes && typeof src.contextMapLayout.nodes === 'object' ? src.contextMapLayout.nodes : {} }
       : { nodes: {} },
@@ -1697,11 +1700,31 @@ const STELLA_MEASURE_JOIN_TOKENS = /^(value|amount|revenue|rev|sales|qty|quantit
 const STELLA_MEASURE_NAME_HINT = /(unit|units|uom|qty|quantity|volume|revenue|amount|sales|packsize|attainment|percent|margin)(s|sold|pack|value|count)?$/;
 const STELLA_DATE_JOIN_TOKENS = /^(date|dt|day|month|quarter|qtr|year|yr|week|wk|period|time)$/;
 const STELLA_JOIN_FAMILIES = [
-  { id: 'territory', tokens: ['territory', 'territories', 'terr', 'geo', 'region', 'area', 'brick', 'postcode', 'zipcode', 'zip', 'alignment'] },
+  { id: 'territory', tokens: ['territory', 'territories', 'terr', 'geo', 'geography', 'region', 'area', 'brick', 'postcode', 'zipcode', 'zip', 'alignment'] },
   { id: 'product', tokens: ['product', 'products', 'brand', 'sku', 'molecule', 'item'] },
   { id: 'customer', tokens: ['customer', 'account', 'hcp', 'npi', 'prescriber', 'client'] },
   { id: 'rep', tokens: ['rep', 'reps', 'salesperson', 'ae', 'kam', 'employee'] },
+  { id: 'specialty', tokens: ['specialty', 'speciality'] },
 ];
+const STELLA_ENTITY_JOIN_FAMILIES = new Set(['territory', 'product', 'customer', 'rep', 'specialty']);
+const STELLA_FACT_FILE_KINDS = [
+  { id: 'sales', tokens: ['sales', 'sale', 'revenue', 'actuals'] },
+  { id: 'orders', tokens: ['orders', 'order'] },
+  { id: 'transactions', tokens: ['transactions', 'transaction', 'txn'] },
+  { id: 'invoices', tokens: ['invoices', 'invoice'] },
+  { id: 'calls', tokens: ['calls', 'call', 'activity', 'activities'] },
+  { id: 'visits', tokens: ['visits', 'visit'] },
+  { id: 'shipments', tokens: ['shipments', 'shipment'] },
+  { id: 'claims', tokens: ['claims', 'claim', 'rx', 'prescriptions', 'prescription'] },
+];
+const STELLA_DIM_FILE_HINTS = new Set([
+  'list', 'master', 'lookup', 'reference', 'dim', 'dimension',
+  'directory', 'roster', 'catalog', 'catalogue',
+]);
+const STELLA_FACT_GRAIN_STEMS = new Set([
+  'transaction', 'txn', 'trans', 'invoice', 'sale', 'order',
+  'call', 'activity', 'visit', 'shipment', 'claim', 'receipt',
+]);
 
 function stellaJoinFamily(col) {
   const blobs = [col?.name, col?.original, col?.description].map(stellaNormJoinToken).filter(Boolean);
@@ -1724,6 +1747,163 @@ function stellaIdStem(col) {
   return t.replace(/(uuid|code|key|id)$/g, '');
 }
 
+const STELLA_GENERIC_ROW_ID_NAMES = new Set([
+  'id', 'pk', 'pkey', 'primarykey', 'index', 'seq', 'sequence',
+  'uuid', 'guid', 'uid', 'recordid', 'rowid', 'lineid',
+  'rowkey', 'rownum', 'rownumber', 'lineno', 'linenumber',
+  'surrogatekey', 'ordinal', 'identity', 'autonumber', 'autoincrement',
+  'rowindex', 'key',
+]);
+const STELLA_GENERIC_ID_STEMS = new Set([
+  '', 'id', 'record', 'row', 'line', 'pk', 'pkey', 'index', 'seq', 'sequence',
+  'uuid', 'guid', 'uid', 'u', 'p', 'key', 'num', 'number',
+]);
+
+/** True for a column that looks like a table's own row identity (id, record_id, uuid), not entity keys like territory_id. */
+function stellaLooksLikeGenericRowId(col) {
+  if (stellaJoinFamily(col)) return false;
+  const n = stellaNormJoinToken(col?.name || col?.original || (typeof col === 'string' ? col : ''));
+  if (!n) return false;
+  if (STELLA_GENERIC_ROW_ID_NAMES.has(n)) return true;
+  return STELLA_GENERIC_ID_STEMS.has(stellaIdStem(col));
+}
+
+/** Transaction/document grain IDs (transaction_id, invoice_id, sale_id) plus generic row IDs. Entity FKs like product_id are excluded. */
+function stellaLooksLikeFactGrainId(col) {
+  if (stellaJoinFamily(col)) return false;
+  if (stellaLooksLikeGenericRowId(col)) return true;
+  const stem = stellaIdStem(col);
+  return !!(stem && STELLA_FACT_GRAIN_STEMS.has(stem));
+}
+
+function stellaFileJoinTokens(file, namesOnly = false) {
+  const bits = namesOnly
+    ? [file?.name, file?.originalName]
+    : [file?.name, file?.originalName, file?.capturedContext?.what_it_represents, file?.summary];
+  const tokens = [];
+  for (const bit of bits) {
+    const stripped = String(bit || '').replace(/\.[a-z0-9]{1,5}$/i, '');
+    for (const t of stripped.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (!t || t.length < 2) continue;
+      if (/^stella/.test(t) || t === 'xlsx' || t === 'csv' || t === 'xls' || t === 'txt') continue;
+      tokens.push(t);
+    }
+  }
+  return tokens;
+}
+
+function stellaMatchJoinFamilyId(tokens, families) {
+  const list = Array.isArray(tokens) ? tokens : [];
+  for (const fam of families) {
+    for (const raw of fam.tokens) {
+      const nt = stellaNormJoinToken(raw);
+      if (nt.length < 3) continue;
+      if (list.some((t) => t === nt || t.includes(nt))) return fam.id;
+    }
+  }
+  return null;
+}
+
+function stellaFileColumnFamily(file) {
+  const cols = Array.isArray(file?.columns) ? file.columns : [];
+  const counts = new Map();
+  for (const c of cols) {
+    const fam = stellaJoinFamily(c);
+    if (!fam || fam === 'date' || !STELLA_ENTITY_JOIN_FAMILIES.has(fam)) continue;
+    counts.set(fam, (counts.get(fam) || 0) + 1);
+  }
+  let best = null;
+  let bestN = 0;
+  for (const [fam, n] of counts) {
+    if (n > bestN) { best = fam; bestN = n; }
+  }
+  return best;
+}
+
+/** Classify a file as fact/sales-like, a dimension/entity list, or unknown. */
+function stellaFileJoinRole(file) {
+  if (!file) return { role: 'unknown', family: null, kind: null };
+  const nameTokens = stellaFileJoinTokens(file, true);
+  const allTokens = stellaFileJoinTokens(file, false);
+  const nameFamily = stellaMatchJoinFamilyId(nameTokens, STELLA_JOIN_FAMILIES);
+  const family = nameFamily || stellaMatchJoinFamilyId(allTokens, STELLA_JOIN_FAMILIES) || stellaFileColumnFamily(file);
+  const nameKind = stellaMatchJoinFamilyId(nameTokens, STELLA_FACT_FILE_KINDS);
+  const kind = nameKind || (nameFamily ? null : stellaMatchJoinFamilyId(allTokens, STELLA_FACT_FILE_KINDS));
+  const dimHint = nameTokens.some((t) => STELLA_DIM_FILE_HINTS.has(t));
+  const cols = Array.isArray(file.columns) ? file.columns : [];
+  const measureCount = cols.filter((c) => stellaLooksLikeMeasureCol(c)).length;
+  if (dimHint && family && !nameKind) return { role: 'dimension', family, kind: null };
+  if (dimHint && family) return { role: 'dimension', family, kind };
+  if (kind) return { role: 'fact', family, kind };
+  if (family) {
+    if (measureCount >= 2 && !nameFamily) return { role: 'fact', family, kind: null };
+    return { role: 'dimension', family, kind: null };
+  }
+  if (measureCount >= 2) return { role: 'fact', family: null, kind: null };
+  return { role: 'unknown', family: null, kind: null };
+}
+
+function stellaFilesBothFactLike(fileA, fileB) {
+  return stellaFileJoinRole(fileA).role === 'fact' && stellaFileJoinRole(fileB).role === 'fact';
+}
+
+function stellaFileHasEntityToken(file, stemOrFamily) {
+  const needle = stellaNormJoinToken(stemOrFamily);
+  if (!needle || needle.length < 3) return false;
+  const tokens = stellaFileJoinTokens(file);
+  if (tokens.some((t) => t === needle || t.includes(needle))) return true;
+  const role = stellaFileJoinRole(file);
+  if (role.family && (role.family === needle || stellaNormJoinToken(role.family) === needle)) return true;
+  for (const fam of STELLA_JOIN_FAMILIES) {
+    if (fam.id !== needle && !fam.tokens.some((t) => stellaNormJoinToken(t) === needle)) continue;
+    if (role.family === fam.id) return true;
+    if (fam.tokens.some((t) => {
+      const nt = stellaNormJoinToken(t);
+      return nt.length >= 3 && tokens.some((x) => x === nt || x.includes(nt));
+    })) return true;
+  }
+  return false;
+}
+
+/**
+ * Classic warehouse PK→FK: products.id (or record_id) matching sales.product_id.
+ * The generic-ID side must look like that entity (filename / role), not a fact table's own row id.
+ */
+function stellaLooksLikePkFkPair(a, b, fileA, fileB) {
+  const aGen = stellaLooksLikeGenericRowId(a);
+  const bGen = stellaLooksLikeGenericRowId(b);
+  if (aGen === bGen) return null;
+  const fkCol = aGen ? b : a;
+  const pkFile = aGen ? fileA : fileB;
+  const fkFam = stellaJoinFamily(fkCol);
+  const fkStem = stellaIdStem(fkCol);
+  if (fkFam === 'date') return null;
+  const namedEntity = !!(fkFam && STELLA_ENTITY_JOIN_FAMILIES.has(fkFam));
+  const namedStem = !!(fkStem && fkStem.length >= 3 && !STELLA_GENERIC_ID_STEMS.has(fkStem) && !STELLA_FACT_GRAIN_STEMS.has(fkStem));
+  if (!namedEntity && !namedStem) return null;
+  const pkRole = stellaFileJoinRole(pkFile);
+  if (pkRole.role === 'fact') return null;
+  if (pkFile) {
+    const matchesFamily = (fkFam && pkRole.family === fkFam)
+      || stellaFileHasEntityToken(pkFile, fkFam || fkStem)
+      || stellaFileHasEntityToken(pkFile, fkStem);
+    if (!matchesFamily) return null;
+  }
+  return { family: fkFam || fkStem, stem: fkStem || fkFam };
+}
+
+function stellaShouldBlockFactGrainJoin(a, b, fileA, fileB) {
+  if (stellaLooksLikePkFkPair(a, b, fileA, fileB)) return false;
+  const aGrain = stellaLooksLikeFactGrainId(a);
+  const bGrain = stellaLooksLikeFactGrainId(b);
+  if (!aGrain && !bGrain) return false;
+  if (!fileA && !fileB) {
+    return stellaLooksLikeGenericRowId(a) && stellaLooksLikeGenericRowId(b);
+  }
+  if (!stellaFilesBothFactLike(fileA, fileB)) return false;
+  return true;
+}
+
 function stellaFindJoinColumn(file, hint) {
   const cols = (Array.isArray(file?.columns) ? file.columns : []).map(stellaColumnJoinMeta).filter((c) => c.name);
   const resolved = stellaResolveJoinField(file, hint);
@@ -1742,14 +1922,24 @@ function stellaLooksLikeMeasureCol(col) {
   return blobs.some((b) => STELLA_MEASURE_NAME_HINT.test(b));
 }
 
-/** True for columns you would actually JOIN on in a warehouse (entity keys), not measures or same-type coincidences. */
-function stellaLooksLikeJoinKeyCol(col) {
+/** True for columns you would actually JOIN on in a warehouse (entity keys / dimension PKs), not measures. */
+function stellaLooksLikeJoinKeyCol(col, file) {
   if (!col || stellaLooksLikeMeasureCol(col)) return false;
   const fam = stellaJoinFamily(col);
-  if (fam === 'territory' || fam === 'product' || fam === 'customer' || fam === 'rep' || fam === 'date') return true;
+  if (fam === 'date' || STELLA_ENTITY_JOIN_FAMILIES.has(fam)) return true;
+  const role = file ? stellaFileJoinRole(file) : null;
+  if (stellaLooksLikeGenericRowId(col)) {
+    if (role?.role === 'fact') return false;
+    if (role?.role === 'dimension') return true;
+    return !file;
+  }
+  if (stellaLooksLikeFactGrainId(col)) {
+    if (role?.role === 'fact') return false;
+    return role?.role === 'dimension';
+  }
   const n = stellaNormJoinToken(col?.name || col?.original);
   if (!n) return false;
-  if (n === 'id' || /(uuid|guid|key|code|id)$/.test(n)) return true;
+  if (/(uuid|guid|key|code|id)$/.test(n)) return true;
   return col?.kind === 'id';
 }
 
@@ -1820,7 +2010,7 @@ function stellaJoinTypesCompatible(aType, bType) {
   return false;
 }
 
-function stellaScoreJoinColumns(a, b) {
+function stellaScoreJoinColumns(a, b, fileA, fileB) {
   const warnings = [];
   const aN = stellaNormJoinToken(a?.name);
   const bN = stellaNormJoinToken(b?.name);
@@ -1837,6 +2027,12 @@ function stellaScoreJoinColumns(a, b) {
   const someOverlap = overlap.compared && overlap.hits >= 1 && overlap.ratio >= 0.08;
   const lowCard = (a?.cardinality === 'low' || a?.cardinality === 'medium')
     && (b?.cardinality === 'low' || b?.cardinality === 'medium');
+  const pkfk = stellaLooksLikePkFkPair(a, b, fileA, fileB);
+  const blockFactGrain = stellaShouldBlockFactGrainJoin(a, b, fileA, fileB);
+  const roleA = stellaFileJoinRole(fileA);
+  const roleB = stellaFileJoinRole(fileB);
+  const bothDimSameFamily = roleA.role === 'dimension' && roleB.role === 'dimension'
+    && roleA.family && roleA.family === roleB.family;
 
   let score = 0;
   let reason = '';
@@ -1856,17 +2052,25 @@ function stellaScoreJoinColumns(a, b) {
   } else if (fa && fb && fa === fb) {
     if (!score) { score = 70; reason = `shared ${fa} key`; }
     else score = Math.max(score, 70);
+  } else if (pkfk) {
+    if (!score) { score = 84; reason = `dimension ${pkfk.family} key`; }
+    else score = Math.max(score, 84);
+    if (!reason) reason = `dimension ${pkfk.family} key`;
   } else if (!score) {
     const sa = stellaIdStem(a);
     const sb = stellaIdStem(b);
+    const grainStem = stellaLooksLikeFactGrainId(a) || stellaLooksLikeFactGrainId(b)
+      || STELLA_FACT_GRAIN_STEMS.has(sa) || STELLA_FACT_GRAIN_STEMS.has(sb);
+    const genericStem = stellaLooksLikeGenericRowId(a) || stellaLooksLikeGenericRowId(b)
+      || STELLA_GENERIC_ID_STEMS.has(sa) || STELLA_GENERIC_ID_STEMS.has(sb);
     const aId = /id$/.test(aN) || aN === 'id' || /id$/.test(aO);
     const bId = /id$/.test(bN) || bN === 'id' || /id$/.test(bO);
-    if (aId && bId && sa && sa === sb && sa.length >= 3) {
+    if (!grainStem && !genericStem && aId && bId && sa && sa === sb && sa.length >= 3) {
       score = 80;
       reason = 'shared ID';
-    } else if (aN === 'id' && bN === 'id') {
-      score = 60;
-      reason = 'shared ID';
+    } else if (genericStem && aN === 'id' && bN === 'id' && bothDimSameFamily) {
+      score = 80;
+      reason = 'shared dimension key';
     }
   }
 
@@ -1879,9 +2083,25 @@ function stellaScoreJoinColumns(a, b) {
     score = Math.min(score, 14);
     if (!reason) reason = 'measure vs key';
   }
-  const aKey = stellaLooksLikeJoinKeyCol(a);
-  const bKey = stellaLooksLikeJoinKeyCol(b);
-  if (!aKey || !bKey) {
+  const aKey = stellaLooksLikeJoinKeyCol(a, fileA);
+  const bKey = stellaLooksLikeJoinKeyCol(b, fileB);
+  const aGeneric = stellaLooksLikeGenericRowId(a);
+  const bGeneric = stellaLooksLikeGenericRowId(b);
+  if (blockFactGrain) {
+    warnings.push('These look like each file\'s own row/transaction IDs, not shared entity keys. Two sales files should join on product, territory, HCP, or similar — not id, record_id, or transaction_id.');
+    score = Math.min(score, 12);
+    if (!reason || reason === 'same column name' || reason === 'shared ID' || reason === 'same source header' || reason === 'shared dimension key') {
+      reason = 'fact-table row/transaction IDs, not entity keys';
+    }
+  } else if (pkfk) {
+    if (!reason || reason === 'same column name') reason = `dimension ${pkfk.family} key`;
+  } else if ((aGeneric || bGeneric) && !bothDimSameFamily) {
+    warnings.push('These look like generic record/row IDs (id, record_id, uuid), not a matching entity key.');
+    score = Math.min(score, 12);
+    if (!reason || reason === 'same column name' || reason === 'shared ID' || reason === 'same source header') {
+      reason = 'generic row IDs, not entity keys';
+    }
+  } else if (!aKey || !bKey) {
     warnings.push('These are not entity keys you would join in a database (territory, HCP/account, product, rep, or ID). Same type or matching numbers is not enough.');
     score = Math.min(score, 16);
     if (!reason) reason = 'not a database join key';
@@ -1928,7 +2148,7 @@ function stellaScoreJoinColumns(a, b) {
 function stellaAssessJoin(fromFile, toFile, thisField, relatedField) {
   const a = stellaFindJoinColumn(fromFile, thisField);
   const b = stellaFindJoinColumn(toFile, relatedField);
-  const scored = stellaScoreJoinColumns(a, b);
+  const scored = stellaScoreJoinColumns(a, b, fromFile, toFile);
   const examples = scored.overlap?.examples?.length
     ? ` e.g. ${scored.overlap.examples.join(', ')}`
     : '';
@@ -2003,9 +2223,10 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
     const otherCols = (other.columns || []).map(stellaColumnJoinMeta).filter((c) => c.name);
     for (const a of thisCols) {
       for (const b of otherCols) {
-        const scored = stellaScoreJoinColumns(a, b);
+        const scored = stellaScoreJoinColumns(a, b, thisFile, other);
         if (scored.verdict !== 'ok') continue;
-        if (!stellaLooksLikeJoinKeyCol(a) || !stellaLooksLikeJoinKeyCol(b)) continue;
+        const pkfk = stellaLooksLikePkFkPair(a, b, thisFile, other);
+        if (!pkfk && (!stellaLooksLikeJoinKeyCol(a, thisFile) || !stellaLooksLikeJoinKeyCol(b, other))) continue;
         ranked.push({
           related_file: other.name,
           related_table: other.tableName,
@@ -2047,9 +2268,11 @@ function stellaJoinQuestion(candidates, otherFiles) {
 }
 
 function stellaLooksLikeJoinDecline(text) {
-  const t = String(text || '').toLowerCase();
+  const t = String(text || '').trim().toLowerCase().replace(/[\u2018\u2019`]/g, "'");
   if (!t) return false;
-  return /\b(unrelated|do not join|don't join|no (common|shared|link|join|connection)|not (linked|related|joined|connected)|separate files|no connection)\b/i.test(t);
+  const compact = t.replace(/'/g, '');
+  if (/^(n|no|nope|nah|wrong|skip|none|neither|dont|do not)[\s.!?]*$/i.test(compact)) return true;
+  return /\b(unrelated|do not join|don't join|dont join|no (?:common|shared|link|join|connection)|not (?:those|that|linked|related|joined|connected)|separate files|should not be joined|skip (?:those|them)|reject|no thanks)\b/i.test(t);
 }
 
 function stellaLooksLikeJoinAccept(text) {
@@ -2666,14 +2889,70 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
           const b = posMap.get(e0.to);
           if (!a || !b) return null;
           const pairKey = `${[e0.from, e0.to].sort().join('|')}${isLarge ? '-lg' : ''}`;
-          const bothOpen = a.expanded && b.expanded;
-          const aRight = a.x <= b.x;
+          const eitherOpen = a.expanded || b.expanded;
           const baseStroke = (activeId === a.id || activeId === b.id) ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.55)';
+          if (!eitherOpen) {
+            const curve = stellaJoinCurvePath(a, b, 0, 1);
+            const bundleKey = `bundle|${pairKey}`;
+            const hot = hoverJoin === bundleKey;
+            const stroke = hot ? 'rgb(34, 211, 238)' : baseStroke;
+            const label = bucket.length === 1 ? 'Joined' : `${bucket.length} joins`;
+            const joinHints = bucket.map((k) => k.label || `${k.thisField} ↔ ${k.relatedField}`).join('\n');
+            return (
+              <g key={pairKey}>
+                <path
+                  d={curve.d}
+                  fill="none"
+                  stroke="transparent"
+                  strokeWidth={16}
+                  className="cursor-pointer"
+                  onPointerEnter={() => setHoverJoin(bundleKey)}
+                  onPointerLeave={() => setHoverJoin((prev) => (prev === bundleKey ? '' : prev))}
+                  onClick={(ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    setExpanded((prev) => new Set([...prev, a.id, b.id]));
+                    onSelectFile?.(a.id);
+                  }}
+                >
+                  <title>{`${label} — click to expand\n${joinHints}`}</title>
+                </path>
+                <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.8 : (bucket.length > 1 ? 2.4 : 1.8)} className="pointer-events-none" />
+                <rect
+                  x={curve.lx - Math.max(28, label.length * 3.4 + 8)}
+                  y={curve.ly - 16}
+                  width={Math.max(56, label.length * 6.8 + 16)}
+                  height={16}
+                  rx={4}
+                  fill="rgba(8, 47, 73, 0.92)"
+                  stroke="rgba(103, 232, 249, 0.45)"
+                  strokeWidth={1}
+                  className="pointer-events-none"
+                />
+                <text
+                  x={curve.lx}
+                  y={curve.ly - 5}
+                  textAnchor="middle"
+                  className="fill-cyan-50"
+                  style={{ fontSize: 10, fontWeight: 700 }}
+                >
+                  {label}
+                </text>
+              </g>
+            );
+          }
           return (
             <g key={pairKey}>
               {bucket.map((k, i) => {
-                const fromPt = bothOpen ? stellaFieldAnchor(a, k.thisField, aRight ? 'right' : 'left') : a;
-                const toPt = bothOpen ? stellaFieldAnchor(b, k.relatedField, aRight ? 'left' : 'right') : b;
+                const fromNode = posMap.get(k.from) || a;
+                const toNode = posMap.get(k.to) || b;
+                const fromRight = fromNode.x <= toNode.x;
+                const fromPt = fromNode.expanded
+                  ? stellaFieldAnchor(fromNode, k.thisField, fromRight ? 'right' : 'left')
+                  : fromNode;
+                const toPt = toNode.expanded
+                  ? stellaFieldAnchor(toNode, k.relatedField, fromRight ? 'left' : 'right')
+                  : toNode;
                 const curve = stellaJoinCurvePath(fromPt, toPt, i, bucket.length);
                 const joinKey = `${k.from}|${k.to}|${k.thisField}|${k.relatedField}`;
                 const hot = hoverJoin === joinKey;
@@ -2697,11 +2976,11 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                       <title>Click to remove {k.thisField} ↔ {k.relatedField}</title>
                     </path>
                     <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.6 : 1.8} className="pointer-events-none" />
-                    {bothOpen ? (
-                      <>
-                        <circle cx={fromPt.x} cy={fromPt.y} r={3.2} fill={stroke} className="pointer-events-none" />
-                        <circle cx={toPt.x} cy={toPt.y} r={3.2} fill={stroke} className="pointer-events-none" />
-                      </>
+                    {fromNode.expanded ? (
+                      <circle cx={fromPt.x} cy={fromPt.y} r={3.2} fill={stroke} className="pointer-events-none" />
+                    ) : null}
+                    {toNode.expanded ? (
+                      <circle cx={toPt.x} cy={toPt.y} r={3.2} fill={stroke} className="pointer-events-none" />
                     ) : null}
                   </g>
                 );
@@ -2843,7 +3122,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
         <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
           <div className="text-sm font-bold text-white flex items-center gap-2">
             <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
-            <span className="text-xs font-normal text-blue-300/60">Click a join to remove (confirm) · Undo restores the last change</span>
+            <span className="text-xs font-normal text-blue-300/60">Expand to see field joins · click a field line to remove · Undo restores the last change</span>
           </div>
           {toolbar}
         </div>
@@ -2866,7 +3145,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
             </div>
             <p className="text-xs text-blue-300/60 mt-1">
               {pairCount
-                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Click a join to remove it (you'll confirm first).`
+                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Collapsed files share one line — expand to see field joins (click a field line to remove).`
                 : 'No connections yet. Expand, then drag a field onto another file to link them.'}
             </p>
           </div>
@@ -2880,7 +3159,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
         </summary>
 
         <p className="text-xs text-blue-300/60 mt-3 mb-3">
-          Click a table to list columns. Drag a field onto another table to create a join. Click a join line to remove it — you'll be asked to confirm, and Undo puts it back.
+          Click a table to list columns. Drag a field onto another table to create a join. Collapsed files share one connection line; expand to see (and remove) field-level joins.
         </p>
         {drawCanvas(false)}
         {isolated.length > 0 && (
@@ -4247,11 +4526,22 @@ function stellaMapRegistryRow(row) {
   const rawCtx = row.context_qa && typeof row.context_qa === 'object' ? row.context_qa : null;
   const maps = rawCtx ? stellaCollectNameMaps(rawCtx) : [];
   const ctx = rawCtx && maps.length ? { ...rawCtx, name_maps: maps } : rawCtx;
+  const schemaChanged = !!(ctx && ctx.schema_changed);
   const qa = ctx && Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : [];
-  const intakeMessages = qa.flatMap(p => [
+  let intakeMessages = qa.flatMap(p => [
     ...(p && p.question ? [{ role: 'assistant', content: p.question }] : []),
     ...(p && p.answer ? [{ role: 'user', content: p.answer }] : []),
   ]);
+  if (schemaChanged) {
+    intakeMessages = [
+      { role: 'assistant', content: 'This file was refreshed from the inbox with different columns. Confirm the context still applies, then send a short reply to complete intake.' },
+      ...intakeMessages,
+    ];
+  } else if (!ctx && /scheduled inbox/i.test(String(row.summary || ''))) {
+    intakeMessages = [
+      { role: 'assistant', content: `⏳ Assessing **${row.file_name}** from the inbox…` },
+    ];
+  }
   return {
     id: row.id,
     dbId: row.id,
@@ -4268,11 +4558,26 @@ function stellaMapRegistryRow(row) {
     summary: row.summary || '',
     capturedContext: ctx,
     intakeMessages,
-    intakeComplete: !!ctx,
+    intakeComplete: !!ctx && !schemaChanged,
     uploadedAt: row.uploaded_at,
     size: row.row_count != null ? `${row.row_count} rows` : '',
     processing: false,
   };
+}
+
+function stellaFileNeedsOpeningIntake(f) {
+  if (!f || f.processing || f.intakeComplete) return false;
+  const msgs = f.intakeMessages || [];
+  const first = String(msgs[0]?.content || '');
+  if (/I assessed this file from its contents/i.test(first) || /^✅ /.test(first)) return false;
+  if (stellaIntakeAskedJoin(msgs)) return false;
+  const schemaStub = !!(f.capturedContext && f.capturedContext.schema_changed)
+    || /refreshed from the inbox with different columns/i.test(first);
+  if (msgs.some((m) => m?.role === 'user') && !schemaStub) return false;
+  const scheduledStub = /scheduled inbox/i.test(String(f.summary || ''))
+    || /Imported from the scheduled inbox/i.test(first)
+    || /Assessing \*\*.*from the inbox/i.test(first);
+  return scheduledStub || schemaStub;
 }
 
 function guessCountry(structure) {
@@ -4754,6 +5059,30 @@ function EditableContextBlock({ label, value, question, answer, qa, line, onSave
   );
 }
 
+function readStellaIntakeDeepLink() {
+  if (typeof window === 'undefined') return null;
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const open = String(q.get('open') || '').trim().toLowerCase();
+    const fileId = String(q.get('file') || q.get('stellaIntake') || '').trim();
+    const fileName = String(q.get('fileName') || '').trim();
+    if (open !== 'stella-intake' && !q.has('stellaIntake') && !fileId) return null;
+    return { fileId, fileName };
+  } catch {
+    return null;
+  }
+}
+
+function clearStellaIntakeDeepLink() {
+  if (typeof window === 'undefined') return;
+  try {
+    const url = new URL(window.location.href);
+    ['open', 'file', 'fileName', 'stellaIntake'].forEach((key) => url.searchParams.delete(key));
+    const next = `${url.pathname}${url.search}${url.hash}` || '/';
+    window.history.replaceState({}, '', next);
+  } catch { /* ignore */ }
+}
+
 export default function CommercialExcellenceApp() {
   // Ensure older sessions (unlocked before userId existed) still have an identity.
   const [currentUser] = useState(() => {
@@ -4765,8 +5094,8 @@ export default function CommercialExcellenceApp() {
     return setCurrentUser(getHardcodedUser());
   });
   const isAdmin = isAdminUser(currentUser);
-  const [activeTab, setActiveTab] = useState('chat');
-  const [showLanding, setShowLanding] = useState(true);
+  const [activeTab, setActiveTab] = useState(() => (readStellaIntakeDeepLink() ? 'user-settings' : 'chat'));
+  const [showLanding, setShowLanding] = useState(() => !readStellaIntakeDeepLink());
   const [chatSessions, setChatSessions] = useState(() => readCachedChatIndex(currentUser.id).chats);
   const [activeChatId, setActiveChatId] = useState(() => readCachedChatIndex(currentUser.id).activeChatId || null);
   const [chatIndexLoading, setChatIndexLoading] = useState(() => !readCachedChatIndex(currentUser.id).chats.length);
@@ -4779,6 +5108,7 @@ export default function CommercialExcellenceApp() {
   const [uploadedFile, setUploadedFile] = useState(null);
   const [stellaSettingsTab, setStellaSettingsTab] = useState('connections'); // connections | goals
   const [stellaConnectionsTab, setStellaConnectionsTab] = useState('files'); // files | connector id
+  const [stellaFilesInnerTab, setStellaFilesInnerTab] = useState('list'); // list | schedule
   const [stellaMessages, setStellaMessages] = useState(() => [stellaWelcome()]);
   const [stellaInput, setStellaInput] = useState('');
   const [stellaIsLoading, setStellaIsLoading] = useState(false);
@@ -4806,7 +5136,9 @@ export default function CommercialExcellenceApp() {
   const [productIntel, setProductIntel] = useState(() => readLocalProductIntelligence());
   const [userSettingsSaveStatus, setUserSettingsSaveStatus] = useState('idle'); // idle | saving | saved | saved-local | error
   const [userSettingsCloudError, setUserSettingsCloudError] = useState('');
-  const [userSettingsPane, setUserSettingsPane] = useState('general'); // general | context-map | incentives | territory | stella
+  const [userSettingsPane, setUserSettingsPane] = useState(() => (
+    readStellaIntakeDeepLink() ? 'stella' : 'general'
+  ));
   const [pptxTemplateStatus, setPptxTemplateStatus] = useState('idle'); // idle | extracting | uploading | error
   const [pptxTemplateError, setPptxTemplateError] = useState('');
   const [knowledgeBase, setKnowledgeBase] = useState('');
@@ -4972,6 +5304,10 @@ export default function CommercialExcellenceApp() {
   const adminFileInputRef = useRef(null);
   const territoryFileInputRef = useRef(null);
   const stellaDataFileInputRef = useRef(null);
+  const [stellaSyncBusy, setStellaSyncBusy] = useState(false);
+  const [stellaInboxCopied, setStellaInboxCopied] = useState(false);
+  const stellaIntakeDeepLinkRef = useRef(readStellaIntakeDeepLink());
+  const stellaOpeningIntakeBusyRef = useRef(new Set());
   const pptxTemplateInputRef = useRef(null);
   const moduleContextFileInputRef = useRef(null);
 
@@ -5391,6 +5727,57 @@ export default function CommercialExcellenceApp() {
     loadStella();
   }, [currentUser.id]);
 
+  const openStellaIntakeAssistant = (fileHint) => {
+    setShowLanding(false);
+    setActiveTab('user-settings');
+    setUserSettingsPane('stella');
+    setStellaSettingsTab('connections');
+    setStellaConnectionsTab('files');
+    setStellaFilesInnerTab('list');
+    setStellaIntakeMinimized(false);
+    const files = stellaDataFilesRef.current || [];
+    const wantId = String(fileHint?.fileId || fileHint?.id || '').trim();
+    const wantName = String(fileHint?.fileName || fileHint?.file || fileHint?.name || '').trim().toLowerCase();
+    const match = files.find((f) => f && (f.dbId === wantId || f.id === wantId))
+      || files.find((f) => wantName && String(f.name || '').trim().toLowerCase() === wantName)
+      || files.find((f) => f && !f.intakeComplete && !f.processing);
+    if (match) {
+      setActiveStellaDataId(match.id);
+      setStellaIntakeMinimized(false);
+    }
+  };
+
+  useEffect(() => {
+    const link = stellaIntakeDeepLinkRef.current;
+    if (!link || !currentUser?.id) return undefined;
+    setShowLanding(false);
+    setActiveTab('user-settings');
+    setUserSettingsPane('stella');
+    setStellaSettingsTab('connections');
+    setStellaConnectionsTab('files');
+    setStellaFilesInnerTab('list');
+    return undefined;
+  }, [currentUser.id]);
+
+  useEffect(() => {
+    const link = stellaIntakeDeepLinkRef.current;
+    if (!link) return;
+    const files = stellaDataFiles || [];
+    if (!files.length && !link.fileId && !link.fileName) return;
+    const wantId = String(link.fileId || '').trim();
+    const wantName = String(link.fileName || '').trim().toLowerCase();
+    const match = files.find((f) => f && (f.dbId === wantId || f.id === wantId))
+      || files.find((f) => wantName && String(f.name || '').trim().toLowerCase() === wantName)
+      || files.find((f) => f && !f.intakeComplete && !f.processing);
+    if (!match && files.length === 0) return;
+    if (match) {
+      setActiveStellaDataId(match.id);
+      setStellaIntakeMinimized(false);
+    }
+    stellaIntakeDeepLinkRef.current = null;
+    clearStellaIntakeDeepLink();
+  }, [stellaDataFiles, currentUser.id]);
+
   useEffect(() => {
     scrollToBottom();
   }, [messages, stellaMessages, activeTab]);
@@ -5414,7 +5801,7 @@ export default function CommercialExcellenceApp() {
 
   useEffect(() => {
     const f = (stellaDataFilesRef.current || []).find((x) => x.id === activeStellaDataId);
-    setStellaIntakeMinimized(!!(f && !f.processing && (f.capturedContext || f.intakeComplete)));
+    setStellaIntakeMinimized(!!(f && !f.processing && f.intakeComplete));
   }, [activeStellaDataId]);
 
   useEffect(() => {
@@ -6952,9 +7339,43 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     );
   };
 
+  const goToIncentiveChat = () => {
+    setShowLanding(false);
+    setActiveTab('chat');
+    setMobileChatToolsOpen(false);
+  };
+
+  const startDesignScheme = () => {
+    goToIncentiveChat();
+    window.setTimeout(() => {
+      void launchWorkflowDirect('design_ic', 'I want to design a new incentive scheme');
+    }, 100);
+  };
+
+  const startAssessIc = () => {
+    goToIncentiveChat();
+    fileInputRef.current?.click();
+  };
+
+  const startBestPractices = () => {
+    goToIncentiveChat();
+    window.setTimeout(() => {
+      void handleSubmit(null, 'What are the key principles for designing effective sales incentive schemes?');
+    }, 100);
+  };
+
   const renderChatToolsBody = (kind) => {
     const isStella = kind === 'stella';
-    const showQuick = !isStella && !waitingForPptxChoice && !messages.some((m) => m.role === 'user');
+    const showQuick = !isStella && !waitingForPptxChoice;
+    const extraWorkflows = showQuick
+      ? (topics || []).filter((t) => (
+        t.status === 'active'
+        && t.id !== 'design_ic'
+        && t.id !== 'analyze_ic'
+        && t.id !== 'territory_assessment'
+        && !String(t.id || '').startsWith('territory')
+      ))
+      : [];
     const pptxClarifyOptions = !isStella && waitingForPptxChoice ? (getPptxClarify().options || []) : [];
     const canExportPptx = !isStella
       && !currentWorkflow
@@ -6967,9 +7388,24 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
           {showQuick && (
             <div className="p-3 space-y-2 border-b border-blue-400/15">
               <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">Start</div>
-              <button type="button" onClick={() => { setInput('I need to design an incentive scheme for a team of 10 AEs.'); setMobileChatToolsOpen(false); }} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 text-left"><Target className="w-3.5 h-3.5 shrink-0" /> Design New Scheme</button>
-              <button type="button" onClick={() => { fileInputRef.current?.click(); setMobileChatToolsOpen(false); }} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"><Upload className="w-3.5 h-3.5 shrink-0" /> Assess Proposal</button>
-              <button type="button" onClick={() => { setInput('What are the key principles for designing effective sales incentive schemes?'); setMobileChatToolsOpen(false); }} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-200 text-left"><Award className="w-3.5 h-3.5 shrink-0" /> Best Practices</button>
+              <button type="button" onClick={startDesignScheme} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 text-left"><Target className="w-3.5 h-3.5 shrink-0" /> Design New Scheme</button>
+              <button type="button" onClick={startAssessIc} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"><Upload className="w-3.5 h-3.5 shrink-0" /> Assess IC</button>
+              {extraWorkflows.map((topic) => (
+                <button
+                  key={topic.id}
+                  type="button"
+                  onClick={() => {
+                    goToIncentiveChat();
+                    window.setTimeout(() => {
+                      void launchWorkflowDirect(topic.id, `I want to start ${topic.name}`);
+                    }, 100);
+                  }}
+                  className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"
+                >
+                  <Sparkles className="w-3.5 h-3.5 shrink-0" /> {topic.name}
+                </button>
+              ))}
+              <button type="button" onClick={startBestPractices} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-200 text-left"><Award className="w-3.5 h-3.5 shrink-0" /> Best Practices</button>
             </div>
           )}
           {!isStella && (
@@ -9152,7 +9588,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Use the SAME checks as a manual join: only propose entity keys you would join in a real database (territory, HCP/account, product, rep, IDs, dates). Sample values must overlap. Never join measures (units, qty, revenue, scores) even if the numbers look similar. Never join from name or type alone. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Use the SAME checks as a manual join: only propose entity keys you would join in a real database (territory, HCP/account, product, rep, IDs, dates). Dimension primary keys to matching foreign keys are valid (products.id to sales.product_id). Do not join two sales/transaction files on their own row or transaction IDs (id, record_id, transaction_id, invoice_id, sale_id). Still propose shared entity keys (product_id, territory_id, hcp_id) between two sales files. Sample values must overlap. Never join measures (units, qty, revenue, scores) even if the numbers look similar. Never join from name or type alone. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -9316,7 +9752,10 @@ ${stepInstruction}`;
 
   const persistStellaIntakeContext = async (fileRec, ctx, intakeMessages) => {
     const maps = stellaCollectNameMaps(ctx, intakeMessages);
-    const nextCtx = maps.length ? { ...ctx, name_maps: maps } : ctx;
+    const nextCtx = ctx && typeof ctx === 'object'
+      ? (maps.length ? { ...ctx, name_maps: maps } : { ...ctx })
+      : ctx;
+    if (nextCtx && typeof nextCtx === 'object') delete nextCtx.schema_changed;
     stellaPatchLocal(fileRec.id, { intakeMessages, capturedContext: nextCtx, intakeComplete: true });
     setStellaIntakeMinimized(true);
     try {
@@ -9328,7 +9767,8 @@ ${stepInstruction}`;
   };
 
   const persistStellaFileContext = async (fileRec, nextCtx) => {
-    const ctx = stellaCapturedContextIsEmpty(nextCtx) ? null : nextCtx;
+    const ctx = stellaCapturedContextIsEmpty(nextCtx) ? null : { ...nextCtx };
+    if (ctx) delete ctx.schema_changed;
     stellaPatchLocal(fileRec.id, { capturedContext: ctx, intakeComplete: !!ctx });
     try {
       if (fileRec.dbId) await stellaUpdateRegistry(fileRec.dbId, { context_qa: ctx });
@@ -9524,8 +9964,9 @@ ${stepInstruction}`;
     const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
     const acceptedJoin = stellaLooksLikeJoinAccept(lastUserText);
     let rels = stellaNormalizeStoredRelationships(parsed?.context_qa?.relationships, live, otherTabular);
-    const askedJoin = stellaIntakeAskedJoin(f.intakeMessages);
-    if (!declinedJoin && candidates.length && (acceptedJoin || askedJoin)) {
+    if (declinedJoin) {
+      rels = [];
+    } else if (candidates.length && acceptedJoin) {
       const strong = candidates.filter((c) => c.score >= 70);
       rels = stellaDedupeRelationships([
         ...rels,
@@ -9535,7 +9976,7 @@ ${stepInstruction}`;
     const priorRels = stellaNormalizeStoredRelationships(live.capturedContext?.relationships || f.capturedContext?.relationships, live, otherTabular);
     if (priorRels.length && !declinedJoin) rels = stellaDedupeRelationships([...priorRels, ...rels]);
     const filteredJoins = stellaFilterJoinRels(rels, live, otherTabular);
-    rels = filteredJoins.keep;
+    rels = declinedJoin ? [] : filteredJoins.keep;
 
     const joinAskCount = (f.intakeMessages || []).filter(m => (
       m?.role === 'assistant' && /\b(join|joined|share an id, territory|correct keys|should not be joined)\b/i.test(String(m.content || ''))
@@ -9555,11 +9996,11 @@ ${stepInstruction}`;
     if (forceJoinQuestion) {
       assistantMessage = stellaJoinQuestion(candidates, otherTabular) || assistantMessage;
     }
-    if (complete && rels.length && !/\bstored join/i.test(assistantMessage)) {
+    if (complete && !declinedJoin && rels.length && !/\bstored join/i.test(assistantMessage)) {
       const joinLines = rels.map(r => `- ${f.tableName}.${r.this_field} = ${r.related_table || r.related_file}.${r.related_field}${r.related_file ? ` (${r.related_file})` : ''}`);
       assistantMessage = `${assistantMessage}\n\nStored joins for queries:\n${joinLines.join('\n')}`;
     }
-    if (filteredJoins.dropped.length) {
+    if (!declinedJoin && filteredJoins.dropped.length) {
       const lines = filteredJoins.dropped.map((d) => `- ${d.r.this_field} ↔ ${d.r.related_field || d.r.related_file}: ${d.why}`);
       assistantMessage = `${assistantMessage}\n\nI did not store these joins because they do not look like matching keys:\n${lines.join('\n')}`;
     }
@@ -9573,7 +10014,7 @@ ${stepInstruction}`;
         relationships: declinedJoin ? [] : rels,
       };
       await persistStellaIntakeContext(f, ctx, nextIntakeMessages);
-      if (rels.length) {
+      if (!declinedJoin && rels.length) {
         for (const r of rels) {
           const other = otherTabular.find(x => (
             (r.related_table && x.tableName === r.related_table)
@@ -9625,6 +10066,135 @@ ${stepInstruction}`;
     return ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
   };
 
+  const composeStellaOpeningIntake = async (fileRec, {
+    records = null,
+    summary: summaryArg = '',
+    columns: columnsArg = null,
+    heading = 'Uploaded',
+    requireConfirm = false,
+  } = {}) => {
+    const name = fileRec.name;
+    const isTabular = Array.isArray(records) && records.length > 0;
+    let columns = Array.isArray(columnsArg) ? columnsArg : (fileRec.columns || []);
+    let summary = String(summaryArg || fileRec.summary || '').trim();
+    let onboarding = { summary, suggestedQuestions: [] };
+    const sampleText = isTabular
+      ? JSON.stringify(records.slice(0, 30), null, 2).substring(0, 16000)
+      : '';
+    const dataProfile = isTabular ? stellaProfileRecords(records) : '';
+    if (!summary || /scheduled inbox/i.test(summary) || /^uploaded (dataset|document)\.?$/i.test(summary)) {
+      onboarding = await stellaBuildContentSummary({
+        name,
+        type: fileRec.fileType || fileRec.type || 'csv',
+        textSample: sampleText || (columns.length ? columns.map((c) => c.original || c.name).join(', ') : ''),
+        columns: columns.map((c) => ({ name: c.original || c.name })),
+        profile: dataProfile,
+      });
+      summary = onboarding.summary || summary || (isTabular ? 'Uploaded dataset.' : 'Uploaded document.');
+      if (isTabular && Array.isArray(onboarding.columns) && onboarding.columns.length) {
+        columns = columns.map((c) => {
+          const match = onboarding.columns.find((oc) => (
+            String(oc.name || '').toLowerCase() === String(c.original || c.name).toLowerCase()
+          ));
+          return match ? { ...c, description: match.description || '' } : c;
+        });
+      }
+    }
+    const otherTabular = stellaOtherTabularFiles(fileRec.id);
+    const profiledColumns = isTabular
+      ? stellaApplyRowSampleToColumns(columns, records.slice(0, 400))
+      : columns;
+    let joinQ = '';
+    if ((isTabular || fileRec.tableName) && otherTabular.length) {
+      await stellaHydrateColumnValueProfiles(otherTabular);
+      const othersNow = stellaOtherTabularFiles(fileRec.id);
+      joinQ = stellaJoinQuestion(
+        stellaGuessJoinCandidates({ ...fileRec, columns: profiledColumns }, othersNow),
+        othersNow,
+      ) || '';
+    }
+    const modelQuestions = pickStellaIntakeQuestions(
+      { ...onboarding, summary },
+      stellaDefaultIntakeQuestions({ isTabular: isTabular || !!fileRec.tableName, columns: profiledColumns }),
+    ).filter((q) => {
+      if (!joinQ) return true;
+      return !/\b(join|related|shared (id|key)|territory, product)\b/i.test(q);
+    });
+    const linkQ = stellaLinkedModuleQuestion(userSettingsRef.current || userSettings, 'stella');
+    const confirmQ = requireConfirm
+      ? 'This file was refreshed from the inbox with different columns. Does the existing context still apply, or should we update it?'
+      : '';
+    const questions = [
+      ...(confirmQ ? [confirmQ] : []),
+      ...(joinQ ? [joinQ] : []),
+      ...(linkQ && !joinQ ? [linkQ] : []),
+      ...modelQuestions.filter((q) => !linkQ || !/\b(linked to|connected module|stay independent)\b/i.test(q)),
+    ];
+    const colLine = profiledColumns.length ? `\n\n**Columns:** ${profiledColumns.map((c) => c.name).join(', ')}` : '';
+    const needsUser = questions.length > 0;
+    const qBlock = formatStellaIntakeQuestionList(questions);
+    const linkNote = linkQ && joinQ
+      ? `\n\nThis workspace is also linked to other modules — confirm whether this file should connect there as well.`
+      : '';
+    const assistantMsg = needsUser
+      ? (questions.length === 1
+        ? `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents${joinQ ? ' and found likely connections' : ''}:\n\n${questions[0]}${linkNote}`
+        : `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents.${joinQ || linkQ || confirmQ ? ' Proposed connections are below.' : ''}\n\n${qBlock}`)
+      : `✅ ${heading}: **${name}**\n\n${summary}${colLine}\n\nI've assessed this file from its contents — that's enough to query it. Ask me anything in Stella Insights.`;
+    const autoCtx = needsUser ? null : {
+      what_it_represents: summary,
+      time_period: '',
+      key_metrics: profiledColumns.slice(0, 12).map((c) => (
+        c.description ? `${c.name} = ${c.description}` : c.name
+      )).filter(Boolean),
+      interpretation_notes: '',
+      qa_pairs: [],
+      relationships: [],
+    };
+    return { assistantMsg, needsUser, autoCtx, profiledColumns, summary, dataProfile };
+  };
+
+  const ensureStellaOpeningIntake = async (fileRec) => {
+    if (!stellaFileNeedsOpeningIntake(fileRec)) return;
+    stellaPatchLocal(fileRec.id, { processing: true });
+    try {
+      let records = null;
+      if (fileRec.tableName) {
+        const data = await stellaTableApi({ sql: `SELECT * FROM ${fileRec.tableName} LIMIT 400` });
+        records = Array.isArray(data.rows) ? data.rows : [];
+      }
+      const schemaChanged = !!(fileRec.capturedContext?.schema_changed);
+      const opening = await composeStellaOpeningIntake(fileRec, {
+        records,
+        heading: schemaChanged ? 'Refreshed from inbox' : 'Imported from inbox',
+        requireConfirm: schemaChanged,
+      });
+      const patch = {
+        processing: false,
+        summary: opening.summary,
+        columns: opening.profiledColumns,
+        previewRows: records?.length ? stellaPreviewRowsFromData(records, 3) : (fileRec.previewRows || []),
+        intakeMessages: [{ role: 'assistant', content: opening.assistantMsg }],
+        intakeComplete: !opening.needsUser && !schemaChanged,
+      };
+      if (opening.autoCtx && !schemaChanged) patch.capturedContext = opening.autoCtx;
+      stellaPatchLocal(fileRec.id, patch);
+      if (fileRec.dbId) {
+        const reg = { summary: opening.summary, columns: opening.profiledColumns };
+        if (opening.autoCtx && !schemaChanged) reg.context_qa = opening.autoCtx;
+        try { await stellaUpdateRegistry(fileRec.dbId, reg); } catch { /* keep local opening even if registry lags */ }
+      }
+    } catch (err) {
+      stellaPatchLocal(fileRec.id, {
+        processing: false,
+        intakeMessages: [{
+          role: 'assistant',
+          content: `Imported from the scheduled inbox. I could not finish the usual intake scan (${err.message || 'error'}). Describe what this file represents and whether it joins to other datasets.`,
+        }],
+      });
+    }
+  };
+
   const handleStellaDataUpload = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -9651,6 +10221,7 @@ ${stepInstruction}`;
     setActiveStellaDataId(tempId);
     setStellaSettingsTab('connections');
     setStellaConnectionsTab('files');
+    setStellaFilesInnerTab('list');
 
     try {
       let tableName = null;
@@ -9731,55 +10302,25 @@ ${stepInstruction}`;
       });
       const dbId = dbRow?.id || tempId;
 
-      // Opening intake message — always include real questions (model or fallback).
-      const otherTabular = stellaOtherTabularFiles(tempId);
-      const profiledColumns = isTabular
-        ? stellaApplyRowSampleToColumns(mergedColumns, records.slice(0, 400))
-        : mergedColumns;
-      let joinQ = '';
-      if (isTabular && otherTabular.length) {
-        await stellaHydrateColumnValueProfiles(otherTabular);
-        const othersNow = stellaOtherTabularFiles(tempId);
-        joinQ = stellaJoinQuestion(
-          stellaGuessJoinCandidates({ id: tempId, columns: profiledColumns }, othersNow),
-          othersNow,
-        ) || '';
-      }
-      const modelQuestions = pickStellaIntakeQuestions(
-        { ...onboarding, summary },
-        stellaDefaultIntakeQuestions({ isTabular, columns: profiledColumns }),
-      ).filter((q) => {
-        if (!joinQ) return true;
-        return !/\b(join|related|shared (id|key)|territory, product)\b/i.test(q);
+      const opening = await composeStellaOpeningIntake({
+        id: tempId,
+        dbId,
+        name: file.name,
+        fileType: kind,
+        type: kind,
+        tableName,
+        columns: mergedColumns,
+        summary,
+      }, {
+        records: isTabular ? records : null,
+        summary,
+        columns: mergedColumns,
+        heading: 'Uploaded',
       });
-      const linkQ = stellaLinkedModuleQuestion(userSettingsRef.current || userSettings, 'stella');
-      const questions = [
-        ...(joinQ ? [joinQ] : []),
-        ...(linkQ && !joinQ ? [linkQ] : []),
-        ...modelQuestions.filter((q) => !linkQ || !/\b(linked to|connected module|stay independent)\b/i.test(q)),
-      ];
-      const colLine = profiledColumns.length ? `\n\n**Columns:** ${profiledColumns.map(c => c.name).join(', ')}` : '';
-      const needsUser = questions.length > 0;
-      const qBlock = formatStellaIntakeQuestionList(questions);
-      const linkNote = linkQ && joinQ
-        ? `\n\nThis workspace is also linked to other modules — confirm whether this file should connect there as well.`
-        : '';
-      const assistantMsg = needsUser
-        ? (questions.length === 1
-          ? `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents${joinQ ? ' and found likely connections' : ''}:\n\n${questions[0]}${linkNote}`
-          : `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents.${joinQ || linkQ ? ' Proposed connections are below.' : ''}\n\n${qBlock}`)
-        : `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI've assessed this file from its contents — that's enough to query it. Ask me anything in Stella Insights.`;
-
-      const autoCtx = needsUser ? null : {
-        what_it_represents: summary,
-        time_period: '',
-        key_metrics: profiledColumns.slice(0, 12).map((c) => (
-          c.description ? `${c.name} = ${c.description}` : c.name
-        )).filter(Boolean),
-        interpretation_notes: '',
-        qa_pairs: [],
-        relationships: [],
-      };
+      const profiledColumns = opening.profiledColumns;
+      const assistantMsg = opening.assistantMsg;
+      const needsUser = opening.needsUser;
+      const autoCtx = opening.autoCtx;
       const finalFile = {
         id: dbId, dbId,
         name: file.name, type: kind, fileType: kind,
@@ -9816,6 +10357,18 @@ ${stepInstruction}`;
       event.target.value = '';
     }
   };
+
+  useEffect(() => {
+    const list = stellaDataFilesRef.current || stellaDataFiles || [];
+    for (const f of list) {
+      if (!stellaFileNeedsOpeningIntake(f)) continue;
+      if (stellaOpeningIntakeBusyRef.current.has(f.id)) continue;
+      stellaOpeningIntakeBusyRef.current.add(f.id);
+      void ensureStellaOpeningIntake(f).finally(() => {
+        stellaOpeningIntakeBusyRef.current.delete(f.id);
+      });
+    }
+  }, [stellaDataFiles]);
 
   const handleStellaIntakeSend = async () => {
     const fileId = activeStellaDataId;
@@ -9905,42 +10458,57 @@ ${stepInstruction}`;
     } catch (err) {
       console.error('Stella file graph failed:', err);
     }
+    const scheduleOpen = stellaFilesInnerTab === 'schedule';
     return (
     <div className="space-y-4">
-      {renderStellaFileLinkMap()}
-      <div className="flex flex-col lg:flex-row gap-4">
-      <div className="w-full lg:w-2/5">
-        <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 mb-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-bold text-white">Files</div>
-              <div className="text-xs text-blue-300/60 mt-1">Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions. Files are stored for your account only.</div>
-              {stellaTenantSchema?.name ? (
-                <div className={`text-[11px] mt-1.5 ${stellaTenantSchema.ready ? 'text-blue-300/50' : 'text-amber-300/85'}`}>
-                  {stellaTenantSchema.ready
-                    ? `Company schema ${stellaTenantSchema.name} — pick that schema in the Table Editor, not public.`
-                    : `Schema ${stellaTenantSchema.name} is not on the database yet. ${stellaTenantSchema.error || 'It is created when the first file is loaded or uploaded.'}`}
-                </div>
-              ) : null}
+      <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5">
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex gap-1 bg-slate-900/50 rounded-lg p-1 w-fit flex-wrap">
+              <button
+                type="button"
+                onClick={() => setStellaFilesInnerTab('list')}
+                className={`px-3 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${!scheduleOpen ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+              >
+                Files
+              </button>
+              <button
+                type="button"
+                onClick={() => setStellaFilesInnerTab('schedule')}
+                className={`px-3 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all flex items-center gap-1.5 ${scheduleOpen ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
+              >
+                <Clock className="w-3.5 h-3.5" /> Schedule refresh
+              </button>
             </div>
+            <div className="text-xs text-blue-300/60 mt-2">
+              {scheduleOpen
+                ? 'Drop files in this account’s inbox folder to import on a schedule. Same filename refreshes the existing dataset; a new name starts intake. Use Upload on the Files tab to load a file immediately.'
+                : 'Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions. Files are stored for your account only.'}
+            </div>
+            {!scheduleOpen && stellaTenantSchema?.name ? (
+              <div className={`text-[11px] mt-1.5 ${stellaTenantSchema.ready ? 'text-blue-300/50' : 'text-amber-300/85'}`}>
+                {stellaTenantSchema.ready
+                  ? `Company schema ${stellaTenantSchema.name} — pick that schema in the Table Editor, not public.`
+                  : `Schema ${stellaTenantSchema.name} is not on the database yet. ${stellaTenantSchema.error || 'It is created when the first file is loaded or uploaded.'}`}
+              </div>
+            ) : null}
+          </div>
+          {!scheduleOpen ? (
             <div className="flex flex-col items-stretch sm:items-end gap-2 flex-shrink-0">
               <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2 text-sm">
                 <Upload className="w-4 h-4" /> Upload
               </button>
-              <button
-                type="button"
-                disabled
-                title="Scheduled imports will be available in a future release"
-                className="px-4 py-2 bg-slate-700/40 text-slate-400 font-semibold rounded-lg border border-slate-500/30 cursor-not-allowed flex items-center justify-center gap-2 text-sm"
-              >
-                <Clock className="w-4 h-4" /> Schedule imports
-                <span className="text-[10px] uppercase tracking-wide text-slate-500">Soon</span>
-              </button>
-              <input ref={stellaDataFileInputRef} type="file" accept=".csv,.json,.xlsx,.xls,.pdf,.txt,.md" onChange={handleStellaDataUpload} className="hidden" />
             </div>
-          </div>
+          ) : null}
+          <input ref={stellaDataFileInputRef} type="file" accept=".csv,.json,.xlsx,.xls,.pdf,.txt,.md" onChange={handleStellaDataUpload} className="hidden" />
         </div>
+      </div>
 
+      {scheduleOpen ? renderStellaScheduleCard() : (
+      <>
+      {renderStellaFileLinkMap()}
+      <div className="flex flex-col lg:flex-row gap-4">
+      <div className="w-full lg:w-2/5">
         <div className="space-y-3">
           {stellaDataFiles.length === 0 && (
             <div className="bg-slate-800/20 border border-slate-700/40 rounded-xl p-5 text-sm text-blue-300/60">
@@ -9956,7 +10524,7 @@ ${stepInstruction}`;
                   {f.summary && <div className="text-xs text-blue-200/80 mt-2 line-clamp-3">{f.summary}</div>}
                 </button>
                 <div className="flex flex-col items-end gap-2 flex-shrink-0">
-                  {f.capturedContext ? (
+                  {f.intakeComplete ? (
                     <span className="px-2 py-1 bg-green-500/20 text-green-300 text-xs rounded border border-green-400/30">Context captured</span>
                   ) : (
                     <span className="px-2 py-1 bg-yellow-500/15 text-yellow-200 text-xs rounded border border-yellow-400/25">Intake pending</span>
@@ -9982,7 +10550,7 @@ ${stepInstruction}`;
           {(() => {
             const f = stellaDataFiles.find(x => x.id === activeStellaDataId);
             const intake = f?.intakeMessages || [];
-            const captured = !!(f && (f.capturedContext || f.intakeComplete) && !f.processing);
+            const captured = !!(f && f.intakeComplete && !f.processing);
             const minimized = stellaIntakeMinimized && captured;
             return (
               <>
@@ -10087,6 +10655,8 @@ ${stepInstruction}`;
         </div>
       </div>
       </div>
+      </>
+      )}
     </div>
     );
   };
@@ -10118,6 +10688,147 @@ ${stepInstruction}`;
     </div>
   );
 
+  const patchStellaInboxSchedule = (patch) => {
+    const connections = mergeStellaConnections(userSettingsRef.current?.stellaConnections);
+    const current = stellaInboxSchedule(connections);
+    const nextSchedule = { ...current, ...patch };
+    const schedules = connections.schedules.map((s) => (
+      (s.id === nextSchedule.id || s.source === 'inbox') ? nextSchedule : s
+    ));
+    const next = { ...connections, schedules };
+    setUserSettings((s) => ({ ...s, stellaConnections: next }));
+    userSettingsRef.current = { ...userSettingsRef.current, stellaConnections: next };
+    return next;
+  };
+
+  const saveStellaInboxSchedule = async (patch) => {
+    const next = patchStellaInboxSchedule(patch);
+    await saveUserSettings({ stellaConnections: next });
+  };
+
+  const runStellaInboxNow = async () => {
+    try {
+      setStellaSyncBusy(true);
+      const res = await fetch(STELLA_SYNC_API_PATH, {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action: 'run' }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload?.error?.message || `Sync failed (${res.status})`);
+      }
+      if (payload.schedule) {
+        const next = patchStellaInboxSchedule(payload.schedule);
+        await saveUserSettings({ stellaConnections: next });
+      }
+      await stellaReloadRegistry();
+      const pendingIntake = (Array.isArray(payload.results) ? payload.results : []).filter((r) => (
+        r && (r.action === 'created' || r.action === 'replaced_schema')
+      ));
+      if (pendingIntake.length) {
+        openStellaIntakeAssistant(pendingIntake[0]);
+      }
+      const n = Array.isArray(payload.results) ? payload.results.filter((r) => r.action !== 'error').length : 0;
+      const status = payload.schedule?.lastStatus || (payload.skipped ? 'Not run' : 'Done');
+      const mailNote = payload.emailed
+        ? ' An email was sent with a link to the intake assistant.'
+        : payload.emailError
+          ? ` Email was not sent (${payload.emailError}).`
+          : pendingIntake.length
+            ? ' Open the file on the left to answer intake.'
+            : '';
+      setStellaMessages((prev) => [...prev, {
+        role: 'system',
+        content: n
+          ? `Inbox sync finished: ${status}.${mailNote}`
+          : `Inbox sync: ${status}.${mailNote}`,
+      }]);
+    } catch (err) {
+      setStellaMessages((prev) => [...prev, {
+        role: 'system',
+        content: `⚠️ Inbox sync failed: ${err.message || err}`,
+      }]);
+    } finally {
+      setStellaSyncBusy(false);
+    }
+  };
+
+  const renderStellaScheduleCard = () => {
+    const schedule = stellaInboxSchedule(userSettings.stellaConnections);
+    const inboxPath = `intelligence/${stellaInboxStoragePrefix(currentUser)}`;
+    const lastRun = schedule.lastRunAt
+      ? new Date(schedule.lastRunAt).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+      : 'Never';
+    return (
+      <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-5 space-y-4">
+        <div>
+          <div className="text-sm font-bold text-white flex items-center gap-2">
+            <Clock className="w-4 h-4 text-cyan-400" /> Inbox schedule
+          </div>
+          <p className="text-xs text-blue-300/60 mt-2">
+            Tick <span className="text-blue-100 font-semibold">Enable schedule</span> to import files dropped in this account&apos;s inbox folder (Supabase Storage / S3). Same filename refreshes the existing dataset; a new name starts intake.
+          </p>
+        </div>
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+          <code className="flex-1 text-[11px] text-cyan-200/90 bg-slate-900/50 border border-blue-400/20 rounded-lg px-3 py-2 break-all">{inboxPath}</code>
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(inboxPath);
+                setStellaInboxCopied(true);
+                setTimeout(() => setStellaInboxCopied(false), 2000);
+              } catch { /* ignore */ }
+            }}
+            className="px-3 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-100 border border-cyan-400/30 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 flex-shrink-0"
+          >
+            <Copy className="w-3.5 h-3.5" /> {stellaInboxCopied ? 'Copied' : 'Copy path'}
+          </button>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <label className="block">
+            <div className="text-xs font-semibold text-blue-200/80 mb-1.5">Frequency</div>
+            <select
+              value={schedule.frequency}
+              onChange={(e) => saveStellaInboxSchedule({ frequency: e.target.value })}
+              className="w-full bg-slate-900/60 border border-blue-400/20 rounded-lg px-3 py-2 text-sm text-white"
+            >
+              {STELLA_SCHEDULE_FREQUENCIES.map((id) => (
+                <option key={id} value={id}>{id.charAt(0).toUpperCase() + id.slice(1)}</option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-3 bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2 mt-0 sm:mt-6">
+            <input
+              type="checkbox"
+              checked={schedule.enabled}
+              onChange={(e) => saveStellaInboxSchedule({ enabled: e.target.checked })}
+              className="w-4 h-4 accent-cyan-500"
+            />
+            <span className="text-sm text-white font-semibold">Enable schedule</span>
+          </label>
+        </div>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-2 border-t border-blue-400/15">
+          <div className="text-xs text-blue-300/70 space-y-1">
+            <div>Last run: <span className="text-blue-100">{lastRun}</span></div>
+            {schedule.lastStatus ? <div>Status: <span className="text-blue-100">{schedule.lastStatus}</span></div> : null}
+            {schedule.lastFile ? <div>Last file: <span className="text-blue-100">{schedule.lastFile}</span></div> : null}
+            {!schedule.enabled ? <div className="text-amber-200/80">Schedule is off — cron will skip this account until you enable it.</div> : null}
+          </div>
+          <button
+            type="button"
+            disabled={stellaSyncBusy}
+            onClick={runStellaInboxNow}
+            className="px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 disabled:opacity-50 text-cyan-100 font-semibold rounded-lg border border-cyan-400/30 flex items-center justify-center gap-2 text-sm"
+          >
+            <Play className="w-4 h-4" /> {stellaSyncBusy ? 'Working…' : 'Run now'}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   const renderStellaConnectionsPanel = () => {
     const connector = STELLA_CONNECTORS.find(c => c.id === stellaConnectionsTab);
     return (
@@ -10125,7 +10836,7 @@ ${stepInstruction}`;
         <div className="flex gap-1 bg-slate-800/50 rounded-lg p-1 w-fit flex-wrap">
           <button
             type="button"
-            onClick={() => setStellaConnectionsTab('files')}
+            onClick={() => { setStellaConnectionsTab('files'); setStellaFilesInnerTab('list'); }}
             className={`px-3 py-1.5 rounded-md text-xs sm:text-sm font-semibold transition-all ${stellaConnectionsTab === 'files' ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}
           >
             Files
@@ -11454,6 +12165,7 @@ ${stepInstruction}`;
           </div>
         </div>
       </header>
+      <input ref={fileInputRef} type="file" accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md" onChange={handleFileUpload} className="hidden" />
 
       {/* Landing Page */}
       {showLanding ? (
@@ -11918,7 +12630,6 @@ ${stepInstruction}`;
                   </div>
                 </form>
               </div>
-              <input ref={fileInputRef} type="file" accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md" onChange={handleFileUpload} className="hidden" />
             </div>
             {renderChatToolsPanel('incentives')}
             </div>

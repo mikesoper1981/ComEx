@@ -80,3 +80,85 @@ export function stellaOrgIdCandidates(user) {
     id ? `user:${id}` : '',
   ].filter(Boolean))];
 }
+
+export const STELLA_SCHEDULE_FREQUENCIES = ['hourly', 'daily', 'weekly'];
+
+export function defaultStellaInboxSchedule() {
+  return {
+    id: 'inbox',
+    source: 'inbox',
+    enabled: false,
+    frequency: 'daily',
+    lastRunAt: '',
+    lastStatus: '',
+    lastFile: '',
+    lastInboxAt: '',
+  };
+}
+
+function normalizeScheduleFrequency(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'hourly' || s === 'weekly' || s === 'daily') return s;
+  return 'daily';
+}
+
+export function mergeStellaSchedule(raw, fallbackId = 'inbox') {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const base = defaultStellaInboxSchedule();
+  return {
+    ...base,
+    id: String(src.id || fallbackId || base.id),
+    source: String(src.source || base.source),
+    enabled: src.enabled === true,
+    frequency: normalizeScheduleFrequency(src.frequency),
+    lastRunAt: String(src.lastRunAt || ''),
+    lastStatus: String(src.lastStatus || ''),
+    lastFile: String(src.lastFile || ''),
+    lastInboxAt: String(src.lastInboxAt || ''),
+  };
+}
+
+export function mergeStellaSchedules(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const merged = list.map((row, i) => mergeStellaSchedule(row, row?.id || `sched_${i + 1}`));
+  if (!merged.some((s) => s.id === 'inbox' || s.source === 'inbox')) {
+    merged.unshift(defaultStellaInboxSchedule());
+  }
+  return merged;
+}
+
+export function mergeStellaConnections(raw = {}) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    ...src,
+    schedules: mergeStellaSchedules(src.schedules),
+  };
+}
+
+export function stellaInboxSchedule(connections) {
+  const list = mergeStellaConnections(connections).schedules;
+  return list.find((s) => s.id === 'inbox' || s.source === 'inbox') || defaultStellaInboxSchedule();
+}
+
+/** Drop folder for scheduled CSV/Excel/JSON: companies/<slug>/users/<display>/stella/inbox/ */
+export function stellaInboxStoragePrefix(userOrName) {
+  const raw = userOrName && typeof userOrName === 'object'
+    ? (userOrName.name || userOrName.id)
+    : userOrName;
+  const folder = String(raw || '')
+    .replace(/[\\/:*?"<>|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'user';
+  const company = companySlug(
+    userOrName && typeof userOrName === 'object'
+      ? resolveUserCompany(userOrName)
+      : '',
+  );
+  return `companies/${company}/users/${folder}/stella/inbox/`;
+}
+
+export function stellaProcessedStoragePrefix(userOrName, dayIso) {
+  const day = String(dayIso || new Date().toISOString()).slice(0, 10);
+  return stellaInboxStoragePrefix(userOrName).replace(/inbox\/$/, `processed/${day}/`);
+}
