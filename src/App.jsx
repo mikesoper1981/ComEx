@@ -10916,52 +10916,39 @@ ${stepInstruction}`;
     if (!show) return null;
     const n = suggestedPrompts.length;
     return (
-      <div className="mb-2">
-        {!suggestionsOpen ? (
-          <button
-            type="button"
-            onClick={() => setSuggestionsOpen(true)}
-            className="inline-flex items-center gap-1.5 px-2 py-1.5 bg-blue-500/15 hover:bg-blue-500/25 border border-blue-400/30 rounded-lg text-xs font-semibold text-blue-100"
-            title={`${n} suggested prompt${n === 1 ? '' : 's'}`}
-          >
-            <span className="relative inline-flex">
+      <div className="mb-2 w-full min-w-0">
+        <button
+          type="button"
+          onClick={() => setSuggestionsOpen((open) => !open)}
+          className="w-full flex items-center justify-between gap-2 px-3 py-1.5 bg-blue-500/15 hover:bg-blue-500/25 border border-blue-400/30 rounded-lg text-xs font-semibold text-blue-100"
+          title={suggestionsOpen ? 'Hide suggestions' : `${n} suggested prompt${n === 1 ? '' : 's'}`}
+          aria-expanded={suggestionsOpen}
+        >
+          <span className="flex items-center gap-2 min-w-0">
+            <span className="relative inline-flex shrink-0">
               <Sparkles className="w-4 h-4 text-cyan-300" />
               <span className="absolute -top-1.5 -right-2 min-w-[1.1rem] h-4 px-0.5 rounded-full bg-cyan-400 text-slate-900 text-[10px] font-bold leading-4 text-center">
                 {n}
               </span>
             </span>
-            <span className="pl-1">Suggested</span>
-            <ChevronDown className="w-3.5 h-3.5 text-blue-300/80" />
-          </button>
-        ) : (
-          <div>
-            <div className="flex items-center justify-between gap-2 mb-1.5">
-              <div className="text-xs text-blue-300/70 flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
-                Suggested next steps
-                <span className="text-[10px] font-bold text-cyan-300/90 bg-cyan-500/15 border border-cyan-400/25 rounded-full px-1.5 leading-4">{n}</span>
-              </div>
+            <span className="truncate">{suggestionsOpen ? 'Suggested next steps' : 'Suggestions'}</span>
+          </span>
+          {suggestionsOpen
+            ? <Minimize2 className="w-4 h-4 text-blue-300/80 shrink-0" />
+            : <ChevronDown className="w-4 h-4 text-blue-300/80 shrink-0" />}
+        </button>
+        {suggestionsOpen && (
+          <div className="flex flex-wrap gap-2 max-h-24 overflow-y-auto custom-scrollbar mt-1.5">
+            {suggestedPrompts.map((prompt, idx) => (
               <button
+                key={idx}
                 type="button"
-                onClick={() => setSuggestionsOpen(false)}
-                className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
-                title="Hide suggestions"
+                onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); handleSubmit(e, prompt); }}
+                className="px-3 py-1.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-400/30 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 hover:text-blue-100 transition-all text-left"
               >
-                <ChevronDown className="w-4 h-4 rotate-180" />
+                {prompt}
               </button>
-            </div>
-            <div className="flex flex-wrap gap-2 max-h-24 overflow-y-auto custom-scrollbar">
-              {suggestedPrompts.map((prompt, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); handleSubmit(e, prompt); }}
-                  className="px-3 py-1.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-400/30 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 hover:text-blue-100 transition-all text-left"
-                >
-                  {prompt}
-                </button>
-              ))}
-            </div>
+            ))}
           </div>
         )}
       </div>
