@@ -22,6 +22,8 @@ NEVER save conversation-specific or this-session detail, including:
 
 When in doubt return {"facts":[],"conflicts":[]}. Prefer names and definitions over numbers. Max 2 new facts.
 
+Never emit conflicts because an analysis mentioned different product, territory, or competitor names than memory. That is file/session data, not the user replacing their identity. Conflicts ONLY when the USER's own words replace a standing identity (they no longer work on product A; the product is now B — mutually exclusive, not an extra name).
+
 ENRICHMENT vs REPLACEMENT (mandatory):
 - Local / UK / country names, aliases, "X is the name for Y", "map X to Y", SKU/code mappings, and "also known as" ENRICH an existing product/brand list. Put them in facts. NEVER put them in conflicts against a remembered product list — they do not replace those products.
 - File-intake interpretive context (name maps, definitions, how to read a column, joins) is already stored on the file. Do not emit those as facts or conflicts.
@@ -337,6 +339,11 @@ function existingCoveredByProposed(existing, proposed) {
   return (inter / ta.size) >= 0.7 || (inter / tb.size) >= 0.7;
 }
 
+export function userAssertsIdentityReplacement(text) {
+  const t = String(text || '');
+  return /\b(no longer|not anymore|instead of|replaced|replace with|now (called|named|only)|we (don'?t|do not) (work on|sell|cover)|switched (from|to)|products? are now\b|only (product|brand)s? (is|are)\b)\b/i.test(t);
+}
+
 /** True only for mutually exclusive identity changes — not aliases, extra names, or list extensions. */
 export function factsAreExclusiveConflict(existing, proposed) {
   const a = String(existing || '').trim();
@@ -345,7 +352,9 @@ export function factsAreExclusiveConflict(existing, proposed) {
   if (factsAreSimilar(a, b)) return false;
   if (isMemoryEnrichmentFact(a) || isMemoryEnrichmentFact(b)) return false;
   if (existingCoveredByProposed(a, b)) return false;
-  return factsShareMemoryTopic(a, b);
+  if (!factsShareMemoryTopic(a, b)) return false;
+  if (userAssertsIdentityReplacement(a) || userAssertsIdentityReplacement(b)) return true;
+  return false;
 }
 
 export function memorySignature(items) {
@@ -445,10 +454,13 @@ export function filterMemoryFacts(facts, opts = {}) {
 
 export function shouldHarvestChatMemory(_assistantText, userText) {
   const user = String(userText || '').trim();
-  if (/\b(remember (this|that|it)|don'?t forget|always use|always remember)\b/i.test(user)) return user.length >= 8;
+  if (isExplicitRememberRequest(user)) return user.length >= 8;
   if (user.length < 12) return false;
+  if (/\?/.test(user)) return false;
   if (/^(y|yes|yeah|yep|sure|ok|okay|start|go|continue|proceed|no|cancel|thanks|thank you|next|please)[\s.!]*$/i.test(user)) return false;
   if (/^User (feedback|instruction):/i.test(user) && user.length < 40) return false;
+  if (/^(do|does|did|can|could|would|will|what|who|where|when|why|how|is|are|have|has|was|were|show|tell|explain|analyse|analyze|chart|plot)\b/i.test(user)) return false;
+  if (/\b(awareness of|do you (know|see|have)|can you (see|query|find|show)|2024 sales|sales (for|in) )\b/i.test(user)) return false;
   return true;
 }
 

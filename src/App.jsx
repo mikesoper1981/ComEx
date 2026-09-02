@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useMemo, lazy, Suspense, Component } from 'react';
 import { createPortal } from 'react-dom';
-import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles } from 'lucide-react';
+import { Send, Upload, FileText, Settings, MessageSquare, CheckCircle, AlertTriangle, TrendingUp, Users, Target, Award, X, Plus, Trash2, BarChart3, DollarSign, Calendar, ChevronDown, ChevronRight, Save, Map as MapIcon, MapPin, Layers, UserCog, History, LogOut, Link2, Maximize2, Minimize2, Undo2, Sparkles, Clock } from 'lucide-react';
 import ExcelExportButton from './ExcelExportButton';
 import { supabase } from './supabase';
 import {
@@ -65,6 +65,7 @@ import {
   isExplicitRememberRequest,
   isFileOrIntakeMemoryFact,
   stripFileIntakeFromMemory,
+  userAssertsIdentityReplacement,
 } from './chatMemory';
 import { extractPptxThemeFromFile, themeToSettingsMeta, getPptxGeneratorThemeFromUserSettings, loadFullPptxStyleForGeneration, applyPptxLayout, renderSlideFromTheme } from './pptxTheme';
 import { DEFAULT_PPTX_CONTEXT, getPptxContext, mergePptxContext } from './defaultPptxContext';
@@ -1395,6 +1396,15 @@ function looksLikeMemoryCorrection(text, { force = false } = {}) {
   return true;
 }
 
+function userMessageJustifiesMemoryConflict(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (isExplicitRememberRequest(t)) return true;
+  if (/\?/.test(t)) return false;
+  if (looksLikeInfoRequest(t)) return false;
+  return looksLikeMemoryCorrection(t) || userAssertsIdentityReplacement(t);
+}
+
 function isClosedChoicePrompt(text) {
   const source = String(text || '');
   const tail = source.length > 1400 ? source.slice(-1400) : source;
@@ -1492,6 +1502,12 @@ function stellaDefaultIntakeQuestions({ isTabular, columns = [] } = {}) {
   ];
 }
 
+function stellaIntakeQuestionLooksIrrelevant(q) {
+  const t = String(q || '').toLowerCase();
+  if (!t) return true;
+  return /\b(kpi|key metrics?|performance|business goals?|incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|what filters|caveats?)\b/i.test(t);
+}
+
 function pickStellaIntakeQuestions(onboarding, fallbacks) {
   const raw = onboarding && typeof onboarding === 'object' ? onboarding : {};
   const fromModel = stellaNormalizeIntakeQuestions(
@@ -1505,10 +1521,19 @@ function pickStellaIntakeQuestions(onboarding, fallbacks) {
   return fallbacks;
 }
 
-function stellaIntakeQuestionLooksIrrelevant(q) {
-  const t = String(q || '').toLowerCase();
-  if (!t) return true;
-  return /\b(kpi|key metrics?|performance|business goals?|incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|what filters|caveats?)\b/i.test(t);
+function stellaEnsureQuestionMark(text) {
+  const t = String(text || '').trim();
+  if (!t) return t;
+  if (/[?？]\s*$/.test(t)) return t;
+  return `${t.replace(/[.!]\s*$/, '')}?`;
+}
+
+function formatStellaIntakeQuestionList(questions) {
+  const list = (questions || []).map((q) => String(q || '').trim()).filter(Boolean);
+  if (!list.length) return '';
+  if (list.length === 1) return list[0];
+  const body = list.map((q, i) => `${i + 1}. ${stellaEnsureQuestionMark(q)}`).join('\n\n');
+  return `${body}\n\nReply as 1= … 2= … or answer them together.`;
 }
 
 function stellaNormJoinToken(s) {
@@ -1668,7 +1693,8 @@ function stellaColumnJoinMeta(col) {
   };
 }
 
-const STELLA_MEASURE_JOIN_TOKENS = /^(value|amount|revenue|rev|sales|qty|quantity|count|actual|target|attainment|percent|pct|score|rate|volume|units|calls|cost|price|margin|total|sum)$/;
+const STELLA_MEASURE_JOIN_TOKENS = /^(value|amount|revenue|rev|sales|qty|quantity|count|actual|target|attainment|percent|pct|score|rate|volume|unit|units|uom|pack|packsize|calls|cost|price|margin|total|sum)$/;
+const STELLA_MEASURE_NAME_HINT = /(unit|units|uom|qty|quantity|volume|revenue|amount|sales|packsize|attainment|percent|margin)(s|sold|pack|value|count)?$/;
 const STELLA_DATE_JOIN_TOKENS = /^(date|dt|day|month|quarter|qtr|year|yr|week|wk|period|time)$/;
 const STELLA_JOIN_FAMILIES = [
   { id: 'territory', tokens: ['territory', 'territories', 'terr', 'geo', 'region', 'area', 'brick', 'postcode', 'zipcode', 'zip', 'alignment'] },
@@ -1708,9 +1734,23 @@ function stellaFindJoinColumn(file, hint) {
 
 function stellaLooksLikeMeasureCol(col) {
   const blobs = [col?.name, col?.original, col?.description].map(stellaNormJoinToken).filter(Boolean);
-  if (blobs.some((b) => b === 'id' || /(id|code|key|uid)$/.test(b))) return false;
+  if (blobs.some((b) => b === 'id' || /(uuid|guid|id|code|key|uid)$/.test(b))) {
+    if (!blobs.some((b) => /^(unit|units|qty|quantity|volume|amount|sales|revenue)/.test(b))) return false;
+  }
   if (col?.kind === 'measure') return true;
-  return blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b));
+  if (blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b))) return true;
+  return blobs.some((b) => STELLA_MEASURE_NAME_HINT.test(b));
+}
+
+/** True for columns you would actually JOIN on in a warehouse (entity keys), not measures or same-type coincidences. */
+function stellaLooksLikeJoinKeyCol(col) {
+  if (!col || stellaLooksLikeMeasureCol(col)) return false;
+  const fam = stellaJoinFamily(col);
+  if (fam === 'territory' || fam === 'product' || fam === 'customer' || fam === 'rep' || fam === 'date') return true;
+  const n = stellaNormJoinToken(col?.name || col?.original);
+  if (!n) return false;
+  if (n === 'id' || /(uuid|guid|key|code|id)$/.test(n)) return true;
+  return col?.kind === 'id';
 }
 
 function stellaJoinKindPhrase(col, asMeasure) {
@@ -1831,13 +1871,20 @@ function stellaScoreJoinColumns(a, b) {
   }
 
   if (aMeas && bMeas && fa !== 'date' && fb !== 'date' && a?.kind !== 'date' && b?.kind !== 'date') {
-    warnings.push('Both columns look like measures (revenue, qty, amounts), not keys to join on.');
+    warnings.push('Both columns look like measures (revenue, qty, units, amounts), not keys to join on.');
     score = Math.min(score, 12);
     if (!reason) reason = 'both look like measures, not join keys';
-  } else if (aMeas !== bMeas && !strongOverlap) {
-    warnings.push(`One column looks like ${stellaJoinKindPhrase(a, aMeas)} and the other like ${stellaJoinKindPhrase(b, bMeas)}.`);
-    score = Math.min(score, 20);
+  } else if (aMeas || bMeas) {
+    warnings.push(`One column looks like ${stellaJoinKindPhrase(a, aMeas)} and the other like ${stellaJoinKindPhrase(b, bMeas)}. Measures are not join keys even when the numbers overlap.`);
+    score = Math.min(score, 14);
     if (!reason) reason = 'measure vs key';
+  }
+  const aKey = stellaLooksLikeJoinKeyCol(a);
+  const bKey = stellaLooksLikeJoinKeyCol(b);
+  if (!aKey || !bKey) {
+    warnings.push('These are not entity keys you would join in a database (territory, HCP/account, product, rep, or ID). Same type or matching numbers is not enough.');
+    score = Math.min(score, 16);
+    if (!reason) reason = 'not a database join key';
   }
   if (fa && fb && fa !== fb && !strongOverlap) {
     warnings.push(`These look like different business keys (${fa} vs ${fb}).`);
@@ -1957,7 +2004,8 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
     for (const a of thisCols) {
       for (const b of otherCols) {
         const scored = stellaScoreJoinColumns(a, b);
-        if (scored.verdict === 'block' || scored.score < 55) continue;
+        if (scored.verdict !== 'ok') continue;
+        if (!stellaLooksLikeJoinKeyCol(a) || !stellaLooksLikeJoinKeyCol(b)) continue;
         ranked.push({
           related_file: other.name,
           related_table: other.tableName,
@@ -5972,7 +6020,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
         }
       }
       const conflict = conflicts.find((c) => c.proposed && c.existingText);
-      if (conflict && !pendingMemoryConfirmRef.current) {
+      if (conflict && userMessageJustifiesMemoryConflict(userText) && !pendingMemoryConfirmRef.current) {
         const existing = String(conflict.existingText || '').trim();
         const proposed = String(conflict.proposed || '').trim();
         const question = `Should I update a remembered fact?\n\n**Currently:** ${existing}\n**Update to:** ${proposed}`;
@@ -9104,7 +9152,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Use the SAME checks as a manual join: sample values must overlap, types/kinds should match, and never join a measure/metric to a key or two unrelated keys (territory vs product, names vs IDs). Do not propose a join from name/type alone if the sample values look like different things. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true. Use the SAME checks as a manual join: only propose entity keys you would join in a real database (territory, HCP/account, product, rep, IDs, dates). Sample values must overlap. Never join measures (units, qty, revenue, scores) even if the numbers look similar. Never join from name or type alone. List matching keys in plain English — never pick only the "best" ones, never ask for SQL. Store only those keys in context_qa.relationships unless the user says the files are unrelated (then use an empty array) or they reject a specific key.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -9712,14 +9760,14 @@ ${stepInstruction}`;
       ];
       const colLine = profiledColumns.length ? `\n\n**Columns:** ${profiledColumns.map(c => c.name).join(', ')}` : '';
       const needsUser = questions.length > 0;
-      const qBlock = questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+      const qBlock = formatStellaIntakeQuestionList(questions);
       const linkNote = linkQ && joinQ
         ? `\n\nThis workspace is also linked to other modules — confirm whether this file should connect there as well.`
         : '';
       const assistantMsg = needsUser
-        ? (questions.length === 1 && joinQ
-          ? `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed the file from its contents and found likely connections:\n\n${joinQ}${linkNote}`
-          : `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents.${joinQ || linkQ ? ' Proposed connections are below.' : ''}\n\n${qBlock}\n\nYou can answer together or one at a time.`)
+        ? (questions.length === 1
+          ? `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents${joinQ ? ' and found likely connections' : ''}:\n\n${questions[0]}${linkNote}`
+          : `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents.${joinQ || linkQ ? ' Proposed connections are below.' : ''}\n\n${qBlock}`)
         : `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI've assessed this file from its contents — that's enough to query it. Ask me anything in Stella Insights.`;
 
       const autoCtx = needsUser ? null : {
@@ -9875,10 +9923,21 @@ ${stepInstruction}`;
                 </div>
               ) : null}
             </div>
-            <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
-              <Upload className="w-4 h-4" /> Upload
-            </button>
-            <input ref={stellaDataFileInputRef} type="file" accept=".csv,.json,.xlsx,.xls,.pdf,.txt,.md" onChange={handleStellaDataUpload} className="hidden" />
+            <div className="flex flex-col items-stretch sm:items-end gap-2 flex-shrink-0">
+              <button onClick={() => stellaDataFileInputRef.current?.click()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all flex items-center justify-center gap-2 text-sm">
+                <Upload className="w-4 h-4" /> Upload
+              </button>
+              <button
+                type="button"
+                disabled
+                title="Scheduled imports will be available in a future release"
+                className="px-4 py-2 bg-slate-700/40 text-slate-400 font-semibold rounded-lg border border-slate-500/30 cursor-not-allowed flex items-center justify-center gap-2 text-sm"
+              >
+                <Clock className="w-4 h-4" /> Schedule imports
+                <span className="text-[10px] uppercase tracking-wide text-slate-500">Soon</span>
+              </button>
+              <input ref={stellaDataFileInputRef} type="file" accept=".csv,.json,.xlsx,.xls,.pdf,.txt,.md" onChange={handleStellaDataUpload} className="hidden" />
+            </div>
           </div>
         </div>
 
@@ -9969,7 +10028,7 @@ ${stepInstruction}`;
                 </div>
 
                 <div className="flex gap-2">
-                  <textarea value={stellaIntakeInput} onChange={(e) => setStellaIntakeInput(e.target.value)} placeholder="Answer the intake questions…" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} />
+                  <textarea value={stellaIntakeInput} onChange={(e) => setStellaIntakeInput(e.target.value)} placeholder="Answer the intake questions… (1= … 2= … if several are listed)" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} />
                   <button onClick={handleStellaIntakeSend} disabled={!stellaIntakeInput.trim()} className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white font-semibold rounded-lg transition-all flex items-center gap-2 text-sm">
                     <Send className="w-4 h-4" /> Send
                   </button>
