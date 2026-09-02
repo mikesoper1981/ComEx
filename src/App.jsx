@@ -741,7 +741,9 @@ function queueUserChatsUpload(user, docOrBuilder) {
   const buildChats = () => (typeof docOrBuilder === 'function' ? docOrBuilder() : docOrBuilder);
   queueUserJsonUpload(user, 'chats-index.json', () => {
     const doc = buildChats() || {};
-    const index = buildUserChatsIndexDocument(doc.userId, doc);
+    const cached = readCachedChatIndex(user?.id);
+    const chats = unionChats(doc.chats, cached.chats);
+    const index = buildUserChatsIndexDocument(doc.userId, { ...doc, chats });
     writeCachedChatIndex(user?.id, index);
     return index;
   });
@@ -889,6 +891,53 @@ function deriveChatTitle(messages) {
 
 function chatHasUserContent(messages) {
   return (Array.isArray(messages) ? messages : []).some((m) => m.role === 'user' && String(m.content || '').trim());
+}
+
+function chatMessageCount(c) {
+  return Array.isArray(c?.messages) ? c.messages.length : 0;
+}
+
+function preferRicherChat(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  const aMsgs = chatMessageCount(a);
+  const bMsgs = chatMessageCount(b);
+  const richer = aMsgs >= bMsgs ? a : b;
+  const other = richer === a ? b : a;
+  const aT = String(a.updatedAt || '');
+  const bT = String(b.updatedAt || '');
+  const titleA = String(a.title || '').trim();
+  const titleB = String(b.title || '').trim();
+  const genericTitle = (t) => !t || t === 'New chat' || t === 'Chat';
+  const title = !genericTitle(titleA) && (genericTitle(titleB) || aMsgs >= bMsgs)
+    ? titleA
+    : (!genericTitle(titleB) ? titleB : (titleA || titleB));
+  return {
+    ...other,
+    ...richer,
+    title: title || richer.title || other.title,
+    createdAt: richer.createdAt || other.createdAt,
+    updatedAt: aT >= bT ? (a.updatedAt || b.updatedAt) : (b.updatedAt || a.updatedAt),
+    hasUserContent: a.hasUserContent === true || b.hasUserContent === true
+      || chatHasUserContent(a.messages)
+      || chatHasUserContent(b.messages),
+    messages: aMsgs >= bMsgs ? (a.messages || []) : (b.messages || []),
+    currentWorkflow: richer.currentWorkflow || other.currentWorkflow || null,
+    module: richer.module || other.module,
+  };
+}
+
+function unionChats(...lists) {
+  const byId = new Map();
+  for (const list of lists) {
+    for (const c of list || []) {
+      if (!c?.id) continue;
+      byId.set(c.id, preferRicherChat(c, byId.get(c.id)));
+    }
+  }
+  return [...byId.values()]
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+    .slice(0, MAX_STORED_CHATS);
 }
 
 function sanitizeMessageForStorage(m, { stampNow = false } = {}) {
@@ -1317,11 +1366,27 @@ function isClosedChoicePrompt(text) {
   return /\b(reply with|choose|select|pick one|which of the following|option [123]|press [123]|tap [123])\b/i.test(tail);
 }
 
+function lastConversationalMessage(messages) {
+  const list = (Array.isArray(messages) ? messages : []).filter((m) => (
+    m && (m.role === 'user' || m.role === 'assistant' || m.role === 'orchestrator')
+    && String(m.content || '').trim()
+  ));
+  return list[list.length - 1] || null;
+}
+
 function isAskingForNumberedReplies(text) {
   if (!hasNumberedClarifyingQuestions(text)) return false;
   const source = String(text || '');
-  const tail = source.length > 1400 ? source.slice(-1400) : source;
-  return /\b(reply|respond|answer with|please (answer|reply)|i (still )?need|clarifying|1\s*=)\b/i.test(tail);
+  const tail = source.length > 1600 ? source.slice(-1600) : source;
+  if (/\b1\s*=|\breply as\s*1\b|\banswers? by number\b/i.test(tail)) return true;
+  const numberedQs = [...tail.matchAll(/(?:^|\n)\s*(?:\*\*)?([1-9])(?:\*\*)?\s*[.:)\]]\s+.{8,240}\?/gm)];
+  return numberedQs.length >= 2;
+}
+
+function unansweredNumberedClarify(messages) {
+  const last = lastConversationalMessage(messages);
+  if (!last || last.role === 'user') return false;
+  return isAskingForNumberedReplies(last.content);
 }
 
 function looksLikeInfoRequest(text) {
@@ -4817,30 +4882,20 @@ export default function CommercialExcellenceApp() {
 
   const applyChatIndex = (indexChats, remoteActive) => {
     skipChatPersistRef.current = true;
-    let chats = Array.isArray(indexChats) ? indexChats : [];
+    const cached = readCachedChatIndex(currentUser.id);
+    const chats = unionChats(indexChats, cached.chats);
     if (!chats.length) {
-      const cached = readCachedChatIndex(currentUser.id);
-      if (cached.chats.length) {
-        chats = cached.chats;
-        remoteActive = remoteActive || cached.activeChatId;
-      }
-    }
-    if (!chats.length && (chatSessionsRef.current || []).length) {
       setChatIndexLoading(false);
       setTimeout(() => { skipChatPersistRef.current = false; }, 0);
       return;
     }
+    remoteActive = remoteActive || cached.activeChatId;
     chatSessionsRef.current = chats;
     setChatSessions(chats);
     writeCachedChatIndex(currentUser.id, { chats, activeChatId: remoteActive });
-    if (chats.length) {
-      const pick = chats.find((c) => c.id === remoteActive) || chats[0];
-      setActiveChatId(pick.id);
-      activeChatIdRef.current = pick.id;
-    } else {
-      setActiveChatId(null);
-      activeChatIdRef.current = null;
-    }
+    const pick = chats.find((c) => c.id === remoteActive) || chats.find((c) => c.id === activeChatIdRef.current) || chats[0];
+    setActiveChatId(pick.id);
+    activeChatIdRef.current = pick.id;
     setChatIndexLoading(false);
     setTimeout(() => { skipChatPersistRef.current = false; }, 0);
   };
@@ -4856,27 +4911,19 @@ export default function CommercialExcellenceApp() {
         ({ chats: remoteChats, activeChatId: remoteActive } = extractChatsFromDocument(chatsParsed));
       }
       const liveId = activeChatIdRef.current;
-      const live = (chatSessionsRef.current || []).find((c) => (
-        c.id === liveId && Array.isArray(c.messages) && chatHasUserContent(c.messages)
-      ));
-      let merged = remoteChats.map((c) => {
-        if (live && c.id === live.id && (live.messages?.length || 0) >= (c.messages?.length || 0)) {
-          return { ...c, ...live };
-        }
-        return c;
-      });
-      if (live && !merged.some((c) => c.id === live.id)) merged.unshift(live);
-      if (!merged.length) {
-        const existing = (chatSessionsRef.current || []).filter((c) => c?.id);
-        const cached = readCachedChatIndex(currentUser.id).chats;
-        merged = existing.length ? existing : cached;
-      }
+      const cached = readCachedChatIndex(currentUser.id);
+      const merged = unionChats(
+        remoteChats,
+        chatSessionsRef.current,
+        cached.chats,
+        chatsBodiesRef.current,
+      );
       chatsBodiesRef.current = merged;
       chatsFullLoadedRef.current = true;
       skipChatPersistRef.current = true;
       chatSessionsRef.current = merged;
       setChatSessions(merged);
-      writeCachedChatIndex(currentUser.id, { chats: merged, activeChatId: remoteActive || liveId });
+      writeCachedChatIndex(currentUser.id, { chats: merged, activeChatId: remoteActive || liveId || cached.activeChatId });
       setTimeout(() => { skipChatPersistRef.current = false; }, 0);
       return merged;
     })().catch((err) => {
@@ -4929,6 +4976,7 @@ export default function CommercialExcellenceApp() {
       chatsFullLoadedRef.current = false;
       chatsFullPromiseRef.current = null;
       chatsBodiesRef.current = [];
+      chatSessionsRef.current = [];
 
       const loadStellaFiles = async () => {
       // File registry (stella_files table), scoped to this company + user.
@@ -5224,14 +5272,12 @@ export default function CommercialExcellenceApp() {
         updatedAt: sameThread ? existing.updatedAt : undefined,
         workflowRuns: existing?.workflowRuns,
       });
-      const next = upsertChatInPlace(chatSessionsRef.current, snap);
+      const next = upsertChatInPlace(unionChats(chatSessionsRef.current, chatsBodiesRef.current), snap);
       chatSessionsRef.current = next;
-      chatsBodiesRef.current = next;
+      chatsBodiesRef.current = unionChats(chatsBodiesRef.current, next);
       setChatSessions(next);
       const toSave = mergeChatListForPersist(next);
-      const listed = (next || []).filter(chatIsListed);
-      if (listed.some((c) => !toSave.some((s) => s.id === c.id))) return;
-      if (!toSave.length && (listed.length || readCachedChatIndex(currentUser.id).chats.length)) return;
+      if (!toSave.length && (next.filter(chatIsListed).length || readCachedChatIndex(currentUser.id).chats.length)) return;
       try {
         await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
@@ -5282,14 +5328,12 @@ export default function CommercialExcellenceApp() {
         updatedAt: sameThread ? existing.updatedAt : undefined,
         workflowRuns: existing?.workflowRuns,
       });
-      const next = upsertChatInPlace(chatSessionsRef.current, snap);
+      const next = upsertChatInPlace(unionChats(chatSessionsRef.current, chatsBodiesRef.current), snap);
       chatSessionsRef.current = next;
-      chatsBodiesRef.current = next;
+      chatsBodiesRef.current = unionChats(chatsBodiesRef.current, next);
       setChatSessions(next);
       const toSave = mergeChatListForPersist(next);
-      const listed = (next || []).filter(chatIsListed);
-      if (listed.some((c) => !toSave.some((s) => s.id === c.id))) return;
-      if (!toSave.length && (listed.length || readCachedChatIndex(currentUser.id).chats.length)) return;
+      if (!toSave.length && (next.filter(chatIsListed).length || readCachedChatIndex(currentUser.id).chats.length)) return;
       try {
         await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
           currentUser.id,
@@ -6287,8 +6331,8 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       workflowRuns: (liveExisting && existingIsStella === liveIsStella) ? liveExisting.workflowRuns : undefined,
     });
     const liveChats = chatHasUserContent(liveSnap.messages)
-      ? upsertChatInPlace(chatSessionsRef.current, liveSnap)
-      : (chatSessionsRef.current || []);
+      ? upsertChatInPlace(unionChats(chatSessionsRef.current, chatsBodiesRef.current), liveSnap)
+      : unionChats(chatSessionsRef.current, chatsBodiesRef.current);
     setUserSettings(settings);
     userSettingsRef.current = settings;
     setUserSettingsSaveStatus('saving');
@@ -6297,23 +6341,10 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
         await ensureFullChatsLoaded();
       } catch { /* still save settings */ }
       if (liveChats !== chatSessionsRef.current) {
-        chatSessionsRef.current = liveChats;
-        setChatSessions(liveChats);
+        chatSessionsRef.current = unionChats(liveChats, chatSessionsRef.current);
+        setChatSessions(chatSessionsRef.current);
       }
-      const chatsToSave = mergeChatListForPersist(chatSessionsRef.current?.length ? chatSessionsRef.current : liveChats);
-      const listedChats = (chatSessionsRef.current || liveChats || []).filter(chatIsListed);
-      const knownChats = listedChats.length || readCachedChatIndex(currentUser.id).chats.length;
-      if (!listedChats.some((c) => !chatsToSave.some((s) => s.id === c.id))
-          && (chatsToSave.length || !knownChats)) {
-        void queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
-          currentUser.id,
-          {
-            chats: chatsToSave,
-            activeChatId: activeChatIdRef.current || liveSnap.id,
-            userName: currentUser.name,
-          },
-        ));
-      }
+      void persistChatList(chatSessionsRef.current, activeChatIdRef.current || liveSnap.id);
       const ok = await queueUserSettingsUpload(currentUser, () => buildUserSettingsDocument(
         currentUser.id,
         mergeUserSettingsFields(userSettingsRef.current),
@@ -6425,23 +6456,23 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   const mergeChatListForPersist = (list) => {
     const fullById = new Map(
       (chatsBodiesRef.current || [])
-        .filter((c) => c?.id && Array.isArray(c.messages) && c.messages.length)
+        .filter((c) => c?.id && chatMessageCount(c) > 0)
         .map((c) => [c.id, c]),
     );
     const out = [];
+    const seen = new Set();
     for (const c of list || []) {
-      if (!c?.id) continue;
-      if (Array.isArray(c.messages) && c.messages.length) {
-        out.push(c);
-        continue;
-      }
-      const full = fullById.get(c.id);
-      if (full) out.push(full);
+      if (!c?.id || seen.has(c.id)) continue;
+      seen.add(c.id);
+      const filled = chatMessageCount(c) > 0
+        ? preferRicherChat(c, fullById.get(c.id))
+        : fullById.get(c.id);
+      if (filled && chatMessageCount(filled) > 0) out.push(filled);
     }
     return out;
   };
 
-  const persistChatList = async (list, activeId) => {
+  const persistChatList = async (list, activeId, { dropIds } = {}) => {
     if (!userSettingsReadyRef.current) return;
     try {
       try {
@@ -6450,16 +6481,20 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
         return;
       }
       if (!chatsFullLoadedRef.current) return;
-      const chats = mergeChatListForPersist(list);
-      const listed = (list || []).filter(chatIsListed);
-      if (listed.some((c) => !chats.some((s) => s.id === c.id))) return;
-      if (!chats.length) {
-        const known = listed.length
-          || (chatSessionsRef.current || []).filter(chatIsListed).length
-          || readCachedChatIndex(currentUser.id).chats.length
-          || (chatsBodiesRef.current || []).filter(chatIsListed).length;
-        if (known) return;
+      if (dropIds?.length) {
+        const drop = new Set(dropIds);
+        const strip = (arr) => (arr || []).filter((c) => !drop.has(c.id));
+        list = strip(list);
+        chatsBodiesRef.current = strip(chatsBodiesRef.current);
+        chatSessionsRef.current = strip(chatSessionsRef.current);
+        setChatSessions(chatSessionsRef.current);
+        writeCachedChatIndex(currentUser.id, {
+          chats: chatSessionsRef.current,
+          activeChatId: activeId,
+        });
       }
+      const chats = mergeChatListForPersist(unionChats(list, chatSessionsRef.current, chatsBodiesRef.current));
+      if (!chats.length && unionChats(list, chatSessionsRef.current, readCachedChatIndex(currentUser.id).chats).filter(chatIsListed).length) return;
       await queueUserChatsUpload(currentUser, () => buildUserChatsDocument(
         currentUser.id,
         {
@@ -6499,10 +6534,17 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       updatedAt: preserveUpdatedAt ? existing?.updatedAt : undefined,
       workflowRuns: existing?.workflowRuns,
     });
-    const next = chatHasUserContent(snap.messages)
-      ? upsertChatInPlace(chatSessionsRef.current, snap)
-      : (chatSessionsRef.current || []).filter((c) => c.id !== snap.id);
+    const base = unionChats(chatSessionsRef.current, chatsBodiesRef.current);
+    let next;
+    if (chatHasUserContent(snap.messages)) {
+      next = upsertChatInPlace(base, snap);
+    } else if (existing && chatIsListed(existing)) {
+      next = base;
+    } else {
+      next = base.filter((c) => c.id !== snap.id);
+    }
     chatSessionsRef.current = next;
+    chatsBodiesRef.current = unionChats(chatsBodiesRef.current, next);
     setChatSessions(next);
     return { list: next, activeId: id, snap };
   };
@@ -6612,16 +6654,18 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     if (event) { event.preventDefault(); event.stopPropagation(); }
     const next = (chatSessionsRef.current || []).filter((c) => c.id !== chatId);
     chatSessionsRef.current = next;
+    chatsBodiesRef.current = (chatsBodiesRef.current || []).filter((c) => c.id !== chatId);
     setChatSessions(next);
+    writeCachedChatIndex(currentUser.id, { chats: next, activeChatId: activeChatIdRef.current === chatId ? null : activeChatIdRef.current });
     if (activeChatIdRef.current === chatId) {
       const id = newChatId();
       const destTab = activeTabRef.current === 'stella' ? 'stella' : (activeTabRef.current === 'territory' ? 'territory' : 'chat');
       const module = destTab === 'stella' ? 'stella' : (destTab === 'territory' ? 'territory' : 'incentives');
       resetLiveChat(id, { module }, { tab: destTab });
-      persistChatList(next, id);
+      persistChatList(next, id, { dropIds: [chatId] });
       return;
     }
-    persistChatList(next, activeChatIdRef.current);
+    persistChatList(next, activeChatIdRef.current, { dropIds: [chatId] });
   };
 
   const handleSignOut = () => {
@@ -10094,8 +10138,8 @@ ${stepInstruction}`;
     if (currentWorkflow?.awaitingAgentReply) return null;
     if (currentWorkflow || pendingWorkflow || orchestratorDecision) return null;
     const list = Array.isArray(messages) ? messages : [];
-    const last = [...list].reverse().find(m => m.role === 'assistant' || m.role === 'orchestrator');
-    if (!last?.content) return null;
+    const last = lastConversationalMessage(list);
+    if (!last?.content || last.role === 'user') return null;
     if (hasNumberedClarifyingQuestions(last.content)) return null;
     if (/remembered facts|update memory/i.test(last.content)) return null;
     if (!isClosedChoicePrompt(last.content)) return null;
@@ -10105,11 +10149,8 @@ ${stepInstruction}`;
   const clarifyingReplyHint = useMemo(() => {
     if (isLoading || pptxGenerating) return false;
     if (pendingWorkflow || orchestratorDecision || pptxClarifyPending || memoryPendingFor('chat')) return false;
-    const list = Array.isArray(messages) ? messages : [];
-    const last = [...list].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator');
-    if (currentWorkflow?.awaitingAgentReply) return hasNumberedClarifyingQuestions(last?.content);
-    if (currentWorkflow) return false;
-    return isAskingForNumberedReplies(last?.content);
+    if (currentWorkflow && !currentWorkflow.awaitingAgentReply) return false;
+    return unansweredNumberedClarify(messages);
   }, [messages, pptxClarifyPending, isLoading, pptxGenerating, currentWorkflow, pendingWorkflow, orchestratorDecision, pendingMemoryConfirm]);
 
   const offerFromClassification = (classified) => {
