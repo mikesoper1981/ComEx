@@ -9,7 +9,9 @@ const {
   companySlug,
   companyPgSchema,
   userObjectPrefix,
+  isCompanyPgSchema,
 } = require('./company');
+const { withPg, quoteIdent } = require('./stella-db');
 
 const ACCOUNTS_PATH = 'accounts.json';
 const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -812,42 +814,38 @@ async function removeFromBucket(bucket, paths) {
 }
 
 async function deleteUserStellaData(user) {
-  const { supabaseUrl, serviceKey } = supabaseConfig();
   const userId = String(user?.id || '').trim();
-  if (!supabaseUrl || !serviceKey || !userId) return;
+  if (!userId) return;
+  const schema = companyPgSchema(resolveUserCompany(user));
   const orgIds = [...new Set([
     `company:${companySlug(resolveUserCompany(user))}:user:${userId}`,
     `user:${userId}`,
   ])];
-  const headers = restHeaders(serviceKey);
-  const schema = companyPgSchema(resolveUserCompany(user));
   const storagePaths = [];
-  for (const orgId of orgIds) {
-    const listUrl = `${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}&select=id,table_name,storage_path`;
-    const listRes = await fetch(listUrl, { headers }).catch(() => null);
-    const files = listRes && listRes.ok ? await listRes.json().catch(() => []) : [];
-    for (const file of Array.isArray(files) ? files : []) {
-      if (file?.table_name) {
-        await fetch(`${supabaseUrl}/rest/v1/rpc/stella_drop_table`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ p_table_name: file.table_name, p_schema: schema }),
-        }).catch(() => null);
-        await fetch(`${supabaseUrl}/rest/v1/rpc/stella_drop_table`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ p_table_name: file.table_name }),
-        }).catch(() => null);
+  if (isCompanyPgSchema(schema)) {
+    const q = quoteIdent(schema);
+    try {
+      const listed = await withPg((client) => client.query(
+        `select table_name, storage_path from ${q}.stella_files where org_id = any($1::text[])`,
+        [orgIds],
+      ));
+      for (const file of listed.rows || []) {
+        const tableName = String(file?.table_name || '');
+        if (/^stella_data_[a-z0-9_]+$/.test(tableName)) {
+          await withPg((client) => client.query(`drop table if exists ${q}."${tableName}"`)).catch(() => null);
+        }
+        if (file?.storage_path) {
+          storagePaths.push(String(file.storage_path));
+          storagePaths.push(`${file.storage_path}.extracted.txt`);
+        }
       }
-      if (file?.storage_path) {
-        storagePaths.push(String(file.storage_path));
-        storagePaths.push(`${file.storage_path}.extracted.txt`);
-      }
+      await withPg((client) => client.query(
+        `delete from ${q}.stella_files where org_id = any($1::text[])`,
+        [orgIds],
+      ));
+    } catch (err) {
+      console.warn('Company Stella cleanup failed', err?.message || err);
     }
-    await fetch(`${supabaseUrl}/rest/v1/stella_files?org_id=eq.${encodeURIComponent(orgId)}`, {
-      method: 'DELETE',
-      headers,
-    }).catch(() => null);
   }
   storagePaths.push(`${userObjectPrefix(user)}/stella`);
   storagePaths.push(`users/${storageFolder(user)}/stella`);

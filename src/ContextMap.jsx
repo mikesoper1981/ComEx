@@ -44,6 +44,7 @@ const KIND_META = {
 const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 250, leafR: 210 };
 const LEAF_PAGE_SIZE = 24;
 const EMPTY_FOCUS = { moduleId: '', group: '', kind: '', fileId: '', factId: '' };
+const EMPTY_SAVED = {};
 
 function clip(text, max = 140) {
   const t = String(text || '').replace(/\s+/g, ' ').trim();
@@ -995,8 +996,10 @@ export default function ContextMap({
   const graphRef = useRef(null);
   const persistLayoutRef = useRef(null);
   const layoutRef = useRef(layout);
+  const ignoreSavedRef = useRef(false);
+  const [ignoreSaved, setIgnoreSaved] = useState(false);
   focusRef.current = focus;
-  layoutRef.current = layout;
+  layoutRef.current = ignoreSavedRef.current ? { nodes: {} } : layout;
   useEffect(() => { setLeafPage(0); }, [focus.moduleId, focus.group, focus.kind]);
 
   const catalog = useMemo(() => withMapVisuals(hubModules), [hubModules]);
@@ -1033,9 +1036,12 @@ export default function ContextMap({
     };
   }, [catalog, userSettings, stellaDataFiles, userName, companyName]);
 
+  const savedNodes = ignoreSaved
+    ? EMPTY_SAVED
+    : ((layout?.nodes && typeof layout.nodes === 'object') ? layout.nodes : EMPTY_SAVED);
   const graph = useMemo(
-    () => layoutStar(model, focus, layout?.nodes, livePos, leafPage),
-    [model, layout, livePos, focus, leafPage],
+    () => layoutStar(model, focus, savedNodes, livePos, leafPage),
+    [model, savedNodes, livePos, focus, leafPage],
   );
 
   const autoCam = useMemo(() => fitCamera(graph.nodes), [graph]);
@@ -1050,6 +1056,7 @@ export default function ContextMap({
 
   const persistLayout = (nodes) => {
     if (!onLayoutChange) return;
+    if (ignoreSavedRef.current) return;
     const prev = (layoutRef.current?.nodes && typeof layoutRef.current.nodes === 'object')
       ? layoutRef.current.nodes
       : {};
@@ -1063,6 +1070,7 @@ export default function ContextMap({
         h: n.h / CANVAS.h,
       };
     }
+    layoutRef.current = next;
     onLayoutChange(next);
   };
   modelRef.current = model;
@@ -1111,6 +1119,21 @@ export default function ContextMap({
       };
     });
   };
+  const zoomAtRef = useRef(zoomAt);
+  zoomAtRef.current = zoomAt;
+
+  useEffect(() => {
+    const els = [canvasRef.current, large ? largeCanvasRef.current : null].filter(Boolean);
+    const onWheel = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      zoomAtRef.current(e.clientX, e.clientY, e.deltaY > 0 ? 0.9 : 1.12, e.currentTarget);
+    };
+    for (const el of els) el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      for (const el of els) el.removeEventListener('wheel', onWheel);
+    };
+  }, [large]);
 
   const onCanvasPointerDown = (ev) => {
     if (ev.button !== 0) return;
@@ -1292,10 +1315,26 @@ export default function ContextMap({
   };
 
   const resetLayout = () => {
+    ignoreSavedRef.current = true;
+    layoutRef.current = { nodes: {} };
+    setIgnoreSaved(true);
     setLivePos({});
     setCamUser(null);
+    setSelected('account');
+    setFocus(EMPTY_FOCUS);
+    setOpenFileId('');
+    setLeafPage(0);
     onLayoutChange?.({ nodes: {} });
   };
+
+  useEffect(() => {
+    if (!ignoreSaved) return;
+    const nodes = layout?.nodes;
+    if (nodes && typeof nodes === 'object' && Object.keys(nodes).length === 0) {
+      ignoreSavedRef.current = false;
+      setIgnoreSaved(false);
+    }
+  }, [layout, ignoreSaved]);
 
   const selectedModule = model.modules.find((m) => m.id === selected) || null;
   const selectedIsAccount = selected === 'account';
@@ -1455,11 +1494,8 @@ export default function ContextMap({
             ref={largeCanvasRef}
             data-ctx-canvas="large"
             className="relative w-full h-full bg-slate-950/50 border border-blue-400/15 rounded-xl overflow-hidden cursor-grab active:cursor-grabbing touch-none"
+            style={{ overscrollBehavior: 'contain' }}
             onPointerDown={onCanvasPointerDown}
-            onWheel={(e) => {
-              e.preventDefault();
-              zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 0.9 : 1.12, e.currentTarget);
-            }}
           >
             <MapCanvas
               {...canvasProps}
@@ -1491,12 +1527,8 @@ export default function ContextMap({
           ref={canvasRef}
           data-ctx-canvas="main"
           className="relative w-full overflow-hidden cursor-grab active:cursor-grabbing touch-none"
-          style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}` }}
+          style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}`, overscrollBehavior: 'contain' }}
           onPointerDown={onCanvasPointerDown}
-          onWheel={(e) => {
-            e.preventDefault();
-            zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 0.9 : 1.12, e.currentTarget);
-          }}
         >
           <MapCanvas
             {...canvasProps}

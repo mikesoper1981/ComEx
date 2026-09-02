@@ -27,6 +27,7 @@ import {
 } from './auth';
 import {
   resolveUserCompany,
+  companyPgSchema,
 } from './company';
 import {
   STELLA_CONNECTORS,
@@ -112,9 +113,16 @@ import {
   patchModuleContextFile,
   removeModuleContextFile,
   formatLinkedModulesPromptBlock,
+  formatStellaFileIndex,
+  formatStellaFileContextCard,
+  formatModuleContextCard,
+  findStellaFile,
+  findHubContextFile,
+  listHubContextFiles,
   mergeModuleConnections,
   toggleModuleConnection,
   connectedModuleIds,
+  connectedComponentIds,
   modulesAreConnected,
   MODULE_CONTEXT_LABELS,
   listModuleContextBlocks,
@@ -1458,7 +1466,7 @@ function buildUserSettingsPromptBlock(settings, { moduleId = '', applyResponseLe
   push('Preferences', s.preferences);
   push('Hard constraints', s.constraints);
   const extra = isEmptyContextValue(s.customContext) ? '' : String(s.customContext).trim();
-  const linkedIds = moduleId ? connectedModuleIds(s.moduleConnections, moduleId) : [];
+  const linkedIds = moduleId ? connectedComponentIds(s.moduleConnections, moduleId) : [];
   const memoryBlock = formatMemoryPromptBlock(s, { moduleId, linkedIds });
   const lengthBlock = applyResponseLength ? formatResponseLengthPrompt(s) : '';
   const identity = `${lines.join('\n')}${extra ? `\n\nAdditional context from the user:\n${extra}` : ''}${memoryBlock}`;
@@ -4555,55 +4563,73 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
 }
 
 // Map a stella_files DB row into the local file object used by the UI.
-function stellaFilesApiDown(res) {
-  return !res || res.status === 404 || res.status === 502 || res.status === 503;
-}
-
 function stellaSchemaStatusFromPayload(payload) {
   const name = typeof payload?.schema === 'string' ? payload.schema.trim() : '';
   if (!name) return null;
   return {
     name,
+    company: typeof payload?.company === 'string' ? payload.company.trim() : '',
     ready: payload.schemaReady !== false,
     error: typeof payload.schemaError === 'string' ? payload.schemaError.trim() : '',
   };
 }
 
-async function stellaListFilesViaSupabase(user, { isAdmin } = {}) {
-  const userOrg = stellaOrgIdForUser(user);
-  const orgCandidates = stellaOrgIdCandidates(user);
-  if (isAdmin) {
-    const { data: own } = await supabase.from('stella_files').select('id').eq('org_id', userOrg).limit(1);
-    if (!own?.length) {
-      const { data: legacy } = await supabase.from('stella_files').select('id').eq('org_id', 'default').limit(1);
-      if (legacy?.length) {
-        await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', 'default');
-      }
-    }
+function stellaParseRegistryJson(val) {
+  let cur = val;
+  for (let i = 0; i < 2; i += 1) {
+    if (typeof cur !== 'string') break;
+    const t = cur.trim();
+    if (!t || (t[0] !== '{' && t[0] !== '[' && t[0] !== '"')) break;
+    try { cur = JSON.parse(t); } catch { break; }
   }
-  let data = [];
-  let sourceOrg = '';
-  for (const org of orgCandidates) {
-    const { data: rows, error } = await supabase
-      .from('stella_files')
-      .select('*')
-      .eq('org_id', org)
-      .order('uploaded_at', { ascending: true });
-    if (!error && Array.isArray(rows) && rows.length) {
-      data = rows;
-      sourceOrg = org;
-      break;
-    }
-  }
-  if (sourceOrg && sourceOrg !== userOrg) {
-    await supabase.from('stella_files').update({ org_id: userOrg }).eq('org_id', sourceOrg);
-    data = data.map((row) => ({ ...row, org_id: userOrg }));
-  }
-  return data;
+  return cur;
+}
+
+function stellaColumnsForRegistry(columns) {
+  return (Array.isArray(columns) ? columns : []).map((c) => ({
+    name: c?.name || '',
+    original: c?.original || c?.name || '',
+    type: c?.type || '',
+    description: c?.description || '',
+    kind: c?.kind || '',
+    samples: Array.isArray(c?.samples) ? c.samples.slice(0, 8) : [],
+  }));
+}
+
+function stellaMergeRegistryFiles(prev, mapped) {
+  const prevList = Array.isArray(prev) ? prev : [];
+  const mappedList = Array.isArray(mapped) ? mapped : [];
+  const prevById = new globalThis.Map(prevList.filter((f) => f.dbId).map((f) => [f.dbId, f]));
+  const merged = mappedList.map((m) => {
+    const p = prevById.get(m.dbId);
+    const keepLive = p && !p.intakeComplete && (p.intakeMessages?.length || 0) > (m.intakeMessages?.length || 0);
+    const next = keepLive
+      ? { ...m, intakeMessages: p.intakeMessages, capturedContext: p.capturedContext || m.capturedContext }
+      : m;
+    return {
+      ...next,
+      previewRows: (p?.previewRows?.length ? p.previewRows : next.previewRows) || [],
+      extractedText: p?.extractedText || next.extractedText || '',
+      columns: (Array.isArray(p?.columns) && p.columns.some((c) => c?.samples?.length)
+        && !(next.columns || []).some((c) => c?.samples?.length))
+        ? p.columns
+        : next.columns,
+      processing: p?.processing || next.processing,
+    };
+  });
+  const mappedIds = new Set(mappedList.map((m) => m.dbId).filter(Boolean));
+  const keepLocal = prevList.filter((f) => {
+    if (!f) return false;
+    if (!f.dbId) return true;
+    return !mappedIds.has(f.dbId);
+  });
+  return [...merged, ...keepLocal];
 }
 
 function stellaMapRegistryRow(row) {
-  const rawCtx = row.context_qa && typeof row.context_qa === 'object' ? row.context_qa : null;
+  const parsedCtx = stellaParseRegistryJson(row.context_qa);
+  const rawCtx = parsedCtx && typeof parsedCtx === 'object' && !Array.isArray(parsedCtx) ? parsedCtx : null;
+  const parsedColumns = stellaParseRegistryJson(row.columns);
   const maps = rawCtx ? stellaCollectNameMaps(rawCtx) : [];
   const ctx = rawCtx && maps.length ? { ...rawCtx, name_maps: maps } : rawCtx;
   const schemaChanged = !!(ctx && ctx.schema_changed);
@@ -4632,8 +4658,10 @@ function stellaMapRegistryRow(row) {
     storagePath: row.storage_path || null,
     textStoragePath: row.storage_path ? stellaExtractedTextPath(row.storage_path) : null,
     storageBucket: null,
-    columns: Array.isArray(row.columns) ? row.columns : [],
-    previewRows: stellaPreviewRowsFromColumns(Array.isArray(row.columns) ? row.columns : [], 3),
+    uploadedBy: row.uploaded_by || null,
+    uploadedByName: row.uploaded_by_name || null,
+    columns: Array.isArray(parsedColumns) ? parsedColumns : [],
+    previewRows: stellaPreviewRowsFromColumns(Array.isArray(parsedColumns) ? parsedColumns : [], 3),
     rowCount: row.row_count ?? null,
     summary: row.summary || '',
     capturedContext: ctx,
@@ -5252,6 +5280,7 @@ export default function CommercialExcellenceApp() {
   const uploadedFileRef = useRef(uploadedFile);
   const userSettingsRef = useRef(userSettings);
   const stellaDataFilesRef = useRef(stellaDataFiles);
+  const runWithStellaDataToolsRef = useRef(null);
   const stellaHydrateColumnProfilesRef = useRef(async () => {});
   const persistChatsTimerRef = useRef(null);
   const persistStellaChatsTimerRef = useRef(null);
@@ -5592,11 +5621,9 @@ export default function CommercialExcellenceApp() {
             const schemaStatus = stellaSchemaStatusFromPayload(payload);
             if (schemaStatus) setStellaTenantSchema(schemaStatus);
             data = Array.isArray(payload.files) ? payload.files : [];
-          } else if (stellaFilesApiDown(res)) {
-            data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
           }
         } catch {
-          data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
+          /* company-schema API is required — do not read public.stella_files */
         }
         if (data.length) {
           const mapped = data.map(stellaMapRegistryRow);
@@ -6613,6 +6640,30 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     return `${base}${endUser}${lengthTail}`;
   };
 
+  const callAnthropicMaybeStellaTools = async (system, messages, maxTokens = 1000, { maxRounds = 4 } = {}) => {
+    const run = runWithStellaDataToolsRef.current;
+    const settings = userSettingsRef.current || userSettings;
+    const home = resolvePromptModule();
+    const stellaFilesAll = (stellaDataFilesRef.current || []).filter((f) => f && !f.processing);
+    const linked = connectedComponentIds(settings?.moduleConnections, home);
+    const stellaInHub = home === 'stella' || linked.includes('stella');
+    const stellaFiles = stellaInHub ? stellaFilesAll : [];
+    const hubFiles = listHubContextFiles(settings, home, { stellaFiles });
+    if (!run || !hubFiles.length) {
+      return callAnthropic(system, messages, maxTokens);
+    }
+    const out = await run({
+      system,
+      messages,
+      files: stellaFiles,
+      hubFiles,
+      maxRounds,
+      maxTokens,
+      thinking: false,
+    });
+    return out.text;
+  };
+
   const getIntel = () => mergeProductIntelligence({
     ...productIntel,
     systemPrompt: customSystemPrompt,
@@ -6633,7 +6684,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   const moduleGetsGeneralKnowledge = (moduleId) => {
     if (moduleId === 'incentives') return true;
     const settings = userSettingsRef.current || userSettings;
-    return connectedModuleIds(settings.moduleConnections, moduleId).includes('incentives');
+    return connectedComponentIds(settings.moduleConnections, moduleId).includes('incentives');
   };
 
   const formatGeneralKnowledgeBlock = () => {
@@ -7724,7 +7775,12 @@ ${taskBlock}
 
 ${clarifyingPolicy}`);
     const lengthSource = `${agent.systemPrompt}\n${taskBlock}\n${step.goal || ''}\n${step.successCriteria || ''}`;
-    return await callAnthropic(system, messages, resolveUserFacingMaxTokens(3000, userSettingsRef.current || userSettings, lengthSource));
+    return await callAnthropicMaybeStellaTools(
+      system,
+      messages,
+      resolveUserFacingMaxTokens(3000, userSettingsRef.current || userSettings, lengthSource),
+      { maxRounds: 4 },
+    );
   };
 
   const normalizeOrchestratorAction = (action) => {
@@ -7875,7 +7931,12 @@ Rules:
     const system = withUserSettings(`${agent.systemPrompt}
 ${knowledge ? `\n\nKNOWLEDGE BASE:\n${knowledge}` : ''}
 ${getWorkflowRuntime().handoffAddon}`);
-    return await callAnthropic(system, [{ role: 'user', content: task }], resolveUserFacingMaxTokens(2000, userSettingsRef.current || userSettings, `${agent.systemPrompt}\n${task}`));
+    return await callAnthropicMaybeStellaTools(
+      system,
+      [{ role: 'user', content: task }],
+      resolveUserFacingMaxTokens(2000, userSettingsRef.current || userSettings, `${agent.systemPrompt}\n${task}`),
+      { maxRounds: 3 },
+    );
   };
 
   const executeOrchestrator = async (topic, userMessage, stepIndex = null, focusedContextOverride = null) => {
@@ -9555,88 +9616,48 @@ ${stepInstruction}`;
           const schemaStatus = stellaSchemaStatusFromPayload(payload);
           if (schemaStatus) setStellaTenantSchema(schemaStatus);
           if (Array.isArray(payload.files)) data = payload.files;
-        } else if (stellaFilesApiDown(res)) {
-          data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
         }
       } catch {
-        data = await stellaListFilesViaSupabase(currentUser, { isAdmin });
+        /* company-schema API is required — do not read public.stella_files */
       }
       if (!Array.isArray(data)) return null;
       const mapped = data.map(stellaMapRegistryRow);
-      setStellaDataFiles(prev => {
-        const prevById = new globalThis.Map(prev.filter(f => f.dbId).map(f => [f.dbId, f]));
-        const merged = mapped.map(m => {
-          const p = prevById.get(m.dbId);
-          const keepLive = p && !p.intakeComplete && (p.intakeMessages?.length || 0) > (m.intakeMessages?.length || 0);
-          const next = keepLive
-            ? { ...m, intakeMessages: p.intakeMessages, capturedContext: p.capturedContext || m.capturedContext }
-            : m;
-          return {
-            ...next,
-            previewRows: (p?.previewRows?.length ? p.previewRows : next.previewRows) || [],
-            extractedText: p?.extractedText || next.extractedText || '',
-            columns: (Array.isArray(p?.columns) && p.columns.some((c) => c?.samples?.length)
-              && !(next.columns || []).some((c) => c?.samples?.length))
-              ? p.columns
-              : next.columns,
-          };
-        });
-        const temps = prev.filter(f => !f.dbId);
-        const next = [...merged, ...temps];
-        stellaDataFilesRef.current = next;
-        return next;
-      });
-      void sweepChatMemoryOfFileContext(factsFromStellaFiles(mapped));
-      return mapped;
+      const prev = stellaDataFilesRef.current || [];
+      const next = stellaMergeRegistryFiles(prev, mapped);
+      stellaDataFilesRef.current = next;
+      setStellaDataFiles(next);
+      void sweepChatMemoryOfFileContext(factsFromStellaFiles(next));
+      return next;
     } catch {
       return null;
     }
   };
 
   const stellaInsertRegistry = async (record) => {
-    try {
-      const res = await fetch(STELLA_FILES_API_PATH, {
-        method: 'POST',
-        headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ action: 'insert', record }),
-      });
-      if (res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        if (payload.file) return payload.file;
-      } else if (!stellaFilesApiDown(res)) {
-        const payload = await res.json().catch(() => ({}));
-        throw new Error(payload?.error?.message || 'Registry insert failed');
-      }
-    } catch (err) {
-      if (err?.message && err.message !== 'Failed to fetch') throw err;
+    const res = await fetch(STELLA_FILES_API_PATH, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ action: 'insert', record }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (res.ok && payload.file) {
+      const schemaStatus = stellaSchemaStatusFromPayload(payload);
+      if (schemaStatus) setStellaTenantSchema(schemaStatus);
+      return payload.file;
     }
-    const { data, error } = await supabase
-      .from('stella_files')
-      .insert({ org_id: stellaOrgIdForUser(currentUser), ...record })
-      .select()
-      .single();
-    if (error) throw new Error(`Registry insert failed: ${error.message}`);
-    return data;
+    throw new Error(payload?.error?.message || 'Registry insert failed');
   };
 
   const stellaUpdateRegistry = async (dbId, patch) => {
     if (!dbId) return;
-    try {
-      const res = await fetch(STELLA_FILES_API_PATH, {
-        method: 'POST',
-        headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ action: 'update', id: dbId, patch }),
-      });
-      if (res.ok) return;
-      if (!stellaFilesApiDown(res)) {
-        const payload = await res.json().catch(() => ({}));
-        throw new Error(payload?.error?.message || 'Registry update failed');
-      }
-    } catch (err) {
-      if (err?.message && err.message !== 'Failed to fetch') throw err;
-    }
-    const { error } = await supabase.from('stella_files').update(patch).eq('id', dbId);
-    if (error) throw new Error(`Registry update failed: ${error.message}`);
+    const res = await fetch(STELLA_FILES_API_PATH, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ action: 'update', id: dbId, patch }),
+    });
+    if (res.ok) return;
+    const payload = await res.json().catch(() => ({}));
+    throw new Error(payload?.error?.message || 'Registry update failed');
   };
 
   const stellaOtherTabularFiles = (exceptId) => {
@@ -9699,7 +9720,7 @@ ${stepInstruction}`;
         const columns = stellaApplyRowSampleToColumns(f.columns, rows);
         patched.set(f.id, { columns, previewRows: stellaPreviewRowsFromData(rows, 3) });
         if (f.dbId) {
-          try { await stellaUpdateRegistry(f.dbId, { columns }); } catch { /* ignore */ }
+          try { await stellaUpdateRegistry(f.dbId, { columns: stellaColumnsForRegistry(columns) }); } catch { /* ignore */ }
         }
       } catch { /* table may not be ready */ }
     }
@@ -10259,7 +10280,7 @@ ${stepInstruction}`;
       if (opening.autoCtx && !schemaChanged) patch.capturedContext = opening.autoCtx;
       stellaPatchLocal(fileRec.id, patch);
       if (fileRec.dbId) {
-        const reg = { summary: opening.summary, columns: opening.profiledColumns };
+        const reg = { summary: opening.summary, columns: stellaColumnsForRegistry(opening.profiledColumns) };
         if (opening.autoCtx && !schemaChanged) reg.context_qa = opening.autoCtx;
         try { await stellaUpdateRegistry(fileRec.dbId, reg); } catch { /* keep local opening even if registry lags */ }
       }
@@ -10319,8 +10340,14 @@ ${stepInstruction}`;
 
       const isTabular = Array.isArray(records) && records.length > 0;
 
+      const cleanName = sanitizeStorageName(file.name);
+      const objectRelPath = `data_${Date.now()}_${cleanName}`;
+      const up = await stellaUploadToStorage(objectRelPath, file, file.type || undefined);
+      storagePath = up.objectPath;
+      storageBucket = up.bucket;
+
       if (isTabular) {
-        // ── Tabular flow: create a dynamic table and load all rows ──
+        // ── Tabular flow: keep the original in storage, load rows into a company table ──
         const payload = stellaBuildTabularPayload(records);
         columns = payload.columns;
         rowCount = payload.rowCount;
@@ -10329,9 +10356,7 @@ ${stepInstruction}`;
         sampleText = JSON.stringify(records.slice(0, 30), null, 2).substring(0, 16000);
         dataProfile = stellaProfileRecords(records);
       } else {
-        // ── Document flow: upload raw file + persist full extracted text ──
-        const cleanName = sanitizeStorageName(file.name);
-        const objectRelPath = `data_${Date.now()}_${cleanName}`;
+        // ── Document flow: raw file already in storage; persist extracted text beside it ──
         let fullDocumentText = '';
         if (kind === 'pdf') {
           try { fullDocumentText = await stellaExtractPdfText(file); }
@@ -10341,9 +10366,6 @@ ${stepInstruction}`;
           fullDocumentText = await stellaReadAsText(file);
         }
         sampleText = fullDocumentText.substring(0, 18000);
-        const up = await stellaUploadToStorage(objectRelPath, file, file.type || undefined);
-        storagePath = up.objectPath;
-        storageBucket = up.bucket;
         if (fullDocumentText.trim()) {
           await stellaUploadToStorage(`${objectRelPath}.extracted.txt`, new Blob([fullDocumentText], { type: 'text/plain' }), 'text/plain');
         }
@@ -10374,12 +10396,12 @@ ${stepInstruction}`;
         file_type: kind,
         storage_path: storagePath,
         table_name: tableName,
-        columns: mergedColumns,
+        columns: stellaColumnsForRegistry(mergedColumns),
         row_count: rowCount,
         summary,
         context_qa: null,
       });
-      const dbId = dbRow?.id || tempId;
+      const dbId = dbRow?.id || null;
 
       const opening = await composeStellaOpeningIntake({
         id: tempId,
@@ -10401,7 +10423,7 @@ ${stepInstruction}`;
       const needsUser = opening.needsUser;
       const autoCtx = opening.autoCtx;
       const finalFile = {
-        id: dbId, dbId,
+        id: dbId || tempId, dbId,
         name: file.name, type: kind, fileType: kind,
         size: rowCount != null ? `${rowCount} rows` : `${(file.size / 1024).toFixed(1)} KB`,
         columns: profiledColumns, rowCount,
@@ -10409,6 +10431,8 @@ ${stepInstruction}`;
         extractedText: isTabular ? '' : sampleText,
         summary, capturedContext: autoCtx, dataProfile,
         tableName, storagePath, storageBucket,
+        uploadedBy: dbRow?.uploaded_by || currentUser.id,
+        uploadedByName: dbRow?.uploaded_by_name || currentUser.name,
         textStoragePath: storagePath ? stellaExtractedTextPath(storagePath) : null,
         intakeMessages: [{ role: 'assistant', content: assistantMsg }],
         intakeComplete: !needsUser, processing: false,
@@ -10419,7 +10443,7 @@ ${stepInstruction}`;
         stellaDataFilesRef.current = next;
         return next;
       });
-      setActiveStellaDataId(prev => (prev === tempId ? dbId : prev));
+      setActiveStellaDataId(prev => (prev === tempId ? (dbId || tempId) : prev));
       if (autoCtx) {
         setStellaIntakeMinimized(true);
         try {
@@ -10457,7 +10481,14 @@ ${stepInstruction}`;
     setStellaIntakeInput('');
     const updated = { ...current, intakeMessages: [...(current.intakeMessages || []), { role: 'user', content: msg }] };
     stellaPatchLocal(fileId, { intakeMessages: updated.intakeMessages });
-    await stellaIntakeNextTurn(updated);
+    try {
+      await stellaIntakeNextTurn(updated);
+    } catch (e) {
+      setStellaMessages((prev) => [...prev, {
+        role: 'system',
+        content: `⚠️ Could not finish intake: ${e.message || e}`,
+      }]);
+    }
   };
 
   const handleStellaDeleteFile = async (fileId) => {
@@ -10466,24 +10497,14 @@ ${stepInstruction}`;
     if (!window.confirm(`Delete "${f.name}" and its captured context? This cannot be undone.`)) return;
     try {
       if (f.dbId) {
-        let usedApi = false;
-        try {
-          const res = await fetch(STELLA_FILES_API_PATH, {
-            method: 'POST',
-            headers: authHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ action: 'delete', id: f.dbId }),
-          });
-          if (res.ok) usedApi = true;
-          else if (!stellaFilesApiDown(res)) {
-            const payload = await res.json().catch(() => ({}));
-            throw new Error(payload?.error?.message || 'Could not remove file from the registry');
-          }
-        } catch (err) {
-          if (err?.message && !/failed to fetch/i.test(err.message) && err.message !== 'Failed to fetch') throw err;
-        }
-        if (!usedApi) {
-          const { error } = await supabase.from('stella_files').delete().eq('id', f.dbId);
-          if (error) throw new Error(error.message);
+        const res = await fetch(STELLA_FILES_API_PATH, {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ action: 'delete', id: f.dbId }),
+        });
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          throw new Error(payload?.error?.message || 'Could not remove file from the registry');
         }
       }
     } catch (e) {
@@ -10562,15 +10583,41 @@ ${stepInstruction}`;
             <div className="text-xs text-blue-300/60 mt-2">
               {scheduleOpen
                 ? 'Scheduled imports pull CSV, Excel, or JSON from this company’s drop folder (matched by company name). Same filename refreshes the existing dataset; a new name starts intake. Use Upload on the Files tab to load a file immediately.'
-                : 'Upload CSV, JSON, Excel, PDF, or plain text. Stella will capture context via intake questions. Files are stored for your account only.'}
+                : 'Upload CSV, JSON, Excel, PDF, or plain text. Stella captures context via intake. Uploads, settings, and memory stay under this company folder; tabular data loads into this company’s database schema.'}
             </div>
-            {!scheduleOpen && stellaTenantSchema?.name ? (
-              <div className={`text-[11px] mt-1.5 ${stellaTenantSchema.ready ? 'text-blue-300/50' : 'text-amber-300/85'}`}>
-                {stellaTenantSchema.ready
-                  ? `Company schema ${stellaTenantSchema.name} — pick that schema in the Table Editor, not public.`
-                  : `Schema ${stellaTenantSchema.name} is not on the database yet. ${stellaTenantSchema.error || 'It is created when the first file is loaded or uploaded.'}`}
-              </div>
-            ) : null}
+            {!scheduleOpen ? (() => {
+              const folder = userStellaStoragePrefix(currentUser).replace(/\/$/, '');
+              const schemaName = stellaTenantSchema?.name || companyPgSchema(resolveUserCompany(currentUser));
+              const status = !stellaTenantSchema
+                ? 'checking'
+                : (stellaTenantSchema.ready !== false ? 'connected' : 'down');
+              const statusLabel = status === 'connected'
+                ? 'Connected'
+                : status === 'checking'
+                  ? 'Checking…'
+                  : 'Not connected';
+              const statusClass = status === 'connected'
+                ? 'text-emerald-300/80'
+                : status === 'checking'
+                  ? 'text-blue-300/50'
+                  : 'text-amber-300/85';
+              const dotClass = status === 'connected'
+                ? 'bg-emerald-400'
+                : status === 'checking'
+                  ? 'bg-blue-400/60'
+                  : 'bg-amber-400';
+              return (
+                <div className="text-[11px] mt-1.5 text-blue-300/50 space-y-0.5">
+                  <div>
+                    Company folder <code className="text-cyan-300/80">{folder}</code>
+                  </div>
+                  <div className={`flex items-center gap-1.5 ${statusClass}`}>
+                    <span className={`inline-block w-1.5 h-1.5 rounded-full ${dotClass}`} />
+                    Schema {schemaName} · {statusLabel}
+                  </div>
+                </div>
+              );
+            })() : null}
           </div>
           {!scheduleOpen ? (
             <div className="flex flex-col items-stretch sm:items-end gap-2 flex-shrink-0">
@@ -10599,7 +10646,7 @@ ${stepInstruction}`;
               <div className="flex items-start justify-between gap-3">
                 <button onClick={() => setActiveStellaDataId(f.id)} className="min-w-0 text-left flex-1">
                   <div className="text-sm font-semibold text-white truncate">{f.name}</div>
-                  <div className="text-xs text-blue-300/60 mt-1">{f.size} • {f.type || 'file'}{Array.isArray(f.columns) && f.columns.length ? ` • ${f.columns.length} cols` : ''}</div>
+                  <div className="text-xs text-blue-300/60 mt-1">{f.size} • {f.type || 'file'}{Array.isArray(f.columns) && f.columns.length ? ` • ${f.columns.length} cols` : ''}{(f.uploadedByName || f.uploadedBy) ? ` • uploaded by ${f.uploadedByName || f.uploadedBy}` : ''}</div>
                   {f.summary && <div className="text-xs text-blue-200/80 mt-2 line-clamp-3">{f.summary}</div>}
                 </button>
                 <div className="flex flex-col items-end gap-2 flex-shrink-0">
@@ -10941,31 +10988,18 @@ ${stepInstruction}`;
 
     const tabular = files.filter(f => f.tableName);
     const docs = files.filter(f => !f.tableName);
-
-    const blocks = files.map((f, i) => {
-      const cols = Array.isArray(f.columns) && f.columns.length
-        ? f.columns.map(c => `    - ${c.name}${c.original && c.original !== c.name ? ` (source header: "${c.original}")` : ''} [${c.type || 'text'}]${c.description ? `: ${c.description}` : ''}`).join('\n')
-        : '    (no columns — this is a document)';
-      const location = f.tableName
-        ? `SQL table: ${f.tableName}`
-        : `Document (use read_document tool for full text; path: ${f.storagePath || 'n/a'})`;
-      const ctx = stellaFormatContextQa(f.capturedContext).split('\n').map(l => `    ${l}`).join('\n');
-      return `FILE ${i + 1}: ${f.name}\n- Type: ${f.fileType || f.type || 'file'}\n- ${location}${f.rowCount != null ? `\n- Rows: ${f.rowCount}` : ''}\n- Summary: ${f.summary || '(none)'}\n- Columns:\n${cols}\n- Interpretive context:\n${ctx}`;
-    }).join('\n\n');
+    const { body: blocks } = formatStellaFileIndex(files, { maxFiles: 40, maxChars: 4000, header: false });
 
     const tableList = tabular.length ? tabular.map(t => t.tableName).join(', ') : '(none)';
-    const joinMap = stellaFormatConfirmedJoins(files);
     const sqlInstr = tabular.length
-      ? `\nTABULAR DATA (query with tools):\n- Query tables using the \`run_sql\` tool (single SELECT only). Available tables: ${tableList}.\n- Use \`inspect_table\` to preview a table's real values/formats before writing analytical queries.\n- Reference the EXACT (safe) column names shown above, not the original headers.\n${joinMap
-        ? `- CONFIRMED JOINS (use these exact table.column names when combining datasets):\n${joinMap.split('\n').map((l) => `  ${l}`).join('\n')}\n`
-        : '- No joins are confirmed yet. Only JOIN if a shared key is obvious, and state the assumption.\n'}`
+      ? `\nTABULAR DATA (query with tools):\n- Call \`get_file_context\` for the files you will query so you have exact column names, types, and interpretation notes.\n- Query tables using the \`run_sql\` tool (single SELECT only). Available tables: ${tableList}.\n- Use \`inspect_table\` to preview a table's real values/formats before writing analytical queries.\n- Reference EXACT (safe) column names from get_file_context / inspect_table, not original headers and not guesses from the index.\n`
       : '';
     const docList = docs.length ? docs.map(d => `"${d.name}"`).join(', ') : '(none)';
     const docInstr = docs.length
-      ? `\nDOCUMENTS (PDF / text):\n- Full text is available via the \`read_document\` tool. Documents: ${docList}.\n- Use \`read_document\` when you need specific facts, quotes, or details from a PDF/text file — not just the summary above.\n`
+      ? `\nDOCUMENTS (PDF / text):\n- Call \`get_file_context\` for interpretive notes, then \`read_document\` for full text. Documents: ${docList}.\n- Use \`read_document\` when you need specific facts, quotes, or details from a PDF/text file.\n`
       : '';
     const crossInstr = (tabular.length && docs.length)
-      ? `\nCROSS-SOURCE QUESTIONS:\nMany questions combine tabular data (sales, engagement metrics in SQL) with document context (policies, reports, PDFs). For these:\n1. Use \`read_document\` to pull relevant passages from PDFs/text files\n2. Use \`inspect_table\` / \`run_sql\` for quantitative data\n3. Synthesise both in your answer — explicitly connect numbers to document context\n4. Verify that findings from each source align before answering\n`
+      ? `\nCROSS-SOURCE QUESTIONS:\nMany questions combine tabular data (sales, engagement metrics in SQL) with document context (policies, reports, PDFs). For these:\n1. Use \`get_file_context\` then \`read_document\` to pull relevant passages from PDFs/text files\n2. Use \`inspect_table\` / \`run_sql\` for quantitative data\n3. Synthesise both in your answer — explicitly connect numbers to document context\n4. Verify that findings from each source align before answering\n`
       : '';
 
     return withUserSettings(`${fillTemplate(getStellaPrompts().analyst, {
@@ -10987,8 +11021,19 @@ ${stepInstruction}`;
   // Tools the Stella agent can call during its investigation loop.
   const STELLA_TOOLS = [
     {
+      name: 'get_file_context',
+      description: 'Load the full context card for one file from this hub session — Stella datasets, Incentive Compensation files, or Territory Design files. Use a file name from the connected-module index. Call this before interpreting or querying a file.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          file_name: { type: 'string', description: 'File name, table name, or unique fragment from the data index.' },
+        },
+        required: ['file_name'],
+      },
+    },
+    {
       name: 'run_sql',
-      description: 'Execute a single read-only SQL SELECT against the uploaded datasets and return matching rows as JSON. Only SELECT is allowed. Use exact table and column names from the data catalog. Use JOINs to combine datasets.',
+      description: 'Execute a single read-only SQL SELECT against the uploaded datasets and return matching rows as JSON. Only SELECT is allowed. Use exact table and column names from get_file_context or inspect_table. Use JOINs to combine datasets.',
       input_schema: {
         type: 'object',
         properties: { query: { type: 'string', description: 'A single SQL SELECT statement.' } },
@@ -11000,17 +11045,17 @@ ${stepInstruction}`;
       description: 'Preview a dataset table (up to 8 sample rows) to understand its real values, formats and categories before writing analytical queries.',
       input_schema: {
         type: 'object',
-        properties: { table: { type: 'string', description: 'Exact table name from the data catalog.' } },
+        properties: { table: { type: 'string', description: 'Exact table name from get_file_context or the data index.' } },
         required: ['table'],
       },
     },
     {
       name: 'read_document',
-      description: 'Read the full text of an uploaded PDF or text document by exact file name from the data catalog. Use when you need specific details, quotes, or facts from a document — especially when combining document content with tabular SQL results.',
+      description: 'Read the full text of a hub file (Stella PDF/text, or an Incentive/Territory context file extract) by file name from the index. Use when you need specific details, quotes, scheme rules, or alignment facts — especially when combining with Stella SQL results.',
       input_schema: {
         type: 'object',
         properties: {
-          file_name: { type: 'string', description: 'Exact file name from the data catalog (e.g. "Q1 Engagement Report.pdf").' },
+          file_name: { type: 'string', description: 'Exact file name from the data index (e.g. "Q1 Engagement Report.pdf").' },
           search_hint: { type: 'string', description: 'Optional keyword or topic to focus on when scanning a long document.' },
         },
         required: ['file_name'],
@@ -11019,7 +11064,25 @@ ${stepInstruction}`;
   ];
 
   // Execute a tool call requested by the agent; returns { text, step }.
-  const runStellaTool = async (name, input, knownTables, files) => {
+  const runStellaTool = async (name, input, knownTables, files, hubFiles = []) => {
+    if (name === 'get_file_context') {
+      const q = String(input?.file_name || '').trim();
+      const stellaHit = findStellaFile(files, q);
+      const hubHit = stellaHit ? null : findHubContextFile(hubFiles, q);
+      const file = stellaHit || hubHit;
+      if (!file) {
+        const available = [...new Set([
+          ...(files || []).filter((f) => f && !f.processing).map((f) => f.name),
+          ...(hubFiles || []).filter((f) => f && !f.processing).map((f) => f.name),
+        ])].slice(0, 40).join(', ') || '(none)';
+        return { text: `File "${q}" not found. Available files: ${available}`, step: { type: 'error', label: 'File context not found', detail: q } };
+      }
+      const useStellaCard = !!(file.tableName || file.hubKind === 'stella-table' || file.hubKind === 'stella-doc');
+      return {
+        text: useStellaCard ? formatStellaFileContextCard(file) : formatModuleContextCard(file),
+        step: { type: 'context', label: `Loaded context for ${file.name}`, detail: file.tableName ? `table ${file.tableName}` : (file.hubModule ? String(file.hubModule) : 'document') },
+      };
+    }
     if (name === 'inspect_table') {
       const table = String(input?.table || '').trim();
       if (!knownTables.includes(table)) {
@@ -11051,32 +11114,61 @@ ${stepInstruction}`;
     if (name === 'read_document') {
       const fileName = String(input?.file_name || '').trim();
       const hint = String(input?.search_hint || '').trim().toLowerCase();
-      const doc = (files || []).find(f => !f.tableName && f.name.toLowerCase() === fileName.toLowerCase())
+      const stellaDoc = (files || []).find(f => !f.tableName && f.name.toLowerCase() === fileName.toLowerCase())
         || (files || []).find(f => !f.tableName && f.name.toLowerCase().includes(fileName.toLowerCase()));
+      const hubDoc = stellaDoc ? null : findHubContextFile(hubFiles, fileName);
+      const doc = stellaDoc || hubDoc;
       if (!doc) {
-        const available = (files || []).filter(f => !f.tableName).map(f => f.name).join(', ') || '(none)';
+        const available = [...new Set([
+          ...(files || []).filter(f => !f.tableName).map(f => f.name),
+          ...(hubFiles || []).filter(f => f && !f.tableName).map(f => f.name),
+        ])].filter(Boolean).join(', ') || '(none)';
         return { text: `Document "${fileName}" not found. Available documents: ${available}`, step: { type: 'error', label: 'Document not found', detail: fileName } };
       }
-      try {
-        let text = await stellaFetchDocumentText(doc);
-        if (!text || !text.trim()) {
-          return { text: `No extractable text found for "${doc.name}". Use the summary and intake context from the catalog.`, step: { type: 'error', label: `Read ${doc.name}`, detail: 'No text extracted' } };
-        }
-        const TOOL_CHAR_CAP = 55000;
-        let excerpt = text;
+      const applyHint = (text) => {
+        let excerpt = String(text || '');
         let truncated = false;
-        if (hint && text.length > 8000) {
-          const paras = text.split(/\n{2,}/);
+        if (hint && excerpt.length > 8000) {
+          const paras = excerpt.split(/\n{2,}/);
           const hits = paras.filter(p => p.toLowerCase().includes(hint));
           if (hits.length) excerpt = hits.join('\n\n');
         }
+        const TOOL_CHAR_CAP = 55000;
         if (excerpt.length > TOOL_CHAR_CAP) {
           excerpt = excerpt.slice(0, TOOL_CHAR_CAP);
           truncated = true;
         }
+        return { excerpt, truncated };
+      };
+      try {
+        if (doc.tableName || doc.hubKind === 'stella-table') {
+          return { text: `"${doc.name}" is a Stella table. Use get_file_context then inspect_table / run_sql.`, step: { type: 'error', label: `Read ${doc.name}`, detail: 'tabular — use SQL tools' } };
+        }
+        if (stellaDoc || doc.hubKind === 'stella-doc') {
+          let text = await stellaFetchDocumentText(doc);
+          if (!text || !text.trim()) {
+            return { text: `No extractable text found for "${doc.name}". Use the summary and intake context from get_file_context.`, step: { type: 'error', label: `Read ${doc.name}`, detail: 'No text extracted' } };
+          }
+          const { excerpt, truncated } = applyHint(text);
+          return {
+            text: `Full text of "${doc.name}"${hint ? ` (filtered by: ${hint})` : ''}${truncated ? ' [truncated]' : ''}:\n\n${excerpt}`,
+            step: { type: 'document', label: `Read ${doc.name}`, detail: `${excerpt.length.toLocaleString()} characters${truncated ? ' (truncated)' : ''}${hint ? ` · hint: ${hint}` : ''}` },
+          };
+        }
+        const bundled = [
+          doc.extractedText,
+          doc.structuredExtract,
+          doc.visionExtract,
+          doc.summary,
+        ].filter((t) => t && String(t).trim()).join('\n\n');
+        if (!bundled.trim()) {
+          const card = formatModuleContextCard(doc);
+          return { text: card || `No extractable text found for "${doc.name}".`, step: { type: 'document', label: `Read ${doc.name}`, detail: 'context card' } };
+        }
+        const { excerpt, truncated } = applyHint(bundled);
         return {
-          text: `Full text of "${doc.name}"${hint ? ` (filtered by: ${hint})` : ''}${truncated ? ' [truncated]' : ''}:\n\n${excerpt}`,
-          step: { type: 'document', label: `Read ${doc.name}`, detail: `${excerpt.length.toLocaleString()} characters${truncated ? ' (truncated)' : ''}${hint ? ` · hint: ${hint}` : ''}` },
+          text: `Extract of "${doc.name}" (${doc.hubModule || 'module'})${hint ? ` (filtered by: ${hint})` : ''}${truncated ? ' [truncated]' : ''}:\n\n${excerpt}`,
+          step: { type: 'document', label: `Read ${doc.name}`, detail: `${excerpt.length.toLocaleString()} characters${truncated ? ' (truncated)' : ''}` },
         };
       } catch (err) {
         return { text: `Could not read "${doc.name}": ${err.message}`, step: { type: 'error', label: `Read ${doc.name}`, detail: err.message } };
@@ -11085,9 +11177,102 @@ ${stepInstruction}`;
     return { text: `Unknown tool: ${name}`, step: { type: 'error', label: `Unknown tool ${name}`, detail: '' } };
   };
 
+  const runWithStellaDataTools = async ({
+    system,
+    messages,
+    files,
+    hubFiles = [],
+    maxRounds = 8,
+    maxTokens = 4000,
+    thinking = false,
+    wrapPrompt = 'Please give your final answer now based on what you found. Do not mention SQL or tool names.',
+  } = {}) => {
+    const knownTables = (files || []).filter((f) => f.tableName).map((f) => f.tableName);
+    const hasTables = knownTables.length > 0;
+    const toolList = hasTables
+      ? STELLA_TOOLS
+      : STELLA_TOOLS.filter((t) => t.name === 'get_file_context' || t.name === 'read_document');
+    const convo = (messages || []).map((m) => ({
+      role: toAnthropicRole(m.role),
+      content: m.content,
+    }));
+    const steps = [];
+    let finalText = '';
+    const thinkingCfg = thinking && typeof thinking === 'object'
+      ? thinking
+      : (thinking ? { type: 'enabled', budget_tokens: 2500 } : null);
+    const tokenBudget = Math.min(8192, Math.max(maxTokens || 1000, thinkingCfg ? (thinkingCfg.budget_tokens || 2500) + 500 : 0));
+
+    for (let round = 0; round < maxRounds; round++) {
+      const payload = {
+        system,
+        messages: convo,
+        tools: toolList,
+        max_tokens: tokenBudget,
+      };
+      if (thinkingCfg) payload.thinking = thinkingCfg;
+      const resp = await anthropicMessagesPost(payload);
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`API error ${resp.status}: ${(errText || '').slice(0, 240)}`);
+      }
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+
+      const content = Array.isArray(data.content) ? data.content : [];
+      const thinkingParts = content
+        .filter((b) => (b.type === 'thinking' || b.type === 'redacted_thinking'))
+        .map((b) => (b.type === 'redacted_thinking' ? '(internal reasoning)' : b.thinking))
+        .filter(Boolean);
+      const textParts = content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+      const toolUses = content.filter((b) => b.type === 'tool_use');
+
+      thinkingParts.forEach((t, idx) => {
+        const detail = String(t).trim();
+        if (detail) steps.push({ type: 'thought', label: (round === 0 && idx === 0) ? 'Plan' : 'Reasoning', detail });
+      });
+      if (textParts && toolUses.length) {
+        steps.push({ type: 'thought', label: 'Note', detail: textParts });
+      }
+
+      if (data.stop_reason !== 'tool_use' || !toolUses.length) {
+        finalText = textParts || finalText;
+        break;
+      }
+
+      convo.push({ role: 'assistant', content });
+      const toolResults = [];
+      for (const tu of toolUses) {
+        const { text, step } = await runStellaTool(tu.name, tu.input, knownTables, files, hubFiles);
+        steps.push(step);
+        toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: text });
+      }
+      convo.push({ role: 'user', content: toolResults });
+
+      if (round === maxRounds - 1) {
+        const wrapPayload = {
+          system,
+          messages: [...convo, { role: 'user', content: wrapPrompt }],
+          max_tokens: tokenBudget,
+        };
+        if (thinkingCfg) wrapPayload.thinking = thinkingCfg;
+        const wrapResp = await anthropicMessagesPost(wrapPayload);
+        if (!wrapResp.ok) {
+          const errText = await wrapResp.text();
+          throw new Error(`API error ${wrapResp.status}: ${(errText || '').slice(0, 240)}`);
+        }
+        const wrapData = await wrapResp.json();
+        if (!wrapData.error) finalText = anthropicAssistantText(wrapData) || finalText;
+      }
+    }
+
+    return { text: stellaStripSqlBlocks(finalText) || finalText || '', steps };
+  };
+  runWithStellaDataToolsRef.current = runWithStellaDataTools;
+
   // Collapsible "How Stella worked this out" reasoning trail.
   const renderStellaSteps = (steps) => {
-    const iconFor = (t) => (t === 'query' ? '🔎' : t === 'inspect' ? '👁' : t === 'document' ? '📄' : t === 'error' ? '⚠️' : '🧠');
+    const iconFor = (t) => (t === 'query' ? '🔎' : t === 'inspect' ? '👁' : t === 'document' ? '📄' : t === 'context' ? '📋' : t === 'error' ? '⚠️' : '🧠');
     return (
       <details className="mt-3 bg-slate-900/50 border border-blue-400/20 rounded-lg overflow-hidden">
         <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-cyan-300/90 hover:bg-slate-800/50 flex items-center gap-2">
@@ -11200,80 +11385,27 @@ ${stepInstruction}`;
     try {
       // Always build the prompt from the freshest registry.
       const registry = await stellaReloadRegistry();
-      const files = registry || stellaDataFiles;
-      const knownTables = files.filter(f => f.tableName).map(f => f.tableName);
+      const files = (Array.isArray(registry) && registry.length)
+        ? registry
+        : (stellaDataFilesRef.current || stellaDataFiles);
       const systemPrompt = buildStellaSystemPrompt(files);
-
-      // Prior turns as plain strings; the agent loop uses structured content.
       const convo = [
         ...stellaMessages.filter(m => m.role !== 'system').map(m => ({ role: toAnthropicRole(m.role), content: m.content })),
         { role: 'user', content: messageContent },
       ];
-
-      const steps = [];
-      let finalText = '';
       const stellaSettings = userSettingsRef.current || userSettings;
       const stellaAnswerTokens = scaleUserFacingMaxTokens(2500, stellaSettings);
-      const MAX_STEPS = 8;
-
-      for (let round = 0; round < MAX_STEPS; round++) {
-        const resp = await anthropicMessagesPost({
-          system: systemPrompt,
-          messages: convo,
-          tools: STELLA_TOOLS,
-          max_tokens: Math.min(8192, 2500 + stellaAnswerTokens),
-          thinking: { type: 'enabled', budget_tokens: 2500 },
-        });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error.message);
-
-        const content = Array.isArray(data.content) ? data.content : [];
-        const thinkingParts = content
-          .filter(b => (b.type === 'thinking' || b.type === 'redacted_thinking'))
-          .map(b => (b.type === 'redacted_thinking' ? '(internal reasoning)' : b.thinking))
-          .filter(Boolean);
-        const textParts = content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-        const toolUses = content.filter(b => b.type === 'tool_use');
-
-        // Capture the model's actual extended-thinking reasoning for the trail.
-        thinkingParts.forEach((t, idx) => {
-          const detail = String(t).trim();
-          if (detail) steps.push({ type: 'thought', label: (round === 0 && idx === 0) ? 'Plan' : 'Reasoning', detail });
-        });
-        // Capture any narrated commentary that accompanies a tool call.
-        if (textParts && toolUses.length) {
-          steps.push({ type: 'thought', label: 'Note', detail: textParts });
-        }
-
-        if (data.stop_reason !== 'tool_use' || !toolUses.length) {
-          finalText = textParts || finalText;
-          break;
-        }
-
-        // Record the assistant turn (must include the tool_use blocks verbatim).
-        convo.push({ role: 'assistant', content });
-
-        // Execute each requested tool and feed results back.
-        const toolResults = [];
-        for (const tu of toolUses) {
-          const { text, step } = await runStellaTool(tu.name, tu.input, knownTables, files);
-          steps.push(step);
-          toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: text });
-        }
-        convo.push({ role: 'user', content: toolResults });
-
-        // On the last allowed round, force a plain-text final answer next.
-        if (round === MAX_STEPS - 1) {
-          const wrapResp = await anthropicMessagesPost({
-            system: systemPrompt,
-            messages: [...convo, { role: 'user', content: 'Please give your final answer now based on what you found.' }],
-            max_tokens: Math.min(8192, 2000 + scaleUserFacingMaxTokens(2000, stellaSettings)),
-            thinking: { type: 'enabled', budget_tokens: 2000 },
-          });
-          const wrapData = await wrapResp.json();
-          if (!wrapData.error) finalText = anthropicAssistantText(wrapData) || finalText;
-        }
-      }
+      const hubFiles = listHubContextFiles(stellaSettings, 'stella', { stellaFiles: files });
+      const { text: finalText, steps } = await runWithStellaDataTools({
+        system: systemPrompt,
+        messages: convo,
+        files,
+        hubFiles,
+        maxRounds: 8,
+        maxTokens: Math.min(8192, 2500 + stellaAnswerTokens),
+        thinking: { type: 'enabled', budget_tokens: 2500 },
+        wrapPrompt: 'Please give your final answer now based on what you found.',
+      });
 
       const cleaned = stellaStripSqlBlocks(finalText) || finalText || 'I couldn\'t find enough to answer that from the available data.';
       const withReply = [...(stellaMessagesRef.current || []), { role: 'assistant', content: cleaned, steps }];
@@ -11831,16 +11963,16 @@ ${stepInstruction}`;
         const history = (messagesRef.current || []).filter((m) => m.role !== 'system').map((m) => ({ role: toAnthropicRole(m.role), content: m.content }));
         const alreadyLatest = history.length && history[history.length - 1]?.role === 'user'
           && String(history[history.length - 1]?.content || '') === messageContent;
-        const response = await anthropicMessagesPost({
-          system: systemPrompt,
-          messages: [
-            ...history,
-            ...(alreadyLatest ? [] : [{ role: 'user', content: messageContent }]),
-          ],
-          max_tokens: scaleUserFacingMaxTokens(4000, userSettingsRef.current || userSettings),
-        });
-        const data = await response.json();
-        const assistantMessage = anthropicAssistantText(data);
+        const convo = [
+          ...history,
+          ...(alreadyLatest ? [] : [{ role: 'user', content: messageContent }]),
+        ];
+        const assistantMessage = await callAnthropicMaybeStellaTools(
+          systemPrompt,
+          convo,
+          scaleUserFacingMaxTokens(4000, userSettingsRef.current || userSettings),
+          { maxRounds: 8 },
+        );
         const withReply = [...(messagesRef.current || []), { role: 'assistant', content: assistantMessage }];
         setMessages(prev => [...prev, { role: 'assistant', content: assistantMessage }]);
         setUploadedFile(null);

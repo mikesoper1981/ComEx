@@ -397,7 +397,9 @@ export function mergeStellaPrompts(partial) {
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)
       || !/NAME MAPS already captured/i.test(out.analyst)
       || !/unless this question or your instructions specify/i.test(out.analyst)
-      || !/CONNECTED MODULES or LINKED MODULE CONTEXT/i.test(out.analyst)) {
+      || !/CONNECTED MODULES/i.test(out.analyst)
+      || !/get_file_context/i.test(out.analyst)
+      || !/two-way hub/i.test(out.analyst)) {
     out.analyst = DEFAULT_STELLA_PROMPTS.analyst;
   }
   return out;

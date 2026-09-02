@@ -408,6 +408,29 @@ export function connectedModuleIds(connections, moduleId) {
     .map((c) => (c.a === moduleId ? c.b : c.a));
 }
 
+/** Every module reachable from this one through hub links (undirected). Direct neighbors first. */
+export function connectedComponentIds(connections, moduleId) {
+  if (!MODULE_CONTEXT_IDS.includes(moduleId)) return [];
+  const adj = new Map(MODULE_CONTEXT_IDS.map((id) => [id, []]));
+  for (const c of mergeModuleConnections(connections)) {
+    adj.get(c.a).push(c.b);
+    adj.get(c.b).push(c.a);
+  }
+  const seen = new Set([moduleId]);
+  const queue = [moduleId];
+  const out = [];
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const n of adj.get(cur) || []) {
+      if (seen.has(n)) continue;
+      seen.add(n);
+      out.push(n);
+      queue.push(n);
+    }
+  }
+  return out;
+}
+
 export function toggleModuleConnection(connections, a, b) {
   const key = connectionKey(a, b);
   if (!key) return mergeModuleConnections(connections);
@@ -419,46 +442,232 @@ export function toggleModuleConnection(connections, a, b) {
   return [...next, { a: left, b: right }];
 }
 
-export function formatStellaSharePromptBlock(files, { maxChars = 4500 } = {}) {
+function oneSentence(text, max = 140) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  const first = s.split(/(?<=\.)\s/)[0] || s;
+  return first.length > max ? `${first.slice(0, max - 1)}…` : first;
+}
+
+function stellaFileJoinKeys(f) {
+  const rels = Array.isArray(f?.capturedContext?.relationships) ? f.capturedContext.relationships : [];
+  const keys = [];
+  const seen = new Set();
+  for (const r of rels) {
+    const k = String(r?.this_field || '').trim();
+    if (!k) continue;
+    const id = k.toLowerCase();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    keys.push(k);
+  }
+  return keys;
+}
+
+function stellaJoinIndexLines(files, maxLines = 20) {
+  const lines = [];
+  const seen = new Set();
+  for (const f of files || []) {
+    const rels = Array.isArray(f?.capturedContext?.relationships) ? f.capturedContext.relationships : [];
+    if (!f?.tableName) continue;
+    for (const r of rels) {
+      if (!r?.this_field || !r?.related_field) continue;
+      const left = `${f.tableName}.${r.this_field}`;
+      const rightTable = r.related_table || r.related_file;
+      if (!rightTable) continue;
+      const right = `${rightTable}.${r.related_field}`;
+      const pair = [left, right].sort().join(' = ');
+      if (seen.has(pair)) continue;
+      seen.add(pair);
+      lines.push(`- ${left} = ${right}${r.note ? ` — ${r.note}` : ''}`);
+      if (lines.length >= maxLines) return lines;
+    }
+  }
+  return lines;
+}
+
+export function formatStellaFileIndexLine(f) {
+  const ctx = f?.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
+  const purpose = oneSentence(ctx.what_it_represents) || oneSentence(f?.summary) || (f?.tableName ? 'tabular dataset' : 'document');
+  const loc = f?.tableName ? `table ${f.tableName}` : 'document';
+  const size = f?.rowCount != null ? `${f.rowCount} rows` : (f?.tableName ? 'table' : 'document');
+  const keys = stellaFileJoinKeys(f).slice(0, 6).join(', ');
+  return `- ${f?.name || 'file'} | ${loc} | ${size} | ${purpose}${keys ? ` | keys: ${keys}` : ''}`;
+}
+
+/** Compact directory of Stella files for prompts — not full catalogs. */
+export function formatStellaFileIndex(files, { maxFiles = 40, maxChars = 4000, header = true } = {}) {
+  const usable = (files || []).filter((f) => f && !f.processing);
+  const shown = usable.slice(0, maxFiles);
+  const omitted = Math.max(0, usable.length - shown.length);
+  const lines = shown.map(formatStellaFileIndexLine);
+  const joins = stellaJoinIndexLines(usable);
+  const parts = [];
+  if (header) {
+    parts.push(`STELLA DATA INDEX (${usable.length} file${usable.length === 1 ? '' : 's'}) — directory only, not the numbers. Use get_file_context for columns/joins/notes, then inspect_table / run_sql / read_document for live facts. Never invent territory counts, product performance, or coverage from the index lines.`);
+  }
+  parts.push(...lines);
+  if (omitted) parts.push(`… ${omitted} more file${omitted === 1 ? '' : 's'} not listed — call get_file_context with the file name from the user's question.`);
+  if (joins.length) {
+    parts.push('CONFIRMED JOINS:');
+    parts.push(...joins);
+  }
+  let body = parts.join('\n');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… Stella index truncated — use get_file_context by file name …]`;
+  return { body, fileCount: usable.length, shown: shown.length, omitted };
+}
+
+/** Full catalog card for one Stella file (tool result, not always-on prompt). */
+export function formatStellaFileContextCard(f, { maxChars = 8000 } = {}) {
+  if (!f) return '';
+  const ctx = f.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
+  const cols = (f.columns || []).map((c) => {
+    if (typeof c === 'string') return `  - ${c}`;
+    const orig = c.original && c.original !== c.name ? ` (source header: "${c.original}")` : '';
+    const desc = c.description ? `: ${c.description}` : '';
+    return `  - ${c.name}${orig} [${c.type || 'text'}]${desc}`;
+  }).filter(Boolean);
+  const metrics = Array.isArray(ctx.key_metrics) ? ctx.key_metrics.filter((m) => !isEmptyContextValue(m)) : [];
+  const maps = Array.isArray(ctx.name_maps)
+    ? ctx.name_maps.filter((m) => m && (m.from || m.to)).map((m) => `  - "${m.from || '?'}" = "${m.to || '?'}"${m.note ? ` (${m.note})` : ''}`)
+    : [];
+  const joins = Array.isArray(ctx.relationships)
+    ? ctx.relationships
+      .filter((r) => r && r.this_field && r.related_field)
+      .map((r) => `  - ${r.this_field} = ${r.related_file || r.related_table}.${r.related_field}${r.note ? ` — ${r.note}` : ''}`)
+    : [];
+  const qa = Array.isArray(ctx.qa_pairs)
+    ? ctx.qa_pairs.filter((p) => p && (p.question || p.answer)).slice(0, 12).map((p) => `  Q: ${p.question || ''}\n  A: ${p.answer || ''}`)
+    : [];
+  const location = f.tableName
+    ? `SQL table: ${f.tableName}`
+    : `Document (use read_document for full text; path: ${f.storagePath || 'n/a'})`;
+  const parts = [
+    `FILE: ${f.name}`,
+    `Type: ${f.fileType || f.type || 'file'}`,
+    location,
+    f.rowCount != null ? `Rows: ${f.rowCount}` : '',
+    !isEmptyContextValue(f.summary) ? `Summary: ${String(f.summary).replace(/\s+/g, ' ').trim()}` : '',
+    cols.length ? `Columns:\n${cols.join('\n')}` : (f.tableName ? 'Columns: (none captured yet — inspect_table)' : 'Columns: (document)'),
+    !isEmptyContextValue(ctx.what_it_represents) ? `What it represents: ${ctx.what_it_represents}` : '',
+    !isEmptyContextValue(ctx.time_period) ? `Time period: ${ctx.time_period}` : '',
+    metrics.length ? `Key metrics: ${metrics.join('; ')}` : '',
+    maps.length ? `NAME MAPS (authoritative — treat mapped names as the same; apply in queries):\n${maps.join('\n')}` : '',
+    joins.length ? `Confirmed joins:\n${joins.join('\n')}` : '',
+    !isEmptyContextValue(ctx.interpretation_notes) ? `Interpretation notes: ${String(ctx.interpretation_notes).replace(/\s+/g, ' ').trim()}` : '',
+    qa.length ? `Intake Q&A:\n${qa.join('\n')}` : '',
+    (!f.tableName && !isEmptyContextValue(f.extractedText))
+      ? `Extract (partial): ${String(f.extractedText).replace(/\s+/g, ' ').trim().slice(0, 1200)}`
+      : '',
+  ].filter(Boolean);
+  let body = parts.join('\n');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… file context truncated …]`;
+  return body;
+}
+
+export function findStellaFile(files, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return null;
+  const list = (files || []).filter((f) => f && !f.processing);
+  const exact = list.find((f) => String(f.name || '').toLowerCase() === q)
+    || list.find((f) => String(f.tableName || '').toLowerCase() === q)
+    || list.find((f) => String(f.id || '').toLowerCase() === q);
+  if (exact) return exact;
+  return list.find((f) => String(f.name || '').toLowerCase().includes(q))
+    || list.find((f) => String(f.tableName || '').toLowerCase().includes(q))
+    || null;
+}
+
+export function formatStellaSharePromptBlock(files, { maxChars = 3500 } = {}) {
   const usable = (files || []).filter((f) => f && !f.processing);
   if (!usable.length) return '';
-  const blocks = usable.map((f) => {
-    const cols = (f.columns || []).slice(0, 18).map((c) => (typeof c === 'string' ? c : c.name)).filter(Boolean).join(', ');
-    const ctx = f.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
-    const metrics = Array.isArray(ctx.key_metrics) ? ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).slice(0, 8).join('; ') : '';
-    const maps = Array.isArray(ctx.name_maps)
-      ? ctx.name_maps.filter((m) => m && (m.from || m.to)).slice(0, 8).map((m) => `${m.from || '?'} → ${m.to || '?'}`).join('; ')
-      : '';
-    const joins = Array.isArray(ctx.relationships)
-      ? ctx.relationships
-        .filter((r) => r && r.this_field && r.related_field)
-        .slice(0, 10)
-        .map((r) => `${r.this_field} = ${r.related_file || r.related_table}.${r.related_field}`)
-        .join('; ')
-      : '';
-    return [
-      `FILE: ${f.name}${f.rowCount != null ? ` (${f.rowCount} rows)` : (f.tableName ? ' (table)' : ' (document)')}`,
-      f.tableName ? `SQL table: ${f.tableName}` : '',
-      !isEmptyContextValue(f.summary) ? `Summary: ${String(f.summary).replace(/\s+/g, ' ').trim().slice(0, 420)}` : '',
-      cols ? `Columns: ${cols}` : '',
-      !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
-      !isEmptyContextValue(ctx.time_period) ? `Period: ${ctx.time_period}` : '',
-      metrics ? `Key metrics: ${metrics}` : '',
-      maps ? `Name maps: ${maps}` : '',
-      joins ? `Joins: ${joins}` : '',
-      !isEmptyContextValue(ctx.interpretation_notes) ? `How to use: ${String(ctx.interpretation_notes).replace(/\s+/g, ' ').trim().slice(0, 280)}` : '',
-      (!f.tableName && !isEmptyContextValue(f.extractedText))
-        ? `Extract: ${String(f.extractedText).replace(/\s+/g, ' ').trim().slice(0, 500)}`
-        : '',
-    ].filter(Boolean).join('\n');
-  });
-  let body = blocks.join('\n\n');
-  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… Stella catalog truncated …]`;
-  return `\n\nLINKED STELLA DATA CATALOG — this user connected Stella to this module. Datasets they uploaded to Stella (summaries and confirmed joins, not live SQL). Use as mandatory background for territories, products, coverage, and metrics. Do not invent extra tables or values:\n${body}\n`;
+  const { body } = formatStellaFileIndex(usable, { maxFiles: 40, maxChars });
+  return `\n\nLINKED STELLA DATA — Stella Insights is in this hub. The index below is a directory of live datasets. Use get_file_context for columns/joins/notes, then inspect_table / run_sql / read_document for live facts (territory counts, product performance, coverage). Do not invent extra tables or values. Do not mention SQL, table names, or tool names to the end user.\n${body}\nSQL: PostgreSQL SELECT only. Columns marked numeric are already numeric — never ROUND(...::float). For division: (SUM(x)::numeric / NULLIF(COUNT(*),0)).\n`;
+}
+
+export function listModuleLibraryFiles(settings, moduleId) {
+  const id = MODULE_CONTEXT_IDS.includes(moduleId) ? moduleId : 'incentives';
+  return (settings?.moduleContext?.[id]?.files || []).filter((f) => f && !f.processing);
+}
+
+export function formatModuleLibraryIndexLine(f, moduleId) {
+  const ctx = f?.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
+  const purpose = oneSentence(ctx.what_it_represents)
+    || oneSentence(f?.summary)
+    || oneSentence(f?.extractedText, 100)
+    || (f?.fileType || 'document');
+  const kind = f?.fileType || f?.kind || 'file';
+  return `- ${f?.name || 'file'} | ${MODULE_CONTEXT_LABELS[moduleId] || moduleId} | ${kind} | ${purpose}`;
+}
+
+export function formatModuleLibraryIndex(settings, moduleId, { maxFiles = 40, maxChars = 2500, linkedFrom = '', role = 'linked' } = {}) {
+  const files = listModuleLibraryFiles(settings, moduleId);
+  if (!files.length) return '';
+  const shown = files.slice(0, maxFiles);
+  const omitted = Math.max(0, files.length - shown.length);
+  const label = MODULE_CONTEXT_LABELS[moduleId] || moduleId;
+  const header = role === 'home'
+    ? `\n\nTHIS MODULE LIBRARY (${label}, ${files.length} file${files.length === 1 ? '' : 's'}) — directory only. Use get_file_context for the full extract, Q&A, and notes.\n`
+    : `\n\nLINKED MODULE LIBRARY (${label}, ${files.length} file${files.length === 1 ? '' : 's'}) — shared both ways because this hub connects ${MODULE_CONTEXT_LABELS[linkedFrom] || linkedFrom} with ${label}. Directory only. Use get_file_context for the full file. Do not contradict it.\n`;
+  const parts = [header.trimEnd(), ...shown.map((f) => formatModuleLibraryIndexLine(f, moduleId))];
+  if (omitted) parts.push(`… ${omitted} more file${omitted === 1 ? '' : 's'} — call get_file_context with the file name.`);
+  let body = parts.join('\n');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… library index truncated — use get_file_context by file name …]`;
+  return `${body}\n`;
+}
+
+export function formatModuleContextCard(f, { maxChars = 8000 } = {}) {
+  if (!f) return '';
+  const moduleLabel = MODULE_CONTEXT_LABELS[f.hubModule] || f.hubModule || '';
+  const blocks = listModuleContextBlocks(f).map(formatBlockForPrompt).filter(Boolean);
+  const parts = [
+    `FILE: ${f.name || 'file'}`,
+    moduleLabel ? `Module: ${moduleLabel}` : '',
+    `Type: ${f.fileType || f.type || 'document'}`,
+    ...blocks,
+  ].filter(Boolean);
+  let body = parts.join('\n');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… file context truncated …]`;
+  return body;
+}
+
+export function listHubContextFiles(settings, homeId, { stellaFiles = [], includeHome = true } = {}) {
+  const home = MODULE_CONTEXT_IDS.includes(homeId) ? homeId : 'incentives';
+  const linked = connectedComponentIds(settings?.moduleConnections, home);
+  const scope = includeHome ? [home, ...linked] : linked;
+  const out = [];
+  const seen = new Set();
+  const push = (f, hubModule, hubKind) => {
+    if (!f || f.processing) return;
+    const key = `${hubModule}|${f.id || f.tableName || f.name || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ ...f, hubModule, hubKind });
+  };
+  for (const id of scope) {
+    if (id === 'stella') {
+      for (const f of (stellaFiles || [])) push(f, 'stella', f?.tableName ? 'stella-table' : 'stella-doc');
+    }
+    for (const f of listModuleLibraryFiles(settings, id)) push(f, id, 'module-file');
+  }
+  return out;
+}
+
+export function findHubContextFile(hubFiles, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return null;
+  const list = (hubFiles || []).filter((f) => f && !f.processing);
+  const exact = list.find((f) => String(f.name || '').toLowerCase() === q)
+    || list.find((f) => String(f.tableName || '').toLowerCase() === q)
+    || list.find((f) => String(f.id || '').toLowerCase() === q);
+  if (exact) return exact;
+  return list.find((f) => String(f.name || '').toLowerCase().includes(q))
+    || list.find((f) => String(f.tableName || '').toLowerCase().includes(q))
+    || null;
 }
 
 export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 12000, linkedFrom = '' } = {}) {
-  const files = (settings?.moduleContext?.[moduleId]?.files || []).filter((f) => f && !f.processing);
+  const files = listModuleLibraryFiles(settings, moduleId);
   const blobs = files.map((f) => {
     const blocks = listModuleContextBlocks(f).map(formatBlockForPrompt).filter(Boolean);
     if (!blocks.length) return '';
@@ -473,29 +682,34 @@ export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 
   return `${header}${body}\n`;
 }
 
-export function formatLinkedModulesPromptBlock(settings, homeId, { stellaFiles = [], maxChars = 14000 } = {}) {
+export function formatLinkedModulesPromptBlock(settings, homeId, { stellaFiles = [], maxChars = 10000 } = {}) {
   const home = MODULE_CONTEXT_IDS.includes(homeId) ? homeId : 'incentives';
-  const linked = connectedModuleIds(settings?.moduleConnections, home);
+  const linked = connectedComponentIds(settings?.moduleConnections, home);
   const chunks = [];
   if (linked.length) {
     const names = linked.map((id) => MODULE_CONTEXT_LABELS[id] || id).join(', ');
-    chunks.push(`\n\nCONNECTED MODULES — this ${MODULE_CONTEXT_LABELS[home] || home} session is linked to ${names}. Files, catalogs, and remembered facts from those modules below are in-scope. Use them. Do not say you cannot see a linked module.\n`);
+    chunks.push(`\n\nCONNECTED MODULES — this ${MODULE_CONTEXT_LABELS[home] || home} session is in a two-way hub with ${names}. Scheme files, territory files, and Stella datasets flow both ways. Use get_file_context to load a file from the indexes below. If Stella is in the hub, use inspect_table / run_sql / read_document for live numbers. Never invent territory counts, product performance, coverage, scheme rules, or alignment facts those libraries would contain. Do not say you cannot see a linked module. Do not mention SQL, table names, or tool names to the end user.\n`);
   }
-  const homeBlock = formatModuleContextPromptBlock(settings, home, { maxChars: 8000 });
-  if (homeBlock) chunks.push(homeBlock);
+  if (home === 'stella') {
+    const homeLib = formatModuleLibraryIndex(settings, 'stella', { role: 'home', maxChars: 2500 });
+    if (homeLib) chunks.push(homeLib);
+  } else {
+    const homeLib = formatModuleLibraryIndex(settings, home, { role: 'home', maxChars: 2500 });
+    if (homeLib) chunks.push(homeLib);
+  }
   for (const id of linked) {
-    const other = formatModuleContextPromptBlock(settings, id, { maxChars: 4500, linkedFrom: home });
-    if (other) chunks.push(other);
-    else if (id !== 'stella') {
-      chunks.push(`\n\nLINKED MODULE CONTEXT (${MODULE_CONTEXT_LABELS[id] || id}) — this user connected ${MODULE_CONTEXT_LABELS[home] || home} with ${MODULE_CONTEXT_LABELS[id] || id}, but that module has no context files uploaded yet.\n`);
-    }
-    if (id === 'stella' && home !== 'stella') {
+    if (id === 'stella') {
       const goals = String(settings?.stellaBusinessContext?.keyGoals || '').trim();
       if (goals) {
         chunks.push(`\n\nLINKED STELLA ANALYSIS GOALS — use as background for what they want from data analysis:\n${goals}\n`);
       }
-      const catalog = formatStellaSharePromptBlock(stellaFiles, { maxChars: 5000 });
-      chunks.push(catalog || `\n\nLINKED STELLA DATA CATALOG — Stella Insights is connected, but no Stella datasets are loaded in this session yet. You can still treat Stella as a linked module.\n`);
+      if (home !== 'stella') {
+        const catalog = formatStellaSharePromptBlock(stellaFiles, { maxChars: 3500 });
+        chunks.push(catalog || `\n\nLINKED STELLA DATA — Stella Insights is in this hub, but no Stella datasets are loaded in this session yet. You can still treat Stella as a linked module.\n`);
+      }
+    } else {
+      const idx = formatModuleLibraryIndex(settings, id, { maxChars: 2500, linkedFrom: home, role: 'linked' });
+      chunks.push(idx || `\n\nLINKED MODULE LIBRARY (${MODULE_CONTEXT_LABELS[id] || id}) — this hub connects ${MODULE_CONTEXT_LABELS[home] || home} with ${MODULE_CONTEXT_LABELS[id] || id}, but that module has no context files uploaded yet.\n`);
     }
   }
   if (!chunks.length) return '';
@@ -507,7 +721,7 @@ export function formatLinkedModulesPromptBlock(settings, homeId, { stellaFiles =
 /** Slim linked-module facts for Stella intake — enough to propose joins, not scheme design. */
 export function formatLinkedModulesIntakeHint(settings, homeId = 'stella', { maxChars = 2800 } = {}) {
   const home = MODULE_CONTEXT_IDS.includes(homeId) ? homeId : 'stella';
-  const linked = connectedModuleIds(settings?.moduleConnections, home).filter((id) => id !== home);
+  const linked = connectedComponentIds(settings?.moduleConnections, home).filter((id) => id !== home);
   if (!linked.length) return '';
   const names = linked.map((id) => MODULE_CONTEXT_LABELS[id] || id).join(', ');
   const parts = [
@@ -534,7 +748,7 @@ export function formatLinkedModulesIntakeHint(settings, homeId = 'stella', { max
 }
 
 export function stellaLinkedModuleQuestion(settings, homeId = 'stella') {
-  const linked = connectedModuleIds(settings?.moduleConnections, homeId).filter((id) => id !== 'stella');
+  const linked = connectedComponentIds(settings?.moduleConnections, homeId).filter((id) => id !== 'stella');
   if (!linked.length) return '';
   const names = linked.map((id) => MODULE_CONTEXT_LABELS[id] || id).join(' and ');
   const fileBits = [];

@@ -244,18 +244,66 @@ async function supabaseRpc(fn, args) {
   }
 }
 
+/** Split SQL so node-pg can run it. Extended protocol rejects multi-statement strings. */
+function splitSqlStatements(sql) {
+  const out = [];
+  let cur = '';
+  const s = String(sql || '');
+  for (let i = 0; i < s.length; i += 1) {
+    if (s[i] === '-' && s[i + 1] === '-') {
+      const end = s.indexOf('\n', i);
+      i = end === -1 ? s.length : end;
+      continue;
+    }
+    if (s[i] === "'") {
+      cur += s[i];
+      i += 1;
+      while (i < s.length) {
+        cur += s[i];
+        if (s[i] === "'" && s[i + 1] === "'") {
+          cur += s[i + 1];
+          i += 2;
+          continue;
+        }
+        if (s[i] === "'") break;
+        i += 1;
+      }
+      continue;
+    }
+    if (s[i] === '$' && s[i + 1] === '$') {
+      const end = s.indexOf('$$', i + 2);
+      cur += s.slice(i, end === -1 ? s.length : end + 2);
+      i = end === -1 ? s.length : end + 1;
+      continue;
+    }
+    if (s[i] === ';') {
+      const stmt = cur.trim();
+      if (stmt) out.push(stmt);
+      cur = '';
+      continue;
+    }
+    cur += s[i];
+  }
+  const tail = cur.trim();
+  if (tail) out.push(tail);
+  return out;
+}
+
+async function applyBootstrapSql(client) {
+  for (const stmt of splitSqlStatements(BOOTSTRAP_SQL)) {
+    try {
+      await client.query(stmt);
+    } catch (err) {
+      console.warn('Stella bootstrap statement failed', String(err?.message || err).slice(0, 220));
+    }
+  }
+}
+
 async function bootstrapViaPg() {
   if (bootstrapped) return true;
   if (bootstrapInFlight) return bootstrapInFlight;
   bootstrapInFlight = (async () => {
-    await withPg(async (client) => {
-      const { rows } = await client.query(
-        `select to_regprocedure('public.stella_ensure_schema(text)') is not null as ok`,
-      );
-      if (!rows[0]?.ok) {
-        await client.query(BOOTSTRAP_SQL);
-      }
-    });
+    await withPg((client) => applyBootstrapSql(client));
     bootstrapped = true;
     return true;
   })();
@@ -278,22 +326,144 @@ function slugFromSchema(schema) {
   return String(schema || '').replace(/^c_/, '');
 }
 
-async function ensureCompanyFilesTable(schema) {
+function quoteDataTable(name) {
+  if (!/^stella_data_[a-z0-9_]+$/.test(String(name || ''))) {
+    throw new Error('Invalid table name');
+  }
+  return `"${name}"`;
+}
+
+async function sharedStellaFilesColumns(client, schema) {
+  const { rows } = await client.query(
+    `select c.column_name
+     from information_schema.columns c
+     join information_schema.columns p
+       on p.column_name = c.column_name
+     where c.table_schema = $1 and c.table_name = 'stella_files'
+       and p.table_schema = 'public' and p.table_name = 'stella_files'
+     order by c.ordinal_position`,
+    [schema],
+  );
+  return rows.map((r) => `"${String(r.column_name).replace(/"/g, '')}"`).filter((c) => c !== '""');
+}
+
+async function ensureStellaFilesColumns(client, schema) {
+  const targets = ['public'];
+  if (isCompanyPgSchema(schema)) targets.push(schema);
+  for (const sch of targets) {
+    const exists = await client.query('select to_regclass($1) is not null as ok', [`${sch}.stella_files`]);
+    if (!exists.rows[0]?.ok) continue;
+    const q = sch === 'public' ? '"public"' : quoteIdent(sch);
+    await client.query(`alter table ${q}.stella_files add column if not exists uploaded_by text`);
+    await client.query(`alter table ${q}.stella_files add column if not exists uploaded_by_name text`);
+    await client.query(
+      `update ${q}.stella_files
+       set uploaded_by = regexp_replace(org_id, '^.*user:', '')
+       where coalesce(uploaded_by, '') = ''
+         and org_id ~ 'user:'`,
+    );
+  }
+}
+
+async function detachFilesInheritance(client, schema) {
+  const q = quoteIdent(schema);
+  await client.query(`
+    do $body$
+    begin
+      if exists (
+        select 1
+        from pg_inherits
+        where inhrelid = to_regclass('${q}.stella_files')
+          and inhparent = 'public.stella_files'::regclass
+      ) then
+        execute 'alter table ${q}.stella_files no inherit public.stella_files';
+      end if;
+    exception when others then
+      null;
+    end
+    $body$;
+  `);
+}
+
+async function moveExtractTable(client, schema, tableName) {
+  if (!/^stella_data_[a-z0-9_]+$/.test(String(tableName || ''))) return;
+  const q = quoteIdent(schema);
+  const t = quoteDataTable(tableName);
+  const pub = await client.query('select to_regclass($1) is not null as ok', [`public.${tableName}`]);
+  const company = await client.query('select to_regclass($1) is not null as ok', [`${schema}.${tableName}`]);
+  const pubOk = !!pub.rows[0]?.ok;
+  const companyOk = !!company.rows[0]?.ok;
+  if (pubOk && !companyOk) {
+    await client.query(`alter table public.${t} set schema ${q}`);
+    return;
+  }
+  if (pubOk && companyOk) {
+    const count = await client.query(`select count(*)::int as n from ${q}.${t}`);
+    if (!count.rows[0]?.n) {
+      await client.query(`insert into ${q}.${t} select * from public.${t}`);
+    }
+    await client.query(`drop table public.${t}`);
+  }
+}
+
+/**
+ * Copy leftover public.stella_files / public.stella_data_* into the company
+ * schema, then remove those leftovers from public. Called on every list/upload
+ * so PharmaCo (c_pharmaco) stays current even if older code wrote public.
+ */
+async function migratePublicStellaIntoCompany(schema, { orgIds } = {}) {
   if (!isCompanyPgSchema(schema)) return;
   const q = quoteIdent(schema);
   const slug = slugFromSchema(schema);
+  const orgs = [...new Set((Array.isArray(orgIds) ? orgIds : []).map((id) => String(id || '').trim()).filter(Boolean))];
   await withPg(async (client) => {
+    await ensureStellaFilesColumns(client, schema);
     const pub = await client.query(`select to_regclass('public.stella_files') is not null as ok`);
     if (pub.rows[0]?.ok) {
       await client.query(`create table if not exists ${q}.stella_files (like public.stella_files including all)`);
-      await client.query(
-        `insert into ${q}.stella_files
-         select * from public.stella_files
-         where company_slug = $1
-            or org_id like $2
-         on conflict (id) do nothing`,
-        [slug, `company:${slug}:%`],
-      );
+      await detachFilesInheritance(client, schema);
+      const cols = await sharedStellaFilesColumns(client, schema);
+      if (cols.length) {
+        const colList = cols.join(', ');
+        const updates = cols
+          .filter((c) => c !== '"id"')
+          .map((c) => `${c} = excluded.${c}`)
+          .join(', ');
+        const storageMatch = cols.includes('"storage_path"')
+          ? ' or storage_path like $4'
+          : '';
+        const matchSql = cols.includes('"company_slug"')
+          ? `(company_slug = $1 or org_id like $2 or ($3::text[] <> '{}' and org_id = any($3::text[]))${storageMatch})`
+          : `(org_id like $2 or ($3::text[] <> '{}' and org_id = any($3::text[]))${storageMatch})`;
+        const copyParams = [slug, `company:${slug}:%`, orgs, `companies/${slug}/%`];
+        const copySql = updates
+          ? `insert into ${q}.stella_files (${colList})
+             select ${colList} from public.stella_files
+             where ${matchSql}
+             on conflict (id) do update set ${updates}`
+          : `insert into ${q}.stella_files (${colList})
+             select ${colList} from public.stella_files
+             where ${matchSql}
+             on conflict (id) do nothing`;
+        try {
+          await client.query(copySql, copyParams);
+        } catch (err) {
+          console.warn('Company registry copy used insert-only', err?.message || err);
+          await client.query(
+            `insert into ${q}.stella_files (${colList})
+             select ${colList} from public.stella_files
+             where ${matchSql}
+               and id not in (select id from ${q}.stella_files)`,
+            copyParams,
+          );
+        }
+        await client.query(
+          `delete from public.stella_files
+           where id in (select id from ${q}.stella_files)
+             and ${matchSql}`,
+          copyParams,
+        );
+      }
     } else {
       await client.query(`
         create table if not exists ${q}.stella_files (
@@ -308,11 +478,30 @@ async function ensureCompanyFilesTable(schema) {
           summary text,
           context_qa jsonb,
           uploaded_at timestamptz default now(),
-          company_slug text
+          company_slug text,
+          uploaded_by text,
+          uploaded_by_name text
         )
       `);
     }
+
+    const tables = await client.query(
+      `select distinct table_name
+       from ${q}.stella_files
+       where table_name ~ '^stella_data_[a-z0-9_]+$'`,
+    );
+    for (const row of tables.rows || []) {
+      try {
+        await moveExtractTable(client, schema, row.table_name);
+      } catch (err) {
+        console.warn('Could not move leftover public extract table', row.table_name, err?.message || err);
+      }
+    }
   });
+}
+
+async function ensureCompanyFilesTable(schema, extra = {}) {
+  await migratePublicStellaIntoCompany(schema, extra);
 }
 
 async function createSchemaViaPg(schema) {
@@ -365,20 +554,30 @@ async function ensureCompanyPgSchema(companyOrSchema) {
     lastEnsureError = 'Invalid company schema name.';
     return false;
   }
+
+  lastEnsureError = '';
+  try {
+    await bootstrapViaPg();
+  } catch (err) {
+    lastEnsureError = lastEnsureError || redact(err);
+    console.warn('Could not bootstrap Stella tenant SQL', lastEnsureError);
+  }
+
   if (ensuredSchemas.has(schema)) {
     lastEnsureError = '';
     return true;
   }
 
-  lastEnsureError = '';
   try {
     const { schemaOk, filesOk } = await inspectCompanySchema(schema);
     if (schemaOk) {
-      if (!filesOk) {
-        try {
-          await ensureCompanyFilesTable(schema);
-        } catch (err) {
-          console.warn('Could not ensure company file registry', schema, err?.message || err);
+      try {
+        await ensureCompanyFilesTable(schema);
+      } catch (err) {
+        console.warn('Could not ensure company file registry', schema, err?.message || err);
+        if (!filesOk) {
+          lastEnsureError = lastEnsureError || redact(err);
+          return false;
         }
       }
       ensuredSchemas.add(schema);
@@ -386,13 +585,6 @@ async function ensureCompanyPgSchema(companyOrSchema) {
     }
   } catch (err) {
     lastEnsureError = redact(err);
-  }
-
-  try {
-    await bootstrapViaPg();
-  } catch (err) {
-    lastEnsureError = lastEnsureError || redact(err);
-    console.warn('Could not bootstrap Stella tenant SQL', lastEnsureError);
   }
 
   let ok = false;
@@ -437,6 +629,7 @@ module.exports = {
   ensureCompanyPgSchema,
   ensureAllCompanySchemas,
   ensureCompanyFilesTable,
+  migratePublicStellaIntoCompany,
   getLastEnsureError,
   withPg,
   quoteIdent,

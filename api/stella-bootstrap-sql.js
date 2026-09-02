@@ -18,11 +18,18 @@ create table if not exists public.stella_files (
 );
 
 alter table public.stella_files add column if not exists company_slug text;
+alter table public.stella_files add column if not exists uploaded_by text;
+alter table public.stella_files add column if not exists uploaded_by_name text;
 
 update public.stella_files
   set company_slug = split_part(org_id, ':', 2)
   where org_id like 'company:%'
     and coalesce(company_slug, '') = '';
+
+update public.stella_files
+  set uploaded_by = regexp_replace(org_id, '^.*user:', '')
+  where coalesce(uploaded_by, '') = ''
+    and org_id ~ 'user:';
 
 create index if not exists stella_files_company_slug_idx on public.stella_files (company_slug);
 create index if not exists stella_files_org_id_idx on public.stella_files (org_id);
@@ -132,13 +139,24 @@ begin
       regexp_replace(p_schema, '^c_', ''),
       'company:' || regexp_replace(p_schema, '^c_', '') || ':%'
     );
+    execute format(
+      'delete from public.stella_files where id in (select id from %I.stella_files) and (company_slug = %L or org_id like %L)',
+      p_schema,
+      regexp_replace(p_schema, '^c_', ''),
+      'company:' || regexp_replace(p_schema, '^c_', '') || ':%'
+    );
   exception when others then
     null;
   end;
 end;
 $$;
 
-create or replace function public.stella_create_table(p_table_name text, p_columns jsonb, p_schema text default 'public')
+drop function if exists public.stella_create_table(text, jsonb);
+drop function if exists public.stella_insert_rows(text, jsonb);
+drop function if exists public.stella_drop_table(text);
+drop function if exists public.stella_run_select(text);
+
+create or replace function public.stella_create_table(p_table_name text, p_columns jsonb, p_schema text default '')
 returns void
 language plpgsql
 security definer
@@ -148,13 +166,13 @@ declare
   col      jsonb;
   col_defs text := '';
   col_type text;
-  sch      text := coalesce(nullif(btrim(p_schema), ''), 'public');
+  sch      text := nullif(btrim(p_schema), '');
 begin
   if p_table_name !~ '^stella_data_[a-z0-9_]+$' then
     raise exception 'Invalid table name: %', p_table_name;
   end if;
-  if sch <> 'public' and sch !~ '^c_[a-z0-9_]+$' then
-    raise exception 'Invalid company schema: %', sch;
+  if sch is null or sch !~ '^c_[a-z0-9_]+$' then
+    raise exception 'Stella data must use a company schema, not public';
   end if;
   perform public.stella_ensure_schema(sch);
   for col in select * from jsonb_array_elements(p_columns) loop
@@ -165,25 +183,27 @@ begin
     raise exception 'No columns provided';
   end if;
   execute format('create table if not exists %I.%I (%s)', sch, p_table_name, rtrim(col_defs, ', '));
+  perform public.stella_move_table(p_table_name, sch);
   perform public.stella_lock_relation(sch, p_table_name);
 end;
 $$;
 
-create or replace function public.stella_insert_rows(p_table_name text, p_rows jsonb, p_schema text default 'public')
+create or replace function public.stella_insert_rows(p_table_name text, p_rows jsonb, p_schema text default '')
 returns void
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  sch text := coalesce(nullif(btrim(p_schema), ''), 'public');
+  sch text := nullif(btrim(p_schema), '');
 begin
   if p_table_name !~ '^stella_data_[a-z0-9_]+$' then
     raise exception 'Invalid table name: %', p_table_name;
   end if;
-  if sch <> 'public' and sch !~ '^c_[a-z0-9_]+$' then
-    raise exception 'Invalid company schema: %', sch;
+  if sch is null or sch !~ '^c_[a-z0-9_]+$' then
+    raise exception 'Stella data must use a company schema, not public';
   end if;
+  perform public.stella_move_table(p_table_name, sch);
   execute format(
     'insert into %I.%I select * from jsonb_populate_recordset(null::%I.%I, $1)',
     sch, p_table_name, sch, p_table_name
@@ -191,26 +211,26 @@ begin
 end;
 $$;
 
-create or replace function public.stella_drop_table(p_table_name text, p_schema text default 'public')
+create or replace function public.stella_drop_table(p_table_name text, p_schema text default '')
 returns void
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  sch text := coalesce(nullif(btrim(p_schema), ''), 'public');
+  sch text := nullif(btrim(p_schema), '');
 begin
   if p_table_name !~ '^stella_data_[a-z0-9_]+$' then
     raise exception 'Invalid table name: %', p_table_name;
   end if;
-  if sch <> 'public' and sch !~ '^c_[a-z0-9_]+$' then
-    raise exception 'Invalid company schema: %', sch;
+  if sch is null or sch !~ '^c_[a-z0-9_]+$' then
+    raise exception 'Stella data must use a company schema, not public';
   end if;
   execute format('drop table if exists %I.%I', sch, p_table_name);
 end;
 $$;
 
-create or replace function public.stella_run_select(query text, p_schema text default 'public')
+create or replace function public.stella_run_select(query text, p_schema text default '')
 returns jsonb
 language plpgsql
 security definer
@@ -219,7 +239,7 @@ as $$
 declare
   result  jsonb;
   cleaned text := btrim(query);
-  sch     text := coalesce(nullif(btrim(p_schema), ''), 'public');
+  sch     text := nullif(btrim(p_schema), '');
 begin
   if left(lower(cleaned), 6) <> 'select' then
     raise exception 'Only SELECT statements are allowed';
@@ -227,8 +247,8 @@ begin
   if position(';' in rtrim(cleaned, ';')) > 0 then
     raise exception 'Multiple statements are not allowed';
   end if;
-  if sch <> 'public' and sch !~ '^c_[a-z0-9_]+$' then
-    raise exception 'Invalid company schema: %', sch;
+  if sch is null or sch !~ '^c_[a-z0-9_]+$' then
+    raise exception 'Stella queries must use a company schema, not public';
   end if;
   perform set_config('search_path', sch, true);
   execute format('select coalesce(jsonb_agg(t), ''[]''::jsonb) from (%s) t', rtrim(cleaned, ';'))
@@ -243,6 +263,8 @@ language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  n bigint := 0;
 begin
   if p_table_name !~ '^stella_data_[a-z0-9_]+$' then
     raise exception 'Invalid table name: %', p_table_name;
@@ -254,6 +276,13 @@ begin
   if to_regclass(format('public.%I', p_table_name)) is not null
      and to_regclass(format('%I.%I', p_schema, p_table_name)) is null then
     execute format('alter table public.%I set schema %I', p_table_name, p_schema);
+  elsif to_regclass(format('public.%I', p_table_name)) is not null
+     and to_regclass(format('%I.%I', p_schema, p_table_name)) is not null then
+    execute format('select count(*) from %I.%I', p_schema, p_table_name) into n;
+    if n = 0 then
+      execute format('insert into %I.%I select * from public.%I', p_schema, p_table_name, p_table_name);
+    end if;
+    execute format('drop table public.%I', p_table_name);
   end if;
   perform public.stella_lock_relation(p_schema, p_table_name);
 end;

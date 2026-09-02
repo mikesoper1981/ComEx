@@ -6,7 +6,7 @@
  * POST { action: 'insert', tableName, rows }
  * POST { action: 'drop', tableName }
  * POST { action: 'replace', tableName, columns, rows }  drop + create + insert (no stacked rows)
- * POST { action: 'move', tableName }   move public.stella_data_* into the company schema
+ * POST { action: 'move', tableName }   move leftover public.stella_data_* into the company schema
  *
  * Schema is always derived from the signed-in user's company. The client cannot
  * choose another tenant's schema.
@@ -18,7 +18,8 @@
  */
 
 const { sessionUserFromRequest } = require('./accounts-store');
-const { companyPgSchema, resolveUserCompany, ensureCompanyPgSchema } = require('./company');
+const { companyPgSchema, resolveUserCompany, ensureCompanyPgSchema, isCompanyPgSchema } = require('./company');
+const { withPg, quoteIdent } = require('./stella-db');
 
 const TABLE_NAME_RE = /^stella_data_[a-z0-9_]+$/;
 
@@ -71,18 +72,84 @@ async function supabaseRpc(supabaseUrl, serviceKey, fn, args) {
   return { ok: res.ok, status: res.status, data };
 }
 
-async function rpcWithSchema(supabaseUrl, serviceKey, fn, withSchema, withoutSchema) {
-  const first = await supabaseRpc(supabaseUrl, serviceKey, fn, withSchema);
-  if (first.ok) return first;
-  const msg = String(first.data?.message || first.data?.code || '');
-  const missing = /PGRST202|could not find|schema cache|does not exist/i.test(msg);
-  if (!missing || !withoutSchema) return first;
-  return supabaseRpc(supabaseUrl, serviceKey, fn, withoutSchema);
-}
-
 function rpcError(result) {
   const data = result?.data || {};
   return data.message || data.error || data.hint || 'Query failed';
+}
+
+function requireCompanySchema(schema) {
+  if (!isCompanyPgSchema(schema)) {
+    throw new Error('Stella data must use a company schema');
+  }
+  return quoteIdent(schema);
+}
+
+function quoteTable(tableName) {
+  if (!TABLE_NAME_RE.test(tableName)) throw new Error('Invalid table name');
+  return `"${tableName}"`;
+}
+
+function quoteCol(name) {
+  const n = String(name || '').replace(/"/g, '');
+  if (!n || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(n)) throw new Error('Invalid column name');
+  return `"${n}"`;
+}
+
+async function pgCreateTable(schema, tableName, columns) {
+  const q = requireCompanySchema(schema);
+  const defs = (columns || []).map((c) => {
+    const type = String(c?.type || '').toLowerCase() === 'numeric' ? 'numeric' : 'text';
+    return `${quoteCol(c.name)} ${type}`;
+  }).join(', ');
+  if (!defs) throw new Error('columns are required');
+  await withPg((client) => client.query(
+    `create table if not exists ${q}.${quoteTable(tableName)} (${defs})`,
+  ));
+}
+
+async function pgInsertRows(schema, tableName, rows) {
+  const q = requireCompanySchema(schema);
+  const t = quoteTable(tableName);
+  await withPg((client) => client.query(
+    `insert into ${q}.${t} select * from jsonb_populate_recordset(null::${q}.${t}, $1::jsonb)`,
+    [JSON.stringify(rows)],
+  ));
+}
+
+async function pgDropTable(schema, tableName) {
+  const q = requireCompanySchema(schema);
+  await withPg((client) => client.query(`drop table if exists ${q}.${quoteTable(tableName)}`));
+}
+
+async function pgRunSelect(schema, sql) {
+  const q = requireCompanySchema(schema);
+  const result = await withPg(async (client) => {
+    await client.query(`set search_path to ${q}`);
+    return client.query(sql);
+  });
+  return result.rows || [];
+}
+
+async function pgMoveTable(schema, tableName) {
+  const q = requireCompanySchema(schema);
+  const t = quoteTable(tableName);
+  await withPg(async (client) => {
+    const pub = await client.query('select to_regclass($1) is not null as ok', [`public.${tableName}`]);
+    const company = await client.query('select to_regclass($1) is not null as ok', [`${schema}.${tableName}`]);
+    const pubOk = !!pub.rows[0]?.ok;
+    const companyOk = !!company.rows[0]?.ok;
+    if (pubOk && !companyOk) {
+      await client.query(`alter table public.${t} set schema ${q}`);
+      return;
+    }
+    if (pubOk && companyOk) {
+      const count = await client.query(`select count(*)::int as n from ${q}.${t}`);
+      if (!count.rows[0]?.n) {
+        await client.query(`insert into ${q}.${t} select * from public.${t}`);
+      }
+      await client.query(`drop table public.${t}`);
+    }
+  });
 }
 
 const INSERT_BATCH = 500;
@@ -97,43 +164,56 @@ function tableRows(body) {
   return Array.isArray(rows) ? rows : [];
 }
 
+async function rpcOnlyWithSchema(supabaseUrl, serviceKey, fn, args) {
+  return supabaseRpc(supabaseUrl, serviceKey, fn, args);
+}
+
 async function rpcCreateTable(supabaseUrl, serviceKey, schema, tableName, columns) {
-  return rpcWithSchema(
-    supabaseUrl,
-    serviceKey,
-    'stella_create_table',
-    { p_table_name: tableName, p_columns: columns, p_schema: schema },
-    { p_table_name: tableName, p_columns: columns },
-  );
+  return rpcOnlyWithSchema(supabaseUrl, serviceKey, 'stella_create_table', {
+    p_table_name: tableName,
+    p_columns: columns,
+    p_schema: schema,
+  });
 }
 
 async function rpcInsertRows(supabaseUrl, serviceKey, schema, tableName, rows) {
-  return rpcWithSchema(
-    supabaseUrl,
-    serviceKey,
-    'stella_insert_rows',
-    { p_table_name: tableName, p_rows: rows, p_schema: schema },
-    { p_table_name: tableName, p_rows: rows },
-  );
+  return rpcOnlyWithSchema(supabaseUrl, serviceKey, 'stella_insert_rows', {
+    p_table_name: tableName,
+    p_rows: rows,
+    p_schema: schema,
+  });
 }
 
 async function rpcDropTable(supabaseUrl, serviceKey, schema, tableName) {
-  return rpcWithSchema(
-    supabaseUrl,
-    serviceKey,
-    'stella_drop_table',
-    { p_table_name: tableName, p_schema: schema },
-    { p_table_name: tableName },
-  );
+  return rpcOnlyWithSchema(supabaseUrl, serviceKey, 'stella_drop_table', {
+    p_table_name: tableName,
+    p_schema: schema,
+  });
 }
 
 async function insertRowsBatched(supabaseUrl, serviceKey, schema, tableName, rows) {
   for (let i = 0; i < rows.length; i += INSERT_BATCH) {
     const chunk = rows.slice(i, i + INSERT_BATCH);
+    try {
+      await pgInsertRows(schema, tableName, chunk);
+      continue;
+    } catch (err) {
+      console.warn('PG insert failed, trying company-schema RPC', err?.message || err);
+    }
     const result = await rpcInsertRows(supabaseUrl, serviceKey, schema, tableName, chunk);
     if (!result.ok) return result;
   }
   return { ok: true, status: 200, data: { ok: true } };
+}
+
+async function companyTableOp(pgFn, rpcFn) {
+  try {
+    await pgFn();
+    return { ok: true, status: 200, data: { ok: true } };
+  } catch (err) {
+    console.warn('Company-schema PG failed, trying RPC with schema', err?.message || err);
+    return rpcFn();
+  }
 }
 
 /** Shared by /api/stella-query and scheduled inbox sync (cron impersonates a user). */
@@ -146,7 +226,7 @@ async function executeTableAction(user, body) {
 
   const schema = companyPgSchema(resolveUserCompany(user));
   const action = String(body.action || (body.sql ? 'query' : '')).trim().toLowerCase();
-  if (action === 'create' || action === 'insert' || action === 'move' || action === 'drop' || action === 'replace') {
+  if (action === 'create' || action === 'insert' || action === 'move' || action === 'drop' || action === 'replace' || action === 'query' || action === '') {
     await ensureCompanyPgSchema(schema);
   }
   const tableName = String(body.tableName || body.p_table_name || '').trim();
@@ -159,13 +239,16 @@ async function executeTableAction(user, body) {
     if (hasForeignSchema(sql, schema)) {
       return { status: 400, json: { error: { message: 'Queries cannot reference another company schema' } } };
     }
-    const result = await rpcWithSchema(
-      supabaseUrl,
-      serviceKey,
-      'stella_run_select',
-      { query: sql, p_schema: schema },
-      { query: sql },
-    );
+    try {
+      const rows = await pgRunSelect(schema, sql);
+      return { status: 200, json: { rows, schema } };
+    } catch (err) {
+      console.warn('Company-schema SELECT failed, trying RPC with schema', err?.message || err);
+    }
+    const result = await rpcOnlyWithSchema(supabaseUrl, serviceKey, 'stella_run_select', {
+      query: sql,
+      p_schema: schema,
+    });
     if (!result.ok) {
       return { status: result.status, json: { error: { message: rpcError(result) } } };
     }
@@ -182,9 +265,15 @@ async function executeTableAction(user, body) {
     if (!columns.length) {
       return { status: 400, json: { error: { message: 'columns are required' } } };
     }
-    const result = await rpcCreateTable(supabaseUrl, serviceKey, schema, tableName, columns);
+    const result = await companyTableOp(
+      () => pgCreateTable(schema, tableName, columns),
+      () => rpcCreateTable(supabaseUrl, serviceKey, schema, tableName, columns),
+    );
     if (!result.ok) {
       return { status: result.status, json: { error: { message: rpcError(result) } } };
+    }
+    try { await pgMoveTable(schema, tableName); } catch (err) {
+      console.warn('Could not move leftover public extract table', tableName, err?.message || err);
     }
     return { status: 200, json: { ok: true, schema } };
   }
@@ -194,6 +283,9 @@ async function executeTableAction(user, body) {
     if (!rows.length) {
       return { status: 400, json: { error: { message: 'rows are required' } } };
     }
+    try { await pgMoveTable(schema, tableName); } catch (err) {
+      console.warn('Could not move leftover public extract table', tableName, err?.message || err);
+    }
     const result = await insertRowsBatched(supabaseUrl, serviceKey, schema, tableName, rows);
     if (!result.ok) {
       return { status: result.status, json: { error: { message: rpcError(result) } } };
@@ -202,7 +294,10 @@ async function executeTableAction(user, body) {
   }
 
   if (action === 'drop') {
-    const result = await rpcDropTable(supabaseUrl, serviceKey, schema, tableName);
+    const result = await companyTableOp(
+      () => pgDropTable(schema, tableName),
+      () => rpcDropTable(supabaseUrl, serviceKey, schema, tableName),
+    );
     if (!result.ok) {
       return { status: result.status, json: { error: { message: rpcError(result) } } };
     }
@@ -218,13 +313,22 @@ async function executeTableAction(user, body) {
     if (!rows.length) {
       return { status: 400, json: { error: { message: 'rows are required' } } };
     }
-    const dropped = await rpcDropTable(supabaseUrl, serviceKey, schema, tableName);
+    const dropped = await companyTableOp(
+      () => pgDropTable(schema, tableName),
+      () => rpcDropTable(supabaseUrl, serviceKey, schema, tableName),
+    );
     if (!dropped.ok) {
       return { status: dropped.status, json: { error: { message: rpcError(dropped) } } };
     }
-    const created = await rpcCreateTable(supabaseUrl, serviceKey, schema, tableName, columns);
+    const created = await companyTableOp(
+      () => pgCreateTable(schema, tableName, columns),
+      () => rpcCreateTable(supabaseUrl, serviceKey, schema, tableName, columns),
+    );
     if (!created.ok) {
       return { status: created.status, json: { error: { message: rpcError(created) } } };
+    }
+    try { await pgMoveTable(schema, tableName); } catch (err) {
+      console.warn('Could not move leftover public extract table', tableName, err?.message || err);
     }
     const inserted = await insertRowsBatched(supabaseUrl, serviceKey, schema, tableName, rows);
     if (!inserted.ok) {
@@ -234,6 +338,12 @@ async function executeTableAction(user, body) {
   }
 
   if (action === 'move') {
+    try {
+      await pgMoveTable(schema, tableName);
+      return { status: 200, json: { ok: true, schema } };
+    } catch (err) {
+      console.warn('Company-schema move failed, trying RPC with schema', err?.message || err);
+    }
     const result = await supabaseRpc(supabaseUrl, serviceKey, 'stella_move_table', {
       p_table_name: tableName,
       p_schema: schema,
