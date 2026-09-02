@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import {
   ResponsiveContainer,
   ComposedChart,
@@ -15,6 +16,7 @@ const TOOLTIP_STYLE = { background: '#0f172a', border: '1px solid rgba(96,165,25
 
 // Renders a chart spec produced by the AI (chart-recharts / chart-stella blocks).
 export default function StellaChart({ spec }) {
+  const chartRef = useRef(null);
   if (!spec || typeof spec !== 'object') return null;
   const type = String(spec.type || '').toLowerCase();
   const title = spec.title || '📊 Chart';
@@ -55,19 +57,20 @@ export default function StellaChart({ spec }) {
 
   const wrap = (children) => (
     <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
-      <div className="flex items-center justify-between gap-2 mb-3">
-        <h3 className="text-base font-semibold text-cyan-400 min-w-0">{title}</h3>
+      <h3 className="text-base font-semibold text-cyan-400 min-w-0 mb-3">{title}</h3>
+      <div ref={chartRef} className="w-full h-[320px]">
+        <ResponsiveContainer width="100%" height="100%">
+          {children}
+        </ResponsiveContainer>
+      </div>
+      <div className="flex justify-end mt-1.5">
         <ExcelExportButton
           rows={data}
           sheetName={title}
           filename={slugFilename(title, 'chart')}
           label="Export this chart to Excel"
+          chartRef={chartRef}
         />
-      </div>
-      <div className="w-full h-[320px]">
-        <ResponsiveContainer width="100%" height="100%">
-          {children}
-        </ResponsiveContainer>
       </div>
     </div>
   );

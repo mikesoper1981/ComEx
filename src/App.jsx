@@ -4515,6 +4515,87 @@ function StellaSafePanel({ render }) {
   return render();
 }
 
+function PayoutCurveChart({ curveData }) {
+  const chartRef = useRef(null);
+  if (!Array.isArray(curveData) || curveData.length === 0) return null;
+  const W = 800, H = 300, PAD_L = 80, PAD_R = 20, PAD_T = 20, PAD_B = 40;
+  const chartW = W - PAD_L - PAD_R;
+  const chartH = H - PAD_T - PAD_B;
+  const xMax = Math.ceil(Math.max(150, ...curveData.map((p) => p.performance)) / 50) * 50;
+  const yMax = Math.ceil(Math.max(150, ...curveData.map((p) => p.payout)) / 50) * 50;
+  const thresholdPerf = (curveData.find((p) => p.payout > 0) || curveData[0]).performance;
+  const xMin = Math.max(0, Math.floor((thresholdPerf - 10) / 25) * 25);
+  const toX = (v) => PAD_L + ((v - xMin) / (xMax - xMin)) * chartW;
+  const toY = (v) => PAD_T + chartH - (v / yMax) * chartH;
+  const fullLine = [{ performance: thresholdPerf, payout: 0 }, ...curveData];
+  const xTicks = Array.from({ length: Math.floor((xMax - xMin) / 25) + 1 }, (_, i) => xMin + i * 25);
+  const yTicks = Array.from({ length: Math.floor(yMax / 50) + 1 }, (_, i) => i * 50);
+  const exportRows = curveData.map((p) => ({
+    'Performance %': p.performance,
+    'Payout %': p.payout,
+    Status: p.payout === 0 ? 'No Payout' : p.payout < 100 ? 'Below Target' : p.payout === 100 ? 'On Target' : 'Accelerator',
+  }));
+  return (
+    <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
+      <h3 className="text-base font-semibold text-cyan-400 mb-3">💹 Payout Curve</h3>
+      <div className="overflow-x-auto">
+        <div ref={chartRef} className="bg-slate-800/50 rounded p-2 mb-4" style={{ minWidth: '500px', height: '300px' }}>
+          <svg width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
+            {yTicks.map((v) => <line key={v} x1={PAD_L} y1={toY(v)} x2={W - PAD_R} y2={toY(v)} stroke="#334155" strokeWidth="0.5" />)}
+            {xTicks.map((v) => <line key={v} x1={toX(v)} y1={PAD_T} x2={toX(v)} y2={PAD_T + chartH} stroke="#334155" strokeWidth="0.5" />)}
+            <line x1={PAD_L} y1={PAD_T + chartH} x2={W - PAD_R} y2={PAD_T + chartH} stroke="#94a3b8" strokeWidth="2" />
+            <line x1={PAD_L} y1={PAD_T} x2={PAD_L} y2={PAD_T + chartH} stroke="#94a3b8" strokeWidth="2" />
+            {yTicks.map((v) => <text key={v} x={PAD_L - 8} y={toY(v) + 4} textAnchor="end" fill="#94a3b8" fontSize="11">{v}%</text>)}
+            {xTicks.filter((v) => v % 25 === 0).map((v) => <text key={v} x={toX(v)} y={PAD_T + chartH + 16} textAnchor="middle" fill="#94a3b8" fontSize="11">{v}%</text>)}
+            <text x={PAD_L + chartW / 2} y={H - 2} textAnchor="middle" fill="#94a3b8" fontSize="12" fontWeight="bold">Performance (% of Quota)</text>
+            <text x="12" y={PAD_T + chartH / 2} textAnchor="middle" fill="#94a3b8" fontSize="12" fontWeight="bold" transform={`rotate(-90,12,${PAD_T + chartH / 2})`}>Payout (%)</text>
+            <line x1={toX(100)} y1={PAD_T} x2={toX(100)} y2={PAD_T + chartH} stroke="#10b981" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
+            <line x1={PAD_L} y1={toY(100)} x2={W - PAD_R} y2={toY(100)} stroke="#10b981" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
+            <text x={toX(100) + 4} y={PAD_T + 14} fill="#10b981" fontSize="11" fontWeight="bold">100% Target</text>
+            <polyline points={fullLine.map((p) => `${toX(p.performance)},${toY(p.payout)}`).join(' ')} fill="none" stroke="#22d3ee" strokeWidth="3" />
+            {curveData.map((p, i) => {
+              const color = p.payout === 0 ? '#ef4444' : p.payout < 100 ? '#eab308' : p.payout === 100 ? '#10b981' : '#22d3ee';
+              return <circle key={i} cx={toX(p.performance)} cy={toY(p.payout)} r="6" fill={color} stroke="#1e293b" strokeWidth="2" />;
+            })}
+          </svg>
+        </div>
+      </div>
+      <table className="w-full border-collapse border border-blue-400/30 rounded text-xs">
+        <thead className="bg-blue-500/20">
+          <tr>
+            <th className="border border-blue-400/30 px-3 py-2 text-left text-blue-300">Performance %</th>
+            <th className="border border-blue-400/30 px-3 py-2 text-left text-blue-300">Payout %</th>
+            <th className="border border-blue-400/30 px-3 py-2 text-left text-blue-300">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {curveData.map((p, i) => (
+            <tr key={i} className={i % 2 === 0 ? 'bg-slate-800/30' : 'bg-slate-800/50'}>
+              <td className="border border-blue-400/30 px-3 py-1.5">{p.performance}%</td>
+              <td className="border border-blue-400/30 px-3 py-1.5 font-semibold">{p.payout}%</td>
+              <td className="border border-blue-400/30 px-3 py-1.5">
+                {p.payout === 0 ? <span className="text-red-400">❌ No Payout</span> :
+                 p.payout < 100 ? <span className="text-yellow-400">📊 Below Target</span> :
+                 p.payout === 100 ? <span className="text-green-400">✅ On Target</span> :
+                 <span className="text-cyan-400">🚀 Accelerator</span>}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="flex justify-end mt-1.5">
+        <ExcelExportButton
+          rows={exportRows}
+          sheetName="Payout curve"
+          filename="payout-curve"
+          label="Export this chart to Excel"
+          chartRef={chartRef}
+        />
+      </div>
+    </div>
+  );
+}
+
 function contextBlocksFromFile(f) {
   return listModuleContextBlocks(f);
 }
@@ -5462,83 +5543,7 @@ export default function CommercialExcellenceApp() {
     );
   };
 
-  const renderPayoutCurveChart = (curveData) => {
-    if (!Array.isArray(curveData) || curveData.length === 0) return null;
-    const W = 800, H = 300, PAD_L = 80, PAD_R = 20, PAD_T = 20, PAD_B = 40;
-    const chartW = W - PAD_L - PAD_R;
-    const chartH = H - PAD_T - PAD_B;
-    const xMax = Math.ceil(Math.max(150, ...curveData.map(p => p.performance)) / 50) * 50;
-    const yMax = Math.ceil(Math.max(150, ...curveData.map(p => p.payout)) / 50) * 50;
-    const thresholdPerf = (curveData.find(p => p.payout > 0) || curveData[0]).performance;
-    const xMin = Math.max(0, Math.floor((thresholdPerf - 10) / 25) * 25);
-    const toX = (v) => PAD_L + ((v - xMin) / (xMax - xMin)) * chartW;
-    const toY = (v) => PAD_T + chartH - (v / yMax) * chartH;
-    const fullLine = [{ performance: thresholdPerf, payout: 0 }, ...curveData];
-    const xTicks = Array.from({ length: Math.floor((xMax - xMin) / 25) + 1 }, (_, i) => xMin + i * 25);
-    const yTicks = Array.from({ length: Math.floor(yMax / 50) + 1 }, (_, i) => i * 50);
-    return (
-      <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
-        <div className="flex items-center justify-between gap-2 mb-3">
-          <h3 className="text-base font-semibold text-cyan-400">💹 Payout Curve</h3>
-          <ExcelExportButton
-            rows={curveData.map((p) => ({
-              'Performance %': p.performance,
-              'Payout %': p.payout,
-              Status: p.payout === 0 ? 'No Payout' : p.payout < 100 ? 'Below Target' : p.payout === 100 ? 'On Target' : 'Accelerator',
-            }))}
-            sheetName="Payout curve"
-            filename="payout-curve"
-            label="Export this chart to Excel"
-          />
-        </div>
-        <div className="overflow-x-auto">
-          <div className="bg-slate-800/50 rounded p-2 mb-4" style={{ minWidth: '500px', height: '300px' }}>
-            <svg width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
-              {yTicks.map(v => <line key={v} x1={PAD_L} y1={toY(v)} x2={W - PAD_R} y2={toY(v)} stroke="#334155" strokeWidth="0.5"/>)}
-              {xTicks.map(v => <line key={v} x1={toX(v)} y1={PAD_T} x2={toX(v)} y2={PAD_T + chartH} stroke="#334155" strokeWidth="0.5"/>)}
-              <line x1={PAD_L} y1={PAD_T + chartH} x2={W - PAD_R} y2={PAD_T + chartH} stroke="#94a3b8" strokeWidth="2"/>
-              <line x1={PAD_L} y1={PAD_T} x2={PAD_L} y2={PAD_T + chartH} stroke="#94a3b8" strokeWidth="2"/>
-              {yTicks.map(v => <text key={v} x={PAD_L - 8} y={toY(v) + 4} textAnchor="end" fill="#94a3b8" fontSize="11">{v}%</text>)}
-              {xTicks.filter(v => v % 25 === 0).map(v => <text key={v} x={toX(v)} y={PAD_T + chartH + 16} textAnchor="middle" fill="#94a3b8" fontSize="11">{v}%</text>)}
-              <text x={PAD_L + chartW / 2} y={H - 2} textAnchor="middle" fill="#94a3b8" fontSize="12" fontWeight="bold">Performance (% of Quota)</text>
-              <text x="12" y={PAD_T + chartH / 2} textAnchor="middle" fill="#94a3b8" fontSize="12" fontWeight="bold" transform={`rotate(-90,12,${PAD_T + chartH / 2})`}>Payout (%)</text>
-              <line x1={toX(100)} y1={PAD_T} x2={toX(100)} y2={PAD_T + chartH} stroke="#10b981" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7"/>
-              <line x1={PAD_L} y1={toY(100)} x2={W - PAD_R} y2={toY(100)} stroke="#10b981" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7"/>
-              <text x={toX(100) + 4} y={PAD_T + 14} fill="#10b981" fontSize="11" fontWeight="bold">100% Target</text>
-              <polyline points={fullLine.map(p => `${toX(p.performance)},${toY(p.payout)}`).join(' ')} fill="none" stroke="#22d3ee" strokeWidth="3"/>
-              {curveData.map((p, i) => {
-                const color = p.payout === 0 ? '#ef4444' : p.payout < 100 ? '#eab308' : p.payout === 100 ? '#10b981' : '#22d3ee';
-                return <circle key={i} cx={toX(p.performance)} cy={toY(p.payout)} r="6" fill={color} stroke="#1e293b" strokeWidth="2"/>;
-              })}
-            </svg>
-          </div>
-        </div>
-        <table className="w-full border-collapse border border-blue-400/30 rounded text-xs">
-          <thead className="bg-blue-500/20">
-            <tr>
-              <th className="border border-blue-400/30 px-3 py-2 text-left text-blue-300">Performance %</th>
-              <th className="border border-blue-400/30 px-3 py-2 text-left text-blue-300">Payout %</th>
-              <th className="border border-blue-400/30 px-3 py-2 text-left text-blue-300">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {curveData.map((p, i) => (
-              <tr key={i} className={i % 2 === 0 ? 'bg-slate-800/30' : 'bg-slate-800/50'}>
-                <td className="border border-blue-400/30 px-3 py-1.5">{p.performance}%</td>
-                <td className="border border-blue-400/30 px-3 py-1.5 font-semibold">{p.payout}%</td>
-                <td className="border border-blue-400/30 px-3 py-1.5">
-                  {p.payout === 0 ? <span className="text-red-400">❌ No Payout</span> :
-                   p.payout < 100 ? <span className="text-yellow-400">📊 Below Target</span> :
-                   p.payout === 100 ? <span className="text-green-400">✅ On Target</span> :
-                   <span className="text-cyan-400">🚀 Accelerator</span>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    );
-  };
+  const renderPayoutCurveChart = (curveData) => <PayoutCurveChart curveData={curveData} />;
 
   const renderRechartsChart = (spec) => {
     if (!spec || typeof spec !== 'object') return null;
@@ -5622,14 +5627,6 @@ export default function CommercialExcellenceApp() {
             const exportRows = [header, ...body];
             return (
               <div key={idx} className="my-3">
-                <div className="flex justify-end mb-1">
-                  <ExcelExportButton
-                    rows={exportRows}
-                    sheetName={header[0] || 'Table'}
-                    filename={header.filter(Boolean).slice(0, 4).join(' ') || 'table'}
-                    label="Export this table to Excel"
-                  />
-                </div>
                 <div className="overflow-x-auto">
                 <table className="min-w-full border-collapse border border-blue-400/30 rounded-lg overflow-hidden text-sm">
                   <thead className="bg-blue-500/20">
@@ -5643,6 +5640,14 @@ export default function CommercialExcellenceApp() {
                     ))}
                   </tbody>
                 </table>
+                </div>
+                <div className="flex justify-end mt-1.5">
+                  <ExcelExportButton
+                    rows={exportRows}
+                    sheetName={header[0] || 'Table'}
+                    filename={header.filter(Boolean).slice(0, 4).join(' ') || 'table'}
+                    label="Export this table to Excel"
+                  />
                 </div>
               </div>
             );
