@@ -108,6 +108,8 @@ import {
   patchModuleContextFile,
   removeModuleContextFile,
   formatLinkedModulesPromptBlock,
+  formatLinkedModulesIntakeHint,
+  stellaLinkedModuleQuestion,
   mergeModuleConnections,
   toggleModuleConnection,
   connectedModuleIds,
@@ -771,9 +773,30 @@ const MAX_STORED_MESSAGES = 80;
 const MAX_VISIBLE_CHATS = 5;
 
 const CHAT_MODULE_META = {
-  incentives: { id: 'incentives', label: 'Incentives', tab: 'chat' },
-  territory: { id: 'territory', label: 'Territory', tab: 'territory' },
-  stella: { id: 'stella', label: 'Stella Insights', tab: 'stella' },
+  incentives: {
+    id: 'incentives',
+    label: 'Incentive Compensation',
+    tab: 'chat',
+    badge: 'bg-sky-500/35 text-sky-50 border-sky-200/55',
+    accent: 'border-l-sky-400',
+    bar: 'bg-sky-400',
+  },
+  territory: {
+    id: 'territory',
+    label: 'Territory Design',
+    tab: 'territory',
+    badge: 'bg-emerald-500/35 text-emerald-50 border-emerald-200/55',
+    accent: 'border-l-emerald-400',
+    bar: 'bg-emerald-400',
+  },
+  stella: {
+    id: 'stella',
+    label: 'Stella Insights',
+    tab: 'stella',
+    badge: 'bg-cyan-400/35 text-cyan-50 border-cyan-100/60',
+    accent: 'border-l-cyan-300',
+    bar: 'bg-cyan-300',
+  },
 };
 
 const ACTIVE_HUB_MODULES = [
@@ -833,6 +856,15 @@ function inferChatModule({ currentWorkflow } = {}) {
 
 function chatModuleMeta(chat) {
   return CHAT_MODULE_META[chat?.module] || CHAT_MODULE_META.incentives;
+}
+
+function chatModuleBadge(chatOrMeta) {
+  const mod = chatOrMeta?.label ? chatOrMeta : chatModuleMeta(chatOrMeta);
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium tracking-wide border ${mod.badge}`}>
+      {mod.label}
+    </span>
+  );
 }
 
 function upsertChatInPlace(list, snap) {
@@ -1464,8 +1496,19 @@ function pickStellaIntakeQuestions(onboarding, fallbacks) {
   const raw = onboarding && typeof onboarding === 'object' ? onboarding : {};
   const fromModel = stellaNormalizeIntakeQuestions(
     raw.suggestedQuestions != null ? raw.suggestedQuestions : raw.questions
-  );
-  return fromModel.length >= 1 ? fromModel : fallbacks;
+  ).filter((q) => !stellaIntakeQuestionLooksIrrelevant(q));
+  if (fromModel.length >= 1) return fromModel;
+  const summary = String(raw.summary || '').replace(/\s+/g, ' ').trim();
+  const colCount = Array.isArray(raw.columns) ? raw.columns.length : 0;
+  const hasSubstance = (summary.length >= 40 && !/^uploaded (dataset|document)\.?$/i.test(summary)) || colCount >= 3;
+  if (hasSubstance) return [];
+  return fallbacks;
+}
+
+function stellaIntakeQuestionLooksIrrelevant(q) {
+  const t = String(q || '').toLowerCase();
+  if (!t) return true;
+  return /\b(kpi|key metrics?|performance|business goals?|incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|what filters|caveats?)\b/i.test(t);
 }
 
 function stellaNormJoinToken(s) {
@@ -5096,7 +5139,9 @@ export default function CommercialExcellenceApp() {
           const mapped = data.map(stellaMapRegistryRow);
           setStellaDataFiles(prev => {
             const existing = new Set(prev.map(f => f.dbId).filter(Boolean));
-            return [...prev, ...mapped.filter(f => !existing.has(f.dbId))];
+            const next = [...prev, ...mapped.filter(f => !existing.has(f.dbId))];
+            stellaDataFilesRef.current = next;
+            return next;
           });
           const tables = [...new Set(mapped.map((f) => f.tableName).filter(Boolean))];
           for (const tableName of tables) {
@@ -6013,6 +6058,11 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
   const resolvePromptModule = () => {
     if (activeTab === 'stella') return 'stella';
     if (activeTab === 'territory') return 'territory';
+    if (activeTab === 'user-settings') {
+      if (userSettingsPane === 'stella') return 'stella';
+      if (userSettingsPane === 'territory') return 'territory';
+      if (userSettingsPane === 'incentives') return 'incentives';
+    }
     const topic = String(currentWorkflow?.topicId || '');
     if (topic.includes('territory')) return 'territory';
     if (topic.includes('stella')) return 'stella';
@@ -6032,8 +6082,13 @@ Do not cite sources. Never name knowledge files, intelligence documents, or file
     }
     const settings = userSettingsRef.current || userSettings;
     const useLength = applyResponseLength && !systemHasExplicitLengthSpec(prompt);
+    const liveStellaFiles = (Array.isArray(stellaDataFilesRef.current) && stellaDataFilesRef.current.length)
+      ? stellaDataFilesRef.current
+      : (stellaDataFiles || []);
     const moduleBlock = moduleContext
-      ? formatLinkedModulesPromptBlock(settings, resolvePromptModule(), { stellaFiles: stellaDataFiles })
+      ? formatLinkedModulesPromptBlock(settings, resolvePromptModule(), {
+        stellaFiles: liveStellaFiles,
+      })
       : '';
     const base = `${prompt}${buildUserSettingsPromptBlock(settings, { moduleId: resolvePromptModule(), applyResponseLength: useLength })}${moduleBlock}`;
     const endUser = isAdmin ? '' : `
@@ -6706,14 +6761,15 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       return (
         <div
           key={chat.id}
-          className={`group flex items-start gap-1 rounded-lg border ${chat.id === activeChatId ? 'bg-blue-500/20 border-blue-400/40' : 'border-transparent hover:bg-slate-700/40 hover:border-blue-400/20'}`}
+          className={`group relative flex items-start gap-1 rounded-lg overflow-hidden border ${chat.id === activeChatId ? 'bg-blue-500/20 border-blue-400/40' : 'border-transparent hover:bg-slate-700/40 hover:border-blue-400/20'}`}
         >
+          <div className={`absolute left-0 top-0 bottom-0 w-1 ${mod.bar || 'bg-blue-400'}`} />
           <button
             type="button"
             onClick={() => continueChat(chat.id)}
-            className="flex-1 min-w-0 text-left px-2.5 py-2"
+            className="flex-1 min-w-0 text-left pl-3.5 pr-2.5 py-2"
           >
-            <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/80">{mod.label}</div>
+            <div className="mb-1">{chatModuleBadge(mod)}</div>
             <div className="text-xs font-semibold text-white truncate">{chat.title || 'Chat'}</div>
             <div className="text-[10px] text-blue-300/55 mt-0.5">
               {formatChatTime(chat.updatedAt)}
@@ -8963,7 +9019,9 @@ ${stepInstruction}`;
           };
         });
         const temps = prev.filter(f => !f.dbId);
-        return [...merged, ...temps];
+        const next = [...merged, ...temps];
+        stellaDataFilesRef.current = next;
+        return next;
       });
       void sweepChatMemoryOfFileContext(factsFromStellaFiles(mapped));
       return mapped;
@@ -9354,7 +9412,12 @@ ${stepInstruction}`;
     const system = withUserSettings(getStellaPrompts().contentSummary, { moduleContext: false, applyResponseLength: false });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
-    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions must be structure-only (grain, ambiguous columns, join keys). Do not ask about metrics, KPIs, or interpretation. Skip questions already answered by the extract.`;
+    const linkHint = formatLinkedModulesIntakeHint(userSettingsRef.current || userSettings, 'stella');
+    const others = (stellaDataFilesRef.current || []).filter((f) => f && f.tableName && !f.processing);
+    const otherHint = others.length
+      ? `\n\nOTHER STELLA DATASETS already loaded:\n${others.map((f) => `- ${f.name}${f.tableName ? ` (table ${f.tableName})` : ''}: ${(f.columns || []).slice(0, 10).map((c) => c.name || c).filter(Boolean).join(', ')}`).join('\n')}`
+      : '';
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}${otherHint}${linkHint}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions must be structure-only (grain, ambiguous columns, join keys, links to other datasets or connected modules). Prefer [] when the extract is already clear. Do not ask about metrics, KPIs, schemes, or interpretation.`;
     const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1400);
     const parsed = extractJsonObject(raw);
     if (!(parsed && typeof parsed === 'object')) {
@@ -9394,8 +9457,8 @@ ${stepInstruction}`;
       kindSubject: isDoc ? 'document contains / represents' : 'data represents',
       relationshipBullet: (!isDoc && otherTabular.length) ? '\n- joins: whether/how it shares keys with other uploaded datasets (matching values, not just similar names)' : '',
       dataProfile: (!isDoc && (live.dataProfile || f.dataProfile)) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${live.dataProfile || f.dataProfile}` : '',
-      relationshipGuidance,
-    }));
+      relationshipGuidance: `${relationshipGuidance || ''}${formatLinkedModulesIntakeHint(userSettingsRef.current || userSettings, 'stella')}`,
+    }), { moduleContext: false, applyResponseLength: false });
     const contextBlob = `FILE: "${f.name}" (type: ${f.fileType || f.type})${f.tableName ? `\nSQL TABLE: ${f.tableName}` : ''}\nSUMMARY: ${f.summary || ''}\nCOLUMNS (use these exact names in relationships.this_field):\n${colsBlob}`;
     const convo = [
       { role: 'user', content: `You are onboarding: "${f.name}".\n\n${contextBlob}` },
@@ -9526,13 +9589,17 @@ ${stepInstruction}`;
       : lower.endsWith('.pdf') ? 'pdf'
       : 'text';
 
-    setStellaDataFiles(prev => [...prev, {
-      id: tempId, dbId: null, name: file.name, type: kind, fileType: kind,
-      size: `${(file.size / 1024).toFixed(1)} KB`, columns: [], rowCount: null,
-      summary: '', capturedContext: null, tableName: null, storagePath: null, storageBucket: null,
-      intakeMessages: [{ role: 'assistant', content: `⏳ Processing **${file.name}**…` }],
-      intakeComplete: false, processing: true,
-    }]);
+    setStellaDataFiles(prev => {
+      const next = [...prev, {
+        id: tempId, dbId: null, name: file.name, type: kind, fileType: kind,
+        size: `${(file.size / 1024).toFixed(1)} KB`, columns: [], rowCount: null,
+        summary: '', capturedContext: null, tableName: null, storagePath: null, storageBucket: null,
+        intakeMessages: [{ role: 'assistant', content: `⏳ Processing **${file.name}**…` }],
+        intakeComplete: false, processing: true,
+      }];
+      stellaDataFilesRef.current = next;
+      return next;
+    });
     setActiveStellaDataId(tempId);
     setStellaSettingsTab('connections');
     setStellaConnectionsTab('files');
@@ -9617,28 +9684,54 @@ ${stepInstruction}`;
       const dbId = dbRow?.id || tempId;
 
       // Opening intake message — always include real questions (model or fallback).
-      const questions = pickStellaIntakeQuestions(
-        onboarding,
-        stellaDefaultIntakeQuestions({ isTabular, columns: mergedColumns }),
-      );
       const otherTabular = stellaOtherTabularFiles(tempId);
-      if (isTabular && otherTabular.length) {
-        await stellaHydrateColumnValueProfiles(otherTabular);
-        const othersNow = stellaOtherTabularFiles(tempId);
-        const joinQ = stellaJoinQuestion(
-          stellaGuessJoinCandidates({ id: tempId, columns: mergedColumns }, othersNow),
-          othersNow,
-        );
-        const alreadyJoin = questions.some((q) => /\b(join|related|shared (id|key)|territory, product)\b/i.test(q));
-        if (joinQ && !alreadyJoin) questions.push(joinQ);
-      }
-      const colLine = mergedColumns.length ? `\n\n**Columns:** ${mergedColumns.map(c => c.name).join(', ')}` : '';
-      const qBlock = questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
-      const assistantMsg = `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nTo interpret this correctly I need a little context:\n\n${qBlock}\n\nYou can answer them all together or one at a time.`;
-
       const profiledColumns = isTabular
         ? stellaApplyRowSampleToColumns(mergedColumns, records.slice(0, 400))
         : mergedColumns;
+      let joinQ = '';
+      if (isTabular && otherTabular.length) {
+        await stellaHydrateColumnValueProfiles(otherTabular);
+        const othersNow = stellaOtherTabularFiles(tempId);
+        joinQ = stellaJoinQuestion(
+          stellaGuessJoinCandidates({ id: tempId, columns: profiledColumns }, othersNow),
+          othersNow,
+        ) || '';
+      }
+      const modelQuestions = pickStellaIntakeQuestions(
+        { ...onboarding, summary },
+        stellaDefaultIntakeQuestions({ isTabular, columns: profiledColumns }),
+      ).filter((q) => {
+        if (!joinQ) return true;
+        return !/\b(join|related|shared (id|key)|territory, product)\b/i.test(q);
+      });
+      const linkQ = stellaLinkedModuleQuestion(userSettingsRef.current || userSettings, 'stella');
+      const questions = [
+        ...(joinQ ? [joinQ] : []),
+        ...(linkQ && !joinQ ? [linkQ] : []),
+        ...modelQuestions.filter((q) => !linkQ || !/\b(linked to|connected module|stay independent)\b/i.test(q)),
+      ];
+      const colLine = profiledColumns.length ? `\n\n**Columns:** ${profiledColumns.map(c => c.name).join(', ')}` : '';
+      const needsUser = questions.length > 0;
+      const qBlock = questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+      const linkNote = linkQ && joinQ
+        ? `\n\nThis workspace is also linked to other modules — confirm whether this file should connect there as well.`
+        : '';
+      const assistantMsg = needsUser
+        ? (questions.length === 1 && joinQ
+          ? `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed the file from its contents and found likely connections:\n\n${joinQ}${linkNote}`
+          : `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI assessed this file from its contents.${joinQ || linkQ ? ' Proposed connections are below.' : ''}\n\n${qBlock}\n\nYou can answer together or one at a time.`)
+        : `✅ Uploaded: **${file.name}**\n\n${summary}${colLine}\n\nI've assessed this file from its contents — that's enough to query it. Ask me anything in Stella Insights.`;
+
+      const autoCtx = needsUser ? null : {
+        what_it_represents: summary,
+        time_period: '',
+        key_metrics: profiledColumns.slice(0, 12).map((c) => (
+          c.description ? `${c.name} = ${c.description}` : c.name
+        )).filter(Boolean),
+        interpretation_notes: '',
+        qa_pairs: [],
+        relationships: [],
+      };
       const finalFile = {
         id: dbId, dbId,
         name: file.name, type: kind, fileType: kind,
@@ -9646,11 +9739,11 @@ ${stepInstruction}`;
         columns: profiledColumns, rowCount,
         previewRows: isTabular ? stellaPreviewRowsFromData(records, 3) : [],
         extractedText: isTabular ? '' : sampleText,
-        summary, capturedContext: null, dataProfile,
+        summary, capturedContext: autoCtx, dataProfile,
         tableName, storagePath, storageBucket,
         textStoragePath: storagePath ? stellaExtractedTextPath(storagePath) : null,
         intakeMessages: [{ role: 'assistant', content: assistantMsg }],
-        intakeComplete: false, processing: false,
+        intakeComplete: !needsUser, processing: false,
         uploadedAt: dbRow?.uploaded_at || new Date().toISOString(),
       };
       setStellaDataFiles((prev) => {
@@ -9659,6 +9752,14 @@ ${stepInstruction}`;
         return next;
       });
       setActiveStellaDataId(prev => (prev === tempId ? dbId : prev));
+      if (autoCtx) {
+        setStellaIntakeMinimized(true);
+        try {
+          if (dbId) await stellaUpdateRegistry(dbId, { context_qa: autoCtx });
+        } catch (e) {
+          setStellaMessages((prev) => [...prev, { role: 'system', content: `⚠️ Could not save captured context: ${e.message}` }]);
+        }
+      }
     } catch (e) {
       setStellaDataFiles(prev => prev.map(f => f.id === tempId
         ? { ...f, processing: false, intakeMessages: [{ role: 'system', content: `❌ Upload failed: ${e.message}` }] }
@@ -11427,11 +11528,12 @@ ${stepInstruction}`;
                   return (
                   <div
                     key={chat.id}
-                    className="text-left bg-slate-800/50 hover:bg-slate-700/55 border border-blue-400/20 hover:border-blue-400/45 rounded-xl p-4 transition-all group"
+                    className="relative text-left bg-slate-800/50 hover:bg-slate-700/55 border border-blue-400/20 hover:border-blue-400/45 rounded-xl p-4 pl-5 transition-all group overflow-hidden"
                   >
+                    <div className={`absolute left-0 top-0 bottom-0 w-1 ${mod.bar || 'bg-blue-400'}`} />
                     <div className="flex items-start justify-between gap-2">
                       <button type="button" onClick={() => continueChat(chat.id)} disabled={!!openingChatId} className="min-w-0 text-left flex-1 disabled:opacity-70">
-                        <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-300/90 mb-1">{mod.label}</div>
+                        <div className="mb-1.5">{chatModuleBadge(mod)}</div>
                         <div className="text-sm font-semibold text-white truncate">{chat.title || 'Chat'}</div>
                         <div className="text-[11px] text-blue-300/60 mt-1">
                           {formatChatTime(chat.updatedAt)}

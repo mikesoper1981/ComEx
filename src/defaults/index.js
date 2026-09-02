@@ -381,19 +381,22 @@ export function mergeStellaPrompts(partial) {
   if (/You are a data onboarding assistant/i.test(out.contentSummary)
       && (/MUST return 3-5 suggestedQuestions/i.test(out.contentSummary)
         || /units, time period, definitions, or caveats/i.test(out.contentSummary)
-        || /meaning and INTENT/i.test(out.contentSummary))) {
+        || /meaning and INTENT/i.test(out.contentSummary)
+        || !/Prefer an empty list over padding/i.test(out.contentSummary))) {
     out.contentSummary = DEFAULT_STELLA_PROMPTS.contentSummary;
   }
   if (/You are the Stella Insights data intake agent/i.test(out.intake)
       && (/key metrics \/ important fields/i.test(out.intake)
         || /how the data should be interpreted/i.test(out.intake)
         || !/name_maps/i.test(out.intake)
-        || !/sample VALUES overlap/i.test(out.intake))) {
+        || !/sample VALUES overlap/i.test(out.intake)
+        || !/incentive schemes, quotas, payouts/i.test(out.intake))) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
   }
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)
       || !/NAME MAPS already captured/i.test(out.analyst)
-      || !/unless this question or your instructions specify/i.test(out.analyst)) {
+      || !/unless this question or your instructions specify/i.test(out.analyst)
+      || !/CONNECTED MODULES or LINKED MODULE CONTEXT/i.test(out.analyst)) {
     out.analyst = DEFAULT_STELLA_PROMPTS.analyst;
   }
   return out;

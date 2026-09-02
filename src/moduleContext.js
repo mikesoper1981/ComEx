@@ -327,6 +327,20 @@ export function listModuleContextBlocks(f) {
     blocks.push({ id: 'metrics', label: 'Key fields', value: ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('\n') });
   }
   if (!isEmptyContextValue(ctx.interpretation_notes)) blocks.push({ id: 'interpretation', label: 'How to use', value: ctx.interpretation_notes });
+  if (Array.isArray(ctx.name_maps) && ctx.name_maps.some((m) => m && (m.from || m.to))) {
+    const maps = ctx.name_maps
+      .filter((m) => m && (m.from || m.to))
+      .map((m) => `${m.from || '?'} → ${m.to || '?'}${m.note ? ` (${m.note})` : ''}`)
+      .join('\n');
+    if (maps) blocks.push({ id: 'name_maps', label: 'Name maps', value: maps });
+  }
+  if (Array.isArray(ctx.relationships) && ctx.relationships.some((r) => r && (r.this_field || r.related_field))) {
+    const joins = ctx.relationships
+      .filter((r) => r && (r.this_field || r.related_field))
+      .map((r) => `${r.this_field || '?'} = ${r.related_file || r.related_table || '?'}.${r.related_field || '?'}${r.note ? ` (${r.note})` : ''}`)
+      .join('\n');
+    if (joins) blocks.push({ id: 'joins', label: 'Joins', value: joins });
+  }
   (ctx.qa_pairs || []).forEach((p, i) => {
     if (isEmptyContextValue(p?.question) && isEmptyContextValue(p?.answer)) return;
     blocks.push({ id: `qa:${i}`, label: 'Clarification', qa: true, question: p.question || '', answer: p.answer || '' });
@@ -405,20 +419,34 @@ export function toggleModuleConnection(connections, a, b) {
   return [...next, { a: left, b: right }];
 }
 
-export function formatStellaSharePromptBlock(files, { maxChars = 3500 } = {}) {
+export function formatStellaSharePromptBlock(files, { maxChars = 4500 } = {}) {
   const usable = (files || []).filter((f) => f && !f.processing);
   if (!usable.length) return '';
   const blocks = usable.map((f) => {
     const cols = (f.columns || []).slice(0, 18).map((c) => (typeof c === 'string' ? c : c.name)).filter(Boolean).join(', ');
     const ctx = f.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
     const metrics = Array.isArray(ctx.key_metrics) ? ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).slice(0, 8).join('; ') : '';
+    const maps = Array.isArray(ctx.name_maps)
+      ? ctx.name_maps.filter((m) => m && (m.from || m.to)).slice(0, 8).map((m) => `${m.from || '?'} → ${m.to || '?'}`).join('; ')
+      : '';
+    const joins = Array.isArray(ctx.relationships)
+      ? ctx.relationships
+        .filter((r) => r && r.this_field && r.related_field)
+        .slice(0, 10)
+        .map((r) => `${r.this_field} = ${r.related_file || r.related_table}.${r.related_field}`)
+        .join('; ')
+      : '';
     return [
       `FILE: ${f.name}${f.rowCount != null ? ` (${f.rowCount} rows)` : (f.tableName ? ' (table)' : ' (document)')}`,
+      f.tableName ? `SQL table: ${f.tableName}` : '',
       !isEmptyContextValue(f.summary) ? `Summary: ${String(f.summary).replace(/\s+/g, ' ').trim().slice(0, 420)}` : '',
       cols ? `Columns: ${cols}` : '',
       !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
       !isEmptyContextValue(ctx.time_period) ? `Period: ${ctx.time_period}` : '',
       metrics ? `Key metrics: ${metrics}` : '',
+      maps ? `Name maps: ${maps}` : '',
+      joins ? `Joins: ${joins}` : '',
+      !isEmptyContextValue(ctx.interpretation_notes) ? `How to use: ${String(ctx.interpretation_notes).replace(/\s+/g, ' ').trim().slice(0, 280)}` : '',
       (!f.tableName && !isEmptyContextValue(f.extractedText))
         ? `Extract: ${String(f.extractedText).replace(/\s+/g, ' ').trim().slice(0, 500)}`
         : '',
@@ -426,7 +454,7 @@ export function formatStellaSharePromptBlock(files, { maxChars = 3500 } = {}) {
   });
   let body = blocks.join('\n\n');
   if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… Stella catalog truncated …]`;
-  return `\n\nLINKED STELLA DATA CATALOG — this user connected Stella to this module. Summaries of datasets they uploaded to Stella (not live SQL). Use as background for territories, products, coverage, and metrics. Do not invent extra tables or values:\n${body}\n`;
+  return `\n\nLINKED STELLA DATA CATALOG — this user connected Stella to this module. Datasets they uploaded to Stella (summaries and confirmed joins, not live SQL). Use as mandatory background for territories, products, coverage, and metrics. Do not invent extra tables or values:\n${body}\n`;
 }
 
 export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 12000, linkedFrom = '' } = {}) {
@@ -440,8 +468,8 @@ export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 
   let body = blobs.join('\n\n');
   if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… module context truncated …]`;
   const header = linkedFrom
-    ? `\n\nLINKED MODULE CONTEXT (${moduleId}) — shared because this user connected ${linkedFrom} with ${moduleId}. Treat it as mandatory background from that module. Do not contradict it. Do not name internal filenames to end users:\n`
-    : `\n\nMODULE CONTEXT (${moduleId}) — user-provided guidance for this module. Treat it as mandatory background. Do not contradict it. Do not name internal filenames to end users:\n`;
+    ? `\n\nLINKED MODULE CONTEXT (${MODULE_CONTEXT_LABELS[moduleId] || moduleId}) — shared because this user connected ${MODULE_CONTEXT_LABELS[linkedFrom] || linkedFrom} with ${MODULE_CONTEXT_LABELS[moduleId] || moduleId}. This is mandatory background from that module. Do not contradict it. Do not name internal filenames to end users:\n`
+    : `\n\nMODULE CONTEXT (${MODULE_CONTEXT_LABELS[moduleId] || moduleId}) — user-provided guidance for this module. Treat it as mandatory background. Do not contradict it. Do not name internal filenames to end users:\n`;
   return `${header}${body}\n`;
 }
 
@@ -449,24 +477,73 @@ export function formatLinkedModulesPromptBlock(settings, homeId, { stellaFiles =
   const home = MODULE_CONTEXT_IDS.includes(homeId) ? homeId : 'incentives';
   const linked = connectedModuleIds(settings?.moduleConnections, home);
   const chunks = [];
+  if (linked.length) {
+    const names = linked.map((id) => MODULE_CONTEXT_LABELS[id] || id).join(', ');
+    chunks.push(`\n\nCONNECTED MODULES — this ${MODULE_CONTEXT_LABELS[home] || home} session is linked to ${names}. Files, catalogs, and remembered facts from those modules below are in-scope. Use them. Do not say you cannot see a linked module.\n`);
+  }
   const homeBlock = formatModuleContextPromptBlock(settings, home, { maxChars: 8000 });
   if (homeBlock) chunks.push(homeBlock);
   for (const id of linked) {
     const other = formatModuleContextPromptBlock(settings, id, { maxChars: 4500, linkedFrom: home });
     if (other) chunks.push(other);
+    else if (id !== 'stella') {
+      chunks.push(`\n\nLINKED MODULE CONTEXT (${MODULE_CONTEXT_LABELS[id] || id}) — this user connected ${MODULE_CONTEXT_LABELS[home] || home} with ${MODULE_CONTEXT_LABELS[id] || id}, but that module has no context files uploaded yet.\n`);
+    }
     if (id === 'stella' && home !== 'stella') {
       const goals = String(settings?.stellaBusinessContext?.keyGoals || '').trim();
       if (goals) {
         chunks.push(`\n\nLINKED STELLA ANALYSIS GOALS — use as background for what they want from data analysis:\n${goals}\n`);
       }
-      const catalog = formatStellaSharePromptBlock(stellaFiles);
-      if (catalog) chunks.push(catalog);
+      const catalog = formatStellaSharePromptBlock(stellaFiles, { maxChars: 5000 });
+      chunks.push(catalog || `\n\nLINKED STELLA DATA CATALOG — Stella Insights is connected, but no Stella datasets are loaded in this session yet. You can still treat Stella as a linked module.\n`);
     }
   }
   if (!chunks.length) return '';
   let body = chunks.join('');
   if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… linked context truncated …]`;
   return body;
+}
+
+/** Slim linked-module facts for Stella intake — enough to propose joins, not scheme design. */
+export function formatLinkedModulesIntakeHint(settings, homeId = 'stella', { maxChars = 2800 } = {}) {
+  const home = MODULE_CONTEXT_IDS.includes(homeId) ? homeId : 'stella';
+  const linked = connectedModuleIds(settings?.moduleConnections, home).filter((id) => id !== home);
+  if (!linked.length) return '';
+  const names = linked.map((id) => MODULE_CONTEXT_LABELS[id] || id).join(', ');
+  const parts = [
+    `CONNECTED MODULES: ${names}. Check whether THIS file shares products, territories, accounts, reps, or IDs with those modules and propose those connections. Do not ask about incentive scheme design, quotas, payouts, KPIs, or analysis goals.`,
+  ];
+  for (const id of linked) {
+    if (id === 'stella') continue;
+    const files = (settings?.moduleContext?.[id]?.files || []).filter((f) => f && !f.processing);
+    if (!files.length) {
+      parts.push(`${MODULE_CONTEXT_LABELS[id] || id}: linked, no context files uploaded yet.`);
+      continue;
+    }
+    for (const f of files.slice(0, 4)) {
+      const extract = String(f.extractedText || f.structuredExtract || f.summary || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 420);
+      parts.push(`${MODULE_CONTEXT_LABELS[id] || id} file "${f.name}": ${extract || '(no extract yet)'}`);
+    }
+  }
+  let body = parts.join('\n');
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n[… linked intake hint truncated …]`;
+  return `\n\n${body}\n`;
+}
+
+export function stellaLinkedModuleQuestion(settings, homeId = 'stella') {
+  const linked = connectedModuleIds(settings?.moduleConnections, homeId).filter((id) => id !== 'stella');
+  if (!linked.length) return '';
+  const names = linked.map((id) => MODULE_CONTEXT_LABELS[id] || id).join(' and ');
+  const fileBits = [];
+  for (const id of linked) {
+    const files = (settings?.moduleContext?.[id]?.files || []).filter((f) => f && !f.processing);
+    for (const f of files.slice(0, 2)) fileBits.push(`"${f.name}"`);
+  }
+  const from = fileBits.length ? ` — e.g. ${fileBits.join(', ')}` : '';
+  return `This Stella workspace is linked to ${names}${from}. Can this file be connected to those modules (shared products, territories, accounts, or IDs), or should it stay independent?`;
 }
 
 
