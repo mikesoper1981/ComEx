@@ -4707,6 +4707,7 @@ export default function CommercialExcellenceApp() {
   const wfCardRefs = useRef({});
   const [wfSavedId, setWfSavedId] = useState('');
   const [suggestedPrompts, setSuggestedPrompts] = useState([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const [suggestionsEnabled, setSuggestionsEnabled] = useState(() => readLocalProductIntelligence().suggestions.enabled);
   const [maxSuggestions, setMaxSuggestions] = useState(() => readLocalProductIntelligence().suggestions.max);
   const [customSystemPrompt, setCustomSystemPrompt] = useState(() => readLocalProductIntelligence().systemPrompt);
@@ -5157,6 +5158,10 @@ export default function CommercialExcellenceApp() {
   useEffect(() => {
     scrollToBottom();
   }, [messages, stellaMessages, activeTab]);
+
+  useEffect(() => {
+    setSuggestionsOpen(false);
+  }, [suggestedPrompts]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -10862,29 +10867,89 @@ ${stepInstruction}`;
     );
   };
 
+  const renderSuggestedPrompts = () => {
+    const show = suggestionsEnabled && suggestedPrompts.length > 0
+      && !pendingWorkflow && !memoryPendingFor('chat') && !currentWorkflow
+      && !pendingImageReview && !pendingProposalIntake && !isLoading
+      && !choiceButtons?.length && !clarifyingReplyHint;
+    if (!show) return null;
+    const n = suggestedPrompts.length;
+    return (
+      <div className="mb-2">
+        {!suggestionsOpen ? (
+          <button
+            type="button"
+            onClick={() => setSuggestionsOpen(true)}
+            className="inline-flex items-center gap-1.5 px-2 py-1.5 bg-blue-500/15 hover:bg-blue-500/25 border border-blue-400/30 rounded-lg text-xs font-semibold text-blue-100"
+            title={`${n} suggested prompt${n === 1 ? '' : 's'}`}
+          >
+            <span className="relative inline-flex">
+              <Sparkles className="w-4 h-4 text-cyan-300" />
+              <span className="absolute -top-1.5 -right-2 min-w-[1.1rem] h-4 px-0.5 rounded-full bg-cyan-400 text-slate-900 text-[10px] font-bold leading-4 text-center">
+                {n}
+              </span>
+            </span>
+            <span className="pl-1">Suggested</span>
+            <ChevronDown className="w-3.5 h-3.5 text-blue-300/80" />
+          </button>
+        ) : (
+          <div>
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <div className="text-xs text-blue-300/70 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                Suggested next steps
+                <span className="text-[10px] font-bold text-cyan-300/90 bg-cyan-500/15 border border-cyan-400/25 rounded-full px-1.5 leading-4">{n}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSuggestionsOpen(false)}
+                className="p-1 rounded-md text-blue-300/70 hover:text-blue-100 hover:bg-slate-700/50"
+                title="Hide suggestions"
+              >
+                <ChevronDown className="w-4 h-4 rotate-180" />
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2 max-h-24 overflow-y-auto custom-scrollbar">
+              {suggestedPrompts.map((prompt, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); handleSubmit(e, prompt); }}
+                  className="px-3 py-1.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-400/30 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 hover:text-blue-100 transition-all text-left"
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 text-white">
+    <div className={`bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 text-white ${showLanding ? 'min-h-dvh' : 'h-dvh max-h-dvh overflow-hidden flex flex-col'}`}>
       {/* Header */}
-      <header className="border-b border-blue-400/30 bg-slate-900/80 backdrop-blur-sm">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 sm:py-4">
+      <header className="border-b border-blue-400/30 bg-slate-900/80 backdrop-blur-sm flex-shrink-0">
+        <div className={`max-w-7xl mx-auto px-4 sm:px-6 ${showLanding ? 'py-3 sm:py-4' : 'py-1.5 sm:py-2'}`}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 sm:gap-3">
-              <button onClick={() => setShowLanding(true)} className="w-8 h-8 sm:w-10 sm:h-10 bg-gradient-to-br from-blue-400 to-cyan-400 rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity">
+              <button onClick={() => setShowLanding(true)} className={`${showLanding ? 'w-8 h-8 sm:w-10 sm:h-10' : 'w-8 h-8 sm:w-9 sm:h-9'} bg-gradient-to-br from-blue-400 to-cyan-400 rounded-lg flex items-center justify-center hover:opacity-80 transition-opacity`}>
                 <TrendingUp className="w-5 h-5 sm:w-6 sm:h-6 text-slate-900" />
               </button>
               <div>
                 <button onClick={() => setShowLanding(true)} className="text-left hover:opacity-80 transition-opacity">
-                  <h1 className="text-lg sm:text-2xl font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">Commercial Excellence Hub</h1>
+                  <h1 className={`${showLanding ? 'text-lg sm:text-2xl' : 'text-base sm:text-xl'} font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent`}>Commercial Excellence Hub</h1>
                 </button>
                 {showLanding && <p className="text-xs text-blue-300/70 hidden sm:block">Field & Commercial Excellence Platform</p>}
               </div>
             </div>
-            <div className="flex items-center gap-2 sm:gap-3">
+            <div className="flex items-center gap-1.5 sm:gap-3">
               {!showLanding && (activeTab === 'chat' || activeTab === 'performance') && (
-                <div className="flex gap-1 sm:gap-2 bg-slate-800/50 rounded-lg p-1">
+                <div className="flex gap-1 bg-slate-800/50 rounded-lg p-0.5 sm:p-1">
                   {[['chat', MessageSquare, 'Consultation'], ['performance', BarChart3, 'Performance']].map(([tab, Icon, label]) => (
-                    <button key={tab} onClick={() => setActiveTab(tab)} className={`flex items-center gap-1 sm:gap-2 px-2 sm:px-4 py-1.5 sm:py-2 rounded-md transition-all text-xs sm:text-sm ${activeTab === tab ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}>
-                      <Icon className="w-3 h-3 sm:w-4 sm:h-4" /><span className="hidden sm:inline">{label}</span>
+                    <button key={tab} onClick={() => setActiveTab(tab)} className={`flex items-center gap-1 sm:gap-2 px-2 sm:px-3 py-1 sm:py-1.5 rounded-md transition-all text-xs sm:text-sm ${activeTab === tab ? 'bg-blue-500 text-white shadow-lg' : 'text-blue-300 hover:bg-slate-700/50'}`}>
+                      <Icon className="w-3.5 h-3.5 sm:w-4 sm:h-4" /><span className="hidden sm:inline">{label}</span>
                     </button>
                   ))}
                 </div>
@@ -10893,9 +10958,9 @@ ${stepInstruction}`;
                 type="button"
                 title="User settings"
                 onClick={() => { setShowLanding(false); setActiveTab('user-settings'); }}
-                className={`h-11 sm:h-12 px-3 sm:px-3.5 rounded-lg flex items-center justify-center gap-2 border transition-all ${!showLanding && activeTab === 'user-settings' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+                className={`${showLanding ? 'h-11 sm:h-12' : 'h-9 sm:h-10'} px-2.5 sm:px-3 rounded-lg flex items-center justify-center gap-2 border transition-all ${!showLanding && activeTab === 'user-settings' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
               >
-                <UserCog className="w-5 h-5 sm:w-6 sm:h-6" />
+                <UserCog className="w-4 h-4 sm:w-5 sm:h-5" />
                 <span className="hidden sm:inline text-sm font-semibold">Settings</span>
               </button>
               {isAdmin && (
@@ -10903,12 +10968,12 @@ ${stepInstruction}`;
                   type="button"
                   title="Admin"
                   onClick={() => { setShowLanding(false); setActiveTab('admin'); }}
-                  className={`h-11 sm:h-12 w-11 sm:w-12 rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'admin' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
+                  className={`${showLanding ? 'h-11 sm:h-12 w-11 sm:w-12' : 'h-9 sm:h-10 w-9 sm:w-10'} rounded-lg flex items-center justify-center border transition-all ${!showLanding && activeTab === 'admin' ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40'}`}
                 >
-                  <Settings className="w-5 h-5 sm:w-6 sm:h-6" />
+                  <Settings className="w-4 h-4 sm:w-5 sm:h-5" />
                 </button>
               )}
-              <div className="hidden sm:flex flex-col items-end leading-tight ml-3 sm:ml-6 pl-3 sm:pl-6 border-l border-blue-400/25">
+              <div className="hidden md:flex flex-col items-end leading-tight ml-2 sm:ml-4 pl-3 sm:pl-4 border-l border-blue-400/25">
                 <span className="text-xs font-semibold text-white max-w-[180px] truncate">{currentUser.name}</span>
                 <span className="text-[10px] text-blue-300/60 max-w-[180px] truncate">{userSettings.companyName || resolveUserCompany(currentUser)}</span>
               </div>
@@ -10916,9 +10981,9 @@ ${stepInstruction}`;
                 type="button"
                 title="Sign out"
                 onClick={handleSignOut}
-                className="h-11 sm:h-12 w-11 sm:w-12 rounded-lg flex items-center justify-center border bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40 transition-all"
+                className={`${showLanding ? 'h-11 sm:h-12 w-11 sm:w-12' : 'h-9 sm:h-10 w-9 sm:w-10'} rounded-lg flex items-center justify-center border bg-slate-800/60 border-blue-400/20 text-blue-200 hover:bg-slate-700/70 hover:border-blue-400/40 transition-all`}
               >
-                <LogOut className="w-5 h-5 sm:w-6 sm:h-6" />
+                <LogOut className="w-4 h-4 sm:w-5 sm:h-5" />
               </button>
             </div>
           </div>
@@ -11087,7 +11152,7 @@ ${stepInstruction}`;
           )}
         </div>
       ) : (
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 sm:py-6 h-[calc(100vh-80px)] sm:h-[calc(100vh-100px)] overflow-hidden">
+        <div className="flex-1 min-h-0 max-w-7xl mx-auto w-full px-4 sm:px-6 py-2 sm:py-3 overflow-hidden flex flex-col">
           <MessageErrorBoundary key={activeTab} fallback={
             <div className="h-full flex items-center justify-center">
               <div className="max-w-md text-center bg-red-500/10 border border-red-400/25 rounded-xl p-6">
@@ -11101,13 +11166,13 @@ ${stepInstruction}`;
             <div className="flex gap-3 h-full min-h-0">
               {renderChatHistorySidebar()}
               <div className="flex flex-col h-full min-w-0 flex-1 overflow-hidden">
-              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-3">
+              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl px-3 py-2 sm:px-4 sm:py-2.5 text-white shadow-xl flex-shrink-0 mb-2">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <div className="flex items-center gap-3">
-                    <DollarSign className="w-6 h-6" />
+                  <div className="flex items-center gap-2.5">
+                    <DollarSign className="w-5 h-5 sm:w-6 sm:h-6" />
                     <div>
-                      <h2 className="text-xl font-bold">Incentive Compensation</h2>
-                      <p className="text-cyan-100 text-xs">Design, assess and optimise sales incentive schemes</p>
+                      <h2 className="text-base sm:text-lg font-bold leading-tight">Incentive Compensation</h2>
+                      <p className="text-cyan-100 text-[11px] hidden sm:block">Design, assess and optimise sales incentive schemes</p>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -11121,16 +11186,18 @@ ${stepInstruction}`;
                 </div>
               </div>
 
-              {/* Quick Actions */}
-              <div className="flex flex-wrap gap-2 mb-3 flex-shrink-0">
-                <button onClick={() => setInput('I need to design an incentive scheme for a team of 10 AEs.')} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-300 hover:text-blue-200 transition-all"><Target className="w-3.5 h-3.5" /> Design New Scheme</button>
-                <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-300 hover:text-cyan-200 transition-all"><Upload className="w-3.5 h-3.5" /> Assess Proposal</button>
-                <button onClick={() => setInput('What are the key principles for designing effective sales incentive schemes?')} className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-300 hover:text-purple-200 transition-all"><Award className="w-3.5 h-3.5" /> Best Practices</button>
+              {/* Quick Actions — hide once the conversation has started so the chat keeps height */}
+              {!messages.some((m) => m.role === 'user') && (
+              <div className="flex flex-nowrap gap-2 mb-2 flex-shrink-0 overflow-x-auto custom-scrollbar">
+                <button onClick={() => setInput('I need to design an incentive scheme for a team of 10 AEs.')} className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-300 hover:text-blue-200 transition-all whitespace-nowrap"><Target className="w-3.5 h-3.5" /> Design New Scheme</button>
+                <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-300 hover:text-cyan-200 transition-all whitespace-nowrap"><Upload className="w-3.5 h-3.5" /> Assess Proposal</button>
+                <button onClick={() => setInput('What are the key principles for designing effective sales incentive schemes?')} className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-300 hover:text-purple-200 transition-all whitespace-nowrap"><Award className="w-3.5 h-3.5" /> Best Practices</button>
               </div>
+              )}
 
               {/* Activity Log */}
               {activityLog.length > 0 && (
-                <div className="bg-slate-800/50 border border-purple-400/30 rounded-xl mb-3 overflow-hidden flex-shrink-0">
+                <div className="bg-slate-800/50 border border-purple-400/30 rounded-xl mb-2 overflow-hidden flex-shrink-0">
                   <button type="button" onClick={() => setShowActivityLog(!showActivityLog)} className="w-full px-4 py-3 flex items-center justify-between hover:bg-slate-700/50 transition-colors">
                     <div className="flex items-center gap-2"><div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse"></div><span className="font-semibold text-purple-400">System Activity</span></div>
                   </button>
@@ -11146,29 +11213,29 @@ ${stepInstruction}`;
 
               {/* Workflow Status Banner */}
               {currentWorkflow && (
-                <div className="bg-gradient-to-r from-blue-500/20 to-cyan-500/20 border border-blue-400/40 rounded-xl p-3 sm:p-4 mb-3 sm:mb-4 flex-shrink-0">
-                  <div className="flex items-center justify-between mb-2 sm:mb-3">
+                <div className="bg-gradient-to-r from-blue-500/20 to-cyan-500/20 border border-blue-400/40 rounded-xl p-2.5 sm:p-3 mb-2 flex-shrink-0">
+                  <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2 sm:gap-3">
-                      <div className="w-8 h-8 sm:w-10 sm:h-10 bg-blue-500 rounded-full flex items-center justify-center animate-pulse"><Target className="w-4 h-4 sm:w-6 sm:h-6 text-white" /></div>
+                      <div className="w-7 h-7 sm:w-9 sm:h-9 bg-blue-500 rounded-full flex items-center justify-center animate-pulse"><Target className="w-4 h-4 sm:w-5 sm:h-5 text-white" /></div>
                       <div>
-                        <div className="text-xs sm:text-sm font-semibold text-blue-300">🔵 Workflow Active</div>
-                        <div className="text-sm sm:text-lg font-bold text-white">{topics.find(t => t.id === currentWorkflow.topicId)?.name || 'Unknown'}</div>
+                        <div className="text-[11px] sm:text-xs font-semibold text-blue-300">Workflow Active</div>
+                        <div className="text-sm sm:text-base font-bold text-white leading-tight">{topics.find(t => t.id === currentWorkflow.topicId)?.name || 'Unknown'}</div>
                       </div>
                     </div>
-                    <button type="button" onClick={handleCancelWorkflow} className="px-2 sm:px-4 py-1.5 sm:py-2 bg-red-500/20 hover:bg-red-500/30 border border-red-400/50 text-red-300 rounded-lg transition-all text-xs sm:text-sm font-semibold cursor-pointer hover:scale-105">
+                    <button type="button" onClick={handleCancelWorkflow} className="px-2 sm:px-3 py-1 sm:py-1.5 bg-red-500/20 hover:bg-red-500/30 border border-red-400/50 text-red-300 rounded-lg transition-all text-xs font-semibold cursor-pointer hover:scale-105">
                       <span className="hidden sm:inline">✕ Cancel Workflow</span><span className="sm:hidden">✕</span>
                     </button>
                   </div>
-                  <div className="space-y-2 mb-4">
-                    <div className="flex items-center justify-between text-sm">
+                  <div className="space-y-1.5 mb-2">
+                    <div className="flex items-center justify-between text-xs sm:text-sm">
                       <span className="text-blue-300 font-medium">Step {currentWorkflow.currentStep + 1} of {topics.find(t => t.id === currentWorkflow.topicId)?.workflow.length || 0}</span>
                       <span className="text-cyan-300 font-bold">{Math.round(((currentWorkflow.currentStep + 1) / (topics.find(t => t.id === currentWorkflow.topicId)?.workflow.length || 1)) * 100)}% Complete</span>
                     </div>
-                    <div className="w-full bg-slate-700/50 rounded-full h-2 overflow-hidden">
+                    <div className="w-full bg-slate-700/50 rounded-full h-1.5 overflow-hidden">
                       <div className="bg-gradient-to-r from-blue-500 to-cyan-500 h-full transition-all duration-500" style={{ width: `${((currentWorkflow.currentStep + 1) / (topics.find(t => t.id === currentWorkflow.topicId)?.workflow.length || 1)) * 100}%` }}></div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 overflow-x-auto pb-2">
+                  <div className="hidden md:flex items-center gap-2 overflow-x-auto pb-1">
                     {topics.find(t => t.id === currentWorkflow.topicId)?.workflow.map((step, idx) => (
                       <div key={idx} className={`flex items-center gap-2 px-3 py-2 rounded-lg flex-shrink-0 transition-all ${idx < currentWorkflow.currentStep ? 'bg-green-500/20 border border-green-400/40' : idx === currentWorkflow.currentStep ? 'bg-cyan-500/30 border border-cyan-400/60 ring-2 ring-cyan-400/30' : 'bg-slate-700/30 border border-slate-600/40'}`}>
                         <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${idx < currentWorkflow.currentStep ? 'bg-green-500 text-white' : idx === currentWorkflow.currentStep ? 'bg-cyan-500 text-white' : 'bg-slate-600 text-slate-400'}`}>{idx < currentWorkflow.currentStep ? '✓' : step.step}</div>
@@ -11183,7 +11250,7 @@ ${stepInstruction}`;
               )}
 
               {/* Messages Area */}
-              <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 overflow-y-auto space-y-4 custom-scrollbar mb-4 min-h-0">
+              <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-5 overflow-y-auto space-y-4 custom-scrollbar mb-2 min-h-0">
                 {messages.map((message, index) => (
                   <div key={index} className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
                     <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-400 to-blue-400' : message.role === 'system' ? 'bg-gradient-to-br from-yellow-400 to-orange-400' : message.role === 'orchestrator' ? 'bg-gradient-to-br from-purple-500 to-pink-500' : 'bg-gradient-to-br from-blue-400 to-purple-400'}`}>
@@ -11446,25 +11513,16 @@ ${stepInstruction}`;
                   </div>
                 )}
 
-                {suggestionsEnabled && suggestedPrompts.length > 0 && !pendingWorkflow && !memoryPendingFor('chat') && !currentWorkflow && !pendingImageReview && !pendingProposalIntake && !isLoading && !choiceButtons?.length && !clarifyingReplyHint && (
-                  <div className="mb-3">
-                    <div className="text-xs text-blue-300/70 mb-2 flex items-center gap-2"><span>💡 Suggested next steps:</span></div>
-                    <div className="flex flex-wrap gap-2">
-                      {suggestedPrompts.map((prompt, idx) => (
-                        <button key={idx} onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); handleSubmit(e, prompt); }} className="px-3 py-2 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-400/30 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 hover:text-blue-100 transition-all hover:scale-105 active:scale-95">{prompt}</button>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                {renderSuggestedPrompts()}
 
-                <form onSubmit={handleSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-4">
+                <form onSubmit={handleSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-2 sm:p-3">
                   <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
                     <div className="flex-1">
-                      <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }} placeholder="Describe your incentive scenario or ask a question..." className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 sm:py-3 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} disabled={isLoading} />
+                      <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(e); } }} placeholder="Describe your incentive scenario or ask a question..." className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none" rows={2} disabled={isLoading} />
                     </div>
                     <div className="flex gap-2 sm:gap-3 sm:items-end">
-                      <button type="button" onClick={() => fileInputRef.current?.click()} className="flex-1 sm:flex-none px-4 py-3 bg-slate-700 hover:bg-slate-600 text-cyan-400 rounded-lg transition-all border border-cyan-400/30 hover:border-cyan-400/50" disabled={isLoading}><Upload className="w-5 h-5 mx-auto" /></button>
-                      <button type="submit" onClick={(e) => { if (input.trim()) handleSubmit(e); }} disabled={isLoading || !input.trim()} className="flex-1 sm:flex-none px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
+                      <button type="button" onClick={() => fileInputRef.current?.click()} className="flex-1 sm:flex-none px-3 sm:px-4 py-2 sm:py-2.5 bg-slate-700 hover:bg-slate-600 text-cyan-400 rounded-lg transition-all border border-cyan-400/30 hover:border-cyan-400/50" disabled={isLoading}><Upload className="w-5 h-5 mx-auto" /></button>
+                      <button type="submit" onClick={(e) => { if (input.trim()) handleSubmit(e); }} disabled={isLoading || !input.trim()} className="flex-1 sm:flex-none px-4 sm:px-6 py-2 sm:py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
                     </div>
                   </div>
                 </form>
@@ -11652,13 +11710,13 @@ ${stepInstruction}`;
             <div className="flex gap-3 h-full min-h-0">
               {renderChatHistorySidebar()}
               <div className="flex flex-col h-full min-w-0 flex-1 overflow-hidden">
-              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-3">
+              <div className="bg-gradient-to-r from-cyan-600 to-blue-600 rounded-xl px-3 py-2 sm:px-4 sm:py-2.5 text-white shadow-xl flex-shrink-0 mb-2">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <div className="flex items-center gap-3">
-                    <Layers className="w-6 h-6" />
+                  <div className="flex items-center gap-2.5">
+                    <Layers className="w-5 h-5 sm:w-6 sm:h-6" />
                     <div>
-                      <h2 className="text-xl font-bold">Stella Insights</h2>
-                      <p className="text-cyan-100 text-xs">Chat with your data — analyse trends and chart insights</p>
+                      <h2 className="text-base sm:text-lg font-bold leading-tight">Stella Insights</h2>
+                      <p className="text-cyan-100 text-[11px] hidden sm:block">Chat with your data — analyse trends and chart insights</p>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -11673,7 +11731,7 @@ ${stepInstruction}`;
               </div>
 
               <div className="flex flex-col flex-1 min-h-0">
-                <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 overflow-y-auto space-y-4 custom-scrollbar mb-4 min-h-0">
+                <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-5 overflow-y-auto space-y-4 custom-scrollbar mb-2 min-h-0">
                   {stellaMessages.map((message, index) => (
                     <div key={index} className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
                       <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-400 to-blue-400' : message.role === 'system' ? 'bg-gradient-to-br from-yellow-400 to-orange-400' : 'bg-gradient-to-br from-blue-400 to-purple-400'}`}>
@@ -11712,7 +11770,7 @@ ${stepInstruction}`;
                     {renderMemoryConfirmActions()}
                   </div>
                 )}
-                <form onSubmit={handleStellaChatSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-4">
+                <form onSubmit={handleStellaChatSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-2 sm:p-3">
                   <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
                     <div className="flex-1">
                       <textarea
@@ -11720,13 +11778,13 @@ ${stepInstruction}`;
                         onChange={(e) => setStellaInput(e.target.value)}
                         onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleStellaChatSubmit(e); } }}
                         placeholder="Ask a question about your uploaded datasets…"
-                        className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 sm:py-3 text-sm outline-none focus:border-blue-400 transition-colors resize-none"
+                        className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none"
                         rows={2}
                         disabled={stellaIsLoading}
                       />
                     </div>
                     <div className="flex gap-2 sm:gap-3 sm:items-end">
-                      <button type="submit" disabled={stellaIsLoading || !stellaInput.trim()} className="flex-1 sm:flex-none px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
+                      <button type="submit" disabled={stellaIsLoading || !stellaInput.trim()} className="flex-1 sm:flex-none px-4 sm:px-6 py-2 sm:py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
                     </div>
                   </div>
                 </form>
