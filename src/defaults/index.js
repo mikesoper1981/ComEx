@@ -382,16 +382,20 @@ export function mergeStellaPrompts(partial) {
       && (/MUST return 3-5 suggestedQuestions/i.test(out.contentSummary)
         || /units, time period, definitions, or caveats/i.test(out.contentSummary)
         || /meaning and INTENT/i.test(out.contentSummary)
-        || !/Prefer an empty list over padding/i.test(out.contentSummary))) {
+        || /Ask only about file structure/i.test(out.contentSummary)
+        || !/Prefer an empty list over padding/i.test(out.contentSummary)
+        || !/Never use a fixed list of must-ask questions/i.test(out.contentSummary))) {
     out.contentSummary = DEFAULT_STELLA_PROMPTS.contentSummary;
   }
   if (/You are the Stella Insights data intake agent/i.test(out.intake)
       && (/key metrics \/ important fields/i.test(out.intake)
         || /how the data should be interpreted/i.test(out.intake)
+        || /Concentrate only on/i.test(out.intake)
         || !/name_maps/i.test(out.intake)
         || !/sample VALUES overlap/i.test(out.intake)
         || !/incentive schemes, quotas, payouts/i.test(out.intake)
-        || !/Never join measures/i.test(out.intake))) {
+        || !/Never join measures/i.test(out.intake)
+        || !/Typical gaps \(guidance only/i.test(out.intake))) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
   }
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)

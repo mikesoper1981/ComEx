@@ -41,6 +41,20 @@ const KIND_META = {
   document: { title: 'Other files', subtitle: 'Text / other' },
 };
 
+const MAP_DIM_HINTS = new Set([
+  'list', 'master', 'lookup', 'reference', 'dim', 'dimension',
+  'directory', 'roster', 'catalog', 'catalogue',
+]);
+
+const MAP_FACT_HINTS = [
+  'sales', 'sale', 'revenue', 'actuals', 'performance',
+  'orders', 'order', 'transactions', 'transaction', 'txn',
+  'invoices', 'invoice', 'calls', 'call', 'activity', 'activities',
+  'visits', 'visit', 'shipments', 'shipment',
+  'claims', 'claim', 'rx', 'prescriptions', 'prescription',
+  'engagements', 'engagement', 'interactions', 'interaction', 'touchpoints', 'touchpoint',
+];
+
 const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 250, leafR: 210 };
 const LEAF_PAGE_SIZE = 24;
 const EMPTY_FOCUS = { moduleId: '', group: '', kind: '', fileId: '', factId: '' };
@@ -50,6 +64,53 @@ function clip(text, max = 140) {
   const t = String(text || '').replace(/\s+/g, ' ').trim();
   if (!t) return '';
   return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+function mapNormToken(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function mapFileTokens(file) {
+  const bits = [
+    file?.name,
+    file?.tableName,
+    file?.summary,
+    file?.represents,
+  ];
+  const out = [];
+  for (const bit of bits) {
+    const stripped = String(bit || '').replace(/\.[a-z0-9]{1,5}$/i, '');
+    for (const t of stripped.split(/[^a-z0-9]+/i)) {
+      const norm = mapNormToken(t);
+      if (norm && norm.length >= 2) out.push(norm);
+    }
+  }
+  return out;
+}
+
+function mapLooksLikeMeasureCol(col) {
+  const blobs = [col?.name, col?.original, col?.description]
+    .map(mapNormToken)
+    .filter(Boolean);
+  return blobs.some((b) => /^(value|amount|revenue|rev|sales|qty|quantity|count|actual|target|attainment|percent|pct|score|rate|volume|unit|units|uom|pack|packsize|calls|cost|price|margin|total|sum)/.test(b));
+}
+
+function mapJoinRole(file) {
+  if (!file) return 'unknown';
+  const tokens = mapFileTokens(file);
+  if (tokens.some((t) => MAP_DIM_HINTS.has(t))) return 'dimension';
+  if (tokens.some((t) => MAP_FACT_HINTS.includes(t))) return 'fact';
+  const cols = Array.isArray(file?.columns) ? file.columns : [];
+  const measureCount = cols.filter(mapLooksLikeMeasureCol).length;
+  if (measureCount >= 1) return 'fact';
+  return 'unknown';
+}
+
+function mapJoinType(fromFile, toFile) {
+  const a = mapJoinRole(fromFile);
+  const b = mapJoinRole(toFile);
+  if ((a === 'dimension' && b === 'fact') || (a === 'fact' && b === 'dimension')) return 'structural';
+  return 'comparison';
 }
 
 function isPptxLike(file) {
@@ -224,12 +285,14 @@ function stellaJoinEdges(files) {
       const key = `${pair}|${[tf, rf].map((s) => s.toLowerCase()).sort().join('=')}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const joinType = mapJoinType(f, other);
       edges.push({
         fromId: f.id,
         toId: other.id,
         fromName: f.name,
         toName: other.name,
         label: `${tf} ↔ ${rf}`,
+        joinType,
       });
     }
   }
@@ -653,7 +716,7 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
         const a = nodeByFile.get(j.fromId);
         const b = nodeByFile.get(j.toId);
         if (!a || !b) continue;
-        joinEdges.push({ from: a, to: b, kind: 'join', label: j.label });
+        joinEdges.push({ from: a, to: b, kind: 'join', label: j.label, joinType: j.joinType || 'comparison' });
       }
       continue;
     }
@@ -668,11 +731,17 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
       merged.get(key).count += p.count;
     }
     for (const e of merged.values()) {
+      const source = joins.find((j) => {
+        const aa = joinEndpointNodeId(mod, j.fromId, nodes, nodeByFile, focus);
+        const bb = joinEndpointNodeId(mod, j.toId, nodes, nodeByFile, focus);
+        return aa === e.from && bb === e.to || aa === e.to && bb === e.from;
+      });
       joinEdges.push({
         from: e.from,
         to: e.to,
         kind: 'join',
         label: e.count === 1 ? 'Joined' : `${e.count} joins`,
+        joinType: source?.joinType || 'comparison',
       });
     }
   }
@@ -842,13 +911,17 @@ function MapCanvas({
           const b = byId.get(e.to);
           if (!a || !b) return null;
           const path = edgePath(a, b, e.kind, hub, e.offset || 0);
-          const stroke = e.kind === 'share' || e.kind === 'join'
+          const stroke = e.kind === 'share'
             ? 'rgba(34,211,238,0.9)'
+            : e.kind === 'join'
+              ? (e.joinType === 'structural' ? 'rgba(251,191,36,0.95)' : 'rgba(34,211,238,0.92)')
             : e.kind === 'spoke'
               ? 'rgba(167,139,250,0.75)'
               : 'rgba(148,163,184,0.45)';
           const width = e.kind === 'share' ? 3.2 : e.kind === 'join' ? 2.4 : e.kind === 'spoke' ? 2.4 : 1.4;
-          const dash = e.kind === 'join' ? '7 5' : e.kind === 'leaf' ? '4 4' : undefined;
+          const dash = e.kind === 'join'
+            ? (e.joinType === 'structural' ? undefined : '7 5')
+            : e.kind === 'leaf' ? '4 4' : undefined;
           const related = selected === e.from || selected === e.to
             || (selectedModule && (e.from === selectedModule.id || e.to === selectedModule.id))
             || (selectedIsAccount && (e.from === 'account' || e.to === 'account'));
@@ -901,7 +974,11 @@ function MapCanvas({
         return (
           <div
             key={`join-label|${e.from}|${e.to}|${e.label}`}
-            className="absolute -translate-x-1/2 -translate-y-1/2 z-40 pointer-events-none px-2 py-1 rounded-md bg-cyan-950 border-2 border-cyan-300 text-[11px] font-bold text-cyan-50 whitespace-nowrap shadow-lg max-w-[220px] truncate"
+            className={`absolute -translate-x-1/2 -translate-y-1/2 z-40 pointer-events-none px-2 py-1 rounded-md border-2 text-[11px] font-bold whitespace-nowrap shadow-lg max-w-[220px] truncate ${
+              e.joinType === 'structural'
+                ? 'bg-amber-950 border-amber-300 text-amber-50'
+                : 'bg-cyan-950 border-cyan-300 text-cyan-50'
+            }`}
             style={{
               left: `${(path.labelX / CANVAS.w) * 100}%`,
               top: `${(path.labelY / CANVAS.h) * 100}%`,
@@ -1378,9 +1455,16 @@ export default function ContextMap({
         <div className="text-xs font-semibold text-blue-200 mb-2">How those files join</div>
         <ul className="space-y-1.5">
           {joins.map((e) => (
-            <li key={`${e.fromId}|${e.toId}|${e.label}`} className="text-xs text-slate-200 bg-slate-900/40 border border-cyan-400/20 rounded-lg px-3 py-2 flex items-center gap-2">
-              <Link2 className="w-3.5 h-3.5 text-cyan-300 flex-shrink-0" />
-              <span><span className="font-semibold">{e.fromName}</span> {e.label} <span className="font-semibold">{e.toName}</span></span>
+            <li key={`${e.fromId}|${e.toId}|${e.label}`} className={`text-xs text-slate-200 bg-slate-900/40 border rounded-lg px-3 py-2 flex items-center gap-2 ${
+              e.joinType === 'structural' ? 'border-amber-400/30' : 'border-cyan-400/20'
+            }`}>
+              <Link2 className={`w-3.5 h-3.5 flex-shrink-0 ${e.joinType === 'structural' ? 'text-amber-300' : 'text-cyan-300'}`} />
+              <span className="min-w-0">
+                <span><span className="font-semibold">{e.fromName}</span> {e.label} <span className="font-semibold">{e.toName}</span></span>
+                <span className={`block text-[10px] mt-0.5 ${e.joinType === 'structural' ? 'text-amber-200/75' : 'text-cyan-200/70'}`}>
+                  {e.joinType === 'structural' ? 'Structural link' : 'Comparison link'}
+                </span>
+              </span>
             </li>
           ))}
         </ul>
@@ -1406,7 +1490,8 @@ export default function ContextMap({
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always passed to the AI</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-cyan-400 rounded" /> Modules sharing context</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-slate-400" /> Parent → child on the map</span>
-      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> File join (keys after you expand a file)</span>
+      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t-2 border-amber-400" /> Structural file join</span>
+      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Comparison file join</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
       {leafPageInfo && leafPageInfo.pages > 1 ? (
         <span className="inline-flex items-center gap-1.5">

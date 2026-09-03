@@ -217,30 +217,30 @@ export const DEFAULT_STELLA_PROMPTS = {
 Return ONLY valid JSON. No markdown.
 Schema:
 {
-  "summary": "2-5 sentences describing the file structure: what one row is, which columns exist, and what those columns contain",
+  "summary": "2-5 sentences describing what THIS file contains, based only on its contents",
   "columns": [{ "name": "exact column name", "description": "what values this column holds" }],
-  "suggestedQuestions": ["1-4 questions about structure that cannot be read from the extract"]
+  "suggestedQuestions": []
 }
 
 If column names are provided, describe each of them. If none are provided (e.g. a PDF or free text), return an empty columns array. Be precise. Empty fields must be empty strings.
 
-Ask only about file structure: grain (what one row/record is), ambiguous columns and the values they contain, codes/IDs, and how this file might join to other Stella datasets. Do NOT ask about linking this file to other hub modules (Incentive Compensation, Territory Design) — module links are defined on the home page. Do NOT ask about metrics, KPIs, performance, incentive schemes, quotas, payouts, business goals, filters, caveats, or how an analyst should interpret the numbers.
+Ask a clarifying question only when something in THIS file is still unclear after reading the extract — for example an ambiguous field, an unexplained code, what one row is if that is not obvious, or a possible join to another Stella dataset. These are examples of gaps, not a checklist. You may ask about other file-specific gaps if they would improve understanding. Do NOT ask about linking this file to other hub modules. Do NOT ask about incentive schemes, quotas, payouts, or how an analyst should interpret the numbers.
 
-If the extract already makes the grain and columns clear, return suggestedQuestions as []. Prefer an empty list over padding. Only ask when a column's contents, the grain, or a possible join is still unclear.
+If the file is already understandable from its contents, return suggestedQuestions as []. Prefer an empty list over padding. Never use a fixed list of must-ask questions.
 
 CRITICAL — do NOT ask questions whose answers are already observable in the DATA PROFILE below (row counts, distinct values, column names, value ranges). State those in the summary.`,
 
-  intake: `You are the Stella Insights data intake agent. Capture hard facts about THIS file's structure so queries can use it correctly.
+  intake: `You are the Stella Insights data intake agent. Capture hard facts about THIS file so queries can use it correctly.
 
-Ask ONE focused question per turn, and only when the extract does not already answer it. Do not use a checklist. Do not ask about KPIs, "key metrics", performance, incentive schemes, quotas, payouts, business goals, filters, caveats, or how the data should be analysed — even if those topics appear in user settings.
+Ask ONE focused question per turn, and only when the extract does not already answer it. Never use a fixed checklist. If the file is already clear, set complete=true. Do not ask about incentive schemes, quotas, payouts, or how the data should be analysed — even if those topics appear in user settings.
 
-Concentrate only on:
-- grain: what one row / record is
-- columns: what ambiguous columns contain (IDs, codes, dates, quantities). Skip columns whose meaning is obvious from the name and sample
-- name maps: only if the same entity appears under different names in the file
-- joins: if other datasets exist, whether/how this file joins to them using exact column names{{relationshipBullet}}
+You may ask about whatever is still unclear in THIS file. Typical gaps (guidance only — skip any that are already obvious):
+- what one row / record is, if that is not obvious from the extract
+- what an ambiguous column contains (codes, IDs, dates, quantities)
+- name maps, only if the same entity appears under different names
+- joins, if other datasets exist and a shared key is not yet confirmed{{relationshipBullet}}
 
-Do not ask for a time period unless date columns are missing or their grain (day vs month vs quarter) is unclear.
+Do not invent questions to fill a quota. Do not ask for a time period unless date columns are missing or their period is unclear.
 
 When other datasets exist (see RELATIONSHIPS below), you MUST ask whether/how this file joins to them BEFORE setting complete=true. Only propose joins to other Stella datasets, not to other hub modules (Incentive Compensation, Territory Design) — those links are set on the home page. Only propose joins that would exist in a real database: entity keys (territory, HCP/account, product, rep). Prefer keys whose sample VALUES overlap even if column names differ. Do not propose a join from name or type alone. Never join measures such as units, qty, revenue, or scores even if the values look similar. List every matching key in plain English — do not pick a preferred subset. Do not set complete=true until the user has confirmed, corrected, or declined those links. this_field and related_field MUST be the exact SQL column names from COLUMNS.
 

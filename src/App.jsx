@@ -1488,45 +1488,17 @@ function stellaNormalizeIntakeQuestions(raw) {
     .slice(0, 5);
 }
 
-function stellaDefaultIntakeQuestions({ isTabular, columns = [] } = {}) {
-  const names = (columns || [])
-    .map((c) => (typeof c === 'string' ? c : (c.name || c.original || '')))
-    .map((n) => String(n || '').trim())
-    .filter(Boolean);
-  const colHint = names.slice(0, 6).join(', ');
-  if (isTabular) {
-    return [
-      colHint
-        ? `What is one row in this file (for example one account, one month, one call)? Columns include ${colHint}.`
-        : 'What is one row in this file — one account, one month, one event, or something else?',
-      colHint
-        ? `Are any of these columns codes or IDs whose values I should treat as keys: ${colHint}?`
-        : 'Which columns are identifiers that could join to other files?',
-    ];
-  }
-  return [
-    'What is this document (list of records, definitions, or something else)?',
-    'Which sections or tables in it describe the data structure Stella should use?',
-  ];
-}
-
 function stellaIntakeQuestionLooksIrrelevant(q) {
   const t = String(q || '').toLowerCase();
   if (!t) return true;
-  return /\b(kpi|key metrics?|performance|business goals?|incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|what filters|caveats?|linked to (other )?modules?|connected modules?|stay independent|connect(ed)? to those modules)\b/i.test(t);
+  return /\b(incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|linked to (other )?modules?|connected modules?|stay independent|connect(ed)? to those modules)\b/i.test(t);
 }
 
-function pickStellaIntakeQuestions(onboarding, fallbacks) {
+function pickStellaIntakeQuestions(onboarding) {
   const raw = onboarding && typeof onboarding === 'object' ? onboarding : {};
-  const fromModel = stellaNormalizeIntakeQuestions(
+  return stellaNormalizeIntakeQuestions(
     raw.suggestedQuestions != null ? raw.suggestedQuestions : raw.questions
   ).filter((q) => !stellaIntakeQuestionLooksIrrelevant(q));
-  if (fromModel.length >= 1) return fromModel;
-  const summary = String(raw.summary || '').replace(/\s+/g, ' ').trim();
-  const colCount = Array.isArray(raw.columns) ? raw.columns.length : 0;
-  const hasSubstance = (summary.length >= 40 && !/^uploaded (dataset|document)\.?$/i.test(summary)) || colCount >= 3;
-  if (hasSubstance) return [];
-  return fallbacks;
 }
 
 function stellaEnsureQuestionMark(text) {
@@ -1745,19 +1717,27 @@ function stellaLooksLikePeriodToken(t) {
   return /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|ytd|mtd)$/.test(s);
 }
 
-function stellaJoinFamily(col) {
-  const blobs = [col?.name, col?.original, col?.description].map(stellaNormJoinToken).filter(Boolean);
-  if (blobs.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b))) return null;
-  if (blobs.some((b) => STELLA_DATE_JOIN_TOKENS.test(b))) return 'date';
-  if (col?.kind === 'date') return 'date';
+function stellaJoinFamilyFromBlobs(blobs) {
+  const list = (blobs || []).filter(Boolean);
+  if (list.some((b) => STELLA_MEASURE_JOIN_TOKENS.test(b))) return null;
+  if (list.some((b) => STELLA_DATE_JOIN_TOKENS.test(b))) return 'date';
   for (const fam of STELLA_JOIN_FAMILIES) {
     for (const t of fam.tokens) {
       const nt = stellaNormJoinToken(t);
       if (nt.length < 3) continue;
-      if (blobs.some((b) => b === nt || b.includes(nt))) return fam.id;
+      if (list.some((b) => b === nt || b.includes(nt))) return fam.id;
     }
   }
   return null;
+}
+
+function stellaJoinFamily(col) {
+  if (col?.kind === 'date') return 'date';
+  // Prefer the column name/header. Descriptions often mention other entities
+  // and must not reclassify the key.
+  const fromName = stellaJoinFamilyFromBlobs([col?.name, col?.original].map(stellaNormJoinToken));
+  if (fromName) return fromName;
+  return stellaJoinFamilyFromBlobs([col?.description].map(stellaNormJoinToken));
 }
 
 function stellaIdStem(col) {
@@ -2165,9 +2145,9 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
     score = Math.min(score, 16);
     if (!reason) reason = 'not a database join key';
   }
-  if (fa && fb && fa !== fb && !strongOverlap) {
+  if (fa && fb && fa !== fb) {
     warnings.push(`These look like different business keys (${fa} vs ${fb}).`);
-    score = Math.min(score, 25);
+    score = Math.min(score, 12);
     if (!reason || reason === 'measure vs key') reason = `different key types (${fa} vs ${fb})`;
   }
   if (!kindOk && !strongOverlap) {
@@ -2304,7 +2284,9 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
       for (const b of otherCols) {
         const scored = stellaScoreJoinColumns(a, b, thisFile, other);
         const fam = stellaJoinFamily(a);
-        const sharedEntity = fam && fam === stellaJoinFamily(b) && STELLA_ENTITY_JOIN_FAMILIES.has(fam);
+        const famB = stellaJoinFamily(b);
+        const sharedEntity = fam && fam === famB && STELLA_ENTITY_JOIN_FAMILIES.has(fam);
+        if (fam && famB && fam !== famB) continue;
         if (scored.verdict === 'block') continue;
         if (scored.verdict !== 'ok' && !sharedEntity) continue;
         if (stellaShouldBlockFactGrainJoin(a, b, thisFile, other)) continue;
@@ -2345,6 +2327,7 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
           related_header: b.original || b.name,
           reason: scored.reason,
           linkType,
+          family: sharedEntity ? fam : (fam || famB || ''),
           score: scored.score + (otherRole.role === 'dimension' && fam && dimByFamily.get(fam) === other.id ? 8 : 0),
           overlapHits: scored.overlap?.hits || 0,
         });
@@ -2352,12 +2335,29 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
     }
   }
   ranked.sort((x, y) => y.score - x.score);
-  const seen = new Set();
+  const seenPair = new Set();
+  const seenThis = new Set();
+  const seenRelated = new Set();
+  const seenFamily = new Set();
   const out = [];
   for (const row of ranked) {
-    const key = `${row.related_id}|${String(row.this_field || '').toLowerCase()}|${String(row.related_field || '').toLowerCase()}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const pair = `${row.related_id}|${String(row.this_field || '').toLowerCase()}|${String(row.related_field || '').toLowerCase()}`;
+    if (seenPair.has(pair)) continue;
+    // One column on this file maps to at most one column on the other file.
+    const thisKey = `${row.related_id}|this|${String(row.this_field || '').toLowerCase()}`;
+    const relKey = `${row.related_id}|rel|${String(row.related_field || '').toLowerCase()}`;
+    if (seenThis.has(thisKey) || seenRelated.has(relKey)) continue;
+    // One entity-family join per file pair — a key maps to the matching key,
+    // not to another attribute on the same master file.
+    const fam = String(row.family || '');
+    if (fam && STELLA_ENTITY_JOIN_FAMILIES.has(fam)) {
+      const famKey = `${row.related_id}|fam|${fam}`;
+      if (seenFamily.has(famKey)) continue;
+      seenFamily.add(famKey);
+    }
+    seenPair.add(pair);
+    seenThis.add(thisKey);
+    seenRelated.add(relKey);
     out.push(row);
   }
   return out;
@@ -2570,6 +2570,29 @@ function stellaFileShortName(name) {
   return `${raw.slice(0, 25)}…`;
 }
 
+function stellaJoinLinkType(fromFile, toFile) {
+  const a = stellaFileJoinRole(fromFile);
+  const b = stellaFileJoinRole(toFile);
+  if ((a.role === 'dimension' && b.role === 'fact') || (a.role === 'fact' && b.role === 'dimension')) return 'structural';
+  return 'comparison';
+}
+
+function stellaJoinTypeStroke(joinType, { hot = false, selected = false } = {}) {
+  if (hot) return 'rgb(248, 113, 113)';
+  if (joinType === 'structural') return selected ? 'rgb(251, 191, 36)' : 'rgba(251, 191, 36, 0.88)';
+  return selected ? 'rgb(34, 211, 238)' : 'rgba(34, 211, 238, 0.75)';
+}
+
+function stellaJoinTypeDash(joinType) {
+  return joinType === 'structural' ? undefined : '7 5';
+}
+
+function stellaJoinTypeLabel(joinType, count = 1) {
+  if (joinType === 'mixed') return count === 1 ? 'Joins' : `${count} joins`;
+  if (joinType === 'structural') return count === 1 ? 'Structural' : `${count} structural`;
+  return count === 1 ? 'Comparison' : `${count} comparison`;
+}
+
 /** Undirected join graph from intake-confirmed relationships. Multiple keys between the same pair stay as separate edges. */
 function stellaBuildFileLinkGraph(files) {
   const list = (files || []).filter((f) => f && !f.processing);
@@ -2618,6 +2641,7 @@ function stellaBuildFileLinkGraph(files) {
         label: `${thisField} ↔ ${relatedField}`,
         fromName: f.name,
         toName: other?.name || r.related_file || r.related_table,
+        joinType: stellaJoinLinkType(f, other),
       });
       const a = nodeById.get(f.id);
       const b = nodeById.get(otherId);
@@ -3029,14 +3053,20 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
           if (!a || !b) return null;
           const pairKey = `${[e0.from, e0.to].sort().join('|')}${isLarge ? '-lg' : ''}`;
           const eitherOpen = a.expanded || b.expanded;
-          const baseStroke = (activeId === a.id || activeId === b.id) ? 'rgb(34, 211, 238)' : 'rgba(96, 165, 250, 0.55)';
+          const types = new Set(bucket.map((k) => k.joinType || 'comparison'));
+          const bundleType = types.size === 1 ? [...types][0] : 'mixed';
+          const selectedPair = activeId === a.id || activeId === b.id;
           if (!eitherOpen) {
             const curve = stellaJoinCurvePath(a, b, 0, 1);
             const bundleKey = `bundle|${pairKey}`;
             const hot = hoverJoin === bundleKey;
-            const stroke = hot ? 'rgb(34, 211, 238)' : baseStroke;
-            const label = bucket.length === 1 ? 'Joined' : `${bucket.length} joins`;
-            const joinHints = bucket.map((k) => k.label || `${k.thisField} ↔ ${k.relatedField}`).join('\n');
+            const stroke = hot ? 'rgb(34, 211, 238)' : stellaJoinTypeStroke(bundleType === 'mixed' ? 'comparison' : bundleType, { selected: selectedPair });
+            const dash = hot ? undefined : stellaJoinTypeDash(bundleType === 'mixed' ? 'comparison' : bundleType);
+            const label = stellaJoinTypeLabel(bundleType, bucket.length);
+            const joinHints = bucket.map((k) => `${k.joinType === 'structural' ? 'Structural' : 'Comparison'}: ${k.label || `${k.thisField} ↔ ${k.relatedField}`}`).join('\n');
+            const badgeFill = bundleType === 'structural' ? 'rgba(69, 26, 3, 0.94)' : 'rgba(8, 47, 73, 0.92)';
+            const badgeStroke = bundleType === 'structural' ? 'rgba(252, 211, 77, 0.7)' : 'rgba(103, 232, 249, 0.45)';
+            const badgeText = bundleType === 'structural' ? 'fill-amber-50' : 'fill-cyan-50';
             return (
               <g key={pairKey}>
                 <path
@@ -3056,15 +3086,15 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                 >
                   <title>{`${label} — click to expand\n${joinHints}`}</title>
                 </path>
-                <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.8 : (bucket.length > 1 ? 2.4 : 1.8)} className="pointer-events-none" />
+                <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.8 : (bucket.length > 1 ? 2.4 : 1.8)} strokeDasharray={dash} className="pointer-events-none" />
                 <rect
                   x={curve.lx - Math.max(28, label.length * 3.4 + 8)}
                   y={curve.ly - 16}
                   width={Math.max(56, label.length * 6.8 + 16)}
                   height={16}
                   rx={4}
-                  fill="rgba(8, 47, 73, 0.92)"
-                  stroke="rgba(103, 232, 249, 0.45)"
+                  fill={badgeFill}
+                  stroke={badgeStroke}
                   strokeWidth={1}
                   className="pointer-events-none"
                 />
@@ -3072,7 +3102,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                   x={curve.lx}
                   y={curve.ly - 5}
                   textAnchor="middle"
-                  className="fill-cyan-50"
+                  className={badgeText}
                   style={{ fontSize: 10, fontWeight: 700 }}
                 >
                   {label}
@@ -3095,7 +3125,9 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                 const curve = stellaJoinCurvePath(fromPt, toPt, i, bucket.length);
                 const joinKey = `${k.from}|${k.to}|${k.thisField}|${k.relatedField}`;
                 const hot = hoverJoin === joinKey;
-                const stroke = hot ? 'rgb(248, 113, 113)' : baseStroke;
+                const joinType = k.joinType || 'comparison';
+                const stroke = stellaJoinTypeStroke(joinType, { hot, selected: selectedPair });
+                const dash = hot ? undefined : stellaJoinTypeDash(joinType);
                 return (
                   <g key={`${k.thisField}-${k.relatedField}`}>
                     <path
@@ -3112,9 +3144,9 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                         removeJoin(k);
                       }}
                     >
-                      <title>Click to remove {k.thisField} ↔ {k.relatedField}</title>
+                      <title>Click to remove {joinType === 'structural' ? 'structural' : 'comparison'} join {k.thisField} ↔ {k.relatedField}</title>
                     </path>
-                    <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.6 : 1.8} className="pointer-events-none" />
+                    <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.6 : 1.8} strokeDasharray={dash} className="pointer-events-none" />
                     {fromNode.expanded ? (
                       <circle cx={fromPt.x} cy={fromPt.y} r={3.2} fill={stroke} className="pointer-events-none" />
                     ) : null}
@@ -3261,7 +3293,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
         <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
           <div className="text-sm font-bold text-white flex items-center gap-2">
             <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
-            <span className="text-xs font-normal text-blue-300/60">Expand to see field joins · click a field line to remove · Undo restores the last change</span>
+            <span className="text-xs font-normal text-blue-300/60">Amber solid = structural · cyan dashed = comparison · click a field line to remove</span>
           </div>
           {toolbar}
         </div>
@@ -3284,7 +3316,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
             </div>
             <p className="text-xs text-blue-300/60 mt-1">
               {pairCount
-                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Collapsed files share one line — expand to see field joins (click a field line to remove).`
+                ? `${pairCount} connection${pairCount === 1 ? '' : 's'}. Amber solid = structural; cyan dashed = comparison. Expand to see field joins.`
                 : 'No connections yet. Expand, then drag a field onto another file to link them.'}
             </p>
           </div>
@@ -3298,8 +3330,12 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
         </summary>
 
         <p className="text-xs text-blue-300/60 mt-3 mb-3">
-          Click a table to list columns. Drag a field onto another table to create a join. Collapsed files share one connection line; expand to see (and remove) field-level joins.
+          Click a table to list columns. Drag a field onto another table to create a join. Amber solid lines are structural (master/reference → dataset). Cyan dashed lines are comparison links.
         </p>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-[10px] text-blue-200/70">
+          <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t-2 border-amber-400" /> Structural</span>
+          <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Comparison</span>
+        </div>
         {drawCanvas(false)}
         {isolated.length > 0 && (
           <p className="text-xs text-blue-300/55 mt-3">
@@ -9745,7 +9781,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.\n\nLINK HIERARCHY (most to least preferred):\n1. STRUCTURAL (preferred) — one file is a master/reference list and the other is a fact/transaction file that references those IDs. Propose when a dimension PK matches a fact FK. The master list defines what the ID means.\n2. COMPARISON (fallback only) — both files are fact/transaction datasets with no master list to join through (e.g. 2024 sales and 2025 sales, or sales vs HCP engagements). Do NOT propose comparison links on an entity when a master/reference list for that entity is already uploaded — propose structural links to the master instead. Only propose comparison links when no master exists. They are NOT row-to-row joins; they only capture shared entity IDs so Stella can group or compare across files.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, engagement_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.\n\nLINK HIERARCHY (most to least preferred):\n1. STRUCTURAL (preferred) — one file is a master/reference list and the other is a fact/transaction file that references those IDs. Propose when a dimension PK matches a fact FK. The master list defines what the ID means.\n2. COMPARISON (fallback only) — both files are fact/transaction datasets with no master list to join through. Do NOT propose comparison links on an entity when a master/reference list for that entity is already uploaded — propose structural links to the master instead. Only propose comparison links when no master exists. They are NOT row-to-row joins; they only capture shared entity IDs so Stella can group or compare across files.\n\nONE PAIR PER ENTITY: Between two files, propose at most one column pair for each shared entity. A master file's other attributes (names, owners, labels) are not extra join keys for the same entity. If MATCHING JOIN KEYS lists more than one pair for the same entity, keep only the best name-aligned pair.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, engagement_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -10061,7 +10097,7 @@ ${stepInstruction}`;
     const otherHint = others.length
       ? `\n\nOTHER STELLA DATASETS already loaded:\n${others.map((f) => `- ${f.name}${f.tableName ? ` (table ${f.tableName})` : ''}: ${(f.columns || []).slice(0, 10).map((c) => c.name || c).filter(Boolean).join(', ')}`).join('\n')}`
       : '';
-    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}${otherHint}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions must be structure-only (grain, ambiguous columns, join keys to other Stella datasets). Prefer [] when the extract is already clear. Do not ask about metrics, KPIs, schemes, other hub modules, or interpretation.`;
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}${otherHint}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions only if something in THIS file is still unclear (ambiguous fields, codes, grain, or a possible join). If the extract already makes the file understandable, return []. Never use a fixed checklist. Do not ask about schemes, other hub modules, or how to analyse the numbers.`;
     const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1400);
     const parsed = extractJsonObject(raw);
     if (!(parsed && typeof parsed === 'object')) {
@@ -10269,10 +10305,7 @@ ${stepInstruction}`;
         othersNow,
       ) || '';
     }
-    const modelQuestions = pickStellaIntakeQuestions(
-      { ...onboarding, summary },
-      stellaDefaultIntakeQuestions({ isTabular: isTabular || !!fileRec.tableName, columns: profiledColumns }),
-    ).filter((q) => {
+    const modelQuestions = pickStellaIntakeQuestions({ ...onboarding, summary }).filter((q) => {
       if (!joinQ) return true;
       return !/\b(join|related|shared (id|key)|territory, product)\b/i.test(q);
     });
@@ -10634,7 +10667,7 @@ ${stepInstruction}`;
             <div className="text-xs text-blue-300/60 mt-2">
               {scheduleOpen
                 ? 'Scheduled imports pull CSV, Excel, or JSON from this company’s drop folder (matched by company name). Same filename refreshes the existing dataset; a new name starts intake. Use Upload on the Files tab to load a file immediately.'
-                : 'Upload CSV, JSON, Excel, PDF, or plain text. Stella captures context via intake. Uploads, settings, and memory stay under this company folder; tabular data loads into this company’s database schema.'}
+                : 'Upload CSV, JSON, Excel, PDF, or plain text. Stella captures context via intake.'}
             </div>
             {!scheduleOpen ? (() => {
               const folder = userStellaStoragePrefix(currentUser).replace(/\/$/, '');
