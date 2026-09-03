@@ -2147,7 +2147,7 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
   const aGeneric = stellaLooksLikeGenericRowId(a);
   const bGeneric = stellaLooksLikeGenericRowId(b);
   if (blockFactGrain) {
-    warnings.push('These look like each file\'s own row/transaction IDs, not shared entity keys. Two sales files should join on product, territory, HCP, or similar — not id, record_id, or transaction_id.');
+    warnings.push('These look like each file\'s own row/transaction IDs, not shared entity keys. Two sales files should join on shared dimension/entity IDs — not id, record_id, or transaction_id.');
     score = Math.min(score, 12);
     if (!reason || reason === 'same column name' || reason === 'shared ID' || reason === 'same source header' || reason === 'shared dimension key') {
       reason = 'fact-table row/transaction IDs, not entity keys';
@@ -2161,7 +2161,7 @@ function stellaScoreJoinColumns(a, b, fileA, fileB) {
       reason = 'generic row IDs, not entity keys';
     }
   } else if (!aKey || !bKey) {
-    warnings.push('These are not entity keys you would join in a database (territory, HCP/account, product, rep, or ID). Same type or matching numbers is not enough.');
+    warnings.push('These are not entity keys you would join in a database (shared dimension/entity IDs). Same type or matching numbers is not enough.');
     score = Math.min(score, 16);
     if (!reason) reason = 'not a database join key';
   }
@@ -2390,12 +2390,12 @@ function stellaJoinQuestion(candidates, otherFiles) {
     if (comparison.length) {
       parts.push(
         `**Comparison links** — both files are transaction or activity datasets with no master list to join through. `
-        + `The ideal setup is to upload a territory list, product catalogue, or rep roster so both files can link *through* that master — `
+        + `The ideal setup is to upload the relevant master/reference list for these IDs so both files can link *through* that master — `
         + `but without one, Stella can still use these shared IDs to group or compare across the files `
         + `(e.g. 2024 vs 2025 performance by territory). `
         + `Each file's own row/record IDs are *not* linked — those are independent and mean nothing across files:\n`
         + comparison.map(formatLine).join('\n')
-        + `\n\n_If you have a territory structure, product catalogue, or rep roster, upload that and these links will be replaced by proper structural joins._`
+        + `\n\n_If you have the relevant master/reference list for these IDs, upload that and these links will be replaced by proper structural joins._`
       );
     }
 
@@ -2403,7 +2403,7 @@ function stellaJoinQuestion(candidates, otherFiles) {
     return parts.join('\n\n');
   }
   const names = others.map((f) => `**${f.name}**`).join(', ');
-  return `Does this file share a territory, product, HCP/account, or other entity ID with ${names}?\n\nThe strongest links are **structural** — where one file is a master list (territory structure, product catalogue, rep roster) and this file references those IDs. If you have that kind of master file, upload it and Stella will link everything through it.\n\nWithout a master list, Stella can still link two transaction files on shared territory/product IDs for comparison queries (e.g. year-over-year) — but this is a fallback, not a true join.\n\nNote: each file's own row or record IDs are always independent — never link those across files. If these files are completely unrelated, just say so.`;
+  return `Does this file share shared entity IDs with ${names}?\n\nThe strongest links are **structural** — where one file is a master/reference list for these IDs and this file references those IDs. If you upload that kind of master/reference file, Stella will link everything through it.\n\nWithout a master/reference list, Stella can still link two transaction files on shared IDs for comparison queries (e.g. year-over-year) — but this is a fallback, not a true join.\n\nNote: each file's own row or record IDs are always independent — never link those across files. If these files are completely unrelated, just say so.`;
 }
 
 function stellaLooksLikeJoinDecline(text) {
@@ -9733,7 +9733,7 @@ ${stepInstruction}`;
       return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
     }).join('\n');
     const candidateBlob = candidates.length
-      ? `\n\nMATCHING JOIN KEYS (entity keys only — product, territory, HCP/account, rep, dates — not sales/transaction/row IDs):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
+      ? `\n\nMATCHING JOIN KEYS (entity keys only — not sales/transaction/row IDs):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
       : '\n\nMATCHING JOIN KEYS: none. Do not invent joins on id, sales_id, record_id, or transaction_id.';
     const grainCols = [thisFile, ...otherTabular].flatMap((f) => (
       (f?.columns || []).filter((c) => stellaLooksLikeFactGrainId(c, f)).map((c) => `${f.name}.${c.name || c.original}`)
@@ -9745,7 +9745,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.\n\nLINK HIERARCHY (most to least preferred):\n1. STRUCTURAL (preferred) — one file is a master/reference list (territory list, product catalogue, rep roster) and the other is a fact/transaction file that references those IDs. Propose when a dimension PK matches a fact FK (e.g. territories.territory_id → sales.territory_id). The master list defines what the ID means.\n2. COMPARISON (fallback only) — both files are fact/transaction datasets with no master list to join through (e.g. 2024 sales and 2025 sales, or sales vs HCP engagements). Do NOT propose comparison links on territory/product/HCP when a master list for that entity is already uploaded — propose structural links to the master instead. Only propose comparison links when no master exists. They are NOT row-to-row joins; they only capture shared entity IDs so Stella can group or compare across files.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, engagement_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.\n\nLINK HIERARCHY (most to least preferred):\n1. STRUCTURAL (preferred) — one file is a master/reference list and the other is a fact/transaction file that references those IDs. Propose when a dimension PK matches a fact FK. The master list defines what the ID means.\n2. COMPARISON (fallback only) — both files are fact/transaction datasets with no master list to join through (e.g. 2024 sales and 2025 sales, or sales vs HCP engagements). Do NOT propose comparison links on an entity when a master/reference list for that entity is already uploaded — propose structural links to the master instead. Only propose comparison links when no master exists. They are NOT row-to-row joins; they only capture shared entity IDs so Stella can group or compare across files.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, engagement_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
