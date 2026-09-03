@@ -1789,7 +1789,10 @@ function stellaFileJoinTokens(file, namesOnly = false) {
     : [file?.name, file?.originalName, file?.capturedContext?.what_it_represents, file?.summary];
   const tokens = [];
   for (const bit of bits) {
-    const stripped = String(bit || '').replace(/\.[a-z0-9]{1,5}$/i, '');
+    const stripped = String(bit || '')
+      .replace(/\.[a-z0-9]{1,5}$/i, '')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
     for (const t of stripped.toLowerCase().split(/[^a-z0-9]+/)) {
       if (!t || t.length < 2) continue;
       if (/^stella/.test(t) || t === 'xlsx' || t === 'csv' || t === 'xls' || t === 'txt') continue;
@@ -2464,7 +2467,7 @@ function stellaRelMatches(rel, otherFile, thisField, relatedField) {
     && String(rel.related_field || '').toLowerCase() === String(relatedField || '').toLowerCase();
 }
 
-function stellaMutateRelationships(ctx, otherFile, thisField, relatedField, type) {
+function stellaMutateRelationships(ctx, otherFile, thisField, relatedField, type, thisFile) {
   const base = (ctx && typeof ctx === 'object') ? { ...ctx } : {};
   let rels = Array.isArray(base.relationships) ? [...base.relationships] : [];
   if (type === 'remove') {
@@ -2478,6 +2481,7 @@ function stellaMutateRelationships(ctx, otherFile, thisField, relatedField, type
         this_field: thisField,
         related_field: relatedField,
         note: 'Linked on the connection map',
+        link_type: stellaJoinLinkType(thisFile, otherFile),
       },
     ]);
   }
@@ -2532,6 +2536,7 @@ function stellaNormalizeStoredRelationships(raw, thisFile, otherFiles) {
       this_field: thisField,
       related_field: relatedField,
       note: String(r.note || '').trim(),
+      link_type: r.link_type || r.linkType || (other ? stellaJoinLinkType(thisFile, other) : 'comparison'),
     };
   }).filter(Boolean));
 }
@@ -2641,7 +2646,7 @@ function stellaBuildFileLinkGraph(files) {
         label: `${thisField} ↔ ${relatedField}`,
         fromName: f.name,
         toName: other?.name || r.related_file || r.related_table,
-        joinType: stellaJoinLinkType(f, other),
+        joinType: r.link_type || r.linkType || stellaJoinLinkType(f, other),
       });
       const a = nodeById.get(f.id);
       const b = nodeById.get(otherId);
@@ -2756,6 +2761,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
   const [joinFrom, setJoinFrom] = useState(null);
   const [joinHover, setJoinHover] = useState(null);
   const [hoverJoin, setHoverJoin] = useState('');
+  const [showStructuralJoins, setShowStructuralJoins] = useState(true);
+  const [showComparisonJoins, setShowComparisonJoins] = useState(true);
   const svgRef = useRef(null);
   const dragRef = useRef(null);
   const joinDragRef = useRef(null);
@@ -3007,6 +3014,29 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
     });
   };
 
+  const joinTypeToggles = (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <button
+        type="button"
+        aria-pressed={showStructuralJoins}
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); setShowStructuralJoins((v) => !v); }}
+        className={`inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[10px] font-semibold border ${showStructuralJoins ? 'border-amber-400/50 text-amber-100' : 'border-white/10 text-blue-300/35'}`}
+        title={showStructuralJoins ? 'Hide structural joins' : 'Show structural joins'}
+      >
+        <span className="w-5 border-t-2 border-amber-400" /> Structural
+      </button>
+      <button
+        type="button"
+        aria-pressed={showComparisonJoins}
+        onClick={(e) => { e.preventDefault(); e.stopPropagation(); setShowComparisonJoins((v) => !v); }}
+        className={`inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[10px] font-semibold border ${showComparisonJoins ? 'border-cyan-400/50 text-cyan-100' : 'border-white/10 text-blue-300/35'}`}
+        title={showComparisonJoins ? 'Hide comparison joins' : 'Show comparison joins'}
+      >
+        <span className="w-5 border-t border-dashed border-cyan-400" /> Comparison
+      </button>
+    </div>
+  );
+
   const toolbar = (
     <div className="flex items-center gap-2">
       {joinUndo && onUndoJoin ? (
@@ -3047,13 +3077,17 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
         }}
       >
         {Array.from(pairBuckets.values()).map((bucket) => {
-          const e0 = bucket[0];
+          const visibleBucket = bucket.filter((k) => (
+            (k.joinType === 'structural' ? showStructuralJoins : showComparisonJoins)
+          ));
+          if (!visibleBucket.length) return null;
+          const e0 = visibleBucket[0];
           const a = posMap.get(e0.from);
           const b = posMap.get(e0.to);
           if (!a || !b) return null;
           const pairKey = `${[e0.from, e0.to].sort().join('|')}${isLarge ? '-lg' : ''}`;
           const eitherOpen = a.expanded || b.expanded;
-          const types = new Set(bucket.map((k) => k.joinType || 'comparison'));
+          const types = new Set(visibleBucket.map((k) => k.joinType || 'comparison'));
           const bundleType = types.size === 1 ? [...types][0] : 'mixed';
           const selectedPair = activeId === a.id || activeId === b.id;
           if (!eitherOpen) {
@@ -3062,8 +3096,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
             const hot = hoverJoin === bundleKey;
             const stroke = hot ? 'rgb(34, 211, 238)' : stellaJoinTypeStroke(bundleType === 'mixed' ? 'comparison' : bundleType, { selected: selectedPair });
             const dash = hot ? undefined : stellaJoinTypeDash(bundleType === 'mixed' ? 'comparison' : bundleType);
-            const label = stellaJoinTypeLabel(bundleType, bucket.length);
-            const joinHints = bucket.map((k) => `${k.joinType === 'structural' ? 'Structural' : 'Comparison'}: ${k.label || `${k.thisField} ↔ ${k.relatedField}`}`).join('\n');
+            const label = stellaJoinTypeLabel(bundleType, visibleBucket.length);
+            const joinHints = visibleBucket.map((k) => `${k.joinType === 'structural' ? 'Structural' : 'Comparison'}: ${k.label || `${k.thisField} ↔ ${k.relatedField}`}`).join('\n');
             const badgeFill = bundleType === 'structural' ? 'rgba(69, 26, 3, 0.94)' : 'rgba(8, 47, 73, 0.92)';
             const badgeStroke = bundleType === 'structural' ? 'rgba(252, 211, 77, 0.7)' : 'rgba(103, 232, 249, 0.45)';
             const badgeText = bundleType === 'structural' ? 'fill-amber-50' : 'fill-cyan-50';
@@ -3086,7 +3120,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                 >
                   <title>{`${label} — click to expand\n${joinHints}`}</title>
                 </path>
-                <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.8 : (bucket.length > 1 ? 2.4 : 1.8)} strokeDasharray={dash} className="pointer-events-none" />
+                <path d={curve.d} fill="none" stroke={stroke} strokeWidth={hot ? 2.8 : (visibleBucket.length > 1 ? 2.4 : 1.8)} strokeDasharray={dash} className="pointer-events-none" />
                 <rect
                   x={curve.lx - Math.max(28, label.length * 3.4 + 8)}
                   y={curve.ly - 16}
@@ -3112,7 +3146,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
           }
           return (
             <g key={pairKey}>
-              {bucket.map((k, i) => {
+              {visibleBucket.map((k, i) => {
                 const fromNode = posMap.get(k.from) || a;
                 const toNode = posMap.get(k.to) || b;
                 const fromRight = fromNode.x <= toNode.x;
@@ -3122,7 +3156,7 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
                 const toPt = toNode.expanded
                   ? stellaFieldAnchor(toNode, k.relatedField, fromRight ? 'left' : 'right')
                   : toNode;
-                const curve = stellaJoinCurvePath(fromPt, toPt, i, bucket.length);
+                const curve = stellaJoinCurvePath(fromPt, toPt, i, visibleBucket.length);
                 const joinKey = `${k.from}|${k.to}|${k.thisField}|${k.relatedField}`;
                 const hot = hoverJoin === joinKey;
                 const joinType = k.joinType || 'comparison';
@@ -3293,7 +3327,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
         <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-blue-400/15">
           <div className="text-sm font-bold text-white flex items-center gap-2">
             <Link2 className="w-4 h-4 text-cyan-300" /> How files connect
-            <span className="text-xs font-normal text-blue-300/60">Amber solid = structural · cyan dashed = comparison · click a field line to remove</span>
+            <span className="text-xs font-normal text-blue-300/60">Click a field line to remove</span>
+            {joinTypeToggles}
           </div>
           {toolbar}
         </div>
@@ -3332,9 +3367,8 @@ function StellaFileConnectionMap({ files, activeId, onSelectFile, onJoinChange, 
         <p className="text-xs text-blue-300/60 mt-3 mb-3">
           Click a table to list columns. Drag a field onto another table to create a join. Amber solid lines are structural (master/reference → dataset). Cyan dashed lines are comparison links.
         </p>
-        <div className="flex flex-wrap gap-x-4 gap-y-1 mb-3 text-[10px] text-blue-200/70">
-          <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t-2 border-amber-400" /> Structural</span>
-          <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Comparison</span>
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          {joinTypeToggles}
         </div>
         {drawCanvas(false)}
         {isolated.length > 0 && (
@@ -9998,8 +10032,8 @@ ${stepInstruction}`;
         return;
       }
     }
-    const fromCtx = stellaMutateRelationships(from.capturedContext, to, tf, rf, type);
-    const toCtx = stellaMutateRelationships(to.capturedContext, from, rf, tf, type);
+    const fromCtx = stellaMutateRelationships(from.capturedContext, to, tf, rf, type, from);
+    const toCtx = stellaMutateRelationships(to.capturedContext, from, rf, tf, type, to);
     stellaPatchLocal(from.id, { capturedContext: fromCtx, intakeComplete: true });
     stellaPatchLocal(to.id, { capturedContext: toCtx, intakeComplete: true });
     setStellaJoinUndo({
@@ -10219,6 +10253,7 @@ ${stepInstruction}`;
             this_field: r.related_field,
             related_field: r.this_field,
             note: r.note || '',
+            link_type: r.link_type || stellaJoinLinkType(other, f),
           };
           const existing = Array.isArray(other.capturedContext?.relationships) ? other.capturedContext.relationships : [];
           const nextRels = stellaDedupeRelationships([...existing, reverse]);

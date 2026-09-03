@@ -76,11 +76,15 @@ function mapFileTokens(file) {
     file?.tableName,
     file?.summary,
     file?.represents,
+    file?.capturedContext?.what_it_represents,
   ];
   const out = [];
   for (const bit of bits) {
-    const stripped = String(bit || '').replace(/\.[a-z0-9]{1,5}$/i, '');
-    for (const t of stripped.split(/[^a-z0-9]+/i)) {
+    const stripped = String(bit || '')
+      .replace(/\.[a-z0-9]{1,5}$/i, '')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
+    for (const t of stripped.toLowerCase().split(/[^a-z0-9]+/)) {
       const norm = mapNormToken(t);
       if (norm && norm.length >= 2) out.push(norm);
     }
@@ -106,10 +110,13 @@ function mapJoinRole(file) {
   return 'unknown';
 }
 
-function mapJoinType(fromFile, toFile) {
+function mapJoinType(fromFile, toFile, stored) {
+  const storedType = String(stored || '').toLowerCase();
+  if (storedType === 'structural' || storedType === 'comparison') return storedType;
   const a = mapJoinRole(fromFile);
   const b = mapJoinRole(toFile);
-  if ((a === 'dimension' && b === 'fact') || (a === 'fact' && b === 'dimension')) return 'structural';
+  if ((a === 'dimension' && (b === 'fact' || b === 'unknown'))
+    || (b === 'dimension' && (a === 'fact' || a === 'unknown'))) return 'structural';
   return 'comparison';
 }
 
@@ -238,8 +245,10 @@ function uniqueJoinPairs(joins) {
   for (const j of joins || []) {
     if (!j?.fromId || !j?.toId || j.fromId === j.toId) continue;
     const key = [j.fromId, j.toId].sort().join('|');
-    if (!map.has(key)) map.set(key, { fromId: j.fromId, toId: j.toId, count: 0 });
-    map.get(key).count += 1;
+    if (!map.has(key)) map.set(key, { fromId: j.fromId, toId: j.toId, count: 0, joinType: j.joinType || 'comparison' });
+    const row = map.get(key);
+    row.count += 1;
+    if (j.joinType === 'structural') row.joinType = 'structural';
   }
   return [...map.values()];
 }
@@ -285,7 +294,7 @@ function stellaJoinEdges(files) {
       const key = `${pair}|${[tf, rf].map((s) => s.toLowerCase()).sort().join('=')}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const joinType = mapJoinType(f, other);
+      const joinType = mapJoinType(f, other, r.link_type || r.linkType);
       edges.push({
         fromId: f.id,
         toId: other.id,
@@ -727,21 +736,20 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
       const b = joinEndpointNodeId(mod, p.toId, nodes, nodeByFile, focus);
       if (!a || !b || a === b) continue;
       const key = [a, b].sort().join('|');
-      if (!merged.has(key)) merged.set(key, { from: a, to: b, count: 0 });
-      merged.get(key).count += p.count;
+      if (!merged.has(key)) merged.set(key, { from: a, to: b, count: 0, joinType: p.joinType || 'comparison' });
+      const row = merged.get(key);
+      row.count += p.count;
+      if (p.joinType === 'structural') row.joinType = 'structural';
     }
     for (const e of merged.values()) {
-      const source = joins.find((j) => {
-        const aa = joinEndpointNodeId(mod, j.fromId, nodes, nodeByFile, focus);
-        const bb = joinEndpointNodeId(mod, j.toId, nodes, nodeByFile, focus);
-        return aa === e.from && bb === e.to || aa === e.to && bb === e.from;
-      });
       joinEdges.push({
         from: e.from,
         to: e.to,
         kind: 'join',
-        label: e.count === 1 ? 'Joined' : `${e.count} joins`,
-        joinType: source?.joinType || 'comparison',
+        label: e.joinType === 'structural'
+          ? (e.count === 1 ? 'Structural' : `${e.count} structural`)
+          : (e.count === 1 ? 'Comparison' : `${e.count} comparison`),
+        joinType: e.joinType || 'comparison',
       });
     }
   }
@@ -877,6 +885,7 @@ function MapCanvas({
   glowId,
   shadowId,
   cam,
+  joinFilters,
 }) {
   const camX = cam?.x || 0;
   const camY = cam?.y || 0;
@@ -922,6 +931,10 @@ function MapCanvas({
           const dash = e.kind === 'join'
             ? (e.joinType === 'structural' ? undefined : '7 5')
             : e.kind === 'leaf' ? '4 4' : undefined;
+          if (e.kind === 'join') {
+            if (e.joinType === 'structural' && joinFilters?.structural === false) return null;
+            if (e.joinType !== 'structural' && joinFilters?.comparison === false) return null;
+          }
           const related = selected === e.from || selected === e.to
             || (selectedModule && (e.from === selectedModule.id || e.to === selectedModule.id))
             || (selectedIsAccount && (e.from === 'account' || e.to === 'account'));
@@ -966,7 +979,11 @@ function MapCanvas({
           );
         })}
       </svg>
-      {graph.edges.filter((e) => e.kind === 'join' && e.label).map((e) => {
+      {graph.edges.filter((e) => {
+        if (e.kind !== 'join' || !e.label) return false;
+        if (e.joinType === 'structural') return joinFilters?.structural !== false;
+        return joinFilters?.comparison !== false;
+      }).map((e) => {
         const a = byId.get(e.from);
         const b = byId.get(e.to);
         if (!a || !b) return null;
@@ -1064,6 +1081,8 @@ export default function ContextMap({
   const [focus, setFocus] = useState(EMPTY_FOCUS);
   const [openFileId, setOpenFileId] = useState('');
   const [livePos, setLivePos] = useState({});
+  const [showStructuralJoins, setShowStructuralJoins] = useState(true);
+  const [showComparisonJoins, setShowComparisonJoins] = useState(true);
   const [large, setLarge] = useState(false);
   const [leafPage, setLeafPage] = useState(0);
   const canvasRef = useRef(null);
@@ -1449,12 +1468,15 @@ export default function ContextMap({
   })();
 
   const renderJoins = (joins) => {
-    if (!joins?.length) return null;
+    const visible = (joins || []).filter((e) => (
+      e.joinType === 'structural' ? showStructuralJoins : showComparisonJoins
+    ));
+    if (!visible.length) return null;
     return (
       <div className="pt-2">
         <div className="text-xs font-semibold text-blue-200 mb-2">How those files join</div>
         <ul className="space-y-1.5">
-          {joins.map((e) => (
+          {visible.map((e) => (
             <li key={`${e.fromId}|${e.toId}|${e.label}`} className={`text-xs text-slate-200 bg-slate-900/40 border rounded-lg px-3 py-2 flex items-center gap-2 ${
               e.joinType === 'structural' ? 'border-amber-400/30' : 'border-cyan-400/20'
             }`}>
@@ -1483,6 +1505,7 @@ export default function ContextMap({
     openFileId,
     onNodePointerDown,
     cam,
+    joinFilters: { structural: showStructuralJoins, comparison: showComparisonJoins },
   };
 
   const toolbar = (
@@ -1490,8 +1513,24 @@ export default function ContextMap({
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-violet-400 rounded" /> Always passed to the AI</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-5 h-0.5 bg-cyan-400 rounded" /> Modules sharing context</span>
       <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-slate-400" /> Parent → child on the map</span>
-      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t-2 border-amber-400" /> Structural file join</span>
-      <span className="inline-flex items-center gap-1.5"><span className="w-5 border-t border-dashed border-cyan-400" /> Comparison file join</span>
+      <button
+        type="button"
+        aria-pressed={showStructuralJoins}
+        onClick={() => setShowStructuralJoins((v) => !v)}
+        className={`inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 border ${showStructuralJoins ? 'border-amber-400/50 text-amber-100' : 'border-white/10 text-blue-300/35'}`}
+        title={showStructuralJoins ? 'Hide structural joins' : 'Show structural joins'}
+      >
+        <span className="w-5 border-t-2 border-amber-400" /> Structural
+      </button>
+      <button
+        type="button"
+        aria-pressed={showComparisonJoins}
+        onClick={() => setShowComparisonJoins((v) => !v)}
+        className={`inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 border ${showComparisonJoins ? 'border-cyan-400/50 text-cyan-100' : 'border-white/10 text-blue-300/35'}`}
+        title={showComparisonJoins ? 'Hide comparison joins' : 'Show comparison joins'}
+      >
+        <span className="w-5 border-t border-dashed border-cyan-400" /> Comparison
+      </button>
       <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
       {leafPageInfo && leafPageInfo.pages > 1 ? (
         <span className="inline-flex items-center gap-1.5">
