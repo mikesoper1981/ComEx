@@ -29,8 +29,6 @@
   word-break: break-word;
 }
 .chat-fit img,
-.chat-fit svg,
-.chat-fit .recharts-wrapper,
-.chat-fit .recharts-surface {
+.chat-fit svg:not(.recharts-surface) {
   max-width: 100%;
 }

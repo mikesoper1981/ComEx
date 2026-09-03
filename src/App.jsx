@@ -6278,6 +6278,18 @@ export default function CommercialExcellenceApp() {
     );
   };
 
+  const parseChartSpec = (raw) => {
+    const text = String(raw || '').trim();
+    const tryParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+    const direct = tryParse(text);
+    if (direct) return direct;
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    const sliced = text.slice(start, end + 1);
+    return tryParse(sliced) || tryParse(sliced.replace(/,\s*([}\]])/g, '$1'));
+  };
+
   const formatMarkdown = (content) => {
     const hideCitations = !isAdmin;
     const raw = typeof content === 'string' ? content : (content == null ? '' : String(content));
@@ -6299,8 +6311,8 @@ export default function CommercialExcellenceApp() {
     }
     const rechartsMatch = cleanContent.match(/```chart-recharts\n([\s\S]+?)\n```/);
     if (rechartsMatch) {
-      try {
-        const spec = JSON.parse(rechartsMatch[1]);
+      const spec = parseChartSpec(rechartsMatch[1]);
+      if (spec) {
         const textWithoutChart = cleanContent.replace(/```chart-recharts\n[\s\S]+?\n```/, '').trim();
         return (
           <div className="space-y-2 chat-fit min-w-0 max-w-full">
@@ -6308,12 +6320,12 @@ export default function CommercialExcellenceApp() {
             {textWithoutChart && <div>{formatMarkdown(textWithoutChart)}</div>}
           </div>
         );
-      } catch (e) { /* fall through */ }
+      }
     }
     const stellaChartMatch = cleanContent.match(/```chart-stella\s*([\s\S]+?)```/);
     if (stellaChartMatch) {
-      try {
-        const spec = JSON.parse(stellaChartMatch[1].trim());
+      const spec = parseChartSpec(stellaChartMatch[1]);
+      if (spec) {
         const textWithoutChart = cleanContent.replace(/```chart-stella\s*[\s\S]+?```/, '').trim();
         return (
           <div className="space-y-2 chat-fit min-w-0 max-w-full">
@@ -6321,7 +6333,7 @@ export default function CommercialExcellenceApp() {
             {textWithoutChart && <div>{formatMarkdown(textWithoutChart)}</div>}
           </div>
         );
-      } catch (e) { /* fall through */ }
+      }
     }
     const lines = cleanContent.split('\n');
     const elements = [];

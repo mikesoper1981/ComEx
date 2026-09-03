@@ -300,14 +300,11 @@ SQL DIALECT (PostgreSQL — follow exactly to avoid errors):
 - If a query errors, read the error message, fix the specific cast/function, and retry — don't repeat the same failing SQL.
 
 CHARTS:
-When a chart helps, include exactly ONE chart block in your FINAL answer, EXACTLY like this:
-\`\`\`chart-stella
-{"type": "bar", "title": "...", "data": [{"label": "A", "value": 10}], "xKey": "label", "yKey": "value"}
-\`\`\`
-- Simple types: bar, line, scatter, pie. Use xKey / yKey to name fields. For several bars/lines of the same kind use "yKeys": ["a","b"].
-- COMBO / DUAL-AXIS (e.g. bars with an overlaid line, or two metrics on different scales): set "type": "combo" and describe each metric in a "series" array. Each series item is {"key": "<field>", "type": "bar" | "line", "axis": "left" | "right", "name": "<label>"}. Put metrics with very different scales on opposite axes.
-  Example (revenue bars + attainment % line on a second axis):
-  {"type": "combo", "title": "Revenue vs Attainment", "xKey": "territory", "series": [{"key": "revenue", "type": "bar", "axis": "left", "name": "Revenue (£)"}, {"key": "attainment", "type": "line", "axis": "right", "name": "Attainment %"}], "data": [{"territory": "North", "revenue": 120000, "attainment": 92}]}
+When a chart helps, include exactly ONE \`\`\`chart-stella JSON block in your FINAL answer. The renderer infers field names and drawing marks — do not limit yourself to a short type list.
+Shape:
+{"title":"...","type":"<mark>","xKey":"<category or time field>","series":[{"key":"<numeric field>","type":"<mark>","axis":"left|right","name":"<legend>"}],"data":[{...one row per category...}]}
+- Put query result rows in "data". xKey is the category/time column. Each series key is a numeric column (aliases dataKey / field also work).
+- type and series.type are drawing marks (bar/column, line, area, scatter, pie/donut, radar, …). Mix marks in one chart via series[].type. Metrics on very different scales use axis "right".
 - Keep to <= 40 data points.
 
 RESPONSE STYLE:

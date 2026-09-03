@@ -403,7 +403,8 @@ export function mergeStellaPrompts(partial) {
       || !/unless this question or your instructions specify/i.test(out.analyst)
       || !/CONNECTED MODULES/i.test(out.analyst)
       || !/get_file_context/i.test(out.analyst)
-      || !/two-way hub/i.test(out.analyst)) {
+      || !/two-way hub/i.test(out.analyst)
+      || !/the renderer infers/i.test(out.analyst)) {
     out.analyst = DEFAULT_STELLA_PROMPTS.analyst;
   }
   return out;
