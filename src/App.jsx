@@ -2311,11 +2311,17 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
         const pkfk = stellaLooksLikePkFkPair(a, b, thisFile, other);
         if (!pkfk && (!stellaLooksLikeJoinKeyCol(a, thisFile) || !stellaLooksLikeJoinKeyCol(b, other))) continue;
         const otherRole = stellaFileJoinRole(other);
+        // Suppress fact↔fact (or unknown↔fact) entity-key links when a proper master/dimension
+        // list already exists for that family. E.g. if a territory structure file is loaded,
+        // don't also propose linking 2024 sales to 2025 sales on territory_id — both should
+        // link structurally to the master list instead.
+        const thisIsFact = thisRole.role === 'fact' || thisRole.role === 'unknown';
+        const otherIsFact2 = otherRole.role === 'fact' || otherRole.role === 'unknown';
         if (
           fam
           && dimByFamily.has(fam)
-          && thisRole.role === 'fact'
-          && otherRole.role === 'fact'
+          && thisIsFact
+          && otherIsFact2
         ) continue;
         // linkType:
         //  'structural' = one file IS the master list that defines what the ID means
@@ -2383,11 +2389,13 @@ function stellaJoinQuestion(candidates, otherFiles) {
 
     if (comparison.length) {
       parts.push(
-        `**Comparison links** — both files are sales/activity data for different periods. `
-        + `They share the same territory, product, or HCP IDs, so Stella can group or compare across them `
+        `**Comparison links** — both files are transaction or activity datasets with no master list to join through. `
+        + `The ideal setup is to upload a territory list, product catalogue, or rep roster so both files can link *through* that master — `
+        + `but without one, Stella can still use these shared IDs to group or compare across the files `
         + `(e.g. 2024 vs 2025 performance by territory). `
         + `Each file's own row/record IDs are *not* linked — those are independent and mean nothing across files:\n`
         + comparison.map(formatLine).join('\n')
+        + `\n\n_If you have a territory structure, product catalogue, or rep roster, upload that and these links will be replaced by proper structural joins._`
       );
     }
 
@@ -2395,7 +2403,7 @@ function stellaJoinQuestion(candidates, otherFiles) {
     return parts.join('\n\n');
   }
   const names = others.map((f) => `**${f.name}**`).join(', ');
-  return `Does this file share a territory, product, HCP/account, or other entity ID with ${names}?\n\nTwo types of links are possible:\n- **Structural** — one file is a master list (e.g. territory structure, product catalogue) that the other references. Stella uses this to look up names and attributes.\n- **Comparison** — both files cover similar data for different time periods. Stella uses the shared territory/product IDs to compare across them (e.g. year-over-year).\n\nNote: each file's own row or record IDs are always independent and should never be linked across files. If these files are unrelated, just say so.`;
+  return `Does this file share a territory, product, HCP/account, or other entity ID with ${names}?\n\nThe strongest links are **structural** — where one file is a master list (territory structure, product catalogue, rep roster) and this file references those IDs. If you have that kind of master file, upload it and Stella will link everything through it.\n\nWithout a master list, Stella can still link two transaction files on shared territory/product IDs for comparison queries (e.g. year-over-year) — but this is a fallback, not a true join.\n\nNote: each file's own row or record IDs are always independent — never link those across files. If these files are completely unrelated, just say so.`;
 }
 
 function stellaLooksLikeJoinDecline(text) {
@@ -9737,7 +9745,7 @@ ${stepInstruction}`;
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.\n\nTWO TYPES OF LINKS:\n1. STRUCTURAL — one file is a master/reference list (territory list, product catalogue, rep roster) and the other is a fact/transaction file that references those IDs. These are the strongest links. Propose when a dimension PK matches a fact FK (e.g. territories.territory_id → sales.territory_id, or products.id → sales.product_id). The master list defines what the ID means; the fact file uses it.\n2. COMPARISON — both files are fact/transaction datasets (e.g. 2024 sales and 2025 sales). They are NOT joined row-to-row. The link only captures shared entity dimensions (territory_id, product_id, hcp_id) that Stella can use to group or compare across the two files. Clearly label these as comparison links in your question.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nIf a territory/product/HCP master list is already uploaded, join each fact file to that list (structural) instead of joining the two fact files to each other (comparison) — the structural link is cleaner.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
+    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.\n\nLINK HIERARCHY (most to least preferred):\n1. STRUCTURAL (preferred) — one file is a master/reference list (territory list, product catalogue, rep roster) and the other is a fact/transaction file that references those IDs. Propose when a dimension PK matches a fact FK (e.g. territories.territory_id → sales.territory_id). The master list defines what the ID means.\n2. COMPARISON (fallback only) — both files are fact/transaction datasets with no master list to join through (e.g. 2024 sales and 2025 sales, or sales vs HCP engagements). Do NOT propose comparison links on territory/product/HCP when a master list for that entity is already uploaded — propose structural links to the master instead. Only propose comparison links when no master exists. They are NOT row-to-row joins; they only capture shared entity IDs so Stella can group or compare across files.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, engagement_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
