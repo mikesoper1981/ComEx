@@ -1713,7 +1713,7 @@ const STELLA_JOIN_FAMILIES = [
 ];
 const STELLA_ENTITY_JOIN_FAMILIES = new Set(['territory', 'product', 'customer', 'rep', 'specialty']);
 const STELLA_FACT_FILE_KINDS = [
-  { id: 'sales', tokens: ['sales', 'sale', 'revenue', 'actuals'] },
+  { id: 'sales', tokens: ['sales', 'sale', 'revenue', 'actuals', 'performance'] },
   { id: 'orders', tokens: ['orders', 'order'] },
   { id: 'transactions', tokens: ['transactions', 'transaction', 'txn'] },
   { id: 'invoices', tokens: ['invoices', 'invoice'] },
@@ -1721,6 +1721,7 @@ const STELLA_FACT_FILE_KINDS = [
   { id: 'visits', tokens: ['visits', 'visit'] },
   { id: 'shipments', tokens: ['shipments', 'shipment'] },
   { id: 'claims', tokens: ['claims', 'claim', 'rx', 'prescriptions', 'prescription'] },
+  { id: 'engagements', tokens: ['engagements', 'engagement', 'interactions', 'interaction', 'touchpoints', 'touchpoint'] },
 ];
 const STELLA_DIM_FILE_HINTS = new Set([
   'list', 'master', 'lookup', 'reference', 'dim', 'dimension',
@@ -1729,6 +1730,7 @@ const STELLA_DIM_FILE_HINTS = new Set([
 const STELLA_FACT_GRAIN_STEMS = new Set([
   'transaction', 'txn', 'trans', 'invoice', 'sale', 'sales', 'order', 'orders',
   'call', 'activity', 'visit', 'shipment', 'claim', 'receipt', 'line', 'record',
+  'engagement', 'engagements', 'interaction', 'touchpoint',
 ]);
 const STELLA_FACT_KIND_STEMS = new Set(
   STELLA_FACT_FILE_KINDS.flatMap((k) => k.tokens.map((t) => stellaNormJoinToken(t)).filter((t) => t.length >= 3))
@@ -2318,11 +2320,14 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
         // linkType:
         //  'structural' = one file IS the master list that defines what the ID means
         //                 (e.g. territories.csv defines territory_id → sales references it)
-        //  'comparison' = both files are transactions/events and share the key only so
-        //                 queries can group or compare across them (e.g. 2024 vs 2025 sales)
-        const isDimLink = (otherRole.role === 'dimension' && thisRole.role === 'fact')
-          || (thisRole.role === 'dimension' && otherRole.role === 'fact')
-          || (pkfk && (otherRole.role === 'dimension' || thisRole.role === 'dimension'));
+        //                 Requires one side to be explicitly classified as 'dimension' —
+        //                 'unknown' role alone is NOT enough to call a link structural.
+        //  'comparison' = both files are transactions/events (or unclassified) and share the
+        //                 key so queries can group or compare across them (2024 vs 2025 sales,
+        //                 sales vs HCP engagements, etc.)
+        const oneIsDimension = otherRole.role === 'dimension' || thisRole.role === 'dimension';
+        const otherIsFact = otherRole.role === 'fact' || thisRole.role === 'fact';
+        const isDimLink = oneIsDimension && (otherIsFact || pkfk);
         const linkType = isDimLink ? 'structural' : 'comparison';
         ranked.push({
           related_file: other.name,
