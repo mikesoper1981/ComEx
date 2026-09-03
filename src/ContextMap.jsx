@@ -901,6 +901,7 @@ function MapCanvas({
     >
       <svg
         viewBox={`0 0 ${CANVAS.w} ${CANVAS.h}`}
+        preserveAspectRatio="none"
         className="absolute inset-0 w-full h-full pointer-events-none overflow-visible"
         overflow="visible"
         role="img"
@@ -1650,14 +1651,14 @@ export default function ContextMap({
         </p>
       </div>
 
-      <div className="w-full min-w-0 flex justify-center">
-        <div className="bg-slate-950/50 border border-blue-400/20 rounded-xl overflow-hidden w-full min-w-0" style={{ maxWidth: `min(100%, calc(min(48vh, 520px) * ${CANVAS.w} / ${CANVAS.h}))` }}>
+      <div className="w-full min-w-0">
+        <div className="bg-slate-950/50 border border-blue-400/20 rounded-xl overflow-hidden w-full min-w-0">
         <div
           ref={canvasRef}
           data-ctx-canvas="main"
           className="relative overflow-hidden cursor-grab active:cursor-grabbing touch-none w-full"
           style={{
-            aspectRatio: `${CANVAS.w} / ${CANVAS.h}`,
+            height: 'min(48vh, 520px)',
             overscrollBehavior: 'contain',
           }}
           onPointerDown={onCanvasPointerDown}
