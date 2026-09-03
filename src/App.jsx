@@ -5164,10 +5164,9 @@ function PayoutCurveChart({ curveData }) {
     Status: p.payout === 0 ? 'No Payout' : p.payout < 100 ? 'Below Target' : p.payout === 100 ? 'On Target' : 'Accelerator',
   }));
   return (
-    <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
+    <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4 min-w-0 max-w-full overflow-x-hidden">
       <h3 className="text-base font-semibold text-cyan-400 mb-3">💹 Payout Curve</h3>
-      <div className="overflow-x-auto">
-        <div ref={chartRef} className="bg-slate-800/50 rounded p-2 mb-4" style={{ minWidth: '500px', height: '300px' }}>
+      <div ref={chartRef} className="bg-slate-800/50 rounded p-2 mb-4 w-full min-w-0" style={{ height: '280px' }}>
           <svg width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet">
             {yTicks.map((v) => <line key={v} x1={PAD_L} y1={toY(v)} x2={W - PAD_R} y2={toY(v)} stroke="#334155" strokeWidth="0.5" />)}
             {xTicks.map((v) => <line key={v} x1={toX(v)} y1={PAD_T} x2={toX(v)} y2={PAD_T + chartH} stroke="#334155" strokeWidth="0.5" />)}
@@ -5187,8 +5186,7 @@ function PayoutCurveChart({ curveData }) {
             })}
           </svg>
         </div>
-      </div>
-      <table className="w-full border-collapse border border-blue-400/30 rounded text-xs">
+      <table className="w-full table-fixed border-collapse border border-blue-400/30 rounded text-xs">
         <thead className="bg-blue-500/20">
           <tr>
             <th className="border border-blue-400/30 px-3 py-2 text-left text-blue-300">Performance %</th>
@@ -6292,7 +6290,7 @@ export default function CommercialExcellenceApp() {
         const chartData = JSON.parse(chartMatch[1]);
         const textWithoutChart = cleanContent.replace(/```chart-payout\n[\s\S]+?\n```/, '').trim();
         return (
-          <div className="space-y-2">
+          <div className="space-y-2 chat-fit min-w-0 max-w-full">
             {renderPayoutCurveChart(chartData)}
             {textWithoutChart && <div>{formatMarkdown(textWithoutChart)}</div>}
           </div>
@@ -6305,7 +6303,7 @@ export default function CommercialExcellenceApp() {
         const spec = JSON.parse(rechartsMatch[1]);
         const textWithoutChart = cleanContent.replace(/```chart-recharts\n[\s\S]+?\n```/, '').trim();
         return (
-          <div className="space-y-2">
+          <div className="space-y-2 chat-fit min-w-0 max-w-full">
             {renderRechartsChart(spec)}
             {textWithoutChart && <div>{formatMarkdown(textWithoutChart)}</div>}
           </div>
@@ -6318,7 +6316,7 @@ export default function CommercialExcellenceApp() {
         const spec = JSON.parse(stellaChartMatch[1].trim());
         const textWithoutChart = cleanContent.replace(/```chart-stella\s*[\s\S]+?```/, '').trim();
         return (
-          <div className="space-y-2">
+          <div className="space-y-2 chat-fit min-w-0 max-w-full">
             {renderRechartsChart(spec)}
             {textWithoutChart && <div>{formatMarkdown(textWithoutChart)}</div>}
           </div>
@@ -6342,7 +6340,7 @@ export default function CommercialExcellenceApp() {
         .replace(/\*(.+?)\*/g, '<em>$1</em>')
         .replace(/`(.+?)`/g, '<code class="bg-slate-700 px-1 rounded text-cyan-300 text-xs">$1</code>');
     return (
-      <div className="space-y-1">
+      <div className="space-y-1 chat-fit">
         {elements.map((el, idx) => {
           if (el.type === 'table') {
             const rows = el.lines.filter(l => !l.match(/^[\s\-:|]+$/)).map(l => l.split('|').map(c => c.trim()).filter(c => c.length > 0)).filter(r => r.length > 0);
@@ -6350,21 +6348,19 @@ export default function CommercialExcellenceApp() {
             const [header, ...body] = rows;
             const exportRows = [header, ...body];
             return (
-              <div key={idx} className="my-3">
-                <div className="overflow-x-auto">
-                <table className="min-w-full border-collapse border border-blue-400/30 rounded-lg overflow-hidden text-sm">
+              <div key={idx} className="my-3 min-w-0 max-w-full">
+                <table className="w-full table-fixed border-collapse border border-blue-400/30 rounded-lg overflow-hidden text-sm">
                   <thead className="bg-blue-500/20">
-                    <tr>{header.map((h, i) => (<th key={i} className="border border-blue-400/30 px-3 py-2 text-left font-semibold text-blue-300 whitespace-nowrap" dangerouslySetInnerHTML={{ __html: inlineFormat(h) }} />))}</tr>
+                    <tr>{header.map((h, i) => (<th key={i} className="border border-blue-400/30 px-2 py-2 text-left font-semibold text-blue-300 break-words" dangerouslySetInnerHTML={{ __html: inlineFormat(h) }} />))}</tr>
                   </thead>
                   <tbody>
                     {body.map((row, i) => (
                       <tr key={i} className={i % 2 === 0 ? 'bg-slate-800/30' : 'bg-slate-800/50'}>
-                        {row.map((cell, j) => (<td key={j} className="border border-blue-400/30 px-3 py-2 text-sm align-top" dangerouslySetInnerHTML={{ __html: inlineFormat(cell) }} />))}
+                        {row.map((cell, j) => (<td key={j} className="border border-blue-400/30 px-2 py-2 text-sm align-top break-words" dangerouslySetInnerHTML={{ __html: inlineFormat(cell) }} />))}
                       </tr>
                     ))}
                   </tbody>
                 </table>
-                </div>
                 <div className="flex justify-end mt-1.5">
                   <ExcelExportButton
                     rows={exportRows}
@@ -6386,14 +6382,14 @@ export default function CommercialExcellenceApp() {
                     const indent = line.match(/^(\s*)/)[1].length;
                     const text = line.replace(/^(\s*[-*+]|\s*\d+\.)\s/, '');
                     return (
-                      <div key={i} className="flex gap-2 leading-relaxed" style={{ paddingLeft: `${indent * 4}px` }}>
+                      <div key={i} className="flex gap-2 leading-relaxed min-w-0" style={{ paddingLeft: `${indent * 4}px` }}>
                         <span className="text-cyan-400 flex-shrink-0 mt-0.5">•</span>
-                        <span className="text-sm">{hideCitations ? text : renderTextWithCitations(text, references)}</span>
+                        <span className="text-sm min-w-0 break-words">{hideCitations ? text : renderTextWithCitations(text, references)}</span>
                       </div>
                     );
                   }
                   if (line.trim() === '' || line.trim() === '---') return <div key={i} className="h-2"/>;
-                  return <div key={i} className="text-sm leading-relaxed">{hideCitations ? line : renderTextWithCitations(line, references)}</div>;
+                  return <div key={i} className="text-sm leading-relaxed break-words">{hideCitations ? line : renderTextWithCitations(line, references)}</div>;
                 })}
               </div>
             );
@@ -6423,15 +6419,15 @@ export default function CommercialExcellenceApp() {
     );
   };
 
-  const generateSuggestions = async (conversationHistory) => {
+  const generateSuggestions = async (conversationHistory, { thread = 'chat' } = {}) => {
     if (!suggestionsEnabled || conversationHistory.length === 0) { setSuggestedPrompts([]); return; }
     // Never invent answers while an agent is waiting on clarifying questions
-    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser || pendingProposalIntake || memoryPendingFor('chat')) {
+    if (currentWorkflow?.awaitingAgentReply || currentWorkflow?.waitingForUser || pendingProposalIntake || memoryPendingFor(thread)) {
       setSuggestedPrompts([]);
       return;
     }
     const lastAssistant = [...conversationHistory].reverse().find((m) => m.role === 'assistant' || m.role === 'orchestrator' || m.role === 'agent');
-    if (hasNumberedClarifyingQuestions(lastAssistant?.content) || /Would you like me to start this workflow|remembered facts|update memory/i.test(lastAssistant?.content || '')) {
+    if (hasNumberedClarifyingQuestions(lastAssistant?.content) || /Would you like me to start this workflow|remembered facts|update memory/i.test(lastAssistant?.content || '') || isPptxClarifyContent(lastAssistant?.content)) {
       setSuggestedPrompts([]);
       return;
     }
@@ -6484,7 +6480,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     } catch (e) { setSuggestedPrompts([]); }
   };
 
-  const detectPptxIntent = async (conversationHistory) => {
+  const detectPptxIntent = async (conversationHistory, thread = 'chat') => {
     if (conversationHistory.length < 2) return;
     try {
       const recentMessages = conversationHistory.slice(-8).map(m => `${m.role}: ${m.content.substring(0, 400)}`).join('\n');
@@ -6499,7 +6495,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
       if (text) {
         const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
         if (parsed.offer && (parsed.summaryDeck || parsed.producedDeck)) {
-          setPptxOffers({ summary: parsed.summaryDeck || null, produced: parsed.producedDeck || null });
+          setPptxOffers({ thread, summary: parsed.summaryDeck || null, produced: parsed.producedDeck || null });
         }
       }
     } catch (e) { console.warn('detectPptxIntent error:', e); }
@@ -6507,7 +6503,7 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
 
   const lastMessageRef = useRef(0);
   useEffect(() => {
-    if (currentWorkflow) return;
+    if (activeTab === 'stella' || currentWorkflow) return;
     const substantiveMessages = messages.filter(m =>
       (m.role === 'assistant' || m.role === 'orchestrator') &&
       m.content?.length > 200 &&
@@ -6519,10 +6515,10 @@ Return ${n} clickable follow-ups. Each must be a complete next message the user 
     if (substantiveMessages.length === lastMessageRef.current) return;
     lastMessageRef.current = substantiveMessages.length;
     const timer = setTimeout(() => {
-      if (!isLoading && !currentWorkflow) detectPptxIntent(messages);
+      if (!isLoading && !currentWorkflow) detectPptxIntent(messages, 'chat');
     }, 2000);
     return () => clearTimeout(timer);
-  }, [messages, isLoading, currentWorkflow]);
+  }, [messages, isLoading, currentWorkflow, activeTab]);
 
   const callAnthropic = async (system, messages, maxTokens = 1000) => {
     const res = await anthropicMessagesPost({ system, messages, max_tokens: maxTokens });
@@ -6799,6 +6795,39 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   const getWorkflowRuntime = () => getIntel().workflowRuntime;
   const getPptxClarify = () => getIntel().pptxClarify;
   const getStellaPrompts = () => getIntel().stellaPrompts;
+
+  const pptxExportThread = () => (activeTab === 'stella' ? 'stella' : 'chat');
+  const pptxThreadMessages = (thread = pptxExportThread()) => (
+    thread === 'stella' ? (stellaMessagesRef.current || []) : (messagesRef.current || [])
+  );
+  const appendPptxThreadMessage = (thread, msg) => {
+    if (thread === 'stella') {
+      setStellaMessages((prev) => {
+        const next = [...prev, msg];
+        stellaMessagesRef.current = next;
+        return next;
+      });
+    } else {
+      setMessages((prev) => {
+        const next = [...prev, msg];
+        messagesRef.current = next;
+        return next;
+      });
+    }
+  };
+  const isPptxClarifyContent = (content) => {
+    const text = String(content || '');
+    if (!text) return false;
+    const prompt = String(getPptxClarify()?.prompt || '').replace(/\s+/g, ' ').trim();
+    const compact = text.replace(/\s+/g, ' ');
+    if (prompt && compact.includes(prompt.slice(0, 48))) return true;
+    return /export a PowerPoint/i.test(text) && /Session summary/i.test(text) && /one-pager/i.test(text);
+  };
+  const threadWaitingForPptx = (list) => {
+    if (currentWorkflow || pptxGenerating) return false;
+    const last = lastConversationalMessage(list);
+    return last?.role === 'assistant' && isPptxClarifyContent(last.content);
+  };
 
   const knowledgeAccessLive = () => mergeKnowledgeAccess(getIntel().knowledgeAccess);
 
@@ -7628,14 +7657,31 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
       ))
       : [];
     const pptxClarifyOptions = !isStella && waitingForPptxChoice ? (getPptxClarify().options || []) : [];
-    const canExportPptx = !isStella
-      && !currentWorkflow
-      && !pptxOffers
+    const threadMsgs = isStella ? stellaMessages : messages;
+    const threadOffers = !isStella && pptxOffers && (pptxOffers.thread || 'chat') !== 'stella' ? pptxOffers : null;
+    const canExportPptx = !currentWorkflow
+      && !threadOffers
       && !pptxGenerating
       && !waitingForPptxChoice
-      && messages.filter((m) => m.role === 'assistant' || m.role === 'orchestrator').length > 0;
+      && !(isStella ? stellaIsLoading : isLoading)
+      && threadMsgs.filter((m) => m.role === 'assistant' || m.role === 'orchestrator').length > 0;
+    const runToolPrompt = (e, value) => {
+      e.preventDefault();
+      setMobileChatToolsOpen(false);
+      if (isStella) handleStellaChatSubmit(e, value);
+      else handleSubmit(e, value);
+    };
+    const startStellaSessionSummary = () => {
+      setMobileChatToolsOpen(false);
+      handleGeneratePptx({ title: 'Session Summary', description: 'Factual recap of this conversation' }, 'summary');
+    };
     return (
       <div className="flex-1 overflow-y-auto custom-scrollbar">
+          {isStella && (
+            <div className="p-3 text-[11px] text-blue-300/55 leading-relaxed border-b border-blue-400/15">
+              Upload datasets in User Settings → Stella Insights, then ask questions in this chat. Tables and charts in replies have their own Excel export.
+            </div>
+          )}
           {showQuick && (
             <div className="p-3 space-y-2 border-b border-blue-400/15">
               <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">Start</div>
@@ -7659,39 +7705,59 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
               <button type="button" onClick={startBestPractices} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-200 text-left"><Award className="w-3.5 h-3.5 shrink-0" /> Best Practices</button>
             </div>
           )}
-          {!isStella && (
             <div className="p-3 space-y-2 border-b border-blue-400/15">
               <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">Export</div>
+              {isStella ? (
+                <>
+                  {pptxGenerating && (
+                    <div className="px-2.5 py-2 bg-violet-900/30 border border-violet-400/30 rounded-lg flex items-center gap-2 text-xs text-violet-300">
+                      <div className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-violet-400 rounded-full animate-spin flex-shrink-0" />
+                      Generating session summary…
+                    </div>
+                  )}
+                  {canExportPptx && (
+                    <button type="button" onClick={startStellaSessionSummary} className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-400/25 hover:border-violet-400/40 rounded-lg text-xs text-violet-200 font-semibold">
+                      Session summary
+                    </button>
+                  )}
+                  {!canExportPptx && !pptxGenerating && (
+                    <div className="text-[11px] text-blue-300/50 leading-relaxed">
+                      Session summary export is available after Stella replies.
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
               {pptxGenerating && (
                 <div className="px-2.5 py-2 bg-violet-900/30 border border-violet-400/30 rounded-lg flex items-center gap-2 text-xs text-violet-300">
                   <div className="w-3.5 h-3.5 border-2 border-violet-400/40 border-t-violet-400 rounded-full animate-spin flex-shrink-0" />
                   Generating PowerPoint…
                 </div>
               )}
-              {pptxOffers && !currentWorkflow && !pptxGenerating && (
+              {threadOffers && !currentWorkflow && !pptxGenerating && (
                 <div className="bg-slate-800/60 border border-violet-400/25 rounded-lg overflow-hidden">
                   <div className="px-2.5 py-1.5 border-b border-violet-400/15 flex items-center justify-between">
                     <div className="flex items-center gap-1.5 text-[11px] text-violet-300/80 font-semibold">Export as PowerPoint</div>
                     <button type="button" onClick={() => setPptxOffers(null)} className="text-slate-500 hover:text-slate-300"><X className="w-3.5 h-3.5" /></button>
                   </div>
                   <div className="divide-y divide-violet-400/15">
-                    {pptxOffers.summary && (
+                    {threadOffers.summary && (
                       <div className="p-2.5 flex flex-col gap-1.5">
                         <div className="text-xs font-semibold text-violet-200">Session Summary</div>
-                        <div className="text-[11px] text-slate-400">{pptxOffers.summary.title}</div>
-                        <button type="button" onClick={() => handleGeneratePptx(pptxOffers.summary, 'summary')} className="mt-1 px-2.5 py-1.5 bg-violet-500/20 hover:bg-violet-500/35 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold">Generate</button>
+                        <div className="text-[11px] text-slate-400">{threadOffers.summary.title}</div>
+                        <button type="button" onClick={() => handleGeneratePptx(threadOffers.summary, 'summary')} className="mt-1 px-2.5 py-1.5 bg-violet-500/20 hover:bg-violet-500/35 border border-violet-400/30 rounded-lg text-xs text-violet-200 font-semibold">Generate</button>
                       </div>
                     )}
-                    {pptxOffers.produced && (
+                    {threadOffers.produced && (
                       <div className="p-2.5 flex flex-col gap-1.5">
                         <div className="text-xs font-semibold text-emerald-300">Working Document</div>
-                        <div className="text-[11px] text-slate-400">{pptxOffers.produced.title}</div>
+                        <div className="text-[11px] text-slate-400">{threadOffers.produced.title}</div>
                         <button
                           type="button"
                           onClick={() => {
-                            const dt = pptxOffers.produced.deckType;
+                            const dt = threadOffers.produced.deckType;
                             if (!dt || dt === 'general') askPptxClarification();
-                            else handleGeneratePptx(pptxOffers.produced, 'produced');
+                            else handleGeneratePptx(threadOffers.produced, 'produced');
                           }}
                           className="mt-1 px-2.5 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/30 rounded-lg text-xs text-emerald-200 font-semibold"
                         >
@@ -7709,7 +7775,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
                     <button
                       key={opt.value}
                       type="button"
-                      onClick={(e) => { e.preventDefault(); setMobileChatToolsOpen(false); handleSubmit(e, opt.value); }}
+                      onClick={(e) => runToolPrompt(e, opt.value)}
                       className="w-full px-2.5 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/35 hover:border-cyan-400/55 rounded-lg text-xs text-cyan-100 font-semibold transition-all text-left leading-snug"
                     >
                       {opt.label}
@@ -7722,25 +7788,19 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
                   Export as PowerPoint
                 </button>
               )}
-              {!canExportPptx && !pptxOffers && !pptxGenerating && !waitingForPptxChoice && (
+              {!canExportPptx && !threadOffers && !pptxGenerating && !waitingForPptxChoice && (
                 <div className="text-[11px] text-blue-300/50 leading-relaxed">
                   {currentWorkflow
                     ? 'Export is paused while a workflow is in progress.'
                     : 'PowerPoint export is available after the assistant replies.'}
                 </div>
               )}
+                </>
+              )}
             </div>
-          )}
-          {!isStella && (
-            <div className="p-3">
-              {renderSuggestedPrompts('panel')}
-            </div>
-          )}
-          {isStella && (
-            <div className="p-3 text-[11px] text-blue-300/55 leading-relaxed">
-              Upload datasets in User Settings → Stella Insights, then ask questions in this chat. Tables and charts in replies have their own Excel export.
-            </div>
-          )}
+          <div className="p-3">
+            {renderSuggestedPrompts('panel', kind)}
+          </div>
       </div>
     );
   };
@@ -9364,11 +9424,11 @@ ${stepInstruction}`;
               ) : (
                 <div className="space-y-3">
                   <div className="text-xs font-bold text-white">{active.intakeComplete ? 'Add context' : 'Intake'}</div>
-                  <div className="max-h-[240px] overflow-y-auto custom-scrollbar space-y-2">
+                  <div className="max-h-[240px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
                     {(active.intakeMessages || []).map((m, i) => (
-                      <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[95%] px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                          <span className="whitespace-pre-wrap">{m.content}</span>
+                      <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                        <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                          <span className="whitespace-pre-wrap break-words">{m.content}</span>
                         </div>
                       </div>
                     ))}
@@ -10828,13 +10888,13 @@ ${stepInstruction}`;
                   <div className="text-sm text-blue-300/60 mt-3">Select a dataset on the left.</div>
                 ) : (
               <div className="space-y-3 mt-4">
-                <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4 max-h-[420px] overflow-y-auto custom-scrollbar space-y-3">
+                <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4 max-h-[420px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-3">
                   {intake.length === 0 ? (
                     <div className="text-sm text-blue-300/60">Upload processing…</div>
                   ) : intake.map((m, i) => (
-                    <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                      <div className={`max-w-[90%] px-3 py-2 rounded-xl text-sm ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                        {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}
+                    <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[90%] min-w-0 chat-fit px-3 py-2 rounded-xl text-sm ${m.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'block w-full bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                        {m.role === 'user' ? <span className="whitespace-pre-wrap break-words">{m.content}</span> : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}
                       </div>
                     </div>
                   ))}
@@ -11403,8 +11463,8 @@ ${stepInstruction}`;
               <div className="font-semibold text-blue-100/90">{i + 1}. {iconFor(s.type)} {s.label}{typeof s.resultCount === 'number' ? ` — ${s.resultCount} row${s.resultCount === 1 ? '' : 's'}` : ''}</div>
               {s.detail && (s.type === 'thought'
                 ? <div className="mt-0.5 whitespace-pre-wrap text-blue-200/85 leading-relaxed">{s.detail}</div>
-                : <pre className="mt-0.5 whitespace-pre-wrap text-blue-300/70 bg-slate-950/40 rounded px-2 py-1 overflow-x-auto">{s.detail}</pre>)}
-              {s.result && <pre className="mt-1 whitespace-pre-wrap text-emerald-200/70 bg-emerald-950/20 border border-emerald-400/15 rounded px-2 py-1 overflow-x-auto">{s.result}</pre>}
+                : <pre className="mt-0.5 whitespace-pre-wrap break-words text-blue-300/70 bg-slate-950/40 rounded px-2 py-1 overflow-x-hidden">{s.detail}</pre>)}
+              {s.result && <pre className="mt-1 whitespace-pre-wrap break-words text-emerald-200/70 bg-emerald-950/20 border border-emerald-400/15 rounded px-2 py-1 overflow-x-hidden">{s.result}</pre>}
             </div>
           ))}
         </ol>
@@ -11474,6 +11534,8 @@ ${stepInstruction}`;
       }
     }
 
+    if (pptxClarifyPending) setPptxClarifyPending(false);
+
     setStellaIsLoading(true);
     if (!skipPost) {
       setStellaMessages((prev) => {
@@ -11502,6 +11564,16 @@ ${stepInstruction}`;
     }
 
     try {
+      const routed = await classifyUserMessageIntent(messageContent);
+      if (routed.kind === 'export') {
+        setStellaIsLoading(false);
+        await handleGeneratePptx({
+          title: routed.title || 'Session Summary',
+          description: routed.description || 'Factual recap of this conversation',
+        }, 'summary');
+        return;
+      }
+
       // Always build the prompt from the freshest registry.
       const registry = await stellaReloadRegistry();
       const files = (Array.isArray(registry) && registry.length)
@@ -11533,6 +11605,11 @@ ${stepInstruction}`;
       if (!skipHarvest && shouldHarvestChatMemory(cleaned, messageContent)) {
         await harvestChatMemory(cleaned, messageContent, recentChatTurnsForMemory(withReply), { thread: 'stella' });
       }
+      if (!memoryPendingFor('stella')) {
+        setTimeout(() => generateSuggestions(withReply, { thread: 'stella' }), 400);
+      } else {
+        setSuggestedPrompts([]);
+      }
     } catch (error) {
       setStellaMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Error: Unable to process request.\n\n${error?.message || 'Unknown error'}` }]);
     } finally {
@@ -11541,28 +11618,18 @@ ${stepInstruction}`;
   };
 
   const askPptxClarification = () => {
+    const thread = pptxExportThread();
     setPptxClarifyPending(true);
     setPptxOffers(null);
     setSuggestedPrompts([]);
-    setMessages(prev => [...prev, { role: 'assistant', content: getPptxClarify().prompt }]);
+    appendPptxThreadMessage(thread, { role: 'assistant', content: getPptxClarify().prompt });
     revealChatTools();
   };
 
-  const isPptxClarifyContent = (content) => {
-    const text = String(content || '');
-    if (!text) return false;
-    const prompt = String(getPptxClarify()?.prompt || '').replace(/\s+/g, ' ').trim();
-    const compact = text.replace(/\s+/g, ' ');
-    if (prompt && compact.includes(prompt.slice(0, 48))) return true;
-    return /export a PowerPoint/i.test(text) && /Session summary/i.test(text) && /one-pager/i.test(text);
-  };
-
   const waitingForPptxChoice = useMemo(() => {
-    if (currentWorkflow || pptxGenerating) return false;
-    if (pptxClarifyPending) return true;
-    const last = lastConversationalMessage(messages);
-    return last?.role === 'assistant' && isPptxClarifyContent(last.content);
-  }, [messages, pptxClarifyPending, pptxGenerating, currentWorkflow, productIntel]);
+    if (activeTab === 'stella' || currentWorkflow || pptxGenerating) return false;
+    return threadWaitingForPptx(messages);
+  }, [messages, activeTab, pptxGenerating, currentWorkflow, productIntel]);
 
   const choiceButtons = useMemo(() => {
     if (isLoading || pptxGenerating) return null;
@@ -11691,15 +11758,26 @@ ${stepInstruction}`;
 
   const resolvePptxClarificationReply = async (messageContent) => {
     const m = String(messageContent || '').toLowerCase().trim();
+    const stella = pptxExportThread() === 'stella';
     // Structural mapping to the numbered clarify UI options (labels live in settings pptxClarify).
     if (/^(1|one)\b/.test(m)) {
       return { mode: 'summary', offer: { title: 'Session Summary', description: 'Factual recap of this conversation' } };
     }
     if (/^(2|two)\b/.test(m)) {
-      return { mode: 'produced', offer: { title: 'IC One-Pager', description: 'Simple one-page IC overview', deckType: 'ic_one_pager', hasRealData: true } };
+      return {
+        mode: 'produced',
+        offer: stella
+          ? { title: 'One-Pager', description: 'Short overview ready to share', deckType: 'one_pager', hasRealData: true }
+          : { title: 'IC One-Pager', description: 'Simple one-page IC overview', deckType: 'ic_one_pager', hasRealData: true },
+      };
     }
     if (/^(3|three)\b/.test(m)) {
-      return { mode: 'produced', offer: { title: 'IC Documentation Pack', description: 'Full IC documentation from this conversation', deckType: 'ic_doc_pack', hasRealData: true } };
+      return {
+        mode: 'produced',
+        offer: stella
+          ? { title: 'Documentation Pack', description: 'Full write-up from this conversation', deckType: 'doc_pack', hasRealData: true }
+          : { title: 'IC Documentation Pack', description: 'Full IC documentation from this conversation', deckType: 'ic_doc_pack', hasRealData: true },
+      };
     }
     const classified = await classifyUserMessageIntent(messageContent);
     if (classified.kind === 'export' && classified.clear && classified.mode) {
@@ -11709,6 +11787,7 @@ ${stepInstruction}`;
   };
 
   const handleGeneratePptx = async (offer, mode = 'summary') => {
+    const thread = pptxExportThread();
     const savedOffers = pptxOffers;
     setPptxOffers(null);
     setPptxClarifyPending(false);
@@ -11716,7 +11795,7 @@ ${stepInstruction}`;
 
     const isSummary = mode === 'summary';
     const deckType = offer?.deckType || (isSummary ? 'session_summary' : 'general');
-    const conversationContext = buildPptxConversationContext(messages);
+    const conversationContext = buildPptxConversationContext(pptxThreadMessages(thread));
     const pptxCtx = getPptxContext(productIntel);
     const systemPrompt = withUserSettings(isSummary ? pptxCtx.summary : pptxCtx.produced, { applyResponseLength: false });
     const userContent = [
@@ -11773,8 +11852,10 @@ ${stepInstruction}`;
 
       if (!slideData?.slides?.length) throw new Error('Could not parse slide JSON from the model response');
 
-      const wantsOnePager = !isSummary || /incentive|scheme|component|weighting|payout|ic\b/i.test(conversationContext.slice(0, 6000));
-      slideData = ensureIcOnePagerSlide(slideData, { force: wantsOnePager });
+      if (thread !== 'stella') {
+        const wantsOnePager = !isSummary || /incentive|scheme|component|weighting|payout|ic\b/i.test(conversationContext.slice(0, 6000));
+        slideData = ensureIcOnePagerSlide(slideData, { force: wantsOnePager });
+      }
 
       const getPptxGen = () => window.PptxGenJS || window.pptxgen || window.PptxGenJs;
       if (!getPptxGen()) {
@@ -11813,13 +11894,18 @@ ${stepInstruction}`;
 
       const fileName = (slideData.title || offer?.title || 'powerpoint').replace(/[^a-z0-9]+/gi, '_').toLowerCase();
       await pptx.writeFile({ fileName: `${fileName}.pptx` });
-      setMessages(prev => [...prev, {
+      appendPptxThreadMessage(thread, {
         role: 'assistant',
         content: `📊 **PowerPoint generated** — "${slideData.title || offer?.title}" (${slides.length} slides${isSummary ? ', conversation summary' : `, ${deckType}`}). Check your downloads folder.`,
-      }]);
+      });
     } catch (e) {
       console.error('PPTX generation error:', e);
-      setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Could not generate PowerPoint: ${e.message || 'Unknown error'}. You can try again, or tell me whether you want a **session summary**, **one-pager**, or **full documentation pack**.` }]);
+      appendPptxThreadMessage(thread, {
+        role: 'assistant',
+        content: thread === 'stella'
+          ? `⚠️ Could not generate the session summary: ${e.message || 'Unknown error'}. You can try **Session summary** in Tools again.`
+          : `⚠️ Could not generate PowerPoint: ${e.message || 'Unknown error'}. You can try again, or tell me whether you want a **session summary**, **one-pager**, or **full documentation pack**.`,
+      });
       if (savedOffers) setPptxOffers(savedOffers);
     } finally {
       setPptxGenerating(false);
@@ -12341,11 +12427,14 @@ ${stepInstruction}`;
     );
   };
 
-  const renderSuggestedPrompts = (variant = 'composer') => {
+  const renderSuggestedPrompts = (variant = 'composer', kind = 'incentives') => {
+    const memKey = kind === 'stella' ? 'stella' : 'chat';
+    const loading = kind === 'stella' ? stellaIsLoading : isLoading;
+    const submitPrompt = kind === 'stella' ? handleStellaChatSubmit : handleSubmit;
     const show = suggestionsEnabled && suggestedPrompts.length > 0
-      && !pendingWorkflow && !memoryPendingFor('chat') && !currentWorkflow
-      && !pendingImageReview && !pendingProposalIntake && !isLoading
-      && !choiceButtons?.length && !clarifyingReplyHint;
+      && !pendingWorkflow && !memoryPendingFor(memKey) && (kind === 'stella' || !currentWorkflow)
+      && !pendingImageReview && !pendingProposalIntake && !loading
+      && (kind === 'stella' || (!choiceButtons?.length && !clarifyingReplyHint));
     if (!show) {
       if (variant === 'panel') {
         return <div className="text-[11px] text-blue-300/50 leading-relaxed">Next-step suggestions appear here after a reply.</div>;
@@ -12366,7 +12455,7 @@ ${stepInstruction}`;
               <button
                 key={idx}
                 type="button"
-                onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); setMobileChatToolsOpen(false); handleSubmit(e, prompt); }}
+                onClick={(e) => { e.preventDefault(); setSuggestedPrompts([]); setMobileChatToolsOpen(false); submitPrompt(e, prompt); }}
                 className="px-2.5 py-2 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-400/30 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 hover:text-blue-100 transition-all text-left leading-snug"
               >
                 {prompt}
@@ -12715,16 +12804,16 @@ ${stepInstruction}`;
               )}
 
               {/* Messages Area */}
-              <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-5 overflow-y-auto space-y-4 custom-scrollbar mb-2 min-h-0">
+              <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-5 overflow-y-auto overflow-x-hidden space-y-4 custom-scrollbar mb-2 min-h-0">
                 {messages.map((message, index) => (
-                  <div key={index} className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                  <div key={index} className={`flex gap-3 min-w-0 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
                     <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-400 to-blue-400' : message.role === 'system' ? 'bg-gradient-to-br from-yellow-400 to-orange-400' : message.role === 'orchestrator' ? 'bg-gradient-to-br from-purple-500 to-pink-500' : 'bg-gradient-to-br from-blue-400 to-purple-400'}`}>
                       {message.role === 'user' ? <Users className="w-5 h-5 text-slate-900" /> : message.role === 'system' ? <FileText className="w-5 h-5 text-slate-900" /> : message.role === 'orchestrator' ? <Target className="w-5 h-5 text-slate-900" /> : <TrendingUp className="w-5 h-5 text-slate-900" />}
                     </div>
-                    <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
-                      <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : message.role === 'orchestrator' ? 'bg-purple-500/20 border border-purple-400/40 text-purple-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
+                    <div className={`flex-1 min-w-0 ${message.role === 'user' ? 'text-right' : ''}`}>
+                      <div className={`max-w-[85%] min-w-0 chat-fit px-4 py-3 rounded-2xl ${message.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : 'block w-full text-left'} ${message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : message.role === 'orchestrator' ? 'bg-purple-500/20 border border-purple-400/40 text-purple-200' : message.role === 'user' ? '' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
                         <div className="text-sm leading-relaxed">
-                          {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : formatMarkdown(message.content)}
+                          {message.role === 'user' ? <span className="whitespace-pre-wrap break-words">{message.content}</span> : formatMarkdown(message.content)}
                         </div>
                         {Array.isArray(message.imagePreviews) && message.imagePreviews.length > 0 && (
                           <div className="mt-3 flex flex-wrap gap-2">
@@ -13131,16 +13220,16 @@ ${stepInstruction}`;
               <div className="flex flex-col h-full min-w-0 flex-1 overflow-hidden">
 
               <div className="flex flex-col flex-1 min-h-0">
-                <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-5 overflow-y-auto space-y-4 custom-scrollbar mb-2 min-h-0">
+                <div className="flex-1 bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-3 sm:p-5 overflow-y-auto overflow-x-hidden space-y-4 custom-scrollbar mb-2 min-h-0">
                   {stellaMessages.map((message, index) => (
-                    <div key={index} className={`flex gap-3 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                    <div key={index} className={`flex gap-3 min-w-0 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
                       <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-400 to-blue-400' : message.role === 'system' ? 'bg-gradient-to-br from-yellow-400 to-orange-400' : 'bg-gradient-to-br from-blue-400 to-purple-400'}`}>
                         {message.role === 'user' ? <Users className="w-5 h-5 text-slate-900" /> : message.role === 'system' ? <FileText className="w-5 h-5 text-slate-900" /> : <Layers className="w-5 h-5 text-slate-900" />}
                       </div>
-                      <div className={`flex-1 ${message.role === 'user' ? 'text-right' : ''}`}>
-                        <div className={`inline-block max-w-[85%] px-4 py-3 rounded-2xl ${message.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
+                      <div className={`flex-1 min-w-0 ${message.role === 'user' ? 'text-right' : ''}`}>
+                        <div className={`max-w-[85%] min-w-0 chat-fit px-4 py-3 rounded-2xl ${message.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : 'block w-full text-left'} ${message.role === 'system' ? 'bg-yellow-500/20 border border-yellow-400/30 text-yellow-200' : message.role === 'user' ? '' : 'bg-slate-700/50 border border-blue-400/20 text-blue-100'}`}>
                           <div className="text-sm leading-relaxed">
-                            {message.role === 'user' ? <span className="whitespace-pre-wrap">{message.content}</span> : <MessageErrorBoundary>{formatMarkdown(message.content)}</MessageErrorBoundary>}
+                            {message.role === 'user' ? <span className="whitespace-pre-wrap break-words">{message.content}</span> : <MessageErrorBoundary>{formatMarkdown(message.content)}</MessageErrorBoundary>}
                           </div>
                           {message.role === 'assistant' && Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps)}
                         </div>
@@ -13170,6 +13259,12 @@ ${stepInstruction}`;
                     {renderMemoryConfirmActions()}
                   </div>
                 )}
+                {pptxGenerating && (
+                  <div className="mb-3 px-3 py-2 bg-violet-900/30 border border-violet-400/30 rounded-xl flex items-center gap-3 text-sm text-violet-300 md:hidden">
+                    <div className="w-4 h-4 border-2 border-violet-400/40 border-t-violet-400 rounded-full animate-spin flex-shrink-0" />
+                    Generating PowerPoint…
+                  </div>
+                )}
                 <form onSubmit={handleStellaChatSubmit} className="bg-slate-800/50 backdrop-blur-sm border border-blue-400/20 rounded-xl p-2 sm:p-3">
                   <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
                     <div className="flex-1">
@@ -13180,11 +13275,11 @@ ${stepInstruction}`;
                         placeholder="Ask a question about your uploaded datasets…"
                         className="w-full bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 sm:px-4 py-2 text-sm outline-none focus:border-blue-400 transition-colors resize-none"
                         rows={2}
-                        disabled={stellaIsLoading}
+                        disabled={stellaIsLoading || pptxGenerating}
                       />
                     </div>
                     <div className="flex gap-2 sm:gap-3 sm:items-end">
-                      <button type="submit" disabled={stellaIsLoading || !stellaInput.trim()} className="flex-1 sm:flex-none px-4 sm:px-6 py-2 sm:py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
+                      <button type="submit" disabled={stellaIsLoading || pptxGenerating || !stellaInput.trim()} className="flex-1 sm:flex-none px-4 sm:px-6 py-2 sm:py-2.5 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"><Send className="w-5 h-5" /><span className="hidden sm:inline">Send</span></button>
                     </div>
                   </div>
                 </form>
@@ -13456,7 +13551,7 @@ ${stepInstruction}`;
                   <>
                     <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">📊 PowerPoint template</h3>
                     <p className="text-xs text-blue-300/60 mb-4">
-                      Used when exporting Incentive Compensation decks. Upload a branded .pptx — exports take its colours, fonts and background. Without a template, ComEx uses the default style. Stored at{' '}
+                      Used when exporting PowerPoint from Incentive Compensation and Territory chats, and for Stella session summaries. Upload a branded .pptx — exports keep its slide size, title style, colours, and logos. Title slides and content slides are captured separately so the corporate identity is preserved. Without a file, ComEx uses the default navy / cyan look. Stored at{' '}
                       <code className="text-cyan-300/80">{userPptxTemplateRemotePath(currentUser)}</code>.
                     </p>
                     {userSettings.pptxTemplate ? (
@@ -13511,9 +13606,16 @@ ${stepInstruction}`;
                               {userSettings.pptxTemplate?.theme?.hasBackgroundImage && (
                                 <span className="text-[10px] text-cyan-300/80 font-semibold">Background from template ✓</span>
                               )}
+                              {userSettings.pptxTemplate?.theme?.capturedLayouts && (
+                                <span className="text-[10px] text-cyan-300/80 font-semibold">
+                                  Layouts: {userSettings.pptxTemplate.theme.capturedLayouts.title ? 'title' : '—'}
+                                  {' + '}
+                                  {userSettings.pptxTemplate.theme.capturedLayouts.content ? 'content' : '—'}
+                                </span>
+                              )}
                               {meta && (
                                 <span className="text-[10px] text-cyan-300/80 font-semibold">
-                                  {meta.cardColumnCount || 0} columns · {meta.chromeShapeCount || 0} shapes
+                                  {meta.hasTitleSlot ? 'title slot · ' : ''}{userSettings.pptxTemplate?.theme?.logoCount || meta.pictureCount || 0} logo(s) · {meta.chromeShapeCount || 0} chrome
                                 </span>
                               )}
                               {gen.slideWidth && gen.slideHeight && (
@@ -13529,7 +13631,7 @@ ${stepInstruction}`;
                       </div>
                     ) : (
                       <div className="bg-slate-900/30 border border-dashed border-blue-400/25 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                        <div className="text-xs text-blue-300/60">No template uploaded — exports use the default navy / cyan ComEx style.</div>
+                        <div className="text-xs text-blue-300/60">No template uploaded — exports use the default ComEx look (widescreen, navy title slides, light content, Calibri, cyan accent).</div>
                         <button
                           type="button"
                           onClick={() => pptxTemplateInputRef.current?.click()}
@@ -13795,11 +13897,11 @@ ${stepInstruction}`;
                     </div>
                     <button type="button" onClick={closeWorkflowBuilder} className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-700/50 hover:bg-slate-700 text-blue-200 border border-blue-400/20">Close</button>
                   </div>
-                  <div ref={wfBuilderChatRef} className="bg-slate-950/50 border border-blue-400/20 rounded-lg p-3 flex-1 min-h-0 overflow-y-auto custom-scrollbar space-y-3">
+                  <div ref={wfBuilderChatRef} className="bg-slate-950/50 border border-blue-400/20 rounded-lg p-3 flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar space-y-3">
                     {wfBuilderMessages.map((m, i) => (
-                      <div key={i} className={`text-sm ${m.role === 'user' ? 'text-right' : ''}`}>
-                        <div className={`inline-block max-w-[95%] rounded-lg px-3 py-2 ${m.role === 'user' ? 'bg-cyan-500/20 text-cyan-50 text-left' : 'bg-slate-800/80 text-blue-100'}`}>
-                          {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : formatMarkdown(m.content)}
+                      <div key={i} className={`text-sm min-w-0 ${m.role === 'user' ? 'text-right' : ''}`}>
+                        <div className={`max-w-[95%] min-w-0 chat-fit rounded-lg px-3 py-2 ${m.role === 'user' ? 'inline-block bg-cyan-500/20 text-cyan-50 text-left' : 'block w-full bg-slate-800/80 text-blue-100'}`}>
+                          {m.role === 'user' ? <span className="whitespace-pre-wrap break-words">{m.content}</span> : formatMarkdown(m.content)}
                           {m.role === 'assistant' && m.reasoning && (
                             <div className="mt-2 border-t border-blue-400/15 pt-2 text-left">
                               <div className="text-[11px] font-semibold text-cyan-300/80">Reasoning</div>

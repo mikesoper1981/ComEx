@@ -34,7 +34,9 @@ export const DEFAULT_PPTX_GENERATOR_THEME = {
   backgroundImage: null,
   logos: [],
   blueprint: null,
+  blueprints: { title: null, content: null },
   useDefaultChrome: true,
+  useContentPanels: true,
 };
 
 function normalizeHex(val) {
@@ -130,6 +132,8 @@ function resolveSchemeColor(schemeClr, colors) {
     dk1: colors.dk1, lt1: colors.lt1, dk2: colors.dk2, lt2: colors.lt2,
     accent1: colors.accent1, accent2: colors.accent2, accent3: colors.accent3,
     accent4: colors.accent4, accent5: colors.accent5, accent6: colors.accent6,
+    bg1: colors.lt1, bg2: colors.lt2, tx1: colors.dk1, tx2: colors.dk2,
+    phclr: colors.accent1,
   };
   return map[key] || null;
 }
@@ -147,7 +151,8 @@ function extractFillColor(xmlFragment, colors) {
 
 function extractFillAlpha(xmlFragment) {
   if (!xmlFragment) return null;
-  const m = xmlFragment.match(/<(?:\w+:)?alpha\b[^>]*\bval\s*=\s*"(\d+)"/i);
+  const fill = xmlFragment.match(/<(?:\w+:)?solidFill\b[\s\S]*?<\/(?:\w+:)?solidFill>/i)?.[0] || xmlFragment;
+  const m = fill.match(/<(?:\w+:)?alpha\b[^>]*\bval\s*=\s*"(\d+)"/i);
   return m ? Number(m[1]) : null;
 }
 
@@ -201,10 +206,24 @@ function uint8ToBase64(u8) {
 async function readMediaAsDataUrl(zip, mediaPath) {
   const file = zip.file(mediaPath);
   if (!file) return null;
-  const mime = mimeFromPath(mediaPath);
-  if (!mime) return null;
   const buf = await file.async('uint8array');
   if (!buf?.length || buf.length > 6_000_000) return null;
+  const lower = String(mediaPath || '').toLowerCase();
+  if (lower.endsWith('.emf') || lower.endsWith('.wmf')) {
+    try {
+      const mod = await import('emf-converter');
+      const convert = lower.endsWith('.wmf')
+        ? (mod.convertWmfToDataUrl || mod.default?.convertWmfToDataUrl)
+        : (mod.convertEmfToDataUrl || mod.default?.convertEmfToDataUrl);
+      if (!convert) return null;
+      const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+      return await convert(ab, { maxWidth: 800, maxHeight: 800, dpiScale: 2 });
+    } catch {
+      return null;
+    }
+  }
+  const mime = mimeFromPath(mediaPath);
+  if (!mime) return null;
   return `data:${mime};base64,${uint8ToBase64(buf)}`;
 }
 
@@ -231,6 +250,7 @@ function pptxShapeName(pptx, preset) {
 
 function firstRunStyle(block, colors) {
   const runs = [...block.matchAll(/<(?:\w+:)?r\b[^>]*>[\s\S]*?<\/(?:\w+:)?r>/gi)].map((m) => m[0]);
+  let best = null;
   for (const run of runs) {
     const rPr = run.match(/<(?:\w+:)?rPr\b[^>]*>[\s\S]*?<\/(?:\w+:)?rPr>/i)?.[0]
       || run.match(/<(?:\w+:)?rPr\b[^>]*\/>/i)?.[0]
@@ -240,9 +260,29 @@ function firstRunStyle(block, colors) {
     const font = (rPr.match(/latin[^>]*\btypeface\s*=\s*"([^"]+)"/i) || [])[1] || null;
     const color = extractFillColor(rPr, colors);
     const text = ((run.match(/<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/i) || [])[1] || '').replace(/<[^>]+>/g, '').trim();
-    if (size || color || font) return { size, bold, font, color, sampleLen: text.length };
+    if (!(size || color || font)) continue;
+    const cand = { size, bold, font, color, sampleLen: text.length };
+    if (!best || (size || 0) > (best.size || 0) || ((size || 0) === (best.size || 0) && bold && !best.bold)) best = cand;
+  }
+  if (best) return best;
+  const defRPr = block.match(/<(?:\w+:)?defRPr\b[^>]*>[\s\S]*?<\/(?:\w+:)?defRPr>/i)?.[0]
+    || block.match(/<(?:\w+:)?defRPr\b[^>]*\/>/i)?.[0]
+    || '';
+  if (defRPr) {
+    const size = halfPointsToPt((defRPr.match(/\bsz\s*=\s*"(\d+)"/i) || [])[1]);
+    const bold = /\bb\s*=\s*"(?:1|true)"/i.test(defRPr);
+    const font = (defRPr.match(/latin[^>]*\btypeface\s*=\s*"([^"]+)"/i) || [])[1] || null;
+    const color = extractFillColor(defRPr, colors);
+    if (size || color || font) return { size, bold, font, color, sampleLen: 0 };
   }
   return null;
+}
+
+function paragraphAlign(block) {
+  const algn = String((block.match(/<(?:\w+:)?pPr\b[^>]*\balgn\s*=\s*"([^"]+)"/i) || [])[1] || '').toLowerCase();
+  if (algn === 'ctr' || algn === 'center') return 'center';
+  if (algn === 'r' || algn === 'right') return 'right';
+  return 'left';
 }
 
 function collectParagraphTexts(block) {
@@ -253,10 +293,248 @@ function collectParagraphTexts(block) {
   }).filter(Boolean);
 }
 
+function placeholderType(block) {
+  const ph = block.match(/<(?:\w+:)?ph\b[^>\/]*\/?>/i)?.[0] || '';
+  return String((ph.match(/\btype\s*=\s*"([^"]*)"/i) || [])[1] || '').toLowerCase();
+}
+
+function cSldName(xml) {
+  return (xml.match(/<(?:\w+:)?cSld\b[^>]*\bname\s*=\s*"([^"]+)"/i) || [])[1] || '';
+}
+
+function isTitleLayoutName(name, phTypes) {
+  const n = String(name || '').toLowerCase();
+  const types = (phTypes || []).map((t) => String(t).toLowerCase());
+  if (types.includes('ctrtitle')) return true;
+  if (/section/.test(n)) return true;
+  if (/title/.test(n) && !/content|body|two|obj|comparison|agenda|caption/.test(n)) return true;
+  if (types.includes('title') && !types.some((t) => t === 'body' || t === 'obj' || t === 'subtitle')) return true;
+  return false;
+}
+
+function isCornerLogo(pic, slideWidth, slideHeight) {
+  if (!pic) return false;
+  const small = pic.w <= slideWidth * 0.22 && pic.h <= slideHeight * 0.22;
+  const inCorner = (pic.x < slideWidth * 0.16 || pic.x + pic.w > slideWidth * 0.84)
+    && (pic.y < slideHeight * 0.18 || pic.y + pic.h > slideHeight * 0.82);
+  return small && inCorner;
+}
+
+function classifySlots(textSlots, slideWidth, slideHeight) {
+  const byPh = (type) => textSlots.find((s) => s.phType === type) || null;
+  const slotsBySize = [...textSlots].sort((a, b) => (b.style?.fontSize || 0) - (a.style?.fontSize || 0));
+  const titleSlot = byPh('ctrtitle') || byPh('title')
+    || slotsBySize.find((s) => s.y < slideHeight * 0.32 && (s.style?.fontSize || 0) >= 16)
+    || slotsBySize[0]
+    || null;
+  const subtitleSlot = byPh('subtitle')
+    || textSlots.filter((s) => s !== titleSlot && s.y < slideHeight * 0.42 && s.w > slideWidth * 0.35).sort((a, b) => a.y - b.y)[0]
+    || null;
+  const bodySlot = byPh('body') || byPh('obj')
+    || textSlots.filter((s) => s !== titleSlot && s !== subtitleSlot && s.y >= slideHeight * 0.22).sort((a, b) => b.area - a.area)[0]
+    || null;
+  const contentSlots = textSlots.filter((s) => s !== titleSlot && s !== subtitleSlot && s.y >= slideHeight * 0.22);
+  const cardColumns = [];
+  const used = new Set();
+  const titleLike = contentSlots.filter((s) => s.h <= 1.2 && (s.style?.fontSize || 0) >= 12);
+  const bodyLike = contentSlots.filter((s) => s.h > 1.2 || (s.paragraphCount || 1) >= 2);
+  for (const t of titleLike) {
+    if (used.has(t)) continue;
+    const body = bodyLike.find((b) => !used.has(b) && Math.abs(b.x - t.x) < 0.6 && b.y > t.y);
+    used.add(t);
+    if (body) used.add(body);
+    cardColumns.push({ title: t, body: body || null });
+  }
+  for (const b of bodyLike) {
+    if (used.has(b)) continue;
+    used.add(b);
+    cardColumns.push({ title: null, body: b });
+  }
+  for (const s of contentSlots) {
+    if (used.has(s)) continue;
+    used.add(s);
+    cardColumns.push({ title: s, body: null });
+  }
+  cardColumns.sort((a, b) => (a.title?.x ?? a.body?.x ?? 0) - (b.title?.x ?? b.body?.x ?? 0));
+  return { titleSlot, subtitleSlot, bodySlot, cardColumns };
+}
+
+function relatedLayoutPath(zip, xmlPath) {
+  const relsPath = xmlPath.replace(/([^/]+)$/, '_rels/$1.rels');
+  const file = zip.file(relsPath);
+  if (!file) return Promise.resolve(null);
+  return file.async('text').then((xml) => {
+    const rels = parseRels(xml);
+    const target = Object.values(rels).find((t) => /slideLayout\d+\.xml/i.test(String(t)));
+    if (!target) return null;
+    return resolveZipPath(xmlPath, target);
+  });
+}
+
+async function parseXmlSurface(zip, xmlPath, colors, slideWidth, slideHeight, { includeAllPictures = false } = {}) {
+  const file = zip.file(xmlPath);
+  if (!file) return null;
+  const xml = await file.async('text');
+  const relsPath = xmlPath.replace(/([^/]+)$/, '_rels/$1.rels');
+  const rels = parseRels(zip.file(relsPath) ? await zip.file(relsPath).async('text') : '');
+  const partDir = xmlPath.split('/').slice(0, -1).join('/');
+
+  const bgBlock = xml.match(/<(?:\w+:)?bg\b[^>]*>([\s\S]*?)<\/(?:\w+:)?bg>/i)?.[1] || '';
+  const bgEmbed = (bgBlock.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i) || [])[1];
+  let backgroundImage = null;
+  if (bgEmbed && rels[bgEmbed]) {
+    backgroundImage = await readMediaAsDataUrl(zip, resolveZipPath(`${partDir}/file.xml`, rels[bgEmbed]));
+  }
+  const backgroundColor = extractFillColor(bgBlock, colors);
+
+  const chromeShapes = [];
+  const textSlots = [];
+  const phTypes = [];
+  const shapes = [...xml.matchAll(/<(?:\w+:)?sp\b[^>]*>[\s\S]*?<\/(?:\w+:)?sp>/gi)].map((m) => m[0]);
+  for (const block of shapes) {
+    const geom = shapeGeom(block);
+    if (geom.w <= 0 || geom.h <= 0) continue;
+    const spPr = block.match(/<(?:\w+:)?spPr\b[\s\S]*?<\/(?:\w+:)?spPr>/i)?.[0] || '';
+    const preset = shapePreset(block);
+    const hasNoFill = /<(?:\w+:)?noFill\b/i.test(spPr);
+    const fill = !hasNoFill && /solidFill/i.test(spPr) ? extractFillColor(spPr, colors) : null;
+    const alpha = !hasNoFill ? extractFillAlpha(spPr) : null;
+    const transparency = alpha != null ? alphaToTransparency(alpha) : 0;
+    const style = firstRunStyle(block, colors);
+    const paras = collectParagraphTexts(block);
+    const phType = placeholderType(block);
+    if (phType) phTypes.push(phType);
+    if (fill) chromeShapes.push({ kind: 'shape', preset, ...geom, fill, transparency });
+    if (phType || (style && (paras.length || style.size))) {
+      const align = phType === 'ctrtitle' ? 'center' : paragraphAlign(block);
+      textSlots.push({
+        kind: 'text',
+        phType,
+        ...geom,
+        style: {
+          fontSize: style?.size || null,
+          bold: !!style?.bold,
+          fontFace: style?.font || null,
+          color: style?.color || null,
+          align,
+        },
+        paragraphCount: Math.max(1, paras.length),
+      });
+    }
+  }
+
+  const pictures = [];
+  const picBlocks = [...xml.matchAll(/<(?:\w+:)?pic\b[^>]*>[\s\S]*?<\/(?:\w+:)?pic>/gi)].map((m) => m[0]);
+  for (const block of picBlocks) {
+    const embed = (block.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i) || [])[1];
+    if (!embed || !rels[embed] || embed === bgEmbed) continue;
+    const geom = shapeGeom(block);
+    if (geom.w < 0.08 || geom.h < 0.08) continue;
+    const mediaPath = resolveZipPath(`${partDir}/file.xml`, rels[embed]);
+    const data = await readMediaAsDataUrl(zip, mediaPath);
+    if (!data) continue;
+    if (geom.w >= slideWidth * 0.92 && geom.h >= slideHeight * 0.92) {
+      if (!backgroundImage) backgroundImage = data;
+      continue;
+    }
+    const pic = { kind: 'picture', data, ...geom };
+    if (includeAllPictures || isCornerLogo(pic, slideWidth, slideHeight)) pictures.push(pic);
+  }
+
+  const slots = classifySlots(textSlots, slideWidth, slideHeight);
+  const panelShapes = chromeShapes
+    .filter((s) => s.area > 1.5 && s.w < slideWidth * 0.95)
+    .sort((a, b) => a.x - b.x || a.y - b.y);
+  const name = cSldName(xml);
+  return {
+    name,
+    kind: isTitleLayoutName(name, phTypes) ? 'title' : 'content',
+    backgroundImage,
+    backgroundColor,
+    chromeShapes,
+    pictures,
+    panelShapes,
+    phTypes,
+    ...slots,
+  };
+}
+
+function isEdgeChrome(shape, slideWidth, slideHeight) {
+  if (!shape) return false;
+  const header = shape.y <= slideHeight * 0.12 && shape.h <= slideHeight * 0.18 && shape.w >= slideWidth * 0.5;
+  const footer = (shape.y + shape.h) >= slideHeight * 0.88 && shape.h <= slideHeight * 0.16 && shape.w >= slideWidth * 0.5;
+  const railW = Math.min(0.55, slideWidth * 0.08);
+  const leftRail = shape.x <= slideWidth * 0.03 && shape.w <= railW && shape.h >= slideHeight * 0.45;
+  const rightRail = (shape.x + shape.w) >= slideWidth * 0.97 && shape.w <= railW && shape.h >= slideHeight * 0.45;
+  return header || footer || leftRail || rightRail;
+}
+
+function mergeSurfaces(master, layout, slide, slideWidth, slideHeight) {
+  if (!master && !layout && !slide) return null;
+  const chromeSeen = new Set();
+  const chromeShapes = [];
+  const addChrome = (list, filterFn) => {
+    for (const sh of list || []) {
+      if (filterFn && !filterFn(sh)) continue;
+      const key = `${sh.fill}:${Math.round(sh.x * 10)}:${Math.round(sh.y * 10)}:${Math.round(sh.w * 10)}:${Math.round(sh.h * 10)}`;
+      if (chromeSeen.has(key)) continue;
+      chromeSeen.add(key);
+      chromeShapes.push(sh);
+    }
+  };
+  addChrome(master?.chromeShapes);
+  addChrome(layout?.chromeShapes);
+  addChrome(slide?.chromeShapes, (s) => isEdgeChrome(s, slideWidth, slideHeight));
+
+  const pictures = [];
+  const seen = new Set();
+  for (const layer of [master, layout, slide]) {
+    for (const p of (layer?.pictures || [])) {
+      const key = `${Math.round(p.x * 20)}:${Math.round(p.y * 20)}:${Math.round(p.w * 20)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pictures.push(p);
+    }
+  }
+
+  const pick = (key) => layout?.[key] || slide?.[key] || master?.[key] || null;
+  return {
+    kind: layout?.kind || slide?.kind || 'content',
+    name: layout?.name || slide?.name || '',
+    slideWidth,
+    slideHeight,
+    backgroundImage: slide?.backgroundImage || layout?.backgroundImage || master?.backgroundImage || null,
+    backgroundColor: slide?.backgroundColor || layout?.backgroundColor || master?.backgroundColor || null,
+    chromeShapes,
+    pictures,
+    panelShapes: layout?.panelShapes || [],
+    titleSlot: pick('titleSlot'),
+    subtitleSlot: pick('subtitleSlot'),
+    bodySlot: pick('bodySlot'),
+    cardColumns: layout?.cardColumns?.length ? layout.cardColumns : [],
+  };
+}
+
+function surfaceToBlueprint(surface) {
+  if (!surface) return null;
+  return {
+    slideWidth: surface.slideWidth,
+    slideHeight: surface.slideHeight,
+    backgroundImage: surface.backgroundImage || null,
+    backgroundColor: surface.backgroundColor || null,
+    chromeShapes: surface.chromeShapes || [],
+    pictures: surface.pictures || [],
+    titleSlot: surface.titleSlot || null,
+    subtitleSlot: surface.subtitleSlot || null,
+    bodySlot: surface.bodySlot || null,
+    cardColumns: surface.cardColumns || [],
+    panelShapes: surface.panelShapes || [],
+  };
+}
+
 /**
- * Build a full visual blueprint from the uploaded slide â€” every filled shape,
- * text slot (with live font/size/colour/position), background, and pictures.
- * Template wording is ignored; styles and layout are kept.
+ * Capture corporate identity from an uploaded deck: slide size, theme colours,
+ * fonts, logos, backgrounds, and separate title vs content layouts.
  */
 export async function extractPptxThemeFromArrayBuffer(arrayBuffer, fileName = null) {
   const zip = await JSZip.loadAsync(arrayBuffer);
@@ -292,159 +570,93 @@ export async function extractPptxThemeFromArrayBuffer(arrayBuffer, fileName = nu
     schemeName = extractSchemeName(themeXml) || 'Custom';
   }
 
+  const masterPaths = Object.keys(files)
+    .filter((n) => /^ppt\/slideMasters\/slideMaster\d+\.xml$/i.test(n))
+    .sort();
+  const layoutPaths = Object.keys(files)
+    .filter((n) => /^ppt\/slideLayouts\/slideLayout\d+\.xml$/i.test(n))
+    .sort((a, b) => Number((a.match(/(\d+)/) || [])[1] || 0) - Number((b.match(/(\d+)/) || [])[1] || 0));
   const slidePaths = Object.keys(files)
     .filter((n) => /^ppt\/slides\/slide\d+\.xml$/i.test(n))
     .sort((a, b) => Number((a.match(/slide(\d+)/i) || [])[1] || 0) - Number((b.match(/slide(\d+)/i) || [])[1] || 0));
 
-  if (!slidePaths.length) throw new Error('No slides found in this PowerPoint');
+  if (!slidePaths.length && !layoutPaths.length) throw new Error('No slides found in this PowerPoint');
 
-  const designSlidePath = slidePaths[0];
-  const slideXml = await zip.file(designSlidePath).async('text');
-  const relsPath = designSlidePath.replace(/([^/]+)$/, '_rels/$1.rels');
-  const rels = parseRels(zip.file(relsPath) ? await zip.file(relsPath).async('text') : '');
-  const partDir = designSlidePath.split('/').slice(0, -1).join('/');
-
-  let backgroundImage = null;
-  const bgBlock = slideXml.match(/<(?:\w+:)?bg\b[^>]*>([\s\S]*?)<\/(?:\w+:)?bg>/i)?.[1] || '';
-  const bgEmbed = (bgBlock.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i) || [])[1];
-  if (bgEmbed && rels[bgEmbed]) {
-    const mediaPath = resolveZipPath(`${partDir}/file.xml`, rels[bgEmbed]);
-    backgroundImage = await readMediaAsDataUrl(zip, mediaPath);
+  const masters = [];
+  for (const p of masterPaths) {
+    masters.push(await parseXmlSurface(zip, p, colors, slideWidth, slideHeight, { includeAllPictures: true }));
+  }
+  const layouts = [];
+  const layoutByPath = {};
+  for (const p of layoutPaths) {
+    const surface = await parseXmlSurface(zip, p, colors, slideWidth, slideHeight, { includeAllPictures: true });
+    layouts.push(surface);
+    layoutByPath[p] = surface;
+  }
+  const slidePairs = [];
+  for (const p of slidePaths.slice(0, 12)) {
+    const surface = await parseXmlSurface(zip, p, colors, slideWidth, slideHeight, { includeAllPictures: false });
+    const layoutPath = await relatedLayoutPath(zip, p);
+    const boundLayout = (layoutPath && layoutByPath[layoutPath]) || null;
+    if (surface && boundLayout?.kind === 'title' && surface.kind !== 'title') surface.kind = 'title';
+    slidePairs.push({ surface, layout: boundLayout });
   }
 
-  const chromeShapes = [];
-  const textSlots = [];
-  const shapes = [...slideXml.matchAll(/<(?:\w+:)?sp\b[^>]*>[\s\S]*?<\/(?:\w+:)?sp>/gi)].map((m) => m[0]);
-
-  for (const block of shapes) {
-    const geom = shapeGeom(block);
-    if (geom.w <= 0 || geom.h <= 0) continue;
-    const spPr = block.match(/<(?:\w+:)?spPr\b[\s\S]*?<\/(?:\w+:)?spPr>/i)?.[0] || '';
-    const preset = shapePreset(block);
-    const hasNoFill = /<(?:\w+:)?noFill\b/i.test(spPr);
-    const fill = !hasNoFill && /solidFill/i.test(spPr) ? extractFillColor(spPr, colors) : null;
-    const alpha = !hasNoFill ? extractFillAlpha(spPr) : null;
-    const transparency = alpha != null ? alphaToTransparency(alpha) : 0;
-    const style = firstRunStyle(block, colors);
-    const paras = collectParagraphTexts(block);
-
-    if (fill) {
-      chromeShapes.push({
-        kind: 'shape',
-        preset,
-        ...geom,
-        fill,
-        transparency,
-      });
-    }
-
-    if (style && (paras.length || style.size)) {
-      textSlots.push({
-        kind: 'text',
-        ...geom,
-        style: {
-          fontSize: style.size,
-          bold: !!style.bold,
-          fontFace: style.font || null,
-          color: style.color || null,
-        },
-        paragraphCount: Math.max(1, paras.length),
-        // sample text length only â€” never used as export content
-        _sampleLen: paras.join(' ').length,
-      });
-    }
-  }
-
-  // Pictures on the design slide (icons / logos) â€” keep positions for visual match
-  const pictures = [];
-  const picBlocks = [...slideXml.matchAll(/<(?:\w+:)?pic\b[^>]*>[\s\S]*?<\/(?:\w+:)?pic>/gi)].map((m) => m[0]);
-  for (const block of picBlocks) {
-    const embed = (block.match(/blip[^>]*\b(?:r:)?embed\s*=\s*"([^"]+)"/i) || [])[1];
-    if (!embed || !rels[embed] || embed === bgEmbed) continue;
-    const geom = shapeGeom(block);
-    if (geom.w >= slideWidth * 0.85 && geom.h >= slideHeight * 0.85) continue;
-    if (geom.w < 0.1 || geom.h < 0.1) continue;
-    const mediaPath = resolveZipPath(`${partDir}/file.xml`, rels[embed]);
-    const data = await readMediaAsDataUrl(zip, mediaPath);
-    if (!data) continue;
-    pictures.push({ kind: 'picture', data, ...geom });
-  }
-
-  // Classify text slots from geometry + relative size (not from wording)
-  const slotsBySize = [...textSlots].sort((a, b) => (b.style.fontSize || 0) - (a.style.fontSize || 0));
-  const titleSlot = slotsBySize.find((s) => s.y < slideHeight * 0.28 && (s.style.fontSize || 0) >= 18)
-    || slotsBySize[0]
+  const titlePair = slidePairs.find((s) => s.layout?.kind === 'title' || s.surface?.kind === 'title')
+    || slidePairs[0]
     || null;
-  const subtitleSlot = textSlots
-    .filter((s) => s !== titleSlot && s.y < slideHeight * 0.35 && s.w > slideWidth * 0.4)
-    .sort((a, b) => a.y - b.y)[0]
-    || null;
+  const contentPair = slidePairs.find((s) => s !== titlePair && (s.layout?.kind === 'content' || s.surface?.kind === 'content'))
+    || slidePairs.find((s) => s !== titlePair)
+    || titlePair;
 
-  const contentSlots = textSlots
-    .filter((s) => s !== titleSlot && s !== subtitleSlot && s.y >= slideHeight * 0.28)
-    .sort((a, b) => (a.x - b.x) || (a.y - b.y));
+  const titleLayout = titlePair?.layout || layouts.find((l) => l?.kind === 'title') || null;
+  const contentLayout = contentPair?.layout
+    || layouts.find((l) => l?.kind === 'content')
+    || layouts.find((l) => l && l !== titleLayout)
+    || titleLayout;
+  const titleSlide = titlePair?.surface || null;
+  const contentSlide = contentPair?.surface || titleSlide;
 
-  // Pair card title (higher, shorter) with card body (lower, taller) into columns
-  const cardColumns = [];
-  const used = new Set();
-  const titleLike = contentSlots.filter((s) => s.h <= 1.2 && (s.style.fontSize || 0) >= 12);
-  const bodyLike = contentSlots.filter((s) => s.h > 1.2 || (s.paragraphCount || 1) >= 2);
-  for (const t of titleLike) {
-    if (used.has(t)) continue;
-    const body = bodyLike.find((b) => !used.has(b) && Math.abs(b.x - t.x) < 0.6 && b.y > t.y);
-    used.add(t);
-    if (body) used.add(body);
-    cardColumns.push({ title: t, body: body || null });
-  }
-  for (const b of bodyLike) {
-    if (used.has(b)) continue;
-    used.add(b);
-    cardColumns.push({ title: null, body: b });
-  }
-  // leftover short content slots
-  for (const s of contentSlots) {
-    if (used.has(s)) continue;
-    used.add(s);
-    cardColumns.push({ title: s, body: null });
-  }
-  cardColumns.sort((a, b) => {
-    const ax = a.title?.x ?? a.body?.x ?? 0;
-    const bx = b.title?.x ?? b.body?.x ?? 0;
-    return ax - bx;
-  });
+  const master = masters[0] || null;
+  const titleSurface = mergeSurfaces(master, titleLayout, titleSlide, slideWidth, slideHeight);
+  const contentSurface = mergeSurfaces(master, contentLayout, contentSlide, slideWidth, slideHeight)
+    || titleSurface;
 
-  const panelShapes = chromeShapes
-    .filter((s) => s.area > 1.5 && s.w < slideWidth * 0.95)
-    .sort((a, b) => a.x - b.x || a.y - b.y);
+  if (titleSurface) titleSurface.kind = 'title';
+  if (contentSurface) contentSurface.kind = 'content';
 
-  const brandCandidates = [colors.accent1, colors.accent5, colors.dk2, ...chromeShapes.map((s) => s.fill)]
-    .map(normalizeHex)
-    .filter((c) => c && !isNearGrey(c) && !isLightHex(c));
+  const titleBp = surfaceToBlueprint(titleSurface);
+  const contentBp = surfaceToBlueprint(contentSurface);
+  const blueprint = contentBp || titleBp;
+
+  const titleStyle = titleBp?.titleSlot?.style || {};
+  const subtitleStyle = titleBp?.subtitleSlot?.style || contentBp?.subtitleSlot?.style || {};
+  const cardTitleStyle = contentBp?.cardColumns?.find((c) => c.title)?.title?.style || {};
+  const cardBodyStyle = contentBp?.cardColumns?.find((c) => c.body)?.body?.style
+    || contentBp?.bodySlot?.style
+    || {};
+  const panel = (contentBp?.panelShapes || [])[0];
+  const brandCandidates = [
+    colors.accent1, colors.accent5, colors.dk2,
+    ...(titleBp?.chromeShapes || []).map((s) => s.fill),
+    ...(contentBp?.chromeShapes || []).map((s) => s.fill),
+  ].map(normalizeHex).filter((c) => c && !isNearGrey(c) && !isLightHex(c));
   brandCandidates.sort((a, b) => colourScore(b) - colourScore(a));
-
-  const titleStyle = titleSlot?.style || {};
-  const subtitleStyle = subtitleSlot?.style || {};
-  const cardTitleStyle = cardColumns.find((c) => c.title)?.title?.style || {};
-  const cardBodyStyle = cardColumns.find((c) => c.body)?.body?.style || {};
-  const panel = panelShapes[0];
 
   const contentTextLight = !!(
     (cardBodyStyle.color && isLightHex(cardBodyStyle.color))
-    || (cardTitleStyle.color && isLightHex(cardTitleStyle.color))
+    || (titleStyle.color && isLightHex(titleStyle.color) && contentBp === titleBp)
     || (panel && panel.transparency >= 50)
   );
 
-  const blueprint = {
-    slideWidth,
-    slideHeight,
-    backgroundImage,
-    chromeShapes,
-    pictures,
-    titleSlot,
-    subtitleSlot,
-    cardColumns,
-    panelShapes,
-  };
+  const logos = [...(titleBp?.pictures || []), ...(contentBp?.pictures || [])];
+  const logoSeen = new Set();
+  const uniqueLogos = logos.filter((p) => {
+    const key = `${Math.round(p.x * 10)}:${Math.round(p.y * 10)}`;
+    if (logoSeen.has(key)) return false;
+    logoSeen.add(key);
+    return true;
+  });
 
   return {
     schemeName,
@@ -468,15 +680,16 @@ export async function extractPptxThemeFromArrayBuffer(arrayBuffer, fileName = nu
     },
     slideWidth,
     slideHeight,
-    backgroundImage,
-    logos: pictures.filter((p) => {
-      const inCorner = (p.x < slideWidth * 0.12 || p.x + p.w > slideWidth * 0.88)
-        && (p.y < slideHeight * 0.15 || p.y + p.h > slideHeight * 0.85);
-      return inCorner;
-    }),
+    backgroundImage: titleBp?.backgroundImage || contentBp?.backgroundImage || null,
+    logos: uniqueLogos,
     blueprint,
+    blueprints: {
+      title: titleBp,
+      content: contentBp,
+    },
     palette: {
       bgDark: brandCandidates[0] || colors.accent1 || null,
+      bgLight: contentBp?.backgroundColor || colors.lt1 || null,
       accent: colors.accent1 || brandCandidates[0] || null,
       subtitleColor: subtitleStyle.color || null,
       cardFill: panel?.fill || null,
@@ -488,6 +701,11 @@ export async function extractPptxThemeFromArrayBuffer(arrayBuffer, fileName = nu
     sourceFileName: fileName || null,
     extractedAt: new Date().toISOString(),
     sampledSlides: slidePaths.length,
+    capturedLayouts: {
+      title: !!titleBp,
+      content: !!contentBp,
+    },
+    useContentPanels: !!(contentLayout?.panelShapes?.length),
   };
 }
 
@@ -498,8 +716,9 @@ export async function extractPptxThemeFromFile(file) {
 
 export function themeToSettingsMeta(extracted) {
   if (!extracted) return null;
-  // Persist styles/layout metadata only â€” binary assets reload from storage on export
-  const bp = extracted.blueprint;
+  // Persist styles/layout metadata only — binary assets reload from storage on export
+  const titleBp = extracted.blueprints?.title || extracted.blueprint;
+  const contentBp = extracted.blueprints?.content || extracted.blueprint;
   return {
     schemeName: extracted.schemeName,
     colors: extracted.colors,
@@ -509,13 +728,18 @@ export function themeToSettingsMeta(extracted) {
     slideHeight: extracted.slideHeight,
     palette: extracted.palette,
     logoCount: Array.isArray(extracted.logos) ? extracted.logos.length : 0,
-    hasBackgroundImage: !!extracted.backgroundImage,
-    blueprintMeta: bp ? {
-      chromeShapeCount: bp.chromeShapes?.length || 0,
-      pictureCount: bp.pictures?.length || 0,
-      cardColumnCount: bp.cardColumns?.length || 0,
-      hasTitleSlot: !!bp.titleSlot,
-      hasSubtitleSlot: !!bp.subtitleSlot,
+    hasBackgroundImage: !!(extracted.backgroundImage || titleBp?.backgroundImage || contentBp?.backgroundImage),
+    capturedLayouts: extracted.capturedLayouts || {
+      title: !!titleBp,
+      content: !!contentBp,
+    },
+    useContentPanels: !!extracted.useContentPanels,
+    blueprintMeta: contentBp ? {
+      chromeShapeCount: (titleBp?.chromeShapes?.length || 0) + (contentBp?.chromeShapes?.length || 0),
+      pictureCount: Array.isArray(extracted.logos) ? extracted.logos.length : (contentBp.pictures?.length || 0),
+      cardColumnCount: contentBp.cardColumns?.length || 0,
+      hasTitleSlot: !!(titleBp?.titleSlot || contentBp.titleSlot),
+      hasSubtitleSlot: !!(titleBp?.subtitleSlot || contentBp.subtitleSlot),
     } : null,
     sampledSlides: extracted.sampledSlides || 0,
     sourceFileName: extracted.sourceFileName,
@@ -524,18 +748,21 @@ export function themeToSettingsMeta(extracted) {
 }
 
 export function resolvePptxGeneratorTheme(extracted) {
-  if (!extracted?.blueprint && !extracted?.palette && !extracted?.colors) {
+  if (!extracted?.blueprint && !extracted?.blueprints && !extracted?.palette && !extracted?.colors) {
     return { ...DEFAULT_PPTX_GENERATOR_THEME };
   }
-  // Template path: values come from the upload only (nulls stay null â€” renderer uses slot styles)
   const p = extracted.palette || {};
   const t = extracted.typography || {};
   const f = extracted.fonts || {};
+  const blueprints = extracted.blueprints || {
+    title: extracted.blueprint || null,
+    content: extracted.blueprint || null,
+  };
   return {
     slideWidth: extracted.slideWidth,
     slideHeight: extracted.slideHeight,
     bgDark: normalizeHex(p.bgDark),
-    bgLight: normalizeHex(p.cardFill),
+    bgLight: normalizeHex(p.bgLight) || normalizeHex(extracted.colors?.lt1),
     accent: normalizeHex(p.accent),
     subtitleColor: normalizeHex(p.subtitleColor) || normalizeHex(t.subtitleColor),
     cardFill: normalizeHex(p.cardFill),
@@ -556,10 +783,12 @@ export function resolvePptxGeneratorTheme(extracted) {
     titleBold: t.titleBold !== false,
     schemeName: extracted.schemeName || 'Custom',
     sourceFileName: extracted.sourceFileName || null,
-    backgroundImage: extracted.backgroundImage || null,
+    backgroundImage: extracted.backgroundImage || blueprints.title?.backgroundImage || blueprints.content?.backgroundImage || null,
     logos: Array.isArray(extracted.logos) ? extracted.logos : [],
-    blueprint: extracted.blueprint || null,
+    blueprint: extracted.blueprint || blueprints.content || blueprints.title || null,
+    blueprints,
     useDefaultChrome: false,
+    useContentPanels: !!extracted.useContentPanels,
   };
 }
 
@@ -588,20 +817,70 @@ export async function loadFullPptxStyleForGeneration(userSettings, supabaseClien
     return getPptxGeneratorThemeFromUserSettings(userSettings);
   }
 }
+function isTitleKind(layout) {
+  return layout === 'title' || layout === 'section';
+}
+
+function blueprintFor(theme, layout) {
+  const bps = theme?.blueprints || {};
+  if (isTitleKind(layout)) return bps.title || bps.content || theme.blueprint || null;
+  return bps.content || bps.title || theme.blueprint || null;
+}
+
+function withSlideBlueprint(theme, layout) {
+  const bp = blueprintFor(theme, layout);
+  return {
+    ...theme,
+    blueprint: bp,
+    backgroundImage: bp?.backgroundImage || theme.backgroundImage || null,
+  };
+}
+
 function applyBackground(slide, theme, { layout } = {}) {
-  if (theme.backgroundImage) {
+  const bp = theme.blueprint;
+  const image = bp?.backgroundImage || theme.backgroundImage;
+  if (image) {
     try {
-      slide.background = { data: theme.backgroundImage };
+      slide.background = { data: image };
       return;
     } catch { /* fall through */ }
   }
   if (theme.useDefaultChrome) {
-    const dark = layout === 'title' || layout === 'section';
+    const dark = isTitleKind(layout);
     slide.background = { color: dark ? (theme.bgDark || '1E2761') : (theme.bgLight || 'FFFFFF') };
     return;
   }
-  if (theme.bgDark) slide.background = { color: theme.bgDark };
-  else if (theme.bgLight) slide.background = { color: theme.bgLight };
+  const color = bp?.backgroundColor
+    || (isTitleKind(layout) && theme.textOnDark && isLightHex(theme.textOnDark) ? (theme.bgDark || theme.bgLight) : null)
+    || theme.bgLight
+    || 'FFFFFF';
+  if (color) slide.background = { color };
+}
+
+function applyBrandChrome(pptx, slide, theme) {
+  if (theme.useDefaultChrome) return;
+  const bp = theme.blueprint;
+  if (!bp) return;
+  const W = theme.slideWidth || 10;
+  const H = theme.slideHeight || 5.625;
+  for (const sh of (bp.chromeShapes || [])) {
+    if (!sh.fill || sh.w <= 0 || sh.h <= 0) continue;
+    const isHuge = sh.w > W * 0.88 && sh.h > H * 0.55;
+    if (isHuge && isLightHex(sh.fill) && (sh.transparency || 0) < 20) continue;
+    try {
+      slide.addShape(pptxShapeName(pptx, sh.preset), {
+        x: sh.x, y: sh.y, w: sh.w, h: sh.h,
+        fill: { color: sh.fill, transparency: sh.transparency || 0 },
+        line: { color: sh.fill, transparency: 100 },
+      });
+    } catch { /* skip unmapped presets */ }
+  }
+  for (const pic of (bp.pictures || [])) {
+    if (!pic.data) continue;
+    try {
+      slide.addImage({ data: pic.data, x: pic.x, y: pic.y, w: pic.w, h: pic.h });
+    } catch { /* skip broken media */ }
+  }
 }
 
 function styleOpts(style = {}, fallback = {}) {
@@ -630,12 +909,16 @@ function panelFill(theme) {
 }
 
 function titleStyleFromTheme(theme) {
-  return styleOpts(theme.blueprint?.titleSlot?.style, {
-    fontSize: theme.titleFontSize || 28,
-    color: theme.textOnDark || 'FFFFFF',
-    fontFace: theme.headingFont || 'Calibri',
-    bold: theme.titleBold !== false,
-  });
+  const slot = theme.blueprint?.titleSlot;
+  return {
+    ...styleOpts(slot?.style, {
+      fontSize: theme.titleFontSize || 28,
+      color: theme.textOnDark || (theme.useDefaultChrome ? 'FFFFFF' : '1E293B'),
+      fontFace: theme.headingFont || 'Calibri',
+      bold: theme.titleBold !== false,
+    }),
+    align: slot?.style?.align || (slot?.phType === 'ctrtitle' ? 'center' : 'left'),
+  };
 }
 
 function subtitleStyleFromTheme(theme) {
@@ -648,6 +931,7 @@ function subtitleStyleFromTheme(theme) {
 
 function bodyStyleFromTheme(theme) {
   const sample = theme.blueprint?.cardColumns?.find((c) => c.body)?.body?.style
+    || theme.blueprint?.bodySlot?.style
     || theme.blueprint?.cardColumns?.find((c) => c.title)?.title?.style;
   return styleOpts(sample, {
     fontSize: theme.bodyFontSize || theme.cardBodyFontSize || 13,
@@ -685,7 +969,7 @@ function addTitleAndSubtitle(pptx, slide, theme, { title, subtitle }) {
       bold: true,
       color: ts.color,
       fontFace: ts.fontFace,
-      align: 'left',
+      align: ts.align || 'left',
       valign: 'middle',
     });
   }
@@ -704,6 +988,7 @@ function addTitleAndSubtitle(pptx, slide, theme, { title, subtitle }) {
 }
 
 function addPanel(pptx, slide, theme, { x, y, w, h }) {
+  if (!theme.useDefaultChrome && !theme.useContentPanels) return;
   slide.addShape(pptx.shapes.ROUNDED_RECTANGLE, {
     x, y, w, h,
     fill: panelFill(theme),
@@ -734,16 +1019,18 @@ function inferLayout(slide, idx) {
 }
 
 /**
- * Template supplies background, colours, fonts, panel shading.
- * Layout is chosen from slide.layout / content — not a clone of the template slide.
+ * Template supplies slide size, background, colours, fonts, logos and chrome.
+ * Title vs content layouts are chosen from the captured corporate identity.
  */
 export function renderSlideFromTheme(pptx, theme, slide, idx = 0) {
-  const t = !theme || theme.useDefaultChrome
+  const base = !theme || theme.useDefaultChrome
     ? { ...DEFAULT_PPTX_GENERATOR_THEME, ...(theme || {}) }
     : theme;
   const layout = inferLayout(slide, idx);
+  const t = withSlideBlueprint(base, layout);
   const s = pptx.addSlide();
   applyBackground(s, t, { layout });
+  applyBrandChrome(pptx, s, t);
 
   if (layout === 'title') return renderLayoutTitle(pptx, s, t, slide);
   if (layout === 'section') return renderLayoutSection(pptx, s, t, slide);
@@ -763,7 +1050,9 @@ function renderLayoutTitle(pptx, s, theme, slide) {
   const ss = subtitleStyleFromTheme(theme);
   const bp = theme.blueprint;
   const panelY = Math.max(2.0, (bp?.subtitleSlot?.y || 1.2) + 0.7);
-  addPanel(pptx, s, theme, { x: 0.5, y: panelY, w: W - 1, h: Math.max(2.2, H - panelY - 0.4) });
+  if (theme.useDefaultChrome || theme.useContentPanels) {
+    addPanel(pptx, s, theme, { x: 0.5, y: panelY, w: W - 1, h: Math.max(2.2, H - panelY - 0.4) });
+  }
 
   s.addText(slide.title || '', {
     x: bp?.titleSlot?.x ?? 0.5,
@@ -774,7 +1063,7 @@ function renderLayoutTitle(pptx, s, theme, slide) {
     bold: true,
     color: ts.color,
     fontFace: ts.fontFace,
-    align: 'left',
+    align: ts.align || 'left',
     valign: 'middle',
   });
   if (slide.subtitle) {
@@ -817,13 +1106,17 @@ function renderLayoutSection(pptx, s, theme, slide) {
   const H = theme.slideHeight || 5.625;
   const ts = titleStyleFromTheme(theme);
   const ss = subtitleStyleFromTheme(theme);
+  const bp = theme.blueprint;
+  const titleBox = bp?.titleSlot || { x: 0.8, y: H * 0.35, w: W - 1.6, h: 0.9 };
   s.addText(slide.title || '', {
-    x: 0.8, y: H * 0.35, w: W - 1.6, h: 0.9,
-    fontSize: ts.fontSize || 32, bold: true, color: ts.color, fontFace: ts.fontFace, align: 'left',
+    x: titleBox.x, y: titleBox.y, w: titleBox.w, h: titleBox.h,
+    fontSize: ts.fontSize || 32, bold: true, color: ts.color, fontFace: ts.fontFace,
+    align: ts.align || 'left', valign: 'middle',
   });
   if (slide.subtitle || slide.body) {
+    const subBox = bp?.subtitleSlot || { x: titleBox.x, y: titleBox.y + titleBox.h + 0.1, w: titleBox.w, h: 0.6 };
     s.addText(String(slide.subtitle || slide.body), {
-      x: 0.8, y: H * 0.35 + 1.0, w: W - 1.6, h: 0.6,
+      x: subBox.x, y: subBox.y, w: subBox.w, h: subBox.h,
       fontSize: ss.fontSize, color: ss.color, fontFace: ss.fontFace,
     });
   }
@@ -1232,5 +1525,7 @@ export function applyPptxLayout(pptx, theme) {
   pptx.layout = 'USER_TEMPLATE';
 }
 
-export function applyTemplateChrome() { /* superseded */ }
+export function applyTemplateChrome(pptx, slide, theme) {
+  applyBrandChrome(pptx, slide, theme);
+}
 export function applyContentHeader() { return 1.2; }

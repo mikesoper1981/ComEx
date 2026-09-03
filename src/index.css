@@ -1,1 +1,36 @@
 @import "tailwindcss";
+
+/* Chat tables/charts must fit the bubble: wrap instead of horizontal scroll. */
+.chat-fit {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  box-sizing: border-box;
+}
+.chat-fit table {
+  width: 100%;
+  max-width: 100%;
+  table-layout: fixed;
+}
+.chat-fit th,
+.chat-fit td {
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.chat-fit pre,
+.chat-fit code {
+  max-width: 100%;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.chat-fit img,
+.chat-fit svg,
+.chat-fit .recharts-wrapper,
+.chat-fit .recharts-surface {
+  max-width: 100%;
+}

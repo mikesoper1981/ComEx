@@ -56,9 +56,9 @@ export default function StellaChart({ spec }) {
   }
 
   const wrap = (children) => (
-    <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4">
-      <h3 className="text-base font-semibold text-cyan-400 min-w-0 mb-3">{title}</h3>
-      <div ref={chartRef} className="w-full h-[320px]">
+    <div className="bg-slate-900/50 border border-blue-400/30 rounded-lg p-4 my-4 min-w-0 max-w-full overflow-x-hidden">
+      <h3 className="text-base font-semibold text-cyan-400 min-w-0 mb-3 break-words">{title}</h3>
+      <div ref={chartRef} className="w-full h-[320px] min-w-0 overflow-hidden">
         <ResponsiveContainer width="100%" height="100%">
           {children}
         </ResponsiveContainer>
@@ -84,9 +84,9 @@ export default function StellaChart({ spec }) {
     return wrap(
       <ComposedChart data={data}>
         <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} />
-        <YAxis yAxisId="left" stroke="#94a3b8" tick={AXIS_TICK} />
-        {usesRight && <YAxis yAxisId="right" orientation="right" stroke="#94a3b8" tick={AXIS_TICK} />}
+        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} interval="preserveStartEnd" minTickGap={24} />
+        <YAxis yAxisId="left" stroke="#94a3b8" tick={AXIS_TICK} width={48} />
+        {usesRight && <YAxis yAxisId="right" orientation="right" stroke="#94a3b8" tick={AXIS_TICK} width={48} />}
         <Tooltip contentStyle={TOOLTIP_STYLE} />
         <Legend />
         {effectiveSeries.map((s, i) => (
@@ -103,8 +103,8 @@ export default function StellaChart({ spec }) {
     return wrap(
       <BarChart data={data}>
         <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} />
-        <YAxis stroke="#94a3b8" tick={AXIS_TICK} />
+        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} interval="preserveStartEnd" minTickGap={24} />
+        <YAxis stroke="#94a3b8" tick={AXIS_TICK} width={48} />
         <Tooltip contentStyle={TOOLTIP_STYLE} />
         <Legend />
         {keys.map((k, i) => <Bar key={k} dataKey={k} fill={PALETTE[i % PALETTE.length]} radius={[6, 6, 0, 0]} />)}
@@ -117,8 +117,8 @@ export default function StellaChart({ spec }) {
     return wrap(
       <LineChart data={data}>
         <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} />
-        <YAxis stroke="#94a3b8" tick={AXIS_TICK} />
+        <XAxis dataKey={xKey} stroke="#94a3b8" tick={AXIS_TICK} interval="preserveStartEnd" minTickGap={24} />
+        <YAxis stroke="#94a3b8" tick={AXIS_TICK} width={48} />
         <Tooltip contentStyle={TOOLTIP_STYLE} />
         <Legend />
         {keys.map((k, i) => <Line key={k} type="monotone" dataKey={k} stroke={PALETTE[i % PALETTE.length]} strokeWidth={3} dot={{ r: 3 }} activeDot={{ r: 5 }} />)}
@@ -130,8 +130,8 @@ export default function StellaChart({ spec }) {
     return wrap(
       <ScatterChart>
         <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-        <XAxis dataKey={xKey} name={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
-        <YAxis dataKey={yKey} name={yKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} />
+        <XAxis dataKey={xKey} name={xKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} interval="preserveStartEnd" minTickGap={24} />
+        <YAxis dataKey={yKey} name={yKey} stroke="#94a3b8" tick={{ fill: '#94a3b8', fontSize: 12 }} width={48} />
         <Tooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={{ background: '#0f172a', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, color: '#e2e8f0' }} />
         <Legend />
         <Scatter name={spec.seriesName || yKey} data={data} fill={PALETTE[0]} />

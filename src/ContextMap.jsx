@@ -55,7 +55,7 @@ const MAP_FACT_HINTS = [
   'engagements', 'engagement', 'interactions', 'interaction', 'touchpoints', 'touchpoint',
 ];
 
-const CANVAS = { w: 1200, h: 860, cx: 600, cy: 400, moduleR: 250, leafR: 210 };
+const CANVAS = { w: 1200, h: 860, cx: 600, cy: 430, moduleR: 250, leafR: 210 };
 const LEAF_PAGE_SIZE = 24;
 const EMPTY_FOCUS = { moduleId: '', group: '', kind: '', fileId: '', factId: '' };
 const EMPTY_SAVED = {};
@@ -416,8 +416,8 @@ function clampNode(n) {
   };
 }
 
-function fitCamera(nodes, pad = 72) {
-  if (!nodes?.length) return { k: 1, x: 0, y: 0 };
+function fitCamera(nodes, pad = 72, { maxK = 1, scale = 1 } = {}) {
+  if (!nodes?.length) return { k: 1, x: CANVAS.w / 2 - CANVAS.cx, y: CANVAS.h / 2 - CANVAS.cy };
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -430,13 +430,14 @@ function fitCamera(nodes, pad = 72) {
   }
   const bw = Math.max(maxX - minX, 160);
   const bh = Math.max(maxY - minY, 160);
-  const k = Math.min((CANVAS.w - 2 * pad) / bw, (CANVAS.h - 2 * pad) / bh, 1.35);
+  const kFit = Math.min((CANVAS.w - 2 * pad) / bw, (CANVAS.h - 2 * pad) / bh, maxK);
+  const k = Math.max(0.18, kFit * scale);
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
   return {
-    k: Math.max(0.18, k),
-    x: CANVAS.cx - cx * k,
-    y: CANVAS.cy - cy * k,
+    k,
+    x: CANVAS.w / 2 - cx * k,
+    y: CANVAS.h / 2 - cy * k,
   };
 }
 
@@ -1140,9 +1141,12 @@ export default function ContextMap({
     [model, savedNodes, livePos, focus, leafPage],
   );
 
-  const autoCam = useMemo(() => fitCamera(graph.nodes), [graph]);
+  const autoCam = useMemo(
+    () => fitCamera(graph.nodes, large ? 88 : 108, { maxK: large ? 1.15 : 1 }),
+    [graph, large],
+  );
   const [camUser, setCamUser] = useState(null);
-  useEffect(() => { setCamUser(null); }, [focus.moduleId, focus.group, focus.kind, leafPage]);
+  useEffect(() => { setCamUser(null); }, [focus.moduleId, focus.group, focus.kind, leafPage, large]);
   const cam = camUser || autoCam;
   const camRef = useRef(cam);
   camRef.current = cam;
@@ -1646,12 +1650,16 @@ export default function ContextMap({
         </p>
       </div>
 
-      <div className="bg-slate-950/50 border border-blue-400/20 rounded-xl overflow-hidden">
+      <div className="w-full min-w-0 flex justify-center">
+        <div className="bg-slate-950/50 border border-blue-400/20 rounded-xl overflow-hidden w-full min-w-0" style={{ maxWidth: `min(100%, calc(min(48vh, 520px) * ${CANVAS.w} / ${CANVAS.h}))` }}>
         <div
           ref={canvasRef}
           data-ctx-canvas="main"
-          className="relative w-full overflow-hidden cursor-grab active:cursor-grabbing touch-none"
-          style={{ aspectRatio: `${CANVAS.w} / ${CANVAS.h}`, overscrollBehavior: 'contain' }}
+          className="relative overflow-hidden cursor-grab active:cursor-grabbing touch-none w-full"
+          style={{
+            aspectRatio: `${CANVAS.w} / ${CANVAS.h}`,
+            overscrollBehavior: 'contain',
+          }}
           onPointerDown={onCanvasPointerDown}
         >
           <MapCanvas
@@ -1661,6 +1669,7 @@ export default function ContextMap({
           />
         </div>
         {toolbar}
+        </div>
       </div>
 
       <div className="bg-slate-800/30 border border-blue-400/20 rounded-xl p-4 sm:p-5">
@@ -1771,7 +1780,7 @@ export default function ContextMap({
             {focus.group === 'pptx-template' && selectedModule.pptx && (
               <div className="bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
                 <div className="text-[10px] uppercase tracking-wide text-blue-300/50 font-semibold">PowerPoint template</div>
-                <div className="text-xs text-slate-200 mt-1">{selectedModule.pptx.fileName || 'Custom template'} — colours and fonts for Incentive exports, not chat context.</div>
+                <div className="text-xs text-slate-200 mt-1">{selectedModule.pptx.fileName || 'Custom template'} — colours and fonts for chat PowerPoint exports, not chat context.</div>
               </div>
             )}
 
