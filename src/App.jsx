@@ -129,6 +129,7 @@ import {
   knowledgeStemPattern,
   isEmptyContextValue,
   compactCapturedContext,
+  harvestModuleCapturedContext,
 } from './moduleContext';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -872,7 +873,6 @@ const ACTIVE_HUB_MODULES = [
     ring: 'border-blue-400/30 hover:border-blue-400/60',
     shadow: 'hover:shadow-blue-500/10',
     iconBg: 'bg-gradient-to-br from-blue-500 to-cyan-500',
-    pptxTemplate: true,
   },
   {
     id: 'territory',
@@ -1542,6 +1542,55 @@ function stellaIntakeQuestionLooksIrrelevant(q) {
   const t = String(q || '').toLowerCase();
   if (!t) return true;
   return /\b(incentive scheme|quota|payout|commission|how should (we|i|stella|an analyst) (analys|interpret|use)|linked to (other )?modules?|connected modules?|stay independent|connect(ed)? to those modules)\b/i.test(t);
+}
+
+function contextIntakeQuestionLooksOffTopic(q) {
+  const t = String(q || '').toLowerCase();
+  if (!t) return true;
+  if (stellaIntakeQuestionLooksIrrelevant(q)) return true;
+  return /\b(scheme design|salary|variable mix|fixed.?variable|on-target|\bote\b|pay mix|target incentive|how (should|would|do) (we|i|you) (design|structure|set)|which plan, product, or audience|which plan\/product)\b/i.test(t);
+}
+
+const CONTEXT_FILE_CONFIRM_QUESTION = 'If any year, product name, figure, or label in this file is still unclear, which one should I treat as the source of truth? Otherwise reply that the capture looks correct.';
+
+function stripOffTopicIntakeQuestions(message) {
+  const t = String(message || '').trim();
+  if (!t) return t;
+  const kept = [];
+  for (const line of t.split('\n')) {
+    const m = line.match(/^\s*(?:\d+[\.)]|[-*])\s+(.+)$/);
+    if (m && contextIntakeQuestionLooksOffTopic(m[1])) continue;
+    kept.push(line);
+  }
+  let n = 1;
+  return kept
+    .map((line) => {
+      if (/^\s*(?:\d+[\.)]|[-*])\s+/.test(line)) {
+        const body = line.replace(/^\s*(?:\d+[\.)]|[-*])\s+/, '');
+        return `${n++}. ${body}`;
+      }
+      return line;
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function intakeMessageLooksLikeAsk(message) {
+  const t = String(message || '').trim();
+  if (!t) return false;
+  if (/\bnow added to\b/i.test(t) || /\bis now added\b/i.test(t)) return false;
+  return /[?？]/.test(t) || /\n\s*1[\.)]\s/.test(t);
+}
+
+function isModuleContextCaptured(file) {
+  if (!file || file.processing) return false;
+  if (file.intakeComplete) return true;
+  const msgs = Array.isArray(file.intakeMessages) ? file.intakeMessages : [];
+  if (!msgs.some((m) => m.role === 'user')) return false;
+  const last = [...msgs].reverse().find((m) => m.role === 'assistant' || m.role === 'user');
+  if (!last || last.role === 'user') return false;
+  return !intakeMessageLooksLikeAsk(last.content);
 }
 
 function pickStellaIntakeQuestions(onboarding) {
@@ -7901,14 +7950,17 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
           {!isStella && (
             <div className="p-3 space-y-2 border-b border-blue-400/15">
               <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">IC context files</div>
-              <p className="text-[11px] text-blue-300/50 leading-relaxed">Upload supporting IC context</p>
+              <p className="text-[11px] text-blue-300/50 leading-relaxed">Load external files so IC design can use them as context</p>
               <button type="button" onClick={startUploadIcContext} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"><Upload className="w-3.5 h-3.5 shrink-0" /> Upload context file</button>
               {(userSettings.moduleContext?.incentives?.files || []).length === 0 ? (
                 <div className="text-[11px] text-blue-300/45">No context files yet.</div>
               ) : (
                 <div className="space-y-1.5">
                   {(userSettings.moduleContext?.incentives?.files || []).map((f) => {
-                    const n = Array.isArray(f.capturedContext?.key_facts) ? f.capturedContext.key_facts.length : 0;
+                    const capturedView = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages)
+                      || f.capturedContext;
+                    const n = Array.isArray(capturedView?.key_facts) ? capturedView.key_facts.length : 0;
+                    const captured = isModuleContextCaptured(f);
                     const inv = Array.isArray(f.imageInventory) ? f.imageInventory : [];
                     const usedN = inv.filter((r) => r.status === 'included').length;
                     const unusedN = inv.filter((r) => r.status === 'skipped').length;
@@ -7921,7 +7973,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
                       >
                         <div className="text-[11px] font-semibold text-blue-100 truncate">{f.name}</div>
                         <div className="text-[10px] text-blue-300/50 mt-0.5">
-                          {f.processing ? 'Processing…' : f.intakeComplete ? (n ? `${n} fact${n === 1 ? '' : 's'}` : 'Ready') : 'Needs intake'}
+                          {f.processing ? 'Processing…' : captured ? (n ? `Context captured · ${n} fact${n === 1 ? '' : 's'}` : 'Context captured') : 'Needs intake'}
                           {(usedN || unusedN) ? ` · ${usedN} used · ${unusedN} not used` : ''}
                         </div>
                       </button>
@@ -8895,14 +8947,14 @@ ${stepInstruction}`;
     const hasUserReply = (intakeMessages || []).some((m) => m.role === 'user');
     let complete = !!parsed.complete;
     const context_qa = pickIntakeContextQa(parsed);
-    let message = stripJsonFromIntakeMessage(parsed.message);
+    let message = stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(parsed.message));
     if (!hasUserReply) {
       complete = false;
-      const looksLikeAsk = /[?？]|\n\s*1[\.)]\s/.test(String(message || ''));
-      if (!looksLikeAsk || String(message || '').replace(/\s+/g, ' ').trim().length < 12) {
-        message = 'I captured this file. A few things I still need from you:\n1. Which year or period should I attach this to?\n2. Which plan, product, or audience is this for?\n3. Anything I should add or correct in the captured facts?';
+      if (!intakeMessageLooksLikeAsk(message) || String(message || '').replace(/\s+/g, ' ').trim().length < 12) {
+        message = CONTEXT_FILE_CONFIRM_QUESTION;
       }
-    } else if (complete) {
+    } else if (!intakeMessageLooksLikeAsk(message) || complete) {
+      complete = true;
       message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(fileName, label);
     } else if (!message) {
       message = 'Is anything in this file still unclear?';
@@ -8952,7 +9004,7 @@ ${stepInstruction}`;
     }
     const questions = stellaNormalizeIntakeQuestions(
       parsed.suggestedQuestions != null ? parsed.suggestedQuestions : parsed.questions
-    ).filter((q) => !isEmptyContextValue(q));
+    ).filter((q) => !isEmptyContextValue(q) && !contextIntakeQuestionLooksOffTopic(q));
     const columnsOut = (Array.isArray(parsed.columns) ? parsed.columns : [])
       .filter((c) => c && !isEmptyContextValue(c.name));
     const summary = isEmptyContextValue(parsed.summary) ? '' : String(parsed.summary).trim();
@@ -9341,7 +9393,8 @@ ${stepInstruction}`;
         postChat(`⚠️ Could not capture facts automatically: ${why}. The raw extract is saved — you can add facts under Incentive Comp context files.`);
       }
     }
-    let questions = stellaNormalizeIntakeQuestions(onboarding.suggestedQuestions);
+    let questions = stellaNormalizeIntakeQuestions(onboarding.suggestedQuestions)
+      .filter((q) => !contextIntakeQuestionLooksOffTopic(q));
     let assistantMsg = '';
     try {
       job.onStatus?.('Asking clarifying questions…');
@@ -9351,7 +9404,7 @@ ${stepInstruction}`;
         fileName: file.name,
         intakeMessages: [],
       });
-      assistantMsg = stripJsonFromIntakeMessage(probe.message);
+      assistantMsg = stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(probe.message));
       if (questions.length && !/\n\s*1[\.)]\s/.test(assistantMsg)) {
         assistantMsg = `${assistantMsg ? `${assistantMsg}\n\n` : ''}${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`;
       }
@@ -9360,10 +9413,10 @@ ${stepInstruction}`;
     }
     const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
     const factCount = (onboarding.key_facts || []).filter((f) => String(f || '').trim()).length;
-    if (!assistantMsg) {
+    if (!assistantMsg || !intakeMessageLooksLikeAsk(assistantMsg)) {
       assistantMsg = questions.length
         ? `${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`
-        : 'I captured this file. A few things I still need from you:\n1. Which year or period should I attach this to?\n2. Which plan, product, or audience is this for?\n3. Anything I should add or correct in the captured facts?';
+        : CONTEXT_FILE_CONFIRM_QUESTION;
     }
     assistantMsg = `I've saved **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}${factCount ? `\n\nI captured **${factCount}** key fact${factCount === 1 ? '' : 's'} so far.` : ''}\n\n${assistantMsg}`;
     const captured = compactCapturedContext({
@@ -9425,31 +9478,11 @@ ${stepInstruction}`;
       const confirm = contextFileAddedConfirm(rec.name, moduleLabelFor(moduleId));
       const assistantMsg = result.complete
         ? confirm
-        : (stripJsonFromIntakeMessage(result.message) || 'Is anything in this file still unclear?');
+        : (stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(result.message)) || 'Is anything in this file still unclear?');
       const withAssistant = [...nextMessages, { role: 'assistant', content: assistantMsg }];
       const qa = result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
-      const prior = rec.capturedContext || {};
-      const mergeLines = (a, b) => {
-        const seen = new Set();
-        const out = [];
-        [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].forEach((item) => {
-          const t = String(item || '').replace(/\s+/g, ' ').trim();
-          if (!t) return;
-          const key = t.toLowerCase();
-          if (seen.has(key)) return;
-          seen.add(key);
-          out.push(t);
-        });
-        return out;
-      };
-      const mergedCtx = (qa || result.complete)
-        ? compactCapturedContext({
-          ...prior,
-          ...(qa || {}),
-          key_facts: mergeLines(prior.key_facts, qa?.key_facts),
-          key_metrics: mergeLines(prior.key_metrics, qa?.key_metrics),
-        })
-        : rec.capturedContext;
+      const mergedCtx = harvestModuleCapturedContext(rec.capturedContext, qa, withAssistant)
+        || rec.capturedContext;
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: withAssistant,
         intakeComplete: !!result.complete,
@@ -9858,7 +9891,7 @@ ${stepInstruction}`;
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
         <p className="text-xs text-blue-300/60 mb-2">
-          PowerPoint, PDF, Excel, CSV, or text. Strategy and IC images are auto-included (logos skipped; unclear slides wait for you, same as Assess IC). Captured facts are stored per file after any clarifying questions, and shared with the incentive LLM and the context map.
+          PowerPoint, PDF, Excel, CSV, or text. Intake harvests facts from the file — it does not design schemes. Strategy and IC images are auto-included (logos skipped; unclear slides wait for you). Captured facts are stored per file and shared with later IC design, the incentive LLM, and the context map.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
           File only: <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.
@@ -9897,7 +9930,11 @@ ${stepInstruction}`;
             {contextEditSaveStatus === 'saved' && <div className="text-[11px] text-green-400 font-semibold">Saved</div>}
             {contextEditSaveStatus === 'error' && <div className="text-[11px] text-red-400 font-semibold">Save failed</div>}
             {files.map((f) => {
-              const factN = Array.isArray(f.capturedContext?.key_facts) ? f.capturedContext.key_facts.length : 0;
+              const capturedView = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages)
+                || f.capturedContext;
+              const factN = Array.isArray(capturedView?.key_facts) ? capturedView.key_facts.length : 0;
+              const qaN = Array.isArray(capturedView?.qa_pairs) ? capturedView.qa_pairs.length : 0;
+              const captured = isModuleContextCaptured(f);
               const sourceBlocks = (f.extractedText || f.structuredExtract || f.visionExtract)
                 ? [
                   f.extractedText && { id: 'extractedText', label: 'Detected from file', value: f.extractedText },
@@ -9924,13 +9961,13 @@ ${stepInstruction}`;
                   if (m.role === 'user' || !intakeChatLooksLikeJson(m.content)) return m;
                   return {
                     ...m,
-                    content: f.intakeComplete
+                    content: captured
                       ? contextFileAddedConfirm(f.name, moduleLabelFor(moduleId))
                       : 'I have a few clarifying questions — please reply below.',
                   };
                 });
               const fileIntakeText = contextIntakeByFile[f.id] ?? '';
-              const needsAttention = !!(f.processing || !f.intakeComplete);
+              const needsAttention = !!(f.processing || !captured);
               return (
                 <details
                   key={f.id}
@@ -9944,6 +9981,7 @@ ${stepInstruction}`;
                         {f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}
                         {(usedN || unusedN) ? ` · ${usedN} used · ${unusedN} not used` : (f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : '')}
                         {factN ? ` · ${factN} fact${factN === 1 ? '' : 's'}` : ''}
+                        {qaN && !factN ? ` · ${qaN} intake answer${qaN === 1 ? '' : 's'}` : ''}
                         {needsAttention
                           ? (f.processing ? ' · Expand to view progress' : ' · Expand to answer intake')
                           : ' · Expand to view or edit'}
@@ -9956,8 +9994,8 @@ ${stepInstruction}`;
                         ) : (
                           <span className="px-2 py-0.5 bg-amber-500/15 text-amber-200 text-[10px] rounded border border-amber-400/25">Processing</span>
                         )
-                      ) : f.intakeComplete ? (
-                        <span className="px-2 py-0.5 bg-green-500/20 text-green-300 text-[10px] rounded border border-green-400/30">Ready</span>
+                      ) : captured ? (
+                        <span className="px-2 py-1 bg-green-500/20 text-green-300 text-xs rounded border border-green-400/30">Context captured</span>
                       ) : (
                         <span className="px-2 py-0.5 bg-yellow-500/15 text-yellow-200 text-[10px] rounded border border-yellow-400/25">Intake</span>
                       )}
@@ -10092,9 +10130,9 @@ ${stepInstruction}`;
                         <div>
                           <div className="text-xs font-bold text-white">Intake assistant</div>
                           <div className="text-[11px] text-blue-300/60 mt-0.5">
-                            {f.intakeComplete
+                            {captured
                               ? 'Context captured. Reply here to add or update notes for this file.'
-                              : 'Answer the questions below so this file can be stored correctly.'}
+                              : 'Confirm anything unclear in this file so its facts can be stored as context. Design happens later, using this capture.'}
                           </div>
                         </div>
                         <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-3 max-h-[280px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
@@ -10115,7 +10153,7 @@ ${stepInstruction}`;
                             value={fileIntakeText}
                             onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeByFile((prev) => ({ ...prev, [f.id]: e.target.value })); }}
                             onFocus={() => setActiveContextFileId(f.id)}
-                            placeholder={f.intakeComplete ? 'Add a comment or update for this file…' : 'Answer the intake questions… (1= … 2= … if several are listed)'}
+                            placeholder={captured ? 'Add a comment or update for this file…' : 'Answer the intake questions… (1= … 2= … if several are listed)'}
                             rows={2}
                             className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
                           />
@@ -10136,7 +10174,7 @@ ${stepInstruction}`;
                           <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
                         </summary>
                         <StellaCapturedContextView
-                          ctx={f.capturedContext}
+                          ctx={capturedView}
                           onPatch={async (next) => {
                             setContextEditSaveStatus('saving');
                             try {

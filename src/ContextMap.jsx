@@ -16,6 +16,7 @@ import {
 import { activeMemoryItems, formatMemoryStamp, MEMORY_CAP } from './chatMemory';
 import {
   connectedModuleIds,
+  harvestModuleCapturedContext,
   listModuleContextBlocks,
   MODULE_CONTEXT_LABELS,
 } from './moduleContext';
@@ -155,7 +156,8 @@ function previewLines(text, limit = 5) {
 }
 
 function contextFileSummary(file) {
-  const ctx = file?.capturedContext && typeof file.capturedContext === 'object' ? file.capturedContext : {};
+  const ctx = harvestModuleCapturedContext(file?.capturedContext, null, file?.intakeMessages)
+    || (file?.capturedContext && typeof file.capturedContext === 'object' ? file.capturedContext : {});
   const blocks = listModuleContextBlocks(file) || [];
   const highlights = [
     clip(ctx.what_it_represents, 160),
@@ -344,15 +346,6 @@ function groupsFor(mod, generalMemory) {
       kind: 'files',
     });
   }
-  if (mod.pptx) {
-    groups.push({
-      id: 'pptx-template',
-      title: 'PPT export template',
-      subtitle: clip(mod.pptx.fileName || 'Custom', 22),
-      count: 1,
-      kind: 'leaf',
-    });
-  }
   if (mod.goalsKey && mod.goals) {
     groups.push({
       id: 'goals',
@@ -401,7 +394,6 @@ function withMapVisuals(hubModules) {
       ? mod.angle
       : (-Math.PI / 2 + (2 * Math.PI * i) / Math.max(list.length, 1)),
     Icon: mod.Icon || Layers,
-    pptxTemplate: !!mod.pptxTemplate,
     goalsKey: mod.goalsKey || '',
     dataFiles: !!mod.dataFiles,
   }));
@@ -536,7 +528,7 @@ function fileNodeSpec(f, joins = []) {
   const n = joinTouchCount(joins, f.id);
   return {
     id: f.nodeId,
-    kind: kind === 'powerpoint' ? 'pptx' : (kind === 'excel' || kind === 'csv' || kind === 'json' ? 'data' : 'file'),
+    kind: (kind === 'excel' || kind === 'csv' || kind === 'json') ? 'data' : 'file',
     groupId: 'files',
     kindKey: kind,
     fileId: f.id,
@@ -635,19 +627,6 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
       continue;
     }
 
-    if (focus.group === 'pptx-template' && mod.pptx) {
-      placeLeaves(nodes, edges, groupNode.id, groupNode, [{
-        id: `${mod.id}-pptx`,
-        kind: 'pptx',
-        groupId: 'pptx-template',
-        title: 'PPT export template',
-        subtitle: clip(mod.pptx.fileName || 'Custom', 22),
-        w: 150,
-        h: 50,
-      }], mod.angle, pos, live, hubNode);
-      continue;
-    }
-
     if (focus.group === 'goals' && mod.goals) {
       placeLeaves(nodes, edges, groupNode.id, groupNode, [{
         id: `${mod.id}-goals`,
@@ -671,7 +650,7 @@ function layoutStar(model, focus, saved, livePos, leafPage = 0) {
             }).length;
             return {
               id: `${mod.id}-kind-${k.id}`,
-              kind: k.id === 'excel' || k.id === 'csv' || k.id === 'json' ? 'data' : (k.id === 'powerpoint' ? 'pptx' : 'file'),
+              kind: k.id === 'excel' || k.id === 'csv' || k.id === 'json' ? 'data' : 'file',
               groupId: 'files',
               kindKey: k.id,
               title: k.title,
@@ -780,7 +759,6 @@ function usedWhenChatting(model, moduleId) {
   if (model.generalMemory.length) parts.push(`${model.generalMemory.length} remembered fact${model.generalMemory.length === 1 ? '' : 's'} from the centre`);
   if (mod.memory.length) parts.push(`${mod.memory.length} ${mod.short} remembered fact${mod.memory.length === 1 ? '' : 's'}`);
   if (mod.files.length) parts.push(`${mod.files.length} context file${mod.files.length === 1 ? '' : 's'} in this module`);
-  if (mod.pptx) parts.push('PowerPoint template (export style only)');
   if (mod.goals) parts.push('Analysis goals');
   if (mod.stellaFiles.length) parts.push(`${mod.stellaFiles.length} data file${mod.stellaFiles.length === 1 ? '' : 's'} and intake notes`);
   if (mod.joins.length) parts.push(`${mod.joins.length} stored join${mod.joins.length === 1 ? '' : 's'} between files`);
@@ -849,11 +827,11 @@ function FilePreviewBlock({ file }) {
     const slides = previewLines(file.structuredExtract || file.extractedText, 3);
     return (
       <div className="mt-3">
-        <div className="text-[10px] uppercase tracking-wide text-amber-200/80 font-semibold mb-1.5">Slide / deck preview</div>
+        <div className="text-[10px] uppercase tracking-wide text-blue-300/70 font-semibold mb-1.5">Slide / deck preview</div>
         {slides.length ? (
           <ol className="space-y-1">
             {slides.map((line, i) => (
-              <li key={i} className="text-[11px] text-slate-200 bg-slate-950/40 border border-amber-400/15 rounded-md px-2 py-1">{line}</li>
+              <li key={i} className="text-[11px] text-slate-200 bg-slate-950/40 border border-blue-400/15 rounded-md px-2 py-1">{line}</li>
             ))}
           </ol>
         ) : (
@@ -1122,7 +1100,6 @@ export default function ContextMap({
         files: files.map(contextFileSummary),
         memory: memoryFor(userSettings, mod.id),
         linked,
-        pptx: mod.pptxTemplate ? userSettings?.pptxTemplate : null,
         goals: mod.goalsKey ? String(userSettings?.stellaBusinessContext?.[mod.goalsKey] || '').trim() : '',
         stellaFiles: mod.dataFiles ? stellaFiles.map(stellaFileSummary) : [],
         joins: mod.dataFiles ? joins : [],
@@ -1471,7 +1448,6 @@ export default function ContextMap({
       const fact = memoryFacts.find((m) => m.id === focus.factId);
       if (fact) bits.push(clip(fact.text, 28));
     }
-    if (focus.group === 'pptx-template') bits.push('PPT export template');
     if (focus.group === 'goals') bits.push('Analysis goals');
     return bits;
   })();
@@ -1540,7 +1516,6 @@ export default function ContextMap({
       >
         <span className="w-5 border-t border-dashed border-cyan-400" /> Comparison
       </button>
-      <span className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400/80" /> PowerPoint / strategy</span>
       {leafPageInfo && leafPageInfo.pages > 1 ? (
         <span className="inline-flex items-center gap-1.5">
           <button
@@ -1779,13 +1754,6 @@ export default function ContextMap({
                 ) : (
                   <p className="text-[11px] text-blue-300/45">Nothing tagged to this module yet. Confirm a remembered fact while chatting here and it will show up on this arm.</p>
                 )}
-              </div>
-            )}
-
-            {focus.group === 'pptx-template' && selectedModule.pptx && (
-              <div className="bg-slate-900/40 border border-blue-400/15 rounded-lg px-3 py-2">
-                <div className="text-[10px] uppercase tracking-wide text-blue-300/50 font-semibold">PowerPoint template</div>
-                <div className="text-xs text-slate-200 mt-1">{selectedModule.pptx.fileName || 'Custom template'} — colours and fonts for chat PowerPoint exports, not chat context.</div>
               </div>
             )}
 

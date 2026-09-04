@@ -42,8 +42,10 @@ export function isEmptyContextValue(value) {
   if (!t) return true;
   const lower = t.toLowerCase().replace(/\s+/g, ' ');
   if (/^(n\/a|na|none|null|nil|undefined|-|—|unknown|not specified|not provided|tbd|none provided)$/i.test(lower)) return true;
-  if (/\bto use this correctly i need a little context\b/i.test(lower)) return true;
-  if (/\byou can answer them together or one at a time\b/i.test(lower)) return true;
+  if (t.length <= 240) {
+    if (/\bto use this correctly i need a little context\b/i.test(lower)) return true;
+    if (/\byou can answer them together or one at a time\b/i.test(lower)) return true;
+  }
   if (t.length < 900) {
     if (/\bappears to be empty\b/i.test(lower)) return true;
     if (/\bcontains? only a filename\b/i.test(lower)) return true;
@@ -129,6 +131,121 @@ export function compactCapturedContext(ctx) {
   return Object.keys(out).length ? out : undefined;
 }
 
+function mergeContextLines(...lists) {
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    const items = Array.isArray(list) ? list : (list ? [list] : []);
+    for (const item of items) {
+      const t = String(item || '').replace(/\s+/g, ' ').trim();
+      if (!t) continue;
+      const key = t.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+function parseNumberedParts(text) {
+  const t = String(text || '').trim();
+  if (!t) return [];
+  const matches = [...t.matchAll(/(\d+)\s*[=:.)]\s+/g)];
+  if (!matches.length) return [];
+  const parts = [];
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index + matches[i][0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index : t.length;
+    const body = t.slice(start, end).replace(/[;,\s]+$/g, '').replace(/\s+/g, ' ').trim();
+    if (body) parts.push(body);
+  }
+  return parts;
+}
+
+function harvestQaPairs(intakeMessages) {
+  const msgs = Array.isArray(intakeMessages) ? intakeMessages : [];
+  const pairs = [];
+  const seen = new Set();
+  const push = (q, a) => {
+    const question = String(q || '').replace(/\s+/g, ' ').trim().slice(0, 800);
+    const answer = String(a || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+    if (!answer) return;
+    const key = `${question.toLowerCase()}|${answer.toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pairs.push({ question: question || 'Clarification', answer });
+  };
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i]?.role !== 'assistant') continue;
+    const ansMsg = msgs.slice(i + 1).find((m) => m.role === 'user');
+    if (!ansMsg) continue;
+    const qs = parseNumberedParts(msgs[i].content);
+    const as = parseNumberedParts(ansMsg.content);
+    if (qs.length && as.length) {
+      const n = Math.max(qs.length, as.length);
+      for (let k = 0; k < n; k++) {
+        push(qs[k] || qs[qs.length - 1] || 'Clarification', as[k] || as[as.length - 1]);
+      }
+    } else if (qs.length) {
+      push(qs.join(' / '), ansMsg.content);
+    } else {
+      const lines = String(msgs[i].content || '').split(/\n+/).map((l) => l.trim()).filter(Boolean);
+      const qLines = lines.filter((l) => /[?？]/.test(l));
+      const question = qLines.length ? qLines.join(' ') : lines.slice(-3).join(' ');
+      push(question, ansMsg.content);
+    }
+  }
+  return pairs;
+}
+
+/** Merge model context_qa with assistant→user pairs from the intake thread. */
+export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
+  const fromModel = modelQa && typeof modelQa === 'object' && !Array.isArray(modelQa) ? modelQa : {};
+  const fromPrior = prior && typeof prior === 'object' ? prior : {};
+  const harvestedQa = harvestQaPairs(intakeMessages);
+  const qa_pairs = [];
+  const seen = new Set();
+  for (const p of [...(fromPrior.qa_pairs || []), ...(fromModel.qa_pairs || []), ...harvestedQa]) {
+    if (!p || typeof p !== 'object') continue;
+    const question = String(p.question || '').trim();
+    const answer = String(p.answer || '').trim();
+    if (!question && !answer) continue;
+    const key = `${question.toLowerCase()}|${answer.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    qa_pairs.push({
+      ...(question ? { question } : {}),
+      ...(answer ? { answer } : {}),
+    });
+  }
+  const answerFacts = harvestedQa
+    .map((p) => p.answer)
+    .filter((a) => {
+      const t = String(a || '').trim();
+      if (t.length < 4 || t.length > 280) return false;
+      if (/^(yes|no|ok|okay|sure|thanks|looks good|that'?s (all|correct)|complete|done)[.!]?\s*$/i.test(t)) return false;
+      return true;
+    });
+  return compactCapturedContext({
+    ...fromPrior,
+    ...fromModel,
+    what_it_represents: fromModel.what_it_represents || fromPrior.what_it_represents,
+    time_period: fromModel.time_period || fromPrior.time_period,
+    interpretation_notes: fromModel.interpretation_notes || fromPrior.interpretation_notes,
+    key_facts: mergeContextLines(fromPrior.key_facts, fromModel.key_facts, answerFacts),
+    key_metrics: mergeContextLines(fromPrior.key_metrics, fromModel.key_metrics),
+    qa_pairs,
+  });
+}
+
+function intakeAssistantStillAsking(content) {
+  const t = String(content || '').trim();
+  if (!t) return false;
+  if (/\bnow added to\b/i.test(t) || /\bis now added\b/i.test(t)) return false;
+  return /[?？]/.test(t) || /\n\s*1[\.)]\s/.test(t);
+}
+
 function normalizeContextFile(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = String(raw.id || '').trim();
@@ -173,15 +290,21 @@ function normalizeContextFile(raw) {
   const intakeMessages = Array.isArray(raw.intakeMessages)
     ? raw.intakeMessages
       .slice(-24)
-      .map((m) => ({ role: m.role, content: usefulString(m.content, 4000) }))
-      .filter((m) => m.role && m.content)
+      .map((m) => ({ role: m.role, content: capText(m.content, 4000) }))
+      .filter((m) => m.role && String(m.content || '').trim())
     : [];
   if (intakeMessages.length) rec.intakeMessages = intakeMessages;
   if (raw.intakeComplete === false) rec.intakeComplete = false;
   else if (raw.intakeComplete) rec.intakeComplete = true;
   if (raw.processing) rec.processing = true;
-  const captured = compactCapturedContext(raw.capturedContext);
+  const captured = harvestModuleCapturedContext(raw.capturedContext, null, intakeMessages)
+    || compactCapturedContext(raw.capturedContext);
   if (captured) rec.capturedContext = captured;
+  const hasUserIntake = intakeMessages.some((m) => m.role === 'user');
+  const lastAssistant = [...intakeMessages].reverse().find((m) => m.role === 'assistant');
+  if (hasUserIntake && rec.intakeComplete === false && !intakeAssistantStillAsking(lastAssistant?.content)) {
+    rec.intakeComplete = true;
+  }
   if (Array.isArray(raw.columns) && raw.columns.length) {
     rec.columns = raw.columns
       .filter((c) => c && usefulString(c.name || c))
@@ -350,7 +473,7 @@ export function removeModuleContextFile(moduleContext, moduleId, fileId) {
 
 export function listModuleContextBlocks(f) {
   if (!f) return [];
-  const ctx = f.capturedContext || {};
+  const ctx = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages) || f.capturedContext || {};
   const blocks = [];
   if (!isEmptyContextValue(ctx.what_it_represents)) blocks.push({ id: 'represents', label: 'What it represents', value: ctx.what_it_represents, line: true });
   if (!isEmptyContextValue(ctx.time_period)) blocks.push({ id: 'period', label: 'Time period', value: ctx.time_period, line: true });

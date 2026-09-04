@@ -168,13 +168,15 @@ Rules:
 - Use the exact filename provided for each image.`,
   contextContentSummaryPrompt: `You extract FACTS from ONE uploaded file so later specialists can use it without rereading the whole document.
 
+Your only job is to harvest what this file contains. Do not design incentive schemes, territories, or analyses — that happens later in dedicated workflows, which will be fed this captured context.
+
 Return ONLY valid JSON. No markdown.
 Schema:
 {
   "summary": "one factual sentence of what THIS file is",
   "what_it_represents": "what the file is for (one sentence, or empty)",
   "time_period": "coverage dates / FY / months if stated, else empty",
-  "key_facts": ["one short factual bullet — names, numbers, rules, eligibility, products, territories"],
+  "key_facts": ["one short factual bullet — names, numbers, products, territories, dates as stated in the file"],
   "key_metrics": ["field or metric = meaning, with units if known"],
   "columns": [{ "name": "exact column name", "description": "what this column represents" }],
   "interpretation_notes": "how to use this file (definitions, caveats). Empty if nothing extra.",
@@ -185,16 +187,20 @@ Rules:
 - Pull facts that are IN the file. Do not write a slide-by-slide narrative or a marketing summary.
 - Each key_facts item is one discrete fact (≤25 words). Prefer 4–20 facts. Skip logos, decoration, and empty slides.
 - Never invent numbers or names. If unreadable, omit rather than guess.
-- Always put 1–3 clarifying questions in suggestedQuestions (year, plan/product, audience, currency, a definition, or “is this capture complete?”). Only use [] when the file is empty or unreadable.
+- Ask a clarifying question only when something IN THIS FILE is still unclear after reading the extract — for example an unreadable figure, an unnamed product on a slide, or an ambiguous year. These are examples of gaps, not a checklist.
+- Never ask IC design questions (salary/variable mix, scheme design, quotas, payouts, eligibility rules, how to design a plan) — even if this file is stored under Incentive Compensation.
+- If the file is already understandable, suggestedQuestions must be []. Prefer an empty list over padding. Never use a fixed list of must-ask questions.
 - Empty fields must be empty / []. Never write n/a, unknown, or "the file contained no text".
 {{moduleLabel}} is only the storage place — not a topic to ask about.`,
-  contextIntakePrompt: `You onboard ONE uploaded file in a short intake chat, the same way Stella files intake works.
+  contextIntakePrompt: `You onboard ONE uploaded file in a short intake chat. Your only job is to harvest facts from this file so later specialists (IC design, territory, Stella) can use them. Do not design, recommend, or discuss how a scheme or territory should work — that happens in the dedicated area, fed with this captured context.
 
-Detected facts may already be in the extract. Ask about anything still ambiguous (year, currency, which plan/product, audience, a definition). Number questions 1. 2. 3. when you ask more than one. Never use a fixed checklist. Never ask about other files or the module in general. Never ask about facts already visible in the extract.
+Ask only about THIS uploaded file: unclear labels, unreadable figures, a missing year on a slide, an unnamed product. Number questions 1. 2. 3. when you ask more than one. Never use a fixed checklist. Never ask about other files, the module in general, or facts already visible in the extract.
 
-FIRST TURN (no user reply yet): Never set complete=true. Always ask 1–3 numbered clarifying questions in "message" so the user can confirm or correct the capture. Do not store yet. Set context_qa to null.
+Never ask IC design questions — salary/variable mix, incentive schemes, quotas, payouts, eligibility, or how to design a plan — even if user settings or the storage module are about incentives. Ignore user settings for what to ask; only the file extract.
 
-LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. If you still need something, ask a follow-up (complete=false).
+FIRST TURN (no user reply yet): If the file still has a gap, ask 1–3 numbered questions about that gap and set complete=false. If the file is already clear, ask one confirm that this capture of the file is correct, or set complete=true. Never ask a year/plan/audience checklist unless those are actually missing from the file. Set context_qa to null until the user has answered.
+
+LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. qa_pairs MUST list every question you asked and the user's answer. If you still need a file-specific gap filled, ask one follow-up (complete=false).
 
 "message" is always a short human chat line. Never put JSON, context_qa, key_facts, or raw extract in "message". When complete=true, message is only a one-line confirmation that the file is now added (for example: "Thanks — this file is now added as Incentive Comp context."). Put the understood facts only in context_qa.
 
