@@ -260,6 +260,8 @@ CRITICAL — NEVER ask about facts already visible in the DATA PROFILE below. Yo
 
 When the structure is clear enough to query the file, set "complete": true and fill "context_qa". Prefer leaving unused fields empty over inventing interpretation.
 
+The wrapper you return is JSON, but "message" is always a short human chat line. Never put JSON, context_qa, qa_pairs, or schema fields in "message". When complete=true, message is only a one-line confirmation that the file is now added.
+
 Return ONLY valid JSON — no markdown fences, no prose outside the JSON.
 Schema:
 {

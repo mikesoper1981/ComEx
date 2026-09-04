@@ -319,10 +319,31 @@ function stripJsonFromIntakeMessage(text) {
   let t = String(text || '').trim();
   t = t.replace(/```json[\s\S]*?```/gi, '').trim();
   const appended = t.search(/\n\s*\{/);
-  if (appended !== -1 && /"complete"\s*:|"context_qa"\s*:|"key_facts"\s*:/.test(t.slice(appended))) {
+  if (appended !== -1 && /"complete"\s*:|"context_qa"\s*:|"key_facts"\s*:|"qa_pairs"\s*:/.test(t.slice(appended))) {
     t = t.slice(0, appended).trim();
   }
   return intakeChatLooksLikeJson(t) ? '' : t;
+}
+
+/** Visible intake chat must never be the model's JSON payload. */
+function humanIntakeAssistantLine(parsed, raw, fallback) {
+  const field = parsed?.message;
+  const fromField = typeof field === 'string' ? field : '';
+  const stripped = stripJsonFromIntakeMessage(fromField);
+  if (stripped) return stripped;
+  const strippedRaw = stripJsonFromIntakeMessage(raw);
+  if (strippedRaw) return strippedRaw;
+  return String(fallback || '').trim();
+}
+
+function displayIntakeChatContent(content, { complete, fileName, moduleLabel } = {}) {
+  const raw = String(content || '');
+  const stripped = stripJsonFromIntakeMessage(raw);
+  if (stripped) return stripped;
+  if (!intakeChatLooksLikeJson(raw)) return raw;
+  return complete
+    ? contextFileAddedConfirm(fileName, moduleLabel)
+    : 'I have a few clarifying questions — please reply below.';
 }
 
 function pickIntakeContextQa(parsed) {
@@ -5041,6 +5062,14 @@ function stellaFileNeedsOpeningIntake(f) {
     || /Imported from the scheduled inbox/i.test(first)
     || /Assessing \*\*.*from the inbox/i.test(first);
   return scheduledStub || schemaStub;
+}
+
+function stellaIntakeNeedsJsonSalvage(f) {
+  if (!f || f.processing || f.intakeComplete) return false;
+  const msgs = Array.isArray(f.intakeMessages) ? f.intakeMessages : [];
+  if (!msgs.some((m) => m?.role === 'user')) return false;
+  const last = [...msgs].reverse().find((m) => m?.role === 'assistant');
+  return !!(last && intakeChatLooksLikeJson(last.content));
 }
 
 function guessCountry(structure) {
@@ -11113,20 +11142,33 @@ ${stepInstruction}`;
     const contextBlob = `FILE: "${f.name}" (type: ${f.fileType || f.type})${f.tableName ? `\nSQL TABLE: ${f.tableName}` : ''}\nSUMMARY: ${f.summary || ''}\nCOLUMNS (use these exact names in relationships.this_field):\n${colsBlob}`;
     const convo = [
       { role: 'user', content: `You are onboarding: "${f.name}".\n\n${contextBlob}` },
-      ...((f.intakeMessages || []).map(m => ({ role: toAnthropicRole(m.role), content: m.content }))),
+      ...((f.intakeMessages || []).map((m) => ({
+        role: toAnthropicRole(m.role),
+        content: m.role === 'assistant'
+          ? (stripJsonFromIntakeMessage(m.content) || 'Thanks — noted.')
+          : String(m.content || ''),
+      }))),
     ];
 
     let parsed = null;
     let raw = '';
     try {
-      raw = await callAnthropic(system, convo, 1400);
+      raw = await callAnthropic(system, convo, 2200);
       parsed = extractJsonObject(raw);
     } catch { /* fall through to fallback handling */ }
 
     const lastUserText = [...(f.intakeMessages || [])].reverse().find(m => m.role === 'user')?.content || '';
+    const hasUserReply = (f.intakeMessages || []).some((m) => m.role === 'user');
     const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
     const acceptedJoin = stellaLooksLikeJoinAccept(lastUserText);
-    let rels = stellaNormalizeStoredRelationships(parsed?.context_qa?.relationships, live, otherTabular);
+    const qaFromModel = (() => {
+      const picked = pickIntakeContextQa(parsed);
+      if (picked && typeof picked === 'object' && !Array.isArray(picked)) return picked;
+      const nested = parsed?.context_qa;
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) return nested;
+      return {};
+    })();
+    let rels = stellaNormalizeStoredRelationships(qaFromModel.relationships, live, otherTabular);
     if (declinedJoin) {
       rels = [];
     } else if (candidates.length && acceptedJoin) {
@@ -11153,11 +11195,21 @@ ${stepInstruction}`;
       }
     }
 
-    let assistantMessage =
-      (parsed && parsed.message) ||
-      (complete ? 'Thanks — I have enough context to interpret this now.' : (String(raw).trim() || 'Could you tell me what this represents, the time period it covers, and the key metrics involved?'));
-    if (forceJoinQuestion) {
-      assistantMessage = stellaJoinQuestion(candidates, otherTabular) || assistantMessage;
+    const modelLine = humanIntakeAssistantLine(parsed, raw, '');
+    if (hasUserReply && !forceJoinQuestion && (complete || !intakeMessageLooksLikeAsk(modelLine) || !modelLine)) {
+      complete = true;
+    }
+
+    let assistantMessage = forceJoinQuestion
+      ? (stellaJoinQuestion(candidates, otherTabular) || modelLine)
+      : modelLine;
+    if (!assistantMessage) {
+      assistantMessage = complete
+        ? contextFileAddedConfirm(f.name, 'Stella Insights')
+        : 'Could you tell me what this represents, the time period it covers, and the key metrics involved?';
+    }
+    if (complete && !forceJoinQuestion && intakeMessageLooksLikeAsk(assistantMessage)) {
+      assistantMessage = contextFileAddedConfirm(f.name, 'Stella Insights');
     }
     if (complete && !declinedJoin && rels.length && !/\bstored join/i.test(assistantMessage)) {
       const joinLines = rels.map(r => `- ${f.tableName}.${r.this_field} = ${r.related_table || r.related_file}.${r.related_field}${r.related_file ? ` (${r.related_file})` : ''}`);
@@ -11173,7 +11225,7 @@ ${stepInstruction}`;
 
     if (shouldPersistContext) {
       const ctx = {
-        ...normalizeContextQa({ ...(f.capturedContext || {}), ...(parsed?.context_qa || {}) }, nextIntakeMessages),
+        ...normalizeContextQa({ ...(f.capturedContext || {}), ...qaFromModel }, nextIntakeMessages),
         relationships: declinedJoin ? [] : rels,
       };
       await persistStellaIntakeContext(f, ctx, nextIntakeMessages);
@@ -11520,6 +11572,21 @@ ${stepInstruction}`;
   useEffect(() => {
     const list = stellaDataFilesRef.current || stellaDataFiles || [];
     for (const f of list) {
+      if (stellaIntakeNeedsJsonSalvage(f)) {
+        const salvageKey = `salvage:${f.id}`;
+        if (stellaOpeningIntakeBusyRef.current.has(salvageKey)) continue;
+        stellaOpeningIntakeBusyRef.current.add(salvageKey);
+        const ctx = normalizeContextQa(f.capturedContext, f.intakeMessages);
+        const msgs = (f.intakeMessages || []).map((m) => (
+          m.role === 'assistant' && intakeChatLooksLikeJson(m.content)
+            ? { ...m, content: contextFileAddedConfirm(f.name, 'Stella Insights') }
+            : m
+        ));
+        void persistStellaIntakeContext(f, ctx, msgs).finally(() => {
+          stellaOpeningIntakeBusyRef.current.delete(salvageKey);
+        });
+        continue;
+      }
       if (!stellaFileNeedsOpeningIntake(f)) continue;
       if (stellaOpeningIntakeBusyRef.current.has(f.id)) continue;
       stellaOpeningIntakeBusyRef.current.add(f.id);
@@ -11768,13 +11835,22 @@ ${stepInstruction}`;
                 <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-4 max-h-[420px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-3">
                   {intake.length === 0 ? (
                     <div className="text-sm text-blue-300/60">Upload processing…</div>
-                  ) : intake.map((m, i) => (
+                  ) : intake.map((m, i) => {
+                    const shown = m.role === 'user'
+                      ? m.content
+                      : displayIntakeChatContent(m.content, {
+                        complete: captured,
+                        fileName: f.name,
+                        moduleLabel: 'Stella Insights',
+                      });
+                    return (
                     <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                       <div className={`max-w-[90%] min-w-0 chat-fit px-3 py-2 rounded-xl text-sm ${m.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'block w-full bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                        {m.role === 'user' ? <span className="whitespace-pre-wrap break-words">{m.content}</span> : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}
+                        {m.role === 'user' ? <span className="whitespace-pre-wrap break-words">{shown}</span> : <MessageErrorBoundary>{formatMarkdown(shown)}</MessageErrorBoundary>}
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
 
                 <div className="flex gap-2">

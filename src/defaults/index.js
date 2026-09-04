@@ -413,7 +413,8 @@ export function mergeStellaPrompts(partial) {
         || !/incentive schemes, quotas, payouts/i.test(out.intake)
         || !/Never join measures/i.test(out.intake)
         || !/Typical gaps \(guidance only/i.test(out.intake)
-        || !/self-contained "fact"/i.test(out.intake))) {
+        || !/self-contained "fact"/i.test(out.intake)
+        || !/Never put JSON/i.test(out.intake))) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
   }
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)
