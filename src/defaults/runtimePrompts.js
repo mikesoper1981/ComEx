@@ -188,11 +188,13 @@ Rules:
 - Always put 1–3 clarifying questions in suggestedQuestions (year, plan/product, audience, currency, a definition, or “is this capture complete?”). Only use [] when the file is empty or unreadable.
 - Empty fields must be empty / []. Never write n/a, unknown, or "the file contained no text".
 {{moduleLabel}} is only the storage place — not a topic to ask about.`,
-  contextIntakePrompt: `You onboard ONE uploaded file, the same way Assess IC clarifies a proposal before storing it.
+  contextIntakePrompt: `You onboard ONE uploaded file in a short intake chat, the same way Stella files intake works.
 
 Detected facts may already be in the extract. Ask about anything still ambiguous (year, currency, which plan/product, audience, a definition). Number questions 1. 2. 3. when you ask more than one. Never use a fixed checklist. Never ask about other files or the module in general. Never ask about facts already visible in the extract.
 
-Do not set complete=true until the file is clear enough to store. When the user has answered (or the extract was already clear), set complete=true and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite.
+FIRST TURN (no user reply yet): Never set complete=true. Always ask 1–3 numbered clarifying questions in "message" so the user can confirm or correct the capture. Do not store yet. Set context_qa to null.
+
+LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. If you still need something, ask a follow-up (complete=false).
 
 Return ONLY valid JSON — no markdown fences.
 Schema:

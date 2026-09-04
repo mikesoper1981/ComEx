@@ -3868,13 +3868,12 @@ relevant="unsure" if it might contain useful content but you cannot tell — the
     unsure: true,
   }));
   const ignored = decided.filter((d) => !d.relevant && !d.unsure).map((d) => ({
-    name: d.img.name,
-    bytes: d.img.bytes,
+    ...d.img,
     included: false,
     reason: d.reason,
     kind: IGNORE_IMAGE_PURPOSES.has(d.purpose) ? d.purpose : 'decorative',
     purpose: d.purpose,
-    src: `data:${d.img.mediaType};base64,${d.img.base64}`,
+    src: imageDataUrl(d.img),
   }));
 
   return {
@@ -3919,6 +3918,21 @@ function purposeLabel(purpose) {
   return map[purpose] || purpose || 'Unknown';
 }
 
+function imageDataUrl(img) {
+  if (img?.src) return img.src;
+  if (img?.base64) return `data:${img.mediaType || 'image/png'};base64,${img.base64}`;
+  return undefined;
+}
+
+function imageWithBlob(img) {
+  if (!img || typeof img !== 'object') return null;
+  if (img.base64) return { ...img, src: imageDataUrl(img) };
+  const src = String(img.src || '');
+  const m = src.match(/^data:([^;]+);base64,(.+)$/);
+  if (!m) return { ...img, src: src || undefined };
+  return { ...img, mediaType: img.mediaType || m[1], base64: img.base64 || m[2], src };
+}
+
 function buildProposalImagePreviews(included, unsure, skipped) {
   return [
     ...(included || []).map((img) => ({
@@ -3929,7 +3943,9 @@ function buildProposalImagePreviews(included, unsure, skipped) {
       purpose: img.purpose || 'scheme_content',
       reason: img.reason,
       sourceFormat: img.sourceFormat || img.convertedFrom || null,
-      src: `data:${img.mediaType};base64,${img.base64}`,
+      src: imageDataUrl(img),
+      base64: img.base64,
+      mediaType: img.mediaType,
     })),
     ...(unsure || []).map((img) => ({
       name: img.name,
@@ -3939,18 +3955,25 @@ function buildProposalImagePreviews(included, unsure, skipped) {
       purpose: img.purpose || 'other_ic',
       reason: img.reason,
       sourceFormat: img.sourceFormat || img.convertedFrom || null,
-      src: `data:${img.mediaType};base64,${img.base64}`,
+      src: imageDataUrl(img),
+      base64: img.base64,
+      mediaType: img.mediaType,
     })),
-    ...(skipped || []).map((s) => ({
-      name: s.name,
-      bytes: s.bytes || 0,
-      included: false,
-      pending: false,
-      reason: s.reason,
-      kind: s.kind,
-      purpose: s.purpose,
-      src: s.src,
-    })),
+    ...(skipped || []).map((s) => {
+      const blob = imageWithBlob(s) || s;
+      return {
+        name: blob.name,
+        bytes: blob.bytes || 0,
+        included: false,
+        pending: false,
+        reason: blob.reason,
+        kind: blob.kind,
+        purpose: blob.purpose,
+        src: imageDataUrl(blob),
+        base64: blob.base64,
+        mediaType: blob.mediaType,
+      };
+    }),
   ];
 }
 
@@ -4294,11 +4317,12 @@ async function finalizeProposalImages(extracted, classifyPrompt, { maxImages = 2
   const images = relevant.slice(0, maxImages);
   for (const img of relevant.slice(maxImages)) {
     skipped.push({
-      name: img.name,
-      bytes: img.bytes,
+      ...img,
       reason: `Relevant but beyond ${maxImages}-image extract limit`,
       kind: 'capped',
       purpose: classByName[img.name]?.purpose,
+      included: false,
+      src: imageDataUrl(img),
     });
   }
 
@@ -5501,11 +5525,15 @@ export default function CommercialExcellenceApp() {
   const pendingModuleContextIntakeRef = useRef(null);
   const [contextIngestJob, setContextIngestJob] = useState(null);
   const contextIngestJobRef = useRef(null);
-  const [contextImagePreviews, setContextImagePreviews] = useState(null); // { fileId, previews } session-only clickable thumbs
+  const [contextImagePreviewsByFile, setContextImagePreviewsByFile] = useState({}); // { [fileId]: previews[] } session-only clickable thumbs
+  const contextImageAssetsRef = useRef({}); // { [fileId]: { included, unsure, skipped } } blobs for toggling use
+  const [contextImageBusy, setContextImageBusy] = useState(null); // { fileId, name }
   const [activeContextFileId, setActiveContextFileId] = useState(null);
   const [contextIntakeInput, setContextIntakeInput] = useState('');
+  const [contextIntakeByFile, setContextIntakeByFile] = useState({});
   const [contextIntakeBusy, setContextIntakeBusy] = useState(false);
   const [contextEditSaveStatus, setContextEditSaveStatus] = useState('idle');
+  const [contextFileDeleteConfirm, setContextFileDeleteConfirm] = useState(null);
   const [landingLinkDrag, setLandingLinkDrag] = useState(null);
   const [landingCardRects, setLandingCardRects] = useState({});
   const [landingLinkNotice, setLandingLinkNotice] = useState('');
@@ -7845,6 +7873,9 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
                 <div className="space-y-1.5">
                   {(userSettings.moduleContext?.incentives?.files || []).map((f) => {
                     const n = Array.isArray(f.capturedContext?.key_facts) ? f.capturedContext.key_facts.length : 0;
+                    const inv = Array.isArray(f.imageInventory) ? f.imageInventory : [];
+                    const usedN = inv.filter((r) => r.status === 'included').length;
+                    const unusedN = inv.filter((r) => r.status === 'skipped').length;
                     return (
                       <button
                         key={f.id}
@@ -7855,6 +7886,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
                         <div className="text-[11px] font-semibold text-blue-100 truncate">{f.name}</div>
                         <div className="text-[10px] text-blue-300/50 mt-0.5">
                           {f.processing ? 'Processing…' : f.intakeComplete ? (n ? `${n} fact${n === 1 ? '' : 's'}` : 'Ready') : 'Needs intake'}
+                          {(usedN || unusedN) ? ` · ${usedN} used · ${unusedN} not used` : ''}
                         </div>
                       </button>
                     );
@@ -8824,10 +8856,24 @@ ${stepInstruction}`;
       raw = await callAnthropic(system, convo, 900);
       parsed = extractJsonObject(raw) || {};
     } catch { /* fall through */ }
-    const message = parsed.message
-      || (parsed.complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || 'Is anything in this file still unclear?'));
+    const hasUserReply = (intakeMessages || []).some((m) => m.role === 'user');
+    let complete = !!parsed.complete;
+    let message = parsed.message
+      || (complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || ''));
+    if (!hasUserReply) {
+      complete = false;
+      const looksLikeAsk = /[?？]|\n\s*1[\.)]\s/.test(String(message || ''));
+      if (!looksLikeAsk || String(message || '').replace(/\s+/g, ' ').trim().length < 12) {
+        message = 'I captured this file. A few things I still need from you:\n1. Which year or period should I attach this to?\n2. Which plan, product, or audience is this for?\n3. Anything I should add or correct in the captured facts?';
+      }
+    }
+    if (!String(message || '').trim()) {
+      message = complete
+        ? 'Thanks — I have enough context to use this file.'
+        : 'Is anything in this file still unclear?';
+    }
     return {
-      complete: !!parsed.complete,
+      complete,
       message,
       context_qa: parsed.context_qa || null,
     };
@@ -9181,6 +9227,17 @@ ${stepInstruction}`;
     await saveUserSettings({ moduleContext: mergeModuleContext(nextModuleContext) });
   };
 
+  const rememberContextImages = (fileId, { included = [], unsure = [], skipped = [] } = {}) => {
+    if (!fileId) return;
+    contextImageAssetsRef.current[fileId] = {
+      included: (included || []).map((img) => imageWithBlob(img)).filter(Boolean),
+      unsure: (unsure || []).map((img) => imageWithBlob(img)).filter(Boolean),
+      skipped: (skipped || []).map((img) => imageWithBlob(img)).filter(Boolean),
+    };
+    const previews = buildProposalImagePreviews(included, unsure, skipped);
+    setContextImagePreviewsByFile((prev) => ({ ...prev, [fileId]: previews }));
+  };
+
   const interpretContextImages = async (images, onStatus, moduleId) => {
     if (!images?.length) return '';
     onStatus?.(`Reading ${Math.min(images.length, 8)} image(s)…`);
@@ -9250,53 +9307,29 @@ ${stepInstruction}`;
       }
     }
     let questions = stellaNormalizeIntakeQuestions(onboarding.suggestedQuestions);
-    if (!isThinContextExtract(extractBlob, file.name)) {
-      try {
-        job.onStatus?.('Checking what still needs clarifying…');
-        const facts = (onboarding.key_facts || []).map((f, i) => `${i + 1}. ${f}`).join('\n') || '(none yet)';
-        const probe = await runContextIntakeTurn({
-          extractBlob,
-          moduleLabel: moduleLabelFor(moduleId),
-          intakeMessages: [{
-            role: 'assistant',
-            content: `Facts captured from **${file.name}**:\n${facts}\n\nAsk numbered clarifying questions if anything a later IC specialist could still misread (year, plan/product, audience, currency, a definition). If the extract looks complete, still ask the user to confirm the capture is correct.`,
-          }],
-        });
-        if (!probe.complete && probe.message) {
-          const msg = String(probe.message || '').replace(/\s+/g, ' ').trim();
-          if (msg.length >= 8 && !questions.length) questions = [msg];
-        }
-        if (probe.context_qa && typeof probe.context_qa === 'object') {
-          const qa = probe.context_qa;
-          const mergeLines = (a, b) => {
-            const seen = new Set();
-            const out = [];
-            [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].forEach((item) => {
-              const t = String(item || '').replace(/\s+/g, ' ').trim();
-              if (!t) return;
-              const key = t.toLowerCase();
-              if (seen.has(key)) return;
-              seen.add(key);
-              out.push(t);
-            });
-            return out;
-          };
-          onboarding = {
-            ...onboarding,
-            what_it_represents: qa.what_it_represents || onboarding.what_it_represents,
-            time_period: qa.time_period || onboarding.time_period,
-            key_facts: mergeLines(onboarding.key_facts, qa.key_facts),
-            key_metrics: mergeLines(onboarding.key_metrics, qa.key_metrics),
-            interpretation_notes: qa.interpretation_notes || onboarding.interpretation_notes,
-          };
-        }
-      } catch (err) {
-        console.warn('Context intake probe failed:', err);
+    let assistantMsg = '';
+    try {
+      job.onStatus?.('Asking clarifying questions…');
+      const probe = await runContextIntakeTurn({
+        extractBlob: extractBlob || `File name: ${file.name}`,
+        moduleLabel: moduleLabelFor(moduleId),
+        intakeMessages: [],
+      });
+      assistantMsg = String(probe.message || '').trim();
+      if (questions.length && !/\n\s*1[\.)]\s/.test(assistantMsg)) {
+        assistantMsg = `${assistantMsg ? `${assistantMsg}\n\n` : ''}${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`;
       }
-      if (!questions.length) {
-        questions = ['Please confirm this capture is correct, or tell me what to add or change (time period, plan/product, audience, or any missing fact).'];
-      }
+    } catch (err) {
+      console.warn('Context intake opening turn failed:', err);
     }
+    const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
+    const factCount = (onboarding.key_facts || []).filter((f) => String(f || '').trim()).length;
+    if (!assistantMsg) {
+      assistantMsg = questions.length
+        ? `${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`
+        : 'I captured this file. A few things I still need from you:\n1. Which year or period should I attach this to?\n2. Which plan, product, or audience is this for?\n3. Anything I should add or correct in the captured facts?';
+    }
+    assistantMsg = `I've saved **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}${factCount ? `\n\nI captured **${factCount}** key fact${factCount === 1 ? '' : 's'} so far.` : ''}\n\n${assistantMsg}`;
     const captured = compactCapturedContext({
       what_it_represents: onboarding.what_it_represents,
       time_period: onboarding.time_period,
@@ -9304,11 +9337,7 @@ ${stepInstruction}`;
       key_metrics: onboarding.key_metrics,
       interpretation_notes: onboarding.interpretation_notes,
     });
-    const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
-    const factCount = captured?.key_facts?.length || 0;
-    const assistantMsg = questions.length
-      ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}\n\nI captured **${factCount}** key fact${factCount === 1 ? '' : 's'}. A few gaps still need you:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
-      : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}${factCount ? `\n\nCaptured **${factCount}** key fact${factCount === 1 ? '' : 's'} — review them under Incentive Comp context files.` : ''}`;
+    rememberContextImages(fileId, { included: images, unsure: [], skipped: job.skipped || [] });
     const rec = {
       id: fileId,
       name: file.name,
@@ -9319,12 +9348,12 @@ ${stepInstruction}`;
       extractedText,
       visionExtract: visionText,
       structuredExtract: structuredText,
-      imageCount: images.length,
+      imageCount: (images.length || 0) + ((job.skipped || []).length || 0),
       columns: onboarding.columns,
       capturedContext: captured,
       imageInventory: compactImageInventory(images, [], job.skipped || []),
       intakeMessages: [{ role: 'assistant', content: assistantMsg }],
-      intakeComplete: questions.length === 0 && !!captured,
+      intakeComplete: false,
       processing: false,
     };
     const nextCtx = upsertModuleContextFile(userSettingsRef.current.moduleContext, moduleId, rec);
@@ -9332,23 +9361,12 @@ ${stepInstruction}`;
     setActiveContextFileId(fileId);
     contextIngestJobRef.current = null;
     setContextIngestJob(null);
-    if (questions.length) {
-      const intake = { moduleId, fileId, fromChat };
-      pendingModuleContextIntakeRef.current = intake;
-      setPendingModuleContextIntake(intake);
-      if (fromChat) {
-        setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
-        setIsLoading(false);
-      }
-    } else {
-      pendingModuleContextIntakeRef.current = null;
-      setPendingModuleContextIntake(null);
-      if (fromChat) {
-        postChat(assistantMsg.replace(/^✅ /, '✅ Context saved. '));
-        setIsLoading(false);
-      } else {
-        job.onStatus?.('Stored — no extra questions needed.');
-      }
+    const intake = { moduleId, fileId, fromChat };
+    pendingModuleContextIntakeRef.current = intake;
+    setPendingModuleContextIntake(intake);
+    if (fromChat) {
+      setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
+      setIsLoading(false);
     }
   };
 
@@ -9356,19 +9374,7 @@ ${stepInstruction}`;
     const files = userSettingsRef.current.moduleContext?.[moduleId]?.files || [];
     const rec = files.find((f) => f.id === fileId);
     if (!rec) return;
-    if (rec.intakeComplete) {
-      setContextIntakeBusy(true);
-      try {
-        await appendContextFileNote(moduleId, fileId, userText);
-        if (fromChat) {
-          setMessages((prev) => [...prev, { role: 'system', content: '✅ Comment saved on this context file.' }]);
-        }
-      } finally {
-        setContextIntakeBusy(false);
-      }
-      return;
-    }
-    const nextMessages = [...(rec.intakeMessages || []), { role: 'user', content: userText }];
+    const nextMessages = [...(rec.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳')), { role: 'user', content: userText }];
     setContextIntakeBusy(true);
     if (fromChat) setIsLoading(true);
     const optimistic = patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, { intakeMessages: nextMessages });
@@ -9431,6 +9437,7 @@ ${stepInstruction}`;
     } finally {
       setContextIntakeBusy(false);
       setContextIntakeInput('');
+      setContextIntakeByFile((prev) => ({ ...prev, [fileId]: '' }));
       if (fromChat) setIsLoading(false);
     }
   };
@@ -9463,7 +9470,7 @@ ${stepInstruction}`;
       unsure = unsure.filter((i) => i.name !== nameOrAll);
     }
     const next = { ...prev, included, unsure, skipped };
-    setContextImagePreviews({ fileId: prev.fileId, previews: buildProposalImagePreviews(included, unsure, skipped) });
+    rememberContextImages(prev.fileId, { included, unsure, skipped });
     if (unsure.length) {
       contextIngestJobRef.current = next;
       setContextIngestJob(next);
@@ -9477,6 +9484,81 @@ ${stepInstruction}`;
       contextIngestJobRef.current = null;
       setContextIngestJob({ ...next, processing: false, error: err.message || 'Upload failed' });
     }
+  };
+
+  const mergeContextFactLines = (a, b) => {
+    const seen = new Set();
+    const out = [];
+    [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].forEach((item) => {
+      const t = String(item || '').replace(/\s+/g, ' ').trim();
+      if (!t) return;
+      const key = t.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(t);
+    });
+    return out;
+  };
+
+  const toggleContextImageUse = async (moduleId, fileId, imageName, use) => {
+    const rec = (userSettingsRef.current.moduleContext?.[moduleId]?.files || []).find((f) => f.id === fileId);
+    if (!rec || rec.processing) return;
+    const job = (contextIngestJob?.fileId === fileId) ? contextIngestJob : null;
+    if (job?.unsure?.length) {
+      await applyContextUnsureImageDecision(imageName, use);
+      return;
+    }
+    const store = contextImageAssetsRef.current[fileId] || { included: [], unsure: [], skipped: [] };
+    let included = [...(store.included || [])];
+    let skipped = [...(store.skipped || [])];
+    const match = (img) => String(img?.name || '') === String(imageName || '');
+    if (use) {
+      const fromSkip = skipped.find(match);
+      if (!fromSkip) return;
+      const blob = imageWithBlob(fromSkip);
+      if (!blob?.base64) {
+        setContextEditSaveStatus('error');
+        return;
+      }
+      skipped = skipped.filter((img) => !match(img));
+      included = [...included.filter((img) => !match(img)), { ...blob, included: true, reason: 'User included' }];
+      rememberContextImages(fileId, { included, unsure: [], skipped });
+      setContextImageBusy({ fileId, name: imageName });
+      try {
+        const extra = await interpretContextImages([blob], undefined, moduleId);
+        const visionExtract = [rec.visionExtract, extra].filter((t) => !isEmptyContextValue(t)).join('\n\n');
+        let captured = rec.capturedContext;
+        if (!isThinContextExtract(extra, rec.name)) {
+          try {
+            const extraFacts = await summarizeContextFile({ name: rec.name, extractBlob: extra, moduleId });
+            captured = compactCapturedContext({
+              ...(captured || {}),
+              key_facts: mergeContextFactLines(captured?.key_facts, extraFacts.key_facts),
+              key_metrics: mergeContextFactLines(captured?.key_metrics, extraFacts.key_metrics),
+              interpretation_notes: extraFacts.interpretation_notes || captured?.interpretation_notes,
+            });
+          } catch { /* keep vision extract even if fact merge fails */ }
+        }
+        await persistContextFiles(patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, {
+          visionExtract,
+          capturedContext: captured,
+          imageInventory: compactImageInventory(included, [], skipped),
+          imageCount: included.length + skipped.length,
+        }));
+      } finally {
+        setContextImageBusy(null);
+      }
+      return;
+    }
+    const fromInc = included.find(match);
+    if (!fromInc) return;
+    included = included.filter((img) => !match(img));
+    skipped = [...skipped.filter((img) => !match(img)), { ...fromInc, included: false, kind: 'skipped_by_user', reason: 'User skipped' }];
+    rememberContextImages(fileId, { included, unsure: [], skipped });
+    await persistContextFiles(patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, {
+      imageInventory: compactImageInventory(included, [], skipped),
+      imageCount: included.length + skipped.length,
+    }));
   };
 
   const handleModuleContextUpload = async (event, moduleId) => {
@@ -9567,7 +9649,7 @@ ${stepInstruction}`;
       };
       const previews = buildProposalImagePreviews(included, unsure, skipped);
       const inventory = compactImageInventory(included, unsure, skipped);
-      if (previews.length) setContextImagePreviews({ fileId, previews });
+      rememberContextImages(fileId, { included, unsure, skipped });
       const ignoredPurpose = skipped.filter((s) =>
         ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
       );
@@ -9631,7 +9713,19 @@ ${stepInstruction}`;
     const next = removeModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId);
     await persistContextFiles(next);
     if (activeContextFileId === fileId) setActiveContextFileId(null);
-    setContextImagePreviews((prev) => (prev?.fileId === fileId ? null : prev));
+    setContextImagePreviewsByFile((prev) => {
+      if (!prev?.[fileId]) return prev;
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
+    if (contextImageAssetsRef.current[fileId]) delete contextImageAssetsRef.current[fileId];
+    setContextFileDeleteConfirm((prev) => (prev?.fileId === fileId ? null : prev));
+  };
+
+  const requestRemoveModuleContextFile = (moduleId, file) => {
+    if (!file?.id) return;
+    setContextFileDeleteConfirm({ moduleId, fileId: file.id, name: file.name || 'this file' });
   };
 
   const persistContextBlock = async (moduleId, fileId, blockId, nextValue, remove = false) => {
@@ -9643,7 +9737,7 @@ ${stepInstruction}`;
         : isEmptyContextValue(nextValue)
     );
     const ctx = { ...(rec.capturedContext || {}) };
-    const patch = { intakeComplete: true };
+    const patch = {};
     if (blockId === 'summary') patch.summary = empty ? '' : nextValue;
     else if (blockId === 'extractedText') patch.extractedText = empty ? '' : nextValue;
     else if (blockId === 'structuredExtract') patch.structuredExtract = empty ? '' : nextValue;
@@ -9696,13 +9790,12 @@ ${stepInstruction}`;
 
   const renderModuleContextPanel = (moduleId) => {
     const files = userSettings.moduleContext?.[moduleId]?.files || [];
-    const active = files.find((f) => f.id === activeContextFileId) || files[files.length - 1] || null;
     const job = (contextIngestJob?.moduleId === moduleId) ? contextIngestJob : null;
     const imagePreviews = (job && !job.processing && (job.unsure?.length || job.included?.length || job.skipped?.length))
       ? buildProposalImagePreviews(job.included || [], job.unsure || [], job.skipped || [])
       : [];
     const pendingImageCount = imagePreviews.filter((img) => img.pending).length;
-    const openContextImageLightbox = (img) => {
+    const openContextImageLightbox = (img, fileId) => {
       if (!img?.src) return;
       setImageLightbox({
         src: img.src,
@@ -9713,6 +9806,9 @@ ${stepInstruction}`;
         pending: !!img.pending,
         sourceFormat: img.sourceFormat,
         contextReview: true,
+        fileId,
+        moduleId,
+        canToggle: !img.pending,
       });
     };
     return (
@@ -9769,30 +9865,37 @@ ${stepInstruction}`;
                 ].filter(Boolean)
                 : [];
               const fileJob = job?.fileId === f.id ? job : null;
-              const thumbs = (contextImagePreviews?.fileId === f.id)
-                ? (contextImagePreviews.previews || [])
-                : (fileJob && !fileJob.processing ? imagePreviews : []);
+              const thumbs = contextImagePreviewsByFile[f.id]
+                || (fileJob && !fileJob.processing ? imagePreviews : []);
               const pendingThumbs = thumbs.filter((img) => img.pending);
               const inventory = fileJob
                 ? compactImageInventory(fileJob.included || [], fileJob.unsure || [], fileJob.skipped || [])
                 : (Array.isArray(f.imageInventory) ? f.imageInventory.filter((row) => row.status !== 'pending') : []);
-              const includedN = inventory.filter((r) => r.status === 'included').length;
-              const skippedN = inventory.filter((r) => r.status === 'skipped').length;
+              const usedN = thumbs.length
+                ? thumbs.filter((img) => img.included && !img.pending).length
+                : inventory.filter((r) => r.status === 'included').length;
+              const unusedN = thumbs.length
+                ? thumbs.filter((img) => !img.included && !img.pending).length
+                : inventory.filter((r) => r.status === 'skipped').length;
+              const intakeThread = (f.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳'));
+              const fileIntakeText = contextIntakeByFile[f.id] ?? '';
+              const needsAttention = !!(f.processing || !f.intakeComplete);
               return (
                 <details
                   key={f.id}
-                  open={active?.id === f.id || f.processing || !f.intakeComplete}
-                  className="bg-slate-900/40 border border-blue-400/20 rounded-xl overflow-hidden"
+                  className="bg-slate-900/40 border border-blue-400/20 rounded-xl overflow-hidden group"
+                  {...(needsAttention ? { open: true } : {})}
                 >
-                  <summary className="cursor-pointer select-none px-4 py-3 flex items-start gap-3 hover:bg-slate-800/40">
-                    <ChevronRight className="w-3.5 h-3.5 text-cyan-300 shrink-0 mt-1" />
+                  <summary className="cursor-pointer select-none list-none px-4 py-3 flex items-start gap-3 hover:bg-slate-800/40 [&::-webkit-details-marker]:hidden">
+                    <ChevronRight className="w-3.5 h-3.5 text-cyan-300 shrink-0 mt-1 transition-transform group-open:rotate-90" />
                     <div className="min-w-0 flex-1 text-left">
                       <div className="text-sm font-semibold text-white truncate">{f.name}</div>
                       <div className="text-[11px] text-blue-300/55 mt-0.5">
-                        {f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}{f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : ''}
+                        {f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}
+                        {(usedN || unusedN) ? ` · ${usedN} used · ${unusedN} not used` : (f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : '')}
                         {factN ? ` · ${factN} fact${factN === 1 ? '' : 's'}` : ''}
+                        {!needsAttention ? ' · Expand to view or edit' : ''}
                       </div>
-                      {f.summary ? <div className="text-[11px] text-blue-200/75 mt-1 line-clamp-2">{f.summary}</div> : null}
                     </div>
                     <div className="flex flex-col items-end gap-1 flex-shrink-0" onClick={(e) => e.preventDefault()}>
                       {f.processing ? (
@@ -9806,7 +9909,7 @@ ${stepInstruction}`;
                       ) : (
                         <span className="px-2 py-0.5 bg-yellow-500/15 text-yellow-200 text-[10px] rounded border border-yellow-400/25">Intake</span>
                       )}
-                      <button type="button" onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleRemoveModuleContextFile(moduleId, f.id); }} className="p-1 hover:bg-red-500/20 rounded text-red-400" title="Remove file"><Trash2 className="w-3.5 h-3.5" /></button>
+                      <button type="button" onClick={(e) => { e.preventDefault(); e.stopPropagation(); requestRemoveModuleContextFile(moduleId, f); }} className="p-1 hover:bg-red-500/20 rounded text-red-400" title="Remove file"><Trash2 className="w-3.5 h-3.5" /></button>
                     </div>
                   </summary>
                   <div className="px-4 pb-4 space-y-3 border-t border-blue-400/10 pt-3">
@@ -9815,7 +9918,7 @@ ${stepInstruction}`;
                         <div className="text-[11px] font-semibold text-blue-200/80 mb-2">
                           {pendingThumbs.length
                             ? `${pendingThumbs.length} image${pendingThumbs.length === 1 ? '' : 's'} need a yes/no — include any that carry strategy or IC context, then they will be read.`
-                            : 'Images from this file — click to enlarge.'}
+                            : `${usedN} used · ${unusedN} not used — click to enlarge. Switch an ignored image to used to read it.`}
                         </div>
                         <div className="flex flex-wrap gap-2">
                           {thumbs.map((img, i) => (
@@ -9823,12 +9926,12 @@ ${stepInstruction}`;
                               key={`${img.name}-${i}`}
                               role={img.src ? 'button' : undefined}
                               tabIndex={img.src ? 0 : undefined}
-                              onClick={() => openContextImageLightbox(img)}
+                              onClick={() => openContextImageLightbox(img, f.id)}
                               onKeyDown={(e) => {
                                 if (!img.src) return;
                                 if (e.key === 'Enter' || e.key === ' ') {
                                   e.preventDefault();
-                                  openContextImageLightbox(img);
+                                  openContextImageLightbox(img, f.id);
                                 }
                               }}
                               className={`rounded-lg overflow-hidden border text-left ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''} ${
@@ -9852,8 +9955,8 @@ ${stepInstruction}`;
                                 </div>
                               )}
                               <figcaption className="px-1 py-1 text-[10px] leading-tight text-slate-300 max-w-[110px]">
-                                <div className="truncate">{img.pending ? '? ' : img.included ? '✓ ' : '✗ '}{img.name}</div>
-                                {img.pending && (
+                                <div className="truncate">{img.pending ? '? ' : img.included ? '✓ used ' : '✗ not used '}{img.name}</div>
+                                {img.pending ? (
                                   <div className="flex gap-1 mt-1">
                                     <button
                                       type="button"
@@ -9870,7 +9973,22 @@ ${stepInstruction}`;
                                       Skip
                                     </button>
                                   </div>
-                                )}
+                                ) : !f.processing && (img.src || img.base64) ? (
+                                  <button
+                                    type="button"
+                                    disabled={contextImageBusy?.fileId === f.id}
+                                    className={`w-full mt-1 px-1 py-0.5 rounded text-[10px] font-semibold disabled:opacity-40 ${
+                                      img.included
+                                        ? 'bg-slate-600/60 hover:bg-slate-500/70 text-slate-100'
+                                        : 'bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100'
+                                    }`}
+                                    onClick={(e) => { e.stopPropagation(); toggleContextImageUse(moduleId, f.id, img.name, !img.included); }}
+                                  >
+                                    {contextImageBusy?.fileId === f.id && contextImageBusy?.name === img.name
+                                      ? 'Reading…'
+                                      : img.included ? "Don't use" : 'Use'}
+                                  </button>
+                                ) : null}
                               </figcaption>
                             </figure>
                           ))}
@@ -9886,18 +10004,21 @@ ${stepInstruction}`;
                     {thumbs.length === 0 && inventory.length > 0 && (
                       <details className="bg-slate-950/40 border border-blue-400/10 rounded-xl overflow-hidden">
                         <summary className="cursor-pointer select-none px-4 py-2 text-[11px] font-semibold text-blue-300/70 hover:bg-slate-800/40">
-                          Images · {includedN} included · {skippedN} skipped
+                          Images · {usedN} used · {unusedN} not used
                         </summary>
                         <div className="px-4 pb-3 space-y-1">
                           {inventory.map((row, i) => (
                             <div key={`${row.name}-${i}`} className="text-[11px] text-blue-200/80 flex gap-2 min-w-0">
                               <span className={row.status === 'included' ? 'text-emerald-300 shrink-0' : 'text-slate-400 shrink-0'}>
-                                {row.status === 'included' ? '✓' : '✗'}
+                                {row.status === 'included' ? '✓ used' : '✗ not used'}
                               </span>
                               <span className="truncate">{row.name}</span>
                               <span className="text-blue-400/50 truncate">{row.purpose ? purposeLabel(row.purpose) : (row.reason || '')}</span>
                             </div>
                           ))}
+                          {unusedN > 0 && (
+                            <div className="text-[10px] text-blue-300/50 pt-1">To change an ignored image to used, do it in this session after upload (Use on the thumbnail), or re-upload the file.</div>
+                          )}
                         </div>
                       </details>
                     )}
@@ -9906,33 +10027,42 @@ ${stepInstruction}`;
                         {(f.intakeMessages[f.intakeMessages.length - 1] || {}).content}
                       </div>
                     )}
-                    {!f.processing && !f.intakeComplete && (
-                      <div className="space-y-2 bg-amber-500/10 border border-amber-400/25 rounded-xl p-3">
-                        <div className="text-[11px] font-semibold text-amber-200">Clarifying questions — answer here to store context</div>
-                        {(f.intakeMessages || []).length > 0 && (
-                          <div className="max-h-[220px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
-                            {(f.intakeMessages || []).map((m, i) => (
-                              <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                                  <span className="whitespace-pre-wrap break-words">{m.content}</span>
-                                </div>
-                              </div>
-                            ))}
+                    {!f.processing && (
+                      <div className="bg-slate-800/30 border border-blue-400/20 rounded-xl p-3 space-y-3">
+                        <div>
+                          <div className="text-xs font-bold text-white">Intake assistant</div>
+                          <div className="text-[11px] text-blue-300/60 mt-0.5">
+                            {f.intakeComplete
+                              ? 'Context captured. Reply here to add or update notes for this file.'
+                              : 'Answer the questions below so this file can be stored correctly.'}
                           </div>
-                        )}
+                        </div>
+                        <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-3 max-h-[280px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
+                          {intakeThread.length === 0 ? (
+                            <div className="text-[11px] text-blue-300/60">Waiting for questions…</div>
+                          ) : intakeThread.map((m, i) => (
+                            <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                              <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'block w-full bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                                {m.role === 'user'
+                                  ? <span className="whitespace-pre-wrap break-words">{m.content}</span>
+                                  : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
                         <div className="flex gap-2">
                           <textarea
-                            value={active?.id === f.id ? contextIntakeInput : ''}
-                            onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeInput(e.target.value); }}
+                            value={fileIntakeText}
+                            onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeByFile((prev) => ({ ...prev, [f.id]: e.target.value })); }}
                             onFocus={() => setActiveContextFileId(f.id)}
-                            placeholder="Answer the intake questions…"
+                            placeholder={f.intakeComplete ? 'Add a comment or update for this file…' : 'Answer the intake questions… (1= … 2= … if several are listed)'}
                             rows={2}
-                            className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
+                            className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
                           />
                           <button
                             type="button"
-                            disabled={!contextIntakeInput.trim() || contextIntakeBusy || active?.id !== f.id}
-                            onClick={() => continueModuleContextIntake(moduleId, f.id, contextIntakeInput.trim())}
+                            disabled={!fileIntakeText.trim() || contextIntakeBusy}
+                            onClick={() => continueModuleContextIntake(moduleId, f.id, fileIntakeText.trim())}
                             className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
                           >
                             <Send className="w-3.5 h-3.5" /> Send
@@ -9954,7 +10084,7 @@ ${stepInstruction}`;
                                 userSettingsRef.current.moduleContext,
                                 moduleId,
                                 f.id,
-                                { capturedContext: next || undefined, intakeComplete: true },
+                                { capturedContext: next || undefined },
                               ));
                               setContextEditSaveStatus('saved');
                               setTimeout(() => setContextEditSaveStatus('idle'), 2500);
@@ -9993,26 +10123,6 @@ ${stepInstruction}`;
                             onDelete={() => persistContextBlock(moduleId, f.id, `note:${n.id}`, '', true)}
                           />
                         ))}
-                      </div>
-                    )}
-                    {!f.processing && f.intakeComplete && (
-                      <div className="flex gap-2">
-                        <textarea
-                          value={active?.id === f.id ? contextIntakeInput : ''}
-                          onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeInput(e.target.value); }}
-                          onFocus={() => setActiveContextFileId(f.id)}
-                          placeholder="Add a comment for this file…"
-                          rows={2}
-                          className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
-                        />
-                        <button
-                          type="button"
-                          disabled={!contextIntakeInput.trim() || contextIntakeBusy || active?.id !== f.id}
-                          onClick={() => continueModuleContextIntake(moduleId, f.id, contextIntakeInput.trim())}
-                          className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
-                        >
-                          <Send className="w-3.5 h-3.5" /> Add
-                        </button>
                       </div>
                     )}
                     {sourceBlocks.length > 0 && (
@@ -10077,7 +10187,7 @@ ${stepInstruction}`;
 
     const next = { ...prev, included, unsure, skipped };
     if (prev.ingestKind === 'moduleContext') {
-      setContextImagePreviews({ fileId: prev.fileId, previews: buildProposalImagePreviews(included, unsure, skipped) });
+      rememberContextImages(prev.fileId, { included, unsure, skipped });
     }
     if (unsure.length) {
       pendingImageReviewRef.current = next;
@@ -15176,6 +15286,43 @@ ${stepInstruction}`;
         </div>
       )}
 
+      {contextFileDeleteConfirm && createPortal(
+        <div
+          className="fixed inset-0 z-[220] bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="context-file-delete-title"
+          onClick={() => setContextFileDeleteConfirm(null)}
+        >
+          <div
+            className="w-full max-w-md bg-slate-900 rounded-2xl shadow-2xl p-5 border border-red-400/30"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 id="context-file-delete-title" className="text-sm font-bold text-white">Delete this context file?</h3>
+            <p className="text-xs text-cyan-100 mt-3 leading-relaxed">
+              Remove <span className="font-semibold">{contextFileDeleteConfirm.name}</span> and its captured context? This cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                type="button"
+                onClick={() => setContextFileDeleteConfirm(null)}
+                className="px-3 py-1.5 rounded-lg text-sm font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRemoveModuleContextFile(contextFileDeleteConfirm.moduleId, contextFileDeleteConfirm.fileId)}
+                className="px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-red-500/85 hover:bg-red-500"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+
       {stellaJoinPending && createPortal(
         <div
           className="fixed inset-0 z-[220] bg-slate-950/70 backdrop-blur-sm flex items-center justify-center p-4"
@@ -15313,6 +15460,27 @@ ${stepInstruction}`;
                       }}
                     >
                       Skip
+                    </button>
+                  </div>
+                )}
+                {!imageLightbox.pending && imageLightbox.contextReview && imageLightbox.fileId && (
+                  <div className="flex gap-2 mt-2">
+                    <button
+                      type="button"
+                      disabled={!!contextImageBusy}
+                      className={`px-3 py-1 rounded-lg text-xs font-semibold disabled:opacity-40 ${
+                        imageLightbox.included
+                          ? 'bg-slate-600/60 hover:bg-slate-500/70 text-slate-100'
+                          : 'bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100'
+                      }`}
+                      onClick={() => {
+                        toggleContextImageUse(imageLightbox.moduleId, imageLightbox.fileId, imageLightbox.name, !imageLightbox.included);
+                        setImageLightbox((prev) => (prev ? { ...prev, included: !prev.included } : prev));
+                      }}
+                    >
+                      {contextImageBusy?.name === imageLightbox.name
+                        ? 'Reading…'
+                        : imageLightbox.included ? "Don't use this image" : 'Use this image'}
                     </button>
                   </div>
                 )}

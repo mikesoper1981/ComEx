@@ -216,8 +216,8 @@ function normalizeContextFile(raw) {
     String(raw.userNotes).split(/\n\n+/).forEach((part, i) => pushNote(`note_${i + 1}`, part));
   }
   if (notes.length) rec.notes = notes;
-  if (rec.intakeComplete !== false && !rec.intakeComplete && !rec.processing) {
-    if (rec.capturedContext || rec.notes?.length) rec.intakeComplete = true;
+  if (rec.intakeComplete == null && !rec.processing && (rec.capturedContext || rec.notes?.length) && !(rec.intakeMessages || []).length) {
+    rec.intakeComplete = true;
   }
   return rec;
 }

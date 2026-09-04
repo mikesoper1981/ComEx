@@ -368,6 +368,8 @@ export function mergeWorkflowRuntime(partial) {
     || !/Always put 1–3 clarifying questions/i.test(contextSummary)
     || !/key_facts/i.test(contextIntake)
     || !/until the file is clear enough to store/i.test(contextIntake)
+    || !/Never set complete=true/i.test(contextIntake)
+    || !/FIRST TURN/i.test(contextIntake)
     || !/Omit or leave empty any field with no real answer/i.test(contextIntake)) {
     out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
     out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;
