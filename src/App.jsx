@@ -304,6 +304,42 @@ function extractJsonObject(text) {
   return null;
 }
 
+function intakeChatLooksLikeJson(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (t.startsWith('{') || t.startsWith('[') || /^```(?:json)?/i.test(t)) return true;
+  if (/"complete"\s*:/.test(t) && (/"context_qa"\s*:/.test(t) || /"key_facts"\s*:/.test(t))) return true;
+  if (/"what_it_represents"\s*:/.test(t) && /"key_facts"\s*:/.test(t)) return true;
+  return false;
+}
+
+function stripJsonFromIntakeMessage(text) {
+  let t = String(text || '').trim();
+  t = t.replace(/```json[\s\S]*?```/gi, '').trim();
+  const appended = t.search(/\n\s*\{/);
+  if (appended !== -1 && /"complete"\s*:|"context_qa"\s*:|"key_facts"\s*:/.test(t.slice(appended))) {
+    t = t.slice(0, appended).trim();
+  }
+  return intakeChatLooksLikeJson(t) ? '' : t;
+}
+
+function pickIntakeContextQa(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const qa = parsed.context_qa;
+  if (qa && typeof qa === 'object' && !Array.isArray(qa)) return qa;
+  if (parsed.key_facts || parsed.what_it_represents || parsed.qa_pairs || parsed.key_metrics || parsed.time_period) {
+    const { complete: _c, message: _m, context_qa: _qa, ...rest } = parsed;
+    return rest;
+  }
+  return null;
+}
+
+function contextFileAddedConfirm(fileName, moduleLabel) {
+  const name = String(fileName || 'this file').trim() || 'this file';
+  const where = String(moduleLabel || 'module').trim() || 'module';
+  return `Thanks — **${name}** is now added to ${where} context.`;
+}
+
 function parseContextSummaryResponse(raw) {
   const parsed = extractJsonObject(raw);
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
@@ -8843,7 +8879,7 @@ ${stepInstruction}`;
     return { kind, fileType: label, extractedText, structuredText, included, unsure, skipped, imageNotes };
   };
 
-  const runContextIntakeTurn = async ({ extractBlob, moduleLabel: label, intakeMessages }) => {
+  const runContextIntakeTurn = async ({ extractBlob, moduleLabel: label, intakeMessages, fileName }) => {
     const rt = getWorkflowRuntime();
     const system = fillTemplate(rt.contextIntakePrompt, { moduleLabel: label });
     const convo = [
@@ -8858,24 +8894,23 @@ ${stepInstruction}`;
     } catch { /* fall through */ }
     const hasUserReply = (intakeMessages || []).some((m) => m.role === 'user');
     let complete = !!parsed.complete;
-    let message = parsed.message
-      || (complete ? 'Thanks — I have enough context to use this file.' : (String(raw).trim() || ''));
+    const context_qa = pickIntakeContextQa(parsed);
+    let message = stripJsonFromIntakeMessage(parsed.message);
     if (!hasUserReply) {
       complete = false;
       const looksLikeAsk = /[?？]|\n\s*1[\.)]\s/.test(String(message || ''));
       if (!looksLikeAsk || String(message || '').replace(/\s+/g, ' ').trim().length < 12) {
         message = 'I captured this file. A few things I still need from you:\n1. Which year or period should I attach this to?\n2. Which plan, product, or audience is this for?\n3. Anything I should add or correct in the captured facts?';
       }
-    }
-    if (!String(message || '').trim()) {
-      message = complete
-        ? 'Thanks — I have enough context to use this file.'
-        : 'Is anything in this file still unclear?';
+    } else if (complete) {
+      message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(fileName, label);
+    } else if (!message) {
+      message = 'Is anything in this file still unclear?';
     }
     return {
       complete,
       message,
-      context_qa: parsed.context_qa || null,
+      context_qa,
     };
   };
 
@@ -9313,9 +9348,10 @@ ${stepInstruction}`;
       const probe = await runContextIntakeTurn({
         extractBlob: extractBlob || `File name: ${file.name}`,
         moduleLabel: moduleLabelFor(moduleId),
+        fileName: file.name,
         intakeMessages: [],
       });
-      assistantMsg = String(probe.message || '').trim();
+      assistantMsg = stripJsonFromIntakeMessage(probe.message);
       if (questions.length && !/\n\s*1[\.)]\s/.test(assistantMsg)) {
         assistantMsg = `${assistantMsg ? `${assistantMsg}\n\n` : ''}${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`;
       }
@@ -9383,10 +9419,15 @@ ${stepInstruction}`;
       const result = await runContextIntakeTurn({
         extractBlob: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter((t) => !isEmptyContextValue(t)).join('\n\n'),
         moduleLabel: moduleLabelFor(moduleId),
+        fileName: rec.name,
         intakeMessages: nextMessages,
       });
-      const withAssistant = [...nextMessages, { role: 'assistant', content: result.message }];
-      const qa = result.complete && result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
+      const confirm = contextFileAddedConfirm(rec.name, moduleLabelFor(moduleId));
+      const assistantMsg = result.complete
+        ? confirm
+        : (stripJsonFromIntakeMessage(result.message) || 'Is anything in this file still unclear?');
+      const withAssistant = [...nextMessages, { role: 'assistant', content: assistantMsg }];
+      const qa = result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
       const prior = rec.capturedContext || {};
       const mergeLines = (a, b) => {
         const seen = new Set();
@@ -9401,12 +9442,12 @@ ${stepInstruction}`;
         });
         return out;
       };
-      const mergedCtx = qa
+      const mergedCtx = (qa || result.complete)
         ? compactCapturedContext({
           ...prior,
-          ...qa,
-          key_facts: mergeLines(prior.key_facts, qa.key_facts),
-          key_metrics: mergeLines(prior.key_metrics, qa.key_metrics),
+          ...(qa || {}),
+          key_facts: mergeLines(prior.key_facts, qa?.key_facts),
+          key_metrics: mergeLines(prior.key_metrics, qa?.key_metrics),
         })
         : rec.capturedContext;
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
@@ -9416,7 +9457,7 @@ ${stepInstruction}`;
       });
       await persistContextFiles(patched);
       if (fromChat) {
-        setMessages((prev) => [...prev, { role: 'assistant', content: result.message, kind: 'intake' }]);
+        setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
       }
       if (result.complete) {
         pendingModuleContextIntakeRef.current = null;
@@ -9877,14 +9918,23 @@ ${stepInstruction}`;
               const unusedN = thumbs.length
                 ? thumbs.filter((img) => !img.included && !img.pending).length
                 : inventory.filter((r) => r.status === 'skipped').length;
-              const intakeThread = (f.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳'));
+              const intakeThread = (f.intakeMessages || [])
+                .filter((m) => !String(m.content || '').startsWith('⏳'))
+                .map((m) => {
+                  if (m.role === 'user' || !intakeChatLooksLikeJson(m.content)) return m;
+                  return {
+                    ...m,
+                    content: f.intakeComplete
+                      ? contextFileAddedConfirm(f.name, moduleLabelFor(moduleId))
+                      : 'I have a few clarifying questions — please reply below.',
+                  };
+                });
               const fileIntakeText = contextIntakeByFile[f.id] ?? '';
               const needsAttention = !!(f.processing || !f.intakeComplete);
               return (
                 <details
                   key={f.id}
                   className="bg-slate-900/40 border border-blue-400/20 rounded-xl overflow-hidden group"
-                  {...(needsAttention ? { open: true } : {})}
                 >
                   <summary className="cursor-pointer select-none list-none px-4 py-3 flex items-start gap-3 hover:bg-slate-800/40 [&::-webkit-details-marker]:hidden">
                     <ChevronRight className="w-3.5 h-3.5 text-cyan-300 shrink-0 mt-1 transition-transform group-open:rotate-90" />
@@ -9894,7 +9944,9 @@ ${stepInstruction}`;
                         {f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}
                         {(usedN || unusedN) ? ` · ${usedN} used · ${unusedN} not used` : (f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : '')}
                         {factN ? ` · ${factN} fact${factN === 1 ? '' : 's'}` : ''}
-                        {!needsAttention ? ' · Expand to view or edit' : ''}
+                        {needsAttention
+                          ? (f.processing ? ' · Expand to view progress' : ' · Expand to answer intake')
+                          : ' · Expand to view or edit'}
                       </div>
                     </div>
                     <div className="flex flex-col items-end gap-1 flex-shrink-0" onClick={(e) => e.preventDefault()}>
@@ -9913,118 +9965,126 @@ ${stepInstruction}`;
                     </div>
                   </summary>
                   <div className="px-4 pb-4 space-y-3 border-t border-blue-400/10 pt-3">
-                    {thumbs.length > 0 && (
-                      <div className={`rounded-xl p-3 ${pendingThumbs.length ? 'bg-slate-900/40 border border-amber-400/25' : 'bg-slate-950/40 border border-blue-400/10'}`}>
-                        <div className="text-[11px] font-semibold text-blue-200/80 mb-2">
-                          {pendingThumbs.length
-                            ? `${pendingThumbs.length} image${pendingThumbs.length === 1 ? '' : 's'} need a yes/no — include any that carry strategy or IC context, then they will be read.`
-                            : `${usedN} used · ${unusedN} not used — click to enlarge. Switch an ignored image to used to read it.`}
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {thumbs.map((img, i) => (
-                            <figure
-                              key={`${img.name}-${i}`}
-                              role={img.src ? 'button' : undefined}
-                              tabIndex={img.src ? 0 : undefined}
-                              onClick={() => openContextImageLightbox(img, f.id)}
-                              onKeyDown={(e) => {
-                                if (!img.src) return;
-                                if (e.key === 'Enter' || e.key === ' ') {
-                                  e.preventDefault();
-                                  openContextImageLightbox(img, f.id);
-                                }
-                              }}
-                              className={`rounded-lg overflow-hidden border text-left ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''} ${
-                                img.pending
-                                  ? 'border-amber-400/70 bg-amber-950/40'
-                                  : img.included
-                                  ? 'border-emerald-400/40 bg-slate-900/40'
-                                  : 'border-slate-500/50 bg-slate-900/30'
-                              }`}
-                              title={img.src ? `Click to enlarge — ${img.pending ? (img.reason || 'Confirm') : img.included ? (img.reason || 'Included') : (img.reason || 'Skipped')}` : (img.reason || '')}
-                            >
-                              {img.src ? (
-                                <img
-                                  src={img.src}
-                                  alt={img.name}
-                                  className={`block h-16 w-auto max-w-[110px] object-contain bg-slate-950/50 ${img.included || img.pending ? '' : 'opacity-60 grayscale-[35%]'}`}
-                                />
-                              ) : (
-                                <div className="h-16 w-[100px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
-                                  {img.reason || img.name}
+                    {(thumbs.length > 0 || inventory.length > 0) && (
+                      <details className={`rounded-xl overflow-hidden group/img ${pendingThumbs.length ? 'bg-slate-900/40 border border-amber-400/25' : 'bg-slate-950/40 border border-blue-400/10'}`}>
+                        <summary className="cursor-pointer select-none list-none px-3 py-2 flex items-center gap-2 hover:bg-slate-800/40 [&::-webkit-details-marker]:hidden">
+                          <ChevronRight className="w-3.5 h-3.5 text-cyan-300 shrink-0 transition-transform group-open/img:rotate-90" />
+                          <span className="text-[11px] font-semibold text-blue-200/80">
+                            Images · {usedN} used · {unusedN} not used
+                            {pendingThumbs.length ? ` · ${pendingThumbs.length} need a yes/no` : ''}
+                          </span>
+                        </summary>
+                        <div className="px-3 pb-3 space-y-2">
+                          {thumbs.length > 0 ? (
+                            <>
+                              <div className="text-[11px] text-blue-300/60">
+                                {pendingThumbs.length
+                                  ? 'Include any that carry strategy or IC context, then they will be read. Click a thumbnail to enlarge.'
+                                  : 'Click to enlarge. Switch an ignored image to used to read it.'}
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {thumbs.map((img, i) => (
+                                  <figure
+                                    key={`${img.name}-${i}`}
+                                    role={img.src ? 'button' : undefined}
+                                    tabIndex={img.src ? 0 : undefined}
+                                    onClick={() => openContextImageLightbox(img, f.id)}
+                                    onKeyDown={(e) => {
+                                      if (!img.src) return;
+                                      if (e.key === 'Enter' || e.key === ' ') {
+                                        e.preventDefault();
+                                        openContextImageLightbox(img, f.id);
+                                      }
+                                    }}
+                                    className={`rounded-lg overflow-hidden border text-left ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''} ${
+                                      img.pending
+                                        ? 'border-amber-400/70 bg-amber-950/40'
+                                        : img.included
+                                        ? 'border-emerald-400/40 bg-slate-900/40'
+                                        : 'border-slate-500/50 bg-slate-900/30'
+                                    }`}
+                                    title={img.src ? `Click to enlarge — ${img.pending ? (img.reason || 'Confirm') : img.included ? (img.reason || 'Included') : (img.reason || 'Skipped')}` : (img.reason || '')}
+                                  >
+                                    {img.src ? (
+                                      <img
+                                        src={img.src}
+                                        alt={img.name}
+                                        className={`block h-16 w-auto max-w-[110px] object-contain bg-slate-950/50 ${img.included || img.pending ? '' : 'opacity-60 grayscale-[35%]'}`}
+                                      />
+                                    ) : (
+                                      <div className="h-16 w-[100px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
+                                        {img.reason || img.name}
+                                      </div>
+                                    )}
+                                    <figcaption className="px-1 py-1 text-[10px] leading-tight text-slate-300 max-w-[110px]">
+                                      <div className="truncate">{img.pending ? '? ' : img.included ? '✓ used ' : '✗ not used '}{img.name}</div>
+                                      {img.pending ? (
+                                        <div className="flex gap-1 mt-1">
+                                          <button
+                                            type="button"
+                                            className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100 text-[10px] font-semibold"
+                                            onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, true); }}
+                                          >
+                                            Include
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 hover:bg-slate-500/70 text-slate-100 text-[10px] font-semibold"
+                                            onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, false); }}
+                                          >
+                                            Skip
+                                          </button>
+                                        </div>
+                                      ) : !f.processing && (img.src || img.base64) ? (
+                                        <button
+                                          type="button"
+                                          disabled={contextImageBusy?.fileId === f.id}
+                                          className={`w-full mt-1 px-1 py-0.5 rounded text-[10px] font-semibold disabled:opacity-40 ${
+                                            img.included
+                                              ? 'bg-slate-600/60 hover:bg-slate-500/70 text-slate-100'
+                                              : 'bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100'
+                                          }`}
+                                          onClick={(e) => { e.stopPropagation(); toggleContextImageUse(moduleId, f.id, img.name, !img.included); }}
+                                        >
+                                          {contextImageBusy?.fileId === f.id && contextImageBusy?.name === img.name
+                                            ? 'Reading…'
+                                            : img.included ? "Don't use" : 'Use'}
+                                        </button>
+                                      ) : null}
+                                    </figcaption>
+                                  </figure>
+                                ))}
+                              </div>
+                              {pendingThumbs.length > 0 && (
+                                <div className="flex flex-wrap gap-2">
+                                  <button type="button" onClick={() => applyContextUnsureImageDecision('*', true)} className="px-3 py-1.5 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold">Include all unsure</button>
+                                  <button type="button" onClick={() => applyContextUnsureImageDecision('*', false)} className="px-3 py-1.5 bg-slate-600/50 hover:bg-slate-500/60 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold">Skip all unsure</button>
                                 </div>
                               )}
-                              <figcaption className="px-1 py-1 text-[10px] leading-tight text-slate-300 max-w-[110px]">
-                                <div className="truncate">{img.pending ? '? ' : img.included ? '✓ used ' : '✗ not used '}{img.name}</div>
-                                {img.pending ? (
-                                  <div className="flex gap-1 mt-1">
-                                    <button
-                                      type="button"
-                                      className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100 text-[10px] font-semibold"
-                                      onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, true); }}
-                                    >
-                                      Include
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 hover:bg-slate-500/70 text-slate-100 text-[10px] font-semibold"
-                                      onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, false); }}
-                                    >
-                                      Skip
-                                    </button>
-                                  </div>
-                                ) : !f.processing && (img.src || img.base64) ? (
-                                  <button
-                                    type="button"
-                                    disabled={contextImageBusy?.fileId === f.id}
-                                    className={`w-full mt-1 px-1 py-0.5 rounded text-[10px] font-semibold disabled:opacity-40 ${
-                                      img.included
-                                        ? 'bg-slate-600/60 hover:bg-slate-500/70 text-slate-100'
-                                        : 'bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100'
-                                    }`}
-                                    onClick={(e) => { e.stopPropagation(); toggleContextImageUse(moduleId, f.id, img.name, !img.included); }}
-                                  >
-                                    {contextImageBusy?.fileId === f.id && contextImageBusy?.name === img.name
-                                      ? 'Reading…'
-                                      : img.included ? "Don't use" : 'Use'}
-                                  </button>
-                                ) : null}
-                              </figcaption>
-                            </figure>
-                          ))}
-                        </div>
-                        {pendingThumbs.length > 0 && (
-                          <div className="flex flex-wrap gap-2 mt-3">
-                            <button type="button" onClick={() => applyContextUnsureImageDecision('*', true)} className="px-3 py-1.5 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold">Include all unsure</button>
-                            <button type="button" onClick={() => applyContextUnsureImageDecision('*', false)} className="px-3 py-1.5 bg-slate-600/50 hover:bg-slate-500/60 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold">Skip all unsure</button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                    {thumbs.length === 0 && inventory.length > 0 && (
-                      <details className="bg-slate-950/40 border border-blue-400/10 rounded-xl overflow-hidden">
-                        <summary className="cursor-pointer select-none px-4 py-2 text-[11px] font-semibold text-blue-300/70 hover:bg-slate-800/40">
-                          Images · {usedN} used · {unusedN} not used
-                        </summary>
-                        <div className="px-4 pb-3 space-y-1">
-                          {inventory.map((row, i) => (
-                            <div key={`${row.name}-${i}`} className="text-[11px] text-blue-200/80 flex gap-2 min-w-0">
-                              <span className={row.status === 'included' ? 'text-emerald-300 shrink-0' : 'text-slate-400 shrink-0'}>
-                                {row.status === 'included' ? '✓ used' : '✗ not used'}
-                              </span>
-                              <span className="truncate">{row.name}</span>
-                              <span className="text-blue-400/50 truncate">{row.purpose ? purposeLabel(row.purpose) : (row.reason || '')}</span>
-                            </div>
-                          ))}
-                          {unusedN > 0 && (
-                            <div className="text-[10px] text-blue-300/50 pt-1">To change an ignored image to used, do it in this session after upload (Use on the thumbnail), or re-upload the file.</div>
+                            </>
+                          ) : (
+                            <>
+                              {inventory.map((row, i) => (
+                                <div key={`${row.name}-${i}`} className="text-[11px] text-blue-200/80 flex gap-2 min-w-0">
+                                  <span className={row.status === 'included' ? 'text-emerald-300 shrink-0' : 'text-slate-400 shrink-0'}>
+                                    {row.status === 'included' ? '✓ used' : '✗ not used'}
+                                  </span>
+                                  <span className="truncate">{row.name}</span>
+                                  <span className="text-blue-400/50 truncate">{row.purpose ? purposeLabel(row.purpose) : (row.reason || '')}</span>
+                                </div>
+                              ))}
+                              {unusedN > 0 && (
+                                <div className="text-[10px] text-blue-300/50 pt-1">To change an ignored image to used, do it in this session after upload (Use on the thumbnail), or re-upload the file.</div>
+                              )}
+                            </>
                           )}
                         </div>
                       </details>
                     )}
                     {f.processing && (f.intakeMessages || []).length > 0 && (
                       <div className="text-[11px] text-amber-200/90 bg-amber-500/10 border border-amber-400/20 rounded-lg px-3 py-2">
-                        {(f.intakeMessages[f.intakeMessages.length - 1] || {}).content}
+                        {stripJsonFromIntakeMessage((f.intakeMessages[f.intakeMessages.length - 1] || {}).content)
+                          || 'Processing this file…'}
                       </div>
                     )}
                     {!f.processing && (

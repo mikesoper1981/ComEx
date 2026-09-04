@@ -370,6 +370,8 @@ export function mergeWorkflowRuntime(partial) {
     || !/until the file is clear enough to store/i.test(contextIntake)
     || !/Never set complete=true/i.test(contextIntake)
     || !/FIRST TURN/i.test(contextIntake)
+    || !/Never put JSON/i.test(contextIntake)
+    || !/one-line confirmation that the file is now added/i.test(contextIntake)
     || !/Omit or leave empty any field with no real answer/i.test(contextIntake)) {
     out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
     out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;

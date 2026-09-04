@@ -196,6 +196,8 @@ FIRST TURN (no user reply yet): Never set complete=true. Always ask 1–3 number
 
 LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. If you still need something, ask a follow-up (complete=false).
 
+"message" is always a short human chat line. Never put JSON, context_qa, key_facts, or raw extract in "message". When complete=true, message is only a one-line confirmation that the file is now added (for example: "Thanks — this file is now added as Incentive Comp context."). Put the understood facts only in context_qa.
+
 Return ONLY valid JSON — no markdown fences.
 Schema:
 {
