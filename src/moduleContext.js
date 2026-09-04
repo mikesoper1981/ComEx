@@ -156,11 +156,128 @@ export function contextualizeIntakeFact(question, answer) {
   return finishFactStatement(`${a} — ${topic}`);
 }
 
-export function intakePairFact(p) {
+const INTAKE_TOPIC_STOP = new Set([
+  'the', 'and', 'for', 'from', 'this', 'that', 'what', 'which', 'does', 'did', 'with', 'into', 'about',
+  'whether', 'your', 'their', 'than', 'then', 'are', 'was', 'were', 'have', 'has', 'had', 'not', 'but',
+  'or', 'nor', 'any', 'can', 'how', 'why', 'when', 'who', 'its', 'it', 'a', 'an', 'of', 'to', 'in', 'on',
+  'as', 'be', 'is', 'if', 'do', 'so', 'we', 'you', 'they', 'should', 'would', 'could', 'please', 'still',
+  'unclear', 'correct', 'right', 'true', 'false',
+]);
+
+const INTAKE_INTERPRET_WORDS = new Set([
+  'target', 'targets', 'performance', 'actual', 'actuals', 'goal', 'goals', 'forecast', 'budget',
+  'going', 'forwards', 'forward', 'onwards',
+]);
+
+export function contextFileExtractBlob(f) {
+  if (!f || typeof f !== 'object') return '';
+  return [f.extractedText, f.structuredExtract, f.visionExtract]
+    .map((t) => String(t || '').trim())
+    .filter((t) => t && !isEmptyContextValue(t))
+    .join('\n\n');
+}
+
+function hasConcreteFileValues(text) {
+  const t = String(text || '');
+  if (/\d/.test(t)) return true;
+  if (/%|£|\$|€/.test(t)) return true;
+  return false;
+}
+
+function intakeTopicTokens(...parts) {
+  const seen = new Set();
+  const out = [];
+  for (const part of parts) {
+    const words = String(part || '').toLowerCase().match(/[a-z][a-z0-9%]{2,}/g) || [];
+    for (const w of words) {
+      if (INTAKE_TOPIC_STOP.has(w) || INTAKE_INTERPRET_WORDS.has(w) || seen.has(w)) continue;
+      seen.add(w);
+      out.push(w);
+    }
+  }
+  return out;
+}
+
+function splitExtractChunks(extract) {
+  const t = String(extract || '').replace(/\r\n/g, '\n');
+  return t.split(/\n+/)
+    .flatMap((line) => line.split(/(?<=[.!?])\s+/))
+    .map((s) => s.replace(/\s+/g, ' ').trim())
+    .filter((s) => s.length >= 2 && s.length <= 420);
+}
+
+function expandTopicWindow(chunks, start) {
+  const parts = [chunks[start]];
+  for (let j = start + 1; j < chunks.length && j <= start + 8; j++) {
+    const next = chunks[j];
+    if (hasConcreteFileValues(next) || /^[-•*]/.test(next) || /^\d/.test(next)) {
+      parts.push(next);
+      continue;
+    }
+    break;
+  }
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function scoreExtractChunk(chunk, tokens) {
+  if (!tokens.length) return 0;
+  const low = chunk.toLowerCase();
+  let hits = 0;
+  for (const tok of tokens) {
+    if (low.includes(tok)) hits += 1;
+  }
+  if (!hits) return 0;
+  let score = hits * 3;
+  if (hasConcreteFileValues(chunk)) score += 5;
+  if (/\d+\s*%/.test(chunk)) score += 3;
+  const valueHits = (chunk.match(/\d+(?:\.\d+)?\s*%/g) || []).length;
+  if (valueHits > 1) score += Math.min(6, valueHits * 2);
+  return score;
+}
+
+export function extractSnippetForQuestion(extract, question, { fact = '', maxChars = 280 } = {}) {
+  const tokens = intakeTopicTokens(question, fact);
+  if (!tokens.length) return '';
+  const chunks = splitExtractChunks(extract);
+  let best = { score: 0, text: '' };
+  const consider = (text) => {
+    const score = scoreExtractChunk(text, tokens);
+    if (score > best.score) best = { score, text };
+  };
+  chunks.forEach((c, i) => {
+    consider(c);
+    consider(expandTopicWindow(chunks, i));
+  });
+  if (best.score < 6) return '';
+  let text = best.text.replace(/\s+/g, ' ').trim();
+  if (text.length > maxChars) text = `${text.slice(0, maxChars - 1)}…`;
+  return text;
+}
+
+/** Interpretation-only facts (e.g. "it is a target") must still carry the file's figures. */
+export function enrichIntakeFact(fact, question, answer, { extract = '', keyFacts = [] } = {}) {
+  let out = String(fact || '').replace(/\s+/g, ' ').trim();
+  if (!out) out = contextualizeIntakeFact(question, answer);
+  if (!out) return '';
+  if (hasConcreteFileValues(out)) return finishFactStatement(out);
+  const tokens = intakeTopicTokens(question, out);
+  const related = (Array.isArray(keyFacts) ? keyFacts : [])
+    .map((line) => String(line || '').replace(/\s+/g, ' ').trim())
+    .filter((line) => line && hasConcreteFileValues(line) && scoreExtractChunk(line, tokens) >= 6)
+    .sort((a, b) => scoreExtractChunk(b, tokens) - scoreExtractChunk(a, tokens))[0] || '';
+  const snippet = related || extractSnippetForQuestion(extract, question, { fact: out });
+  if (!snippet) return finishFactStatement(out);
+  const needle = snippet.slice(0, 48).toLowerCase();
+  if (needle && out.toLowerCase().includes(needle)) return finishFactStatement(out);
+  return finishFactStatement(`${out.replace(/[.]+$/, '')}: ${snippet}`.slice(0, 420));
+}
+
+export function intakePairFact(p, extra = {}) {
   if (!p || typeof p !== 'object') return '';
   const stored = String(p.fact || '').replace(/\s+/g, ' ').trim();
-  if (stored && !isBareAffirmation(stored)) return stored;
-  return contextualizeIntakeFact(p.question, p.answer);
+  const base = stored && !isBareAffirmation(stored) ? stored : contextualizeIntakeFact(p.question, p.answer);
+  if (!extra.extract && !(extra.keyFacts && extra.keyFacts.length)) return base;
+  return enrichIntakeFact(base, p.question, p.answer, extra);
 }
 
 export function compactCapturedContext(ctx) {
@@ -271,6 +388,7 @@ function expandQaPairs(list) {
       out.push({
         ...(question ? { question } : {}),
         ...(answer ? { answer } : {}),
+        ...(n === 1 && p.fact ? { fact: p.fact } : {}),
       });
     }
   }
@@ -319,10 +437,12 @@ function harvestQaPairs(intakeMessages) {
 }
 
 /** Merge model context_qa with assistant→user pairs from the intake thread. */
-export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
+export function harvestModuleCapturedContext(prior, modelQa, intakeMessages, { extract = '' } = {}) {
   const fromModel = modelQa && typeof modelQa === 'object' && !Array.isArray(modelQa) ? modelQa : {};
   const fromPrior = prior && typeof prior === 'object' ? prior : {};
   const harvestedQa = harvestQaPairs(intakeMessages);
+  const keyFactsSeed = mergeContextLines(fromPrior.key_facts, fromModel.key_facts);
+  const qaExtra = { extract, keyFacts: keyFactsSeed };
   const qa_pairs = [];
   const seen = new Set();
   for (const p of expandQaPairs([...(fromPrior.qa_pairs || []), ...(fromModel.qa_pairs || []), ...harvestedQa])) {
@@ -333,7 +453,7 @@ export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
     const key = `${question.toLowerCase()}|${answer.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const fact = intakePairFact({ question, answer, fact: p.fact });
+    const fact = intakePairFact({ question, answer, fact: p.fact }, qaExtra);
     qa_pairs.push({
       ...(question ? { question } : {}),
       ...(answer ? { answer } : {}),
@@ -348,7 +468,7 @@ export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
     interpretation_notes: fromModel.interpretation_notes || fromPrior.interpretation_notes,
     key_facts: mergeContextLines(fromPrior.key_facts, fromModel.key_facts, qa_pairs.map((p) => intakePairFact(p)).filter((a) => {
       const t = String(a || '').trim();
-      if (t.length < 12 || t.length > 280) return false;
+      if (t.length < 12 || t.length > 420) return false;
       if (isBareAffirmation(t)) return false;
       return true;
     })),
@@ -415,7 +535,9 @@ function normalizeContextFile(raw) {
   if (raw.intakeComplete === false) rec.intakeComplete = false;
   else if (raw.intakeComplete) rec.intakeComplete = true;
   if (raw.processing) rec.processing = true;
-  const captured = harvestModuleCapturedContext(raw.capturedContext, null, intakeMessages)
+  const captured = harvestModuleCapturedContext(raw.capturedContext, null, intakeMessages, {
+    extract: [extractedText, structuredExtract, visionExtract].filter(Boolean).join('\n\n'),
+  })
     || compactCapturedContext(raw.capturedContext);
   if (captured) rec.capturedContext = captured;
   const hasUserIntake = intakeMessages.some((m) => m.role === 'user');
@@ -591,7 +713,9 @@ export function removeModuleContextFile(moduleContext, moduleId, fileId) {
 
 export function listModuleContextBlocks(f) {
   if (!f) return [];
-  const ctx = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages) || f.capturedContext || {};
+  const ctx = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages, {
+    extract: contextFileExtractBlob(f),
+  }) || f.capturedContext || {};
   const blocks = [];
   if (!isEmptyContextValue(ctx.what_it_represents)) blocks.push({ id: 'represents', label: 'What it represents', value: ctx.what_it_represents, line: true });
   if (!isEmptyContextValue(ctx.time_period)) blocks.push({ id: 'period', label: 'Time period', value: ctx.time_period, line: true });

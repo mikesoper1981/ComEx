@@ -19,6 +19,7 @@ import {
   harvestModuleCapturedContext,
   intakePairFact,
   listModuleContextBlocks,
+  contextFileExtractBlob,
   MODULE_CONTEXT_LABELS,
 } from './moduleContext';
 
@@ -157,7 +158,9 @@ function previewLines(text, limit = 5) {
 }
 
 function contextFileSummary(file) {
-  const ctx = harvestModuleCapturedContext(file?.capturedContext, null, file?.intakeMessages)
+  const ctx = harvestModuleCapturedContext(file?.capturedContext, null, file?.intakeMessages, {
+    extract: contextFileExtractBlob(file),
+  })
     || (file?.capturedContext && typeof file.capturedContext === 'object' ? file.capturedContext : {});
   const blocks = listModuleContextBlocks(file) || [];
   const highlights = [

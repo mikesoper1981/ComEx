@@ -131,6 +131,7 @@ import {
   compactCapturedContext,
   harvestModuleCapturedContext,
   intakePairFact,
+  contextFileExtractBlob,
 } from './moduleContext';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -7996,7 +7997,9 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
               ) : (
                 <div className="space-y-1.5">
                   {(userSettings.moduleContext?.incentives?.files || []).map((f) => {
-                    const capturedView = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages)
+                    const capturedView = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages, {
+                      extract: contextFileExtractBlob(f),
+                    })
                       || f.capturedContext;
                     const n = Array.isArray(capturedView?.key_facts) ? capturedView.key_facts.length : 0;
                     const captured = isModuleContextCaptured(f);
@@ -9537,7 +9540,9 @@ ${stepInstruction}`;
         : (stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(result.message)) || 'Is anything in this file still unclear?');
       const withAssistant = [...nextMessages, { role: 'assistant', content: assistantMsg }];
       const qa = result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
-      const mergedCtx = harvestModuleCapturedContext(rec.capturedContext, qa, withAssistant)
+      const mergedCtx = harvestModuleCapturedContext(rec.capturedContext, qa, withAssistant, {
+        extract: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter((t) => !isEmptyContextValue(t)).join('\n\n'),
+      })
         || rec.capturedContext;
       const storedFacts = (mergedCtx?.qa_pairs || []).map((p) => intakePairFact(p)).filter(Boolean);
       const intakeSteps = [
@@ -10002,7 +10007,9 @@ ${stepInstruction}`;
             {contextEditSaveStatus === 'saved' && <div className="text-[11px] text-green-400 font-semibold">Saved</div>}
             {contextEditSaveStatus === 'error' && <div className="text-[11px] text-red-400 font-semibold">Save failed</div>}
             {files.map((f) => {
-              const capturedView = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages)
+              const capturedView = harvestModuleCapturedContext(f.capturedContext, null, f.intakeMessages, {
+                extract: contextFileExtractBlob(f),
+              })
                 || f.capturedContext;
               const factN = Array.isArray(capturedView?.key_facts) ? capturedView.key_facts.length : 0;
               const qaN = Array.isArray(capturedView?.qa_pairs) ? capturedView.qa_pairs.length : 0;
@@ -10933,8 +10940,10 @@ ${stepInstruction}`;
     if (nextCtx && typeof nextCtx === 'object') {
       delete nextCtx.schema_changed;
       if (Array.isArray(nextCtx.qa_pairs)) {
+        const extract = [fileRec.extractedText, fileRec.structuredExtract, fileRec.summary].filter(Boolean).join('\n\n');
+        const keyFacts = Array.isArray(nextCtx.key_metrics) ? nextCtx.key_metrics : [];
         nextCtx.qa_pairs = nextCtx.qa_pairs.map((p) => {
-          const fact = intakePairFact(p);
+          const fact = intakePairFact(p, { extract, keyFacts });
           return fact ? { ...p, fact } : p;
         });
       }
@@ -10954,8 +10963,10 @@ ${stepInstruction}`;
     if (ctx) {
       delete ctx.schema_changed;
       if (Array.isArray(ctx.qa_pairs)) {
+        const extract = [fileRec.extractedText, fileRec.structuredExtract, fileRec.summary].filter(Boolean).join('\n\n');
+        const keyFacts = Array.isArray(ctx.key_metrics) ? ctx.key_metrics : [];
         ctx.qa_pairs = ctx.qa_pairs.map((p) => {
-          const fact = intakePairFact(p);
+          const fact = intakePairFact(p, { extract, keyFacts });
           return fact ? { ...p, fact } : p;
         });
       }

@@ -176,7 +176,7 @@ Schema:
   "summary": "one factual sentence of what THIS file is",
   "what_it_represents": "what the file is for (one sentence, or empty)",
   "time_period": "coverage dates / FY / months if stated, else empty",
-  "key_facts": ["one short factual bullet — names, numbers, products, territories, dates as stated in the file"],
+  "key_facts": ["one self-contained factual bullet — include names, numbers, mix shares, and dates as stated in the file"],
   "key_metrics": ["field or metric = meaning, with units if known"],
   "columns": [{ "name": "exact column name", "description": "what this column represents" }],
   "interpretation_notes": "how to use this file (definitions, caveats). Empty if nothing extra.",
@@ -185,7 +185,7 @@ Schema:
 
 Rules:
 - Pull facts that are IN the file. Do not write a slide-by-slide narrative or a marketing summary.
-- Each key_facts item is one discrete fact (≤25 words). Prefer 4–20 facts. Skip logos, decoration, and empty slides.
+- Each key_facts item is one discrete, self-contained fact. Include the actual names, numbers, weights, and mix shares as stated (e.g. "Going-forward channel mix is Specialty 45%, Retail 35%, Hospital 20%" — not "a channel mix is shown"). A breakdown may be longer than 25 words. Prefer 4–20 facts. Skip logos, decoration, and empty slides.
 - Never invent numbers or names. If unreadable, omit rather than guess.
 - Ask a clarifying question only when something IN THIS FILE is still unclear after reading the extract — for example an unreadable figure, an unnamed product on a slide, or an ambiguous year. These are examples of gaps, not a checklist.
 - Never ask IC design questions (salary/variable mix, scheme design, quotas, payouts, eligibility rules, how to design a plan) — even if this file is stored under Incentive Compensation.
@@ -200,7 +200,7 @@ Never ask IC design questions — salary/variable mix, incentive schemes, quotas
 
 FIRST TURN (no user reply yet): If the file still has a gap, ask 1–3 numbered questions about that gap and set complete=false. If the file is already clear, ask one confirm that this capture of the file is correct, or set complete=true. Never ask a year/plan/audience checklist unless those are actually missing from the file. Set context_qa to null until the user has answered.
 
-LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. qa_pairs MUST list every question you asked, the user's answer, and a "fact" field: one standalone sentence that is useful without the question. Never store a bare yes/no as the remembered content. Example: if the user answers "Yes" to "the chart is Jan–Dec 2025 by month, is that correct?", fact is "The chart shows Jan–Dec 2025 calls aggregated by month, not by territory." If you still need a file-specific gap filled, ask one follow-up (complete=false).
+LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. A later specialist will NOT see the slide, only these facts. qa_pairs MUST list every question you asked, the user's answer, and a "fact" field: one standalone sentence that is useful without the question AND still includes the file's actual figures, names, or mix. Never store a bare yes/no or an interpretation with the numbers stripped. Examples: if the user answers "Yes" to "the chart is Jan–Dec 2025 by month, is that correct?", fact is "The chart shows Jan–Dec 2025 calls aggregated by month, not by territory." If they say the channel mix is a target, fact is "The going-forward channel mix target is Specialty 45%, Retail 35%, Hospital 20%" (use the real values from FILE CONTENTS — do not invent). If you still need a file-specific gap filled, ask one follow-up (complete=false).
 
 "message" is always a short human chat line. Never put JSON, context_qa, key_facts, or raw extract in "message". When complete=true, message is only a one-line confirmation that the file is now added (for example: "Thanks — this file is now added as Incentive Comp context."). Put the understood facts only in context_qa.
 
@@ -277,7 +277,7 @@ Schema:
     "relationships": [{"related_file": "other file name", "related_table": "its table name if known", "this_field": "column in THIS dataset", "related_field": "column in the other dataset", "note": "plain-English description the user confirmed"}]
   }
 }
-When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked, the user's answer, and a self-contained "fact" (never a bare yes/no), "name_maps" MUST list confirmed aliases (empty array if none), and "relationships" MUST list every join key that matches (empty array only if they declined or none apply). Use exact SQL column names for this_field / related_field. Put column-content facts in key_metrics as short "column = what it contains" lines, not KPIs.{{relationshipGuidance}}`,
+When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked, the user's answer, and a self-contained "fact" (never a bare yes/no, and never an interpretation that drops the file's actual values), "name_maps" MUST list confirmed aliases (empty array if none), and "relationships" MUST list every join key that matches (empty array only if they declined or none apply). Use exact SQL column names for this_field / related_field. Put column-content facts in key_metrics as short "column = what it contains" lines, not KPIs.{{relationshipGuidance}}`,
 
   analyst: `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and document reading (for PDFs/text), verify your findings, and explain them clearly.
 

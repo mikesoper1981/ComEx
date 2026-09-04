@@ -377,6 +377,9 @@ export function mergeWorkflowRuntime(partial) {
     || !/Never put JSON/i.test(contextIntake)
     || !/one-line confirmation that the file is now added/i.test(contextIntake)
     || !/standalone sentence/i.test(contextIntake)
+    || !/will NOT see the slide/i.test(contextIntake)
+    || !/going-forward channel mix/i.test(contextIntake)
+    || !/actual names, numbers, weights/i.test(contextSummary)
     || !/Omit or leave empty any field with no real answer/i.test(contextIntake)) {
     out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
     out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;
@@ -414,7 +417,8 @@ export function mergeStellaPrompts(partial) {
         || !/Never join measures/i.test(out.intake)
         || !/Typical gaps \(guidance only/i.test(out.intake)
         || !/self-contained "fact"/i.test(out.intake)
-        || !/Never put JSON/i.test(out.intake))) {
+        || !/Never put JSON/i.test(out.intake)
+        || !/drops the file's actual values/i.test(out.intake))) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
   }
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)
