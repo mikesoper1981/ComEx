@@ -22,6 +22,12 @@ const { companyPgSchema, resolveUserCompany, ensureCompanyPgSchema, isCompanyPgS
 const { withPg, quoteIdent } = require('./stella-db');
 
 const TABLE_NAME_RE = /^stella_data_[a-z0-9_]+$/;
+const SELECT_RESULT_CAP = 500;
+
+function capSelectSql(sql) {
+  const cleaned = String(sql || '').trim().replace(/;+\s*$/, '');
+  return `SELECT * FROM (${cleaned}) AS _stella_cap LIMIT ${SELECT_RESULT_CAP}`;
+}
 
 function isSelectOnly(sql) {
   if (typeof sql !== 'string') return false;
@@ -127,7 +133,8 @@ async function pgRunSelect(schema, sql) {
     await client.query(`set search_path to ${q}`);
     return client.query(sql);
   });
-  return result.rows || [];
+  const rows = result.rows || [];
+  return rows.length > SELECT_RESULT_CAP ? rows.slice(0, SELECT_RESULT_CAP) : rows;
 }
 
 async function pgMoveTable(schema, tableName) {
@@ -240,20 +247,21 @@ async function executeTableAction(user, body) {
       return { status: 400, json: { error: { message: 'Queries cannot reference another company schema' } } };
     }
     try {
-      const rows = await pgRunSelect(schema, sql);
-      return { status: 200, json: { rows, schema } };
+      const rows = await pgRunSelect(schema, capSelectSql(sql));
+      return { status: 200, json: { rows, schema, truncated: Array.isArray(rows) && rows.length >= SELECT_RESULT_CAP } };
     } catch (err) {
       console.warn('Company-schema SELECT failed, trying RPC with schema', err?.message || err);
     }
     const result = await rpcOnlyWithSchema(supabaseUrl, serviceKey, 'stella_run_select', {
-      query: sql,
+      query: capSelectSql(sql),
       p_schema: schema,
     });
     if (!result.ok) {
       return { status: result.status, json: { error: { message: rpcError(result) } } };
     }
     const rows = Array.isArray(result.data) ? result.data : (result.data == null ? [] : result.data);
-    return { status: 200, json: { rows, schema } };
+    const capped = Array.isArray(rows) ? rows.slice(0, SELECT_RESULT_CAP) : [];
+    return { status: 200, json: { rows: capped, schema, truncated: capped.length >= SELECT_RESULT_CAP } };
   }
 
   if (!TABLE_NAME_RE.test(tableName)) {

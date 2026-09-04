@@ -12,7 +12,7 @@
 
 const { sessionUserFromRequest } = require('./accounts-store');
 const { companySlug, companyPgSchema, resolveUserCompany, ensureCompanyPgSchema } = require('./company');
-const { getLastEnsureError, withPg, quoteIdent, migratePublicStellaIntoCompany } = require('./stella-db');
+const { getLastEnsureError, withPg, quoteIdent } = require('./stella-db');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ALLOWED_FIELDS = [
@@ -166,11 +166,6 @@ async function listFilesForUser(user) {
     return { files: [], schema, schemaReady: false };
   }
   try {
-    await migratePublicStellaIntoCompany(schema, { orgIds: orgCandidates(user) });
-  } catch (err) {
-    console.warn('Could not move leftover public Stella files', err?.message || err);
-  }
-  try {
     const rows = await listByOrgPg(schema, orgCandidates(user));
     return { files: rows, schema, schemaReady: true };
   } catch (err) {
@@ -201,11 +196,6 @@ async function insertFileForUser(user, recordInput) {
     return { error: 'storage_path is required', status: 400 };
   }
   if (!schemaReady) return schemaUnavailable(schema);
-  try {
-    await migratePublicStellaIntoCompany(schema, { orgIds: orgCandidates(user) });
-  } catch (err) {
-    console.warn('Could not move leftover public Stella files', err?.message || err);
-  }
   try {
     const row = await insertPg(schema, record);
     if (row) return { file: row, schema, company: slug };

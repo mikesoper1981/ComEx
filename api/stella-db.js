@@ -555,21 +555,21 @@ async function ensureCompanyPgSchema(companyOrSchema) {
     return false;
   }
 
-  lastEnsureError = '';
-  try {
-    await bootstrapViaPg();
-  } catch (err) {
-    lastEnsureError = lastEnsureError || redact(err);
-    console.warn('Could not bootstrap Stella tenant SQL', lastEnsureError);
-  }
-
   if (ensuredSchemas.has(schema)) {
     lastEnsureError = '';
     return true;
   }
 
+  lastEnsureError = '';
+
+  // Cheap path: company schema already exists — skip bootstrap SQL and leftover
+  // public-table copies. Those only matter on first create.
   try {
     const { schemaOk, filesOk } = await inspectCompanySchema(schema);
+    if (schemaOk && filesOk) {
+      ensuredSchemas.add(schema);
+      return true;
+    }
     if (schemaOk) {
       try {
         await ensureCompanyFilesTable(schema);
@@ -585,6 +585,13 @@ async function ensureCompanyPgSchema(companyOrSchema) {
     }
   } catch (err) {
     lastEnsureError = redact(err);
+  }
+
+  try {
+    await bootstrapViaPg();
+  } catch (err) {
+    lastEnsureError = lastEnsureError || redact(err);
+    console.warn('Could not bootstrap Stella tenant SQL', lastEnsureError);
   }
 
   let ok = false;

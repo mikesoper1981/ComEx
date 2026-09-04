@@ -901,8 +901,8 @@ export function formatModuleLibraryIndex(settings, moduleId, { maxFiles = 40, ma
   const omitted = Math.max(0, files.length - shown.length);
   const label = MODULE_CONTEXT_LABELS[moduleId] || moduleId;
   const header = role === 'home'
-    ? `\n\nTHIS MODULE LIBRARY (${label}, ${files.length} file${files.length === 1 ? '' : 's'}) — directory only. Use get_file_context for the full extract, Q&A, and notes.\n`
-    : `\n\nLINKED MODULE LIBRARY (${label}, ${files.length} file${files.length === 1 ? '' : 's'}) — shared both ways because this hub connects ${MODULE_CONTEXT_LABELS[linkedFrom] || linkedFrom} with ${label}. Directory only. Use get_file_context for the full file. Do not contradict it.\n`;
+    ? `\n\nTHIS MODULE LIBRARY (${label}, ${files.length} file${files.length === 1 ? '' : 's'}) — directory only (name + purpose). These files belong here even when other hub modules are not connected. If the question could be answered by a file below, call get_file_context on it before answering. Do not say you lack this information.\n`
+    : `\n\nLINKED MODULE LIBRARY (${label}, ${files.length} file${files.length === 1 ? '' : 's'}) — shared because this hub connects ${MODULE_CONTEXT_LABELS[linkedFrom] || linkedFrom} with ${label}. Directory only. If relevant, call get_file_context on that file. Do not contradict it.\n`;
   const parts = [header.trimEnd(), ...shown.map((f) => formatModuleLibraryIndexLine(f, moduleId))];
   if (omitted) parts.push(`… ${omitted} more file${omitted === 1 ? '' : 's'} — call get_file_context with the file name.`);
   let body = parts.join('\n');
@@ -972,43 +972,42 @@ export function formatModuleContextPromptBlock(settings, moduleId, { maxChars = 
   if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… module context truncated …]`;
   const header = linkedFrom
     ? `\n\nLINKED MODULE CONTEXT (${MODULE_CONTEXT_LABELS[moduleId] || moduleId}) — shared because this user connected ${MODULE_CONTEXT_LABELS[linkedFrom] || linkedFrom} with ${MODULE_CONTEXT_LABELS[moduleId] || moduleId}. This is mandatory background from that module. Do not contradict it. Do not name internal filenames to end users:\n`
-    : `\n\nMODULE CONTEXT (${MODULE_CONTEXT_LABELS[moduleId] || moduleId}) — user-provided guidance for this module. Treat it as mandatory background. Do not contradict it. Do not name internal filenames to end users:\n`;
+    : `\n\nTHIS MODULE CONTEXT (${MODULE_CONTEXT_LABELS[moduleId] || moduleId}) — files uploaded to this module. They are in-session here even when other hub modules are not connected. Treat as mandatory background. Do not say you lack this information. Do not name internal filenames to end users:\n`;
   return `${header}${body}\n`;
 }
 
 export function formatLinkedModulesPromptBlock(settings, homeId, { stellaFiles = [], maxChars = 10000 } = {}) {
   const home = MODULE_CONTEXT_IDS.includes(homeId) ? homeId : 'incentives';
   const linked = connectedComponentIds(settings?.moduleConnections, home);
-  const chunks = [];
+  const homeChunks = [];
+  const linkedChunks = [];
+  const homeLib = formatModuleLibraryIndex(settings, home, { role: 'home', maxChars: 1800 });
+  if (homeLib) homeChunks.push(homeLib);
   if (linked.length) {
     const names = linked.map((id) => MODULE_CONTEXT_LABELS[id] || id).join(', ');
-    chunks.push(`\n\nCONNECTED MODULES — this ${MODULE_CONTEXT_LABELS[home] || home} session is in a two-way hub with ${names}. Scheme files, territory files, and Stella datasets flow both ways. Use get_file_context to load a file from the indexes below. If Stella is in the hub, use inspect_table / run_sql / read_document for live numbers. Never invent territory counts, product performance, coverage, scheme rules, or alignment facts those libraries would contain. Do not say you cannot see a linked module. Do not mention SQL, table names, or tool names to the end user.\n`);
-  }
-  if (home === 'stella') {
-    const homeLib = formatModuleLibraryIndex(settings, 'stella', { role: 'home', maxChars: 2500 });
-    if (homeLib) chunks.push(homeLib);
-  } else {
-    const homeLib = formatModuleLibraryIndex(settings, home, { role: 'home', maxChars: 2500 });
-    if (homeLib) chunks.push(homeLib);
+    linkedChunks.push(`\n\nCONNECTED MODULES — this ${MODULE_CONTEXT_LABELS[home] || home} session is in a two-way hub with ${names}. Indexes below are directories, not contents. Call get_file_context on a listed file when it is relevant. If Stella is in the hub, use inspect_table / run_sql / read_document for live numbers. Never invent facts those libraries would contain. Do not say you cannot see a linked module. Do not mention SQL, table names, or tool names to the end user.\n`);
   }
   for (const id of linked) {
     if (id === 'stella') {
       const goals = String(settings?.stellaBusinessContext?.keyGoals || '').trim();
       if (goals) {
-        chunks.push(`\n\nLINKED STELLA ANALYSIS GOALS — use as background for what they want from data analysis:\n${goals}\n`);
+        linkedChunks.push(`\n\nLINKED STELLA ANALYSIS GOALS — use as background for what they want from data analysis:\n${goals}\n`);
       }
       if (home !== 'stella') {
-        const catalog = formatStellaSharePromptBlock(stellaFiles, { maxChars: 3500 });
-        chunks.push(catalog || `\n\nLINKED STELLA DATA — Stella Insights is in this hub, but no Stella datasets are loaded in this session yet. You can still treat Stella as a linked module.\n`);
+        const catalog = formatStellaSharePromptBlock(stellaFiles, { maxChars: 1800 });
+        linkedChunks.push(catalog || `\n\nLINKED STELLA DATA — Stella Insights is in this hub, but no Stella datasets are loaded in this session yet. You can still treat Stella as a linked module.\n`);
       }
     } else {
-      const idx = formatModuleLibraryIndex(settings, id, { maxChars: 2500, linkedFrom: home, role: 'linked' });
-      chunks.push(idx || `\n\nLINKED MODULE LIBRARY (${MODULE_CONTEXT_LABELS[id] || id}) — this hub connects ${MODULE_CONTEXT_LABELS[home] || home} with ${MODULE_CONTEXT_LABELS[id] || id}, but that module has no context files uploaded yet.\n`);
+      const idx = formatModuleLibraryIndex(settings, id, { maxChars: 1800, linkedFrom: home, role: 'linked' });
+      linkedChunks.push(idx || `\n\nLINKED MODULE LIBRARY (${MODULE_CONTEXT_LABELS[id] || id}) — this hub connects ${MODULE_CONTEXT_LABELS[home] || home} with ${MODULE_CONTEXT_LABELS[id] || id}, but that module has no context files uploaded yet.\n`);
     }
   }
-  if (!chunks.length) return '';
-  let body = chunks.join('');
-  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… linked context truncated …]`;
+  if (!homeChunks.length && !linkedChunks.length) return '';
+  const access = `\n\nFILE ACCESS — libraries below are directories (file name + one-line purpose), not the file contents. If the question could be answered by a listed file, call get_file_context on that file before answering. Use read_document only for a long extract. THIS MODULE LIBRARY is in-session even when no other modules are connected. Do not say you lack a listed file. Do not mention tool names to the end user.\n`;
+  let homeBody = homeChunks.join('');
+  let linkedBody = linkedChunks.join('');
+  let body = `${access}${homeBody}${linkedBody}`;
+  if (body.length > maxChars) body = `${body.slice(0, maxChars)}\n\n[… library indexes truncated — call get_file_context by file name …]`;
   return body;
 }
 

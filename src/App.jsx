@@ -1643,6 +1643,10 @@ function stellaNormJoinToken(s) {
 
 const STELLA_JOIN_SAMPLE_CAP = 48;
 const STELLA_JOIN_SAMPLE_LEN = 80;
+/** Rows pulled from Postgres for join/profile samples — hard cap, not “a % of the table”. */
+const STELLA_SQL_SAMPLE_ROWS = 64;
+/** Max rows scanned in-browser when profiling an upload. Total rowCount is still the full file. */
+const STELLA_PROFILE_SCAN_CAP = 2000;
 
 function stellaNormJoinValue(v) {
   return String(v ?? '').trim().replace(/\s+/g, ' ').slice(0, STELLA_JOIN_SAMPLE_LEN);
@@ -4529,10 +4533,18 @@ function stellaPreviewRows(rows) {
 function stellaProfileRecords(records) {
   if (!Array.isArray(records) || records.length === 0) return '';
   const rowCount = records.length;
+  const sample = rowCount > STELLA_PROFILE_SCAN_CAP ? records.slice(0, STELLA_PROFILE_SCAN_CAP) : records;
   const headers = Object.keys(records[0] || {});
-  const lines = [`Total rows: ${rowCount}`, `Columns (${headers.length}): ${headers.join(', ')}`, '', 'Per-column profile:'];
+  const lines = [
+    `Total rows: ${rowCount}`,
+    `Columns (${headers.length}): ${headers.join(', ')}`,
+  ];
+  if (sample.length < rowCount) {
+    lines.push(`Column profile from the first ${sample.length} rows (table is larger — query SQL for full-table stats).`);
+  }
+  lines.push('', 'Per-column profile:');
   for (const h of headers) {
-    const values = records.map(r => r?.[h]).filter(v => v !== null && v !== undefined && v !== '');
+    const values = sample.map(r => r?.[h]).filter(v => v !== null && v !== undefined && v !== '');
     const distinct = new globalThis.Set(values.map(v => String(v)));
     const nums = values.map(v => Number(String(v).replace(/[,\s%£$€]/g, ''))).filter(Number.isFinite);
     const isNumeric = values.length > 0 && nums.length >= values.length * 0.8;
@@ -6020,16 +6032,12 @@ export default function CommercialExcellenceApp() {
             return next;
           });
           const tables = [...new Set(mapped.map((f) => f.tableName).filter(Boolean))];
-          for (const tableName of tables) {
-            try {
-              await fetch(STELLA_QUERY_API_PATH, {
-                method: 'POST',
-                headers: authHeaders({ 'Content-Type': 'application/json' }),
-                body: JSON.stringify({ action: 'move', tableName }),
-              });
-            } catch { /* company-schema SQL may not be applied yet */ }
-          }
-          try { await stellaHydrateColumnProfilesRef.current?.(mapped); } catch { /* profiles are best-effort */ }
+          void Promise.all(tables.map((tableName) => fetch(STELLA_QUERY_API_PATH, {
+            method: 'POST',
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ action: 'move', tableName }),
+          }).catch(() => null)));
+          void stellaHydrateColumnProfilesRef.current?.(mapped, { persist: false });
           return mapped;
         }
       } catch { /* stella_files table may not exist yet */ }
@@ -10775,22 +10783,22 @@ ${stepInstruction}`;
     return data;
   };
 
-  const stellaHydrateColumnValueProfiles = async (files) => {
+  const stellaHydrateColumnValueProfiles = async (files, { persist = false } = {}) => {
     const list = (files || []).filter((f) => f && stellaFileNeedsValueProfile(f));
     if (!list.length) return (stellaDataFilesRef.current || []);
     const patched = new Map();
-    for (const f of list) {
+    await Promise.all(list.map(async (f) => {
       try {
-        const data = await stellaTableApi({ sql: `SELECT * FROM ${f.tableName} LIMIT 400` });
+        const data = await stellaTableApi({ sql: `SELECT * FROM ${f.tableName} LIMIT ${STELLA_SQL_SAMPLE_ROWS}` });
         const rows = Array.isArray(data.rows) ? data.rows : [];
-        if (!rows.length) continue;
+        if (!rows.length) return;
         const columns = stellaApplyRowSampleToColumns(f.columns, rows);
         patched.set(f.id, { columns, previewRows: stellaPreviewRowsFromData(rows, 3) });
-        if (f.dbId) {
+        if (persist && f.dbId) {
           try { await stellaUpdateRegistry(f.dbId, { columns: stellaColumnsForRegistry(columns) }); } catch { /* ignore */ }
         }
       } catch { /* table may not be ready */ }
-    }
+    }));
     if (!patched.size) return (stellaDataFilesRef.current || []);
     let result = stellaDataFilesRef.current || [];
     setStellaDataFiles((prev) => {
@@ -10813,23 +10821,13 @@ ${stepInstruction}`;
     }
   };
 
-  const stellaRemoveStorage = async (objectPath) => {
+  const stellaRemoveStorage = async (objectPath, { bucket } = {}) => {
     if (!objectPath) return;
-    const rel = objectPath.replace(/^stella\//, '');
-    const userRel = objectPath.replace(new RegExp(`^${stellaUserPrefix().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), '');
-    const paths = [...new Set([objectPath, rel, `stella/${rel}`, `${stellaUserPrefix()}${rel}`, `${stellaUserPrefix()}${userRel}`])];
-    const buckets = ['intelligence', 'stella-data'];
-    for (const bucket of buckets) {
-      for (const p of paths) {
-        try { await supabase.storage.from(bucket).remove([p]); } catch { /* ignore */ }
-      }
-    }
-    for (const candidate of STELLA_STORAGE_CANDIDATES) {
-      for (const p of paths) {
-        try { await supabase.storage.from(candidate.bucket).remove([p]); } catch { /* ignore */ }
-        try { await supabase.storage.from(candidate.bucket).remove([stellaResolveStoragePath(candidate, rel)]); } catch { /* ignore */ }
-      }
-    }
+    const buckets = [...new Set([bucket, 'intelligence', 'stella-data'].filter(Boolean))];
+    const paths = [...new Set([objectPath, objectPath.replace(/^stella\//, '')].filter(Boolean))];
+    await Promise.all(buckets.flatMap((b) => paths.map((p) => (
+      supabase.storage.from(b).remove([p]).catch(() => null)
+    ))));
   };
 
   // Download a blob from Stella storage (tries path variants across candidate buckets).
@@ -11318,7 +11316,7 @@ ${stepInstruction}`;
     }
     const otherTabular = stellaOtherTabularFiles(fileRec.id);
     const profiledColumns = isTabular
-      ? stellaApplyRowSampleToColumns(columns, records.slice(0, 400))
+      ? stellaApplyRowSampleToColumns(columns, records.slice(0, STELLA_SQL_SAMPLE_ROWS))
       : columns;
     let joinQ = '';
     if ((isTabular || fileRec.tableName) && otherTabular.length) {
@@ -11368,7 +11366,7 @@ ${stepInstruction}`;
     try {
       let records = null;
       if (fileRec.tableName) {
-        const data = await stellaTableApi({ sql: `SELECT * FROM ${fileRec.tableName} LIMIT 400` });
+        const data = await stellaTableApi({ sql: `SELECT * FROM ${fileRec.tableName} LIMIT ${STELLA_SQL_SAMPLE_ROWS}` });
         records = Array.isArray(data.rows) ? data.rows : [];
       }
       const schemaChanged = !!(fileRec.capturedContext?.schema_changed);
@@ -11618,6 +11616,21 @@ ${stepInstruction}`;
     const f = stellaDataFiles.find(x => x.id === fileId);
     if (!f) return;
     if (!window.confirm(`Delete "${f.name}" and its captured context? This cannot be undone.`)) return;
+    setStellaDataFiles((prev) => {
+      const next = prev.filter((x) => x.id !== fileId);
+      stellaDataFilesRef.current = next;
+      return next;
+    });
+    setActiveStellaDataId((prev) => (prev === fileId ? null : prev));
+    const restore = () => {
+      setStellaDataFiles((prev) => {
+        if (prev.some((x) => x.id === fileId)) return prev;
+        const next = [...prev, f];
+        stellaDataFilesRef.current = next;
+        return next;
+      });
+      setActiveStellaDataId((prev) => prev || fileId);
+    };
     try {
       if (f.dbId) {
         const res = await fetch(STELLA_FILES_API_PATH, {
@@ -11631,13 +11644,15 @@ ${stepInstruction}`;
         }
       }
     } catch (e) {
-      setStellaMessages(prev => [...prev, { role: 'system', content: `⚠️ Could not remove "${f.name}" from the registry: ${e.message}` }]);
+      restore();
+      setStellaMessages((prev) => [...prev, { role: 'system', content: `⚠️ Could not remove "${f.name}" from the registry: ${e.message}` }]);
+      return;
     }
-    try { if (f.tableName) await stellaTableApi({ action: 'drop', tableName: f.tableName }); } catch { /* ignore */ }
-    await stellaRemoveStorage(f.storagePath);
-    if (f.storagePath) await stellaRemoveStorage(stellaExtractedTextPath(f.storagePath));
-    setStellaDataFiles(prev => prev.filter(x => x.id !== fileId));
-    setActiveStellaDataId(prev => (prev === fileId ? null : prev));
+    void Promise.all([
+      f.tableName ? stellaTableApi({ action: 'drop', tableName: f.tableName }).catch(() => null) : null,
+      stellaRemoveStorage(f.storagePath, { bucket: f.storageBucket }),
+      f.storagePath ? stellaRemoveStorage(stellaExtractedTextPath(f.storagePath), { bucket: f.storageBucket }) : null,
+    ]);
   };
 
   // ── STELLA: Reusable admin panels ──
@@ -12154,7 +12169,7 @@ ${stepInstruction}`;
   const STELLA_TOOLS = [
     {
       name: 'get_file_context',
-      description: 'Load the full context card for one file from this hub session — Stella datasets, Incentive Compensation files, or Territory Design files. Use a file name from the connected-module index. Call this before interpreting or querying a file.',
+      description: 'Load the full context card for one file from this hub session (this module or a connected module). Use a file name from THIS MODULE LIBRARY or a LINKED MODULE LIBRARY index. Call this before answering from, interpreting, or querying a file.',
       input_schema: {
         type: 'object',
         properties: {
@@ -12165,7 +12180,7 @@ ${stepInstruction}`;
     },
     {
       name: 'run_sql',
-      description: 'Execute a single read-only SQL SELECT against the uploaded datasets and return matching rows as JSON. Only SELECT is allowed. Use exact table and column names from get_file_context or inspect_table. Use JOINs to combine datasets.',
+      description: 'Execute a single read-only SQL SELECT against the uploaded datasets and return matching rows as JSON. Only SELECT is allowed. Results are capped at 500 rows — use COUNT/SUM/GROUP BY for full-table stats on large files. Use exact table and column names from get_file_context or inspect_table. Use JOINs to combine datasets.',
       input_schema: {
         type: 'object',
         properties: { query: { type: 'string', description: 'A single SQL SELECT statement.' } },
@@ -12235,8 +12250,9 @@ ${stepInstruction}`;
       const query = String(input?.query || '').trim();
       try {
         const rows = await stellaRunQuery(query);
+        const capped = rows.length >= 500;
         return {
-          text: `Rows (${rows.length}):\n${JSON.stringify(rows).slice(0, 10000)}`,
+          text: `Rows (${rows.length}${capped ? ', capped at 500 — aggregate if you need the full table' : ''}):\n${JSON.stringify(rows).slice(0, 10000)}`,
           step: { type: 'query', label: 'Ran query', detail: query, resultCount: rows.length, result: stellaPreviewRows(rows) },
         };
       } catch (err) {
@@ -13131,7 +13147,7 @@ ${stepInstruction}`;
               ? (isAdmin
                 ? `KNOWLEDGE BASE (loaded from intelligence files):\n${kb}`
                 : `KNOWLEDGE BASE (best-practice guidance — never name source files):\n${kb}`)
-              : 'KNOWLEDGE BASE:\nNo knowledge files are marked General Context yet. Answer from conversation context and user settings only.'
+              : 'KNOWLEDGE BASE:\nNo general best-practice files are marked yet. If THIS MODULE LIBRARY appears below, call get_file_context on a listed file before answering from it. Do not claim those files are missing.'
           )
           + fileContext
           + (extraInstruction ? `\n\n${extraInstruction}` : ''));

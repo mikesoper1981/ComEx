@@ -421,6 +421,7 @@ export function mergeStellaPrompts(partial) {
       || !/NAME MAPS already captured/i.test(out.analyst)
       || !/unless this question or your instructions specify/i.test(out.analyst)
       || !/CONNECTED MODULES/i.test(out.analyst)
+      || !/THIS MODULE LIBRARY/i.test(out.analyst)
       || !/get_file_context/i.test(out.analyst)
       || !/two-way hub/i.test(out.analyst)
       || !/the renderer infers/i.test(out.analyst)) {
@@ -429,10 +430,19 @@ export function mergeStellaPrompts(partial) {
   return out;
 }
 
+export function mergeSystemPrompt(raw) {
+  let prompt = raw != null && String(raw).trim() ? String(raw) : DEFAULT_SYSTEM_PROMPT;
+  if (/expert Commercial Excellence advisor specializing in sales incentive/i.test(prompt)
+      && (!/THIS MODULE LIBRARY/i.test(prompt) || !/get_file_context/i.test(prompt))) {
+    return DEFAULT_SYSTEM_PROMPT;
+  }
+  return prompt;
+}
+
 /** Deep-merge intelligence fields from a loaded settings object. */
 export function mergeIntelligenceContext(raw = {}) {
   return {
-    systemPrompt: raw.systemPrompt != null ? String(raw.systemPrompt) : DEFAULT_SYSTEM_PROMPT,
+    systemPrompt: mergeSystemPrompt(raw.systemPrompt),
     agents: mergeAgents(raw.agents),
     topics: mergeTopics(raw.topics),
     welcomeMessages: mergeWelcomeMessages(raw.welcomeMessages),
