@@ -34,6 +34,25 @@ export function looksLikeUkPostcode(value) {
   return false;
 }
 
+export function looksLikeUkPostcodeArea(value) {
+  const t = String(value || '').trim().toUpperCase();
+  if (!t) return false;
+  if (looksLikeUkPostcode(t)) return true;
+  const parts = t.split(/[^A-Z0-9]+/).filter(Boolean);
+  if (!parts.length) return false;
+  return parts.every((p) => /^[A-Z]{1,2}\d{0,2}[A-Z]?$/.test(p));
+}
+
+export const UK_BOUNDS = { minLat: 49.5, maxLat: 61.0, minLng: -8.8, maxLng: 2.2 };
+
+export function isUkLatLng(lat, lng) {
+  const la = Number(lat);
+  const ln = Number(lng);
+  return Number.isFinite(la) && Number.isFinite(ln)
+    && la >= UK_BOUNDS.minLat && la <= UK_BOUNDS.maxLat
+    && ln >= UK_BOUNDS.minLng && ln <= UK_BOUNDS.maxLng;
+}
+
 export function looksLikeUsZip(value) {
   const t = String(value || '').trim();
   const digits = t.replace(/\D/g, '');
@@ -72,7 +91,13 @@ export function normalizeMapLayout(raw) {
 function inferGeoKind(geoColumn, columns, sampleRows) {
   const col = (columns || []).find((c) => c.name === geoColumn || c.original === geoColumn);
   const key = colKey(col || { name: geoColumn });
-  if (/\b(post.?code|postal.?code)\b/.test(key)) return 'postcode';
+  if (/\b(post.?code|postal.?code)\b/.test(key)) {
+    const values = (sampleRows || []).map((r) => r?.[geoColumn] ?? r?.[col?.original]).filter((v) => v != null && v !== '');
+    const full = values.filter(looksLikeUkPostcode).length;
+    if (full >= Math.max(3, values.length * 0.4)) return 'postcode';
+    if (values.filter(looksLikeUkPostcodeArea).length >= Math.max(2, values.length * 0.5)) return 'postcode';
+    return 'postcode';
+  }
   if (/\b(zip.?code|zip)\b/.test(key)) return 'zip';
   if (/\b(city|town)\b/.test(key)) return 'city';
   if (/\b(county|counties)\b/.test(key)) return 'county';
@@ -87,11 +112,16 @@ function inferGeoKind(geoColumn, columns, sampleRows) {
 }
 
 function inferCountry(geoKind, geoColumn, sampleRows) {
-  if (geoKind === 'postcode') return 'United Kingdom';
+  if (geoKind === 'postcode' || geoKind === 'city') return 'United Kingdom';
   if (geoKind === 'zip') return 'United States';
   const blob = (sampleRows || []).slice(0, 40).map((r) => String(r?.[geoColumn] || '')).join(' ').toLowerCase();
-  if (/\b(yorkshire|surrey|kent|fife|lothian|glasgow|manchester|birmingham)\b/.test(blob)) return 'United Kingdom';
+  if (/\b(yorkshire|surrey|kent|fife|lothian|glasgow|manchester|birmingham|london|nottingham|leicester|cardiff|belfast|westminster|camden|islington)\b/.test(blob)) return 'United Kingdom';
   return '';
+}
+
+function isVaguePostcodeColumn(c) {
+  const k = colKey(c);
+  return /\b(post.?code|postal.?code)\b/.test(k) && /\b(area|districts?|example)\b/.test(k);
 }
 
 export function isRosterLikeColumn(colName, sampleRows = []) {
@@ -131,11 +161,20 @@ export function inferTerritoryLayout(columns, sampleRows = []) {
   const territoryColumn = pickColumn(columns, [
     /\b(territory|terr_?id|brick|sales.?area|sales.?region)\b/,
   ]);
-  let geoColumn = pickColumn(columns, [
+  const postcodeColumn = pickColumn((columns || []).filter((c) => !isVaguePostcodeColumn(c)), [
     /\b(post.?code|postal.?code|zip.?code|zip)\b/,
+  ]);
+  const cityColumn = pickColumn(columns, [
     /\b(city|town)\b/,
+  ]);
+  const regionColumn = pickColumn(columns, [
     /\b(county|counties|region|state|province)\b/,
   ]);
+  const postcodeValues = (sampleRows || []).map((r) => r?.[postcodeColumn]).filter((v) => v != null && String(v).trim() !== '');
+  const precisePostcodes = postcodeValues.filter(looksLikeUkPostcode).length >= Math.max(3, postcodeValues.length * 0.5);
+  let geoColumn = '';
+  if (cityColumn && (!postcodeColumn || !precisePostcodes)) geoColumn = cityColumn;
+  else geoColumn = postcodeColumn || cityColumn || regionColumn;
   if (!geoColumn && territoryColumn) geoColumn = territoryColumn;
   const geoKind = geoColumn ? inferGeoKind(geoColumn, columns, sampleRows) : 'region';
   let repColumn = pickColumn(columns, [
@@ -145,7 +184,8 @@ export function inferTerritoryLayout(columns, sampleRows = []) {
     if (!repColumn) repColumn = teamColumn;
     teamColumn = '';
   }
-  const country = inferCountry(geoKind, geoColumn, sampleRows);
+  const country = inferCountry(geoKind, geoColumn, sampleRows)
+    || ((cityColumn || postcodeColumn) ? 'United Kingdom' : '');
   return normalizeMapLayout({
     teamColumn,
     territoryColumn,
@@ -272,6 +312,38 @@ export function convexHullLatLng(points) {
   return lower.concat(upper);
 }
 
+export function geometryTooLarge(geometry) {
+  let minLat = 90;
+  let maxLat = -90;
+  let minLng = 180;
+  let maxLng = -180;
+  const walk = (c) => {
+    if (!Array.isArray(c)) return;
+    if (typeof c[0] === 'number' && typeof c[1] === 'number') {
+      minLng = Math.min(minLng, c[0]);
+      maxLng = Math.max(maxLng, c[0]);
+      minLat = Math.min(minLat, c[1]);
+      maxLat = Math.max(maxLat, c[1]);
+      return;
+    }
+    c.forEach(walk);
+  };
+  walk(geometry?.coordinates);
+  return (maxLat - minLat) > 4 || (maxLng - minLng) > 4;
+}
+
+export function clusterLatLng(coords) {
+  const pts = (coords || []).filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+  const uk = pts.filter((p) => isUkLatLng(p[0], p[1]));
+  if (uk.length >= Math.max(1, Math.ceil(pts.length * 0.4))) return uk;
+  if (pts.length <= 2) return pts;
+  const lats = pts.map((p) => p[0]).sort((a, b) => a - b);
+  const lngs = pts.map((p) => p[1]).sort((a, b) => a - b);
+  const medLat = lats[Math.floor(lats.length / 2)];
+  const medLng = lngs[Math.floor(lngs.length / 2)];
+  return pts.filter((p) => Math.abs(p[0] - medLat) <= 4 && Math.abs(p[1] - medLng) <= 4);
+}
+
 export function capGeoJson(geometry, maxRing = 80) {
   if (!geometry || typeof geometry !== 'object') return null;
   const capRing = (ring) => {
@@ -316,13 +388,14 @@ export function groupTerritoryShapes(points) {
     const lng = Number(p.lng);
     if (Number.isFinite(lat) && Number.isFinite(lng)) g.coords.push([lat, lng]);
     const geom = capGeoJson(typeof p.geojson === 'string' ? (() => { try { return JSON.parse(p.geojson); } catch { return null; } })() : p.geojson);
-    if (geom) g.polygons.push(geom);
+    if (geom && !geometryTooLarge(geom)) g.polygons.push(geom);
   }
   return [...byKey.values()].map((g) => {
     const colours = hashTerritoryColour(g.territory);
-    const hull = convexHullLatLng(g.coords);
-    const lat = g.coords.length ? g.coords.reduce((s, c) => s + c[0], 0) / g.coords.length : null;
-    const lng = g.coords.length ? g.coords.reduce((s, c) => s + c[1], 0) / g.coords.length : null;
+    const coords = clusterLatLng(g.coords);
+    const hull = convexHullLatLng(coords);
+    const lat = coords.length ? coords.reduce((s, c) => s + c[0], 0) / coords.length : null;
+    const lng = coords.length ? coords.reduce((s, c) => s + c[1], 0) / coords.length : null;
     return {
       id: g.id,
       territory: g.territory,
@@ -343,6 +416,25 @@ export function mergeTerritoryLayout(base, overlay) {
   const a = normalizeMapLayout(base) || {};
   const b = normalizeMapLayout(overlay) || {};
   return normalizeMapLayout({ ...a, ...b }) || a;
+}
+
+export function refineTerritoryLayout(layout, columns, sampleRows = []) {
+  const inferred = inferTerritoryLayout(columns, sampleRows);
+  const current = normalizeMapLayout(layout) || {};
+  const merged = { ...inferred, ...current };
+  const currentCol = (columns || []).find((c) => c.name === current.geoColumn || c.original === current.geoColumn);
+  const currentIsVaguePostcode = currentCol
+    ? isVaguePostcodeColumn(currentCol)
+    : /\b(postcode_area|post_code_area|example_postcode)/i.test(String(current.geoColumn || ''));
+  if (inferred.geoColumn && inferred.geoKind === 'city' && (current.geoKind === 'postcode' || currentIsVaguePostcode)) {
+    merged.geoColumn = inferred.geoColumn;
+    merged.geoKind = 'city';
+    merged.country = inferred.country || current.country || 'United Kingdom';
+  }
+  if (!merged.country && (merged.geoKind === 'city' || merged.geoKind === 'postcode')) {
+    merged.country = 'United Kingdom';
+  }
+  return normalizeMapLayout(merged) || merged;
 }
 
 export function territoryColourFor(index) {

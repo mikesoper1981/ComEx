@@ -227,7 +227,7 @@ EXCEL TABS: When EXCEL SHEETS lists more than one tab, you MUST ask which tab to
 
 TEAM NAME: These files are usually ONE field team (a list of reps and their territories). Ask "What is this team called?" and put the answer in team_name. Do NOT treat each rep as a separate team or structure. team_column is only for a true field-force / franchise column with a few team labels — never a rep-name column.
 
-COLUMNS: Confirm which column is the territory, which holds geography (postcode/zip, city, county, or region), and the country if that is not obvious. If COLUMN GUESSES already name those columns, ask one short confirm that also includes the team name. If a required column is missing or the profile looks empty, say so and ask the user to pick the right tab or columns — do not invent data.
+COLUMNS: Confirm which column is the territory, which holds geography (postcode/zip, city, county, or region), and the country if that is not obvious. Prefer a City/Town column over a Postcode Area or Example Postcode Districts column — letter-only areas like EC, N, or NG are not precise enough to geocode. If COLUMN GUESSES already name those columns, ask one short confirm that also includes the team name. If a required column is missing or the profile looks empty, say so and ask the user to pick the right tab or columns — do not invent data.
 
 FIRST TURN: If multiple tabs exist and none is chosen, ask only which tab. If a tab is already chosen (or there is only one), ask the team name and column confirm. Set context_qa to null until the user has answered.
 

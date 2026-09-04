@@ -63,6 +63,24 @@ function looksLikeUkPostcode(value) {
   return /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/.test(t) || /^[A-Z]{1,2}\d[A-Z\d]?$/.test(t);
 }
 
+function isUkCountry(country) {
+  return /united kingdom|^uk$|great britain|england|scotland|wales/i.test(String(country || ''));
+}
+
+function inExpectedBBox(lat, lng, country) {
+  const la = Number(lat);
+  const ln = Number(lng);
+  if (!Number.isFinite(la) || !Number.isFinite(ln)) return false;
+  if (isUkCountry(country)) {
+    return la >= 49.5 && la <= 61.0 && ln >= -8.8 && ln <= 2.2;
+  }
+  return true;
+}
+
+function ukSearchExtra() {
+  return { countrycodes: 'gb', viewbox: '-8.8,61.0,2.2,49.5' };
+}
+
 function normalizeUkPostcode(value) {
   const t = String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   if (/^[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}$/.test(t)) {
@@ -88,13 +106,17 @@ function normalizeGeoValue(raw, kind) {
     if (digits.length >= 5) return digits.slice(0, 5);
     return s;
   }
-  if (kind === 'postcode') return normalizeUkPostcode(s);
+  if (kind === 'postcode') {
+    const parts = s.toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+    const token = parts.find((p) => /^[A-Z]{1,2}\d[A-Z\d]?$/.test(p) || /^[A-Z]{1,2}$/.test(p)) || parts[0] || '';
+    return token ? normalizeUkPostcode(token) : '';
+  }
   return s;
 }
 
 function defaultCountry(kind, layoutCountry, sampleGeo) {
   if (layoutCountry) return layoutCountry;
-  if (kind === 'postcode' || looksLikeUkPostcode(sampleGeo)) return 'United Kingdom';
+  if (kind === 'postcode' || kind === 'city' || looksLikeUkPostcode(sampleGeo)) return 'United Kingdom';
   if (kind === 'zip') return 'United States';
   return '';
 }
@@ -107,7 +129,7 @@ function searchQuery(geo, kind, country) {
 }
 
 function cacheKey(kind, country, geo) {
-  return `${kind || 'region'}|${String(country || '').toLowerCase()}|${String(geo || '').toLowerCase()}`;
+  return `v2|${kind || 'region'}|${String(country || '').toLowerCase()}|${String(geo || '').toLowerCase()}`;
 }
 
 function sleep(ms) {
@@ -146,7 +168,7 @@ async function nominatimSearch(query, extra = {}) {
   const params = new URLSearchParams({
     format: 'json',
     limit: '1',
-    polygon_geojson: '1',
+    polygon_geojson: '0',
   });
   if (query) params.set('q', query);
   for (const [key, value] of Object.entries(extra)) {
@@ -186,11 +208,42 @@ function capRing(ring, maxPts = 80) {
   return out;
 }
 
+function geometrySpanTooLarge(g) {
+  if (!g) return false;
+  let minLat = 90;
+  let maxLat = -90;
+  let minLng = 180;
+  let maxLng = -180;
+  const walk = (c) => {
+    if (!Array.isArray(c)) return;
+    if (typeof c[0] === 'number' && typeof c[1] === 'number') {
+      minLng = Math.min(minLng, c[0]);
+      maxLng = Math.max(maxLng, c[0]);
+      minLat = Math.min(minLat, c[1]);
+      maxLat = Math.max(maxLat, c[1]);
+      return;
+    }
+    c.forEach(walk);
+  };
+  walk(g.coordinates);
+  return (maxLat - minLat) > 4 || (maxLng - minLng) > 4;
+}
+
+function acceptHit(hit, country) {
+  if (!hit) return null;
+  if (!inExpectedBBox(hit.lat, hit.lng, country)) return null;
+  if (hit.geojson && geometrySpanTooLarge(hit.geojson)) hit = { ...hit, geojson: null };
+  return hit;
+}
+
 function geometryFromNominatim(hit) {
   const g = hit?.geojson;
   if (g && (g.type === 'Polygon' || g.type === 'MultiPolygon')) {
-    if (g.type === 'Polygon') return { type: 'Polygon', coordinates: (g.coordinates || []).map((r) => capRing(r)) };
-    return { type: 'MultiPolygon', coordinates: (g.coordinates || []).map((poly) => (poly || []).map((r) => capRing(r))) };
+    const geom = g.type === 'Polygon'
+      ? { type: 'Polygon', coordinates: (g.coordinates || []).map((r) => capRing(r)) }
+      : { type: 'MultiPolygon', coordinates: (g.coordinates || []).map((poly) => (poly || []).map((r) => capRing(r))) };
+    if (geometrySpanTooLarge(geom)) return null;
+    return geom;
   }
   const bb = hit?.boundingbox;
   if (Array.isArray(bb) && bb.length === 4) {
@@ -198,7 +251,9 @@ function geometryFromNominatim(hit) {
     const north = parseFloat(bb[1]);
     const west = parseFloat(bb[2]);
     const east = parseFloat(bb[3]);
-    if ([south, north, west, east].every(Number.isFinite) && (north - south) > 0.002 && (east - west) > 0.002) {
+    if ([south, north, west, east].every(Number.isFinite)
+      && (north - south) > 0.002 && (east - west) > 0.002
+      && (north - south) < 4 && (east - west) < 4) {
       return {
         type: 'Polygon',
         coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]],
@@ -247,18 +302,23 @@ async function geocodeMisses(schema, misses, kind, country) {
   const written = [];
   for (let i = 0; i < misses.length && i < GEOCODE_BATCH; i += 1) {
     const item = misses[i];
+    const extra = (isUkCountry(country) || kind === 'postcode') ? ukSearchExtra() : {};
     const queries = [];
-    if (kind === 'postcode') {
-      queries.push({ postalcode: item.geo, country: country || 'United Kingdom', countrycodes: 'gb' });
+    if (kind === 'postcode' && /^[A-Z]{1,2}$/i.test(item.geo)) {
+      queries.push({ q: `${item.geo} postcode, United Kingdom`, ...extra });
+    } else if (kind === 'postcode') {
+      queries.push({ q: `${item.geo}, United Kingdom`, ...extra });
+    } else {
+      const qText = searchQuery(item.geo, kind, country || (kind === 'city' ? 'United Kingdom' : ''));
+      queries.push({ q: qText, ...extra });
+      if (extra.countrycodes) queries.push({ q: qText, countrycodes: extra.countrycodes });
     }
-    queries.push({ q: searchQuery(item.geo, kind, country), ...(kind === 'postcode' || /united kingdom|uk/i.test(country) ? { countrycodes: 'gb' } : {}) });
-    if (kind === 'postcode' && item.geo.includes(' ')) {
-      queries.push({ postalcode: outwardPostcode(item.geo), country: country || 'United Kingdom', countrycodes: 'gb' });
-      queries.push({ q: searchQuery(outwardPostcode(item.geo), kind, country || 'United Kingdom'), countrycodes: 'gb' });
+    if (kind === 'postcode' && /[A-Z]{1,2}\d/i.test(item.geo) && item.geo.length > 2) {
+      queries.push({ q: `${outwardPostcode(item.geo)}, United Kingdom`, ...extra });
     }
     let hit = null;
     for (const q of queries) {
-      hit = await nominatimSearch(q.q || '', q);
+      hit = acceptHit(await nominatimSearch(q.q || '', q), country);
       if (hit) break;
       await sleep(NOMINATIM_PAUSE_MS);
     }
@@ -404,10 +464,13 @@ async function executeTerritoryAction(user, body) {
 
   await ensureGeocodeCache(schema);
   const cached = await loadCached(schema, uniqueGeos.map((g) => g.key));
-  const misses = uniqueGeos.filter((g) => {
-    const hit = cached.get(g.key);
-    return !hit || (hit.status !== 'ok' && hit.status !== 'miss');
-  });
+  const cacheUsable = (hit) => {
+    if (!hit) return false;
+    if (hit.status === 'miss') return true;
+    if (hit.status !== 'ok') return false;
+    return inExpectedBBox(hit.lat, hit.lng, country);
+  };
+  const misses = uniqueGeos.filter((g) => !cacheUsable(cached.get(g.key)));
 
   const shouldGeocode = body.geocode !== false;
   if (shouldGeocode && misses.length) {
@@ -415,10 +478,7 @@ async function executeTerritoryAction(user, body) {
     for (const row of written) cached.set(row.query_key, row);
   }
 
-  const remaining = uniqueGeos.filter((g) => {
-    const hit = cached.get(g.key);
-    return !hit || (hit.status !== 'ok' && hit.status !== 'miss');
-  }).length;
+  const remaining = uniqueGeos.filter((g) => !cacheUsable(cached.get(g.key))).length;
 
   const points = [];
   let geocoded = 0;
@@ -427,8 +487,9 @@ async function executeTerritoryAction(user, body) {
     const hit = cached.get(key);
     const lat = hit?.lat != null ? Number(hit.lat) : null;
     const lng = hit?.lng != null ? Number(hit.lng) : null;
-    const okHit = hit?.status === 'ok' && Number.isFinite(lat) && Number.isFinite(lng);
+    const okHit = hit?.status === 'ok' && inExpectedBBox(lat, lng, country);
     if (okHit) geocoded += 1;
+    const geojson = okHit && hit.geojson && !geometrySpanTooLarge(hit.geojson) ? hit.geojson : null;
     points.push({
       id: `${row.territory}::${row.geo}`,
       team: row.team,
@@ -437,7 +498,7 @@ async function executeTerritoryAction(user, body) {
       count: row.count,
       lat: okHit ? lat : null,
       lng: okHit ? lng : null,
-      geojson: okHit ? (hit.geojson || null) : null,
+      geojson,
     });
   }
 

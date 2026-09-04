@@ -136,6 +136,7 @@ import {
 import {
   inferTerritoryLayout,
   mergeTerritoryLayout,
+  refineTerritoryLayout,
   normalizeMapLayout,
   buildTerritoryPointsMapHTML,
   hashTerritoryColour,
@@ -10818,9 +10819,13 @@ ${stepInstruction}`;
 
     const justChoseSheet = !!(hasUserReply && rec.sheetName && matchTerritorySheetName(lastUser.content, sheets));
     const needSheet = (rec.fileType === 'excel' || sheets.length > 1) && !rec.sheetName;
-    const nextLayout = mergeTerritoryLayout(
-      normalizeMapLayout(rec.mapLayout) || layout,
-      parsed.layout,
+    const nextLayout = refineTerritoryLayout(
+      mergeTerritoryLayout(
+        normalizeMapLayout(rec.mapLayout) || layout,
+        parsed.layout,
+      ),
+      rec.columns,
+      rec.previewRows,
     );
     if (!nextLayout.teamName && hasUserReply && !justChoseSheet && !needSheet) {
       const fromUser = extractTerritoryTeamName(lastUser.content);
@@ -10983,6 +10988,14 @@ ${stepInstruction}`;
       setTerritoryMapPayload((prev) => (prev?.teams ? { ...prev, points: [] } : null));
       return;
     }
+    const layout = refineTerritoryLayout(file.mapLayout, file.columns, file.previewRows);
+    if (layout.geoColumn && layout.geoColumn !== file.mapLayout?.geoColumn) {
+      void patchTerritoryFile(file.id, { mapLayout: { ...file.mapLayout, ...layout } });
+    }
+    if (!layout.geoColumn) {
+      setTerritoryMapPayload((prev) => (prev?.teams ? { ...prev, points: [] } : null));
+      return;
+    }
     const gen = ++territoryMapAbortRef.current;
     setTerritoryMapBusy(true);
     setTerritoryMapError('');
@@ -10992,7 +11005,7 @@ ${stepInstruction}`;
         const data = await territoryApi({
           action: 'map',
           tableName: file.tableName,
-          layout: file.mapLayout,
+          layout,
           team: teamFilter,
           geocode: true,
         });
