@@ -163,6 +163,56 @@ function parseNumberedParts(text) {
   return parts;
 }
 
+/** Split only at `? / next question`, not at slashes inside a single question. */
+function splitJoinedQuestions(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return [];
+  const parts = t.split(/\?\s*\/\s+/).map((s, i, arr) => {
+    const body = s.trim();
+    if (!body) return '';
+    return (i < arr.length - 1 && !/[?？]$/.test(body)) ? `${body}?` : body;
+  }).filter(Boolean);
+  return parts.length ? parts : [t];
+}
+
+function splitAnswerParts(text, n) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  const count = Math.max(1, Number(n) || 1);
+  if (!t) return [];
+  if (count <= 1) return [t];
+  const numbered = parseNumberedParts(t);
+  if (numbered.length >= 2) return numbered;
+  const lines = String(text || '').split(/\n+/).map((s) => s.trim()).filter(Boolean);
+  if (lines.length >= count) return lines.slice(0, count);
+  const sentences = t.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  if (sentences.length >= count) return sentences.slice(0, count);
+  const clauses = t.split(/(?<=[a-z0-9)])\s+(?=[A-Z])/).map((s) => s.trim()).filter(Boolean);
+  if (clauses.length >= count) {
+    return [...clauses.slice(0, count - 1), clauses.slice(count - 1).join(' ')];
+  }
+  return [t];
+}
+
+function expandQaPairs(list) {
+  const out = [];
+  for (const p of Array.isArray(list) ? list : []) {
+    if (!p || typeof p !== 'object') continue;
+    const qs = splitJoinedQuestions(p.question || '');
+    const as = splitAnswerParts(p.answer || '', Math.max(qs.length, 1));
+    const n = Math.max(qs.length, as.length, 1);
+    for (let i = 0; i < n; i++) {
+      const question = String(qs[i] || '').trim();
+      const answer = String(as[i] || '').trim();
+      if (!question && !answer) continue;
+      out.push({
+        ...(question ? { question } : {}),
+        ...(answer ? { answer } : {}),
+      });
+    }
+  }
+  return out;
+}
+
 function harvestQaPairs(intakeMessages) {
   const msgs = Array.isArray(intakeMessages) ? intakeMessages : [];
   const pairs = [];
@@ -170,33 +220,38 @@ function harvestQaPairs(intakeMessages) {
   const push = (q, a) => {
     const question = String(q || '').replace(/\s+/g, ' ').trim().slice(0, 800);
     const answer = String(a || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
-    if (!answer) return;
+    if (!question && !answer) return;
     const key = `${question.toLowerCase()}|${answer.toLowerCase()}`;
     if (seen.has(key)) return;
     seen.add(key);
-    pairs.push({ question: question || 'Clarification', answer });
+    pairs.push({
+      ...(question ? { question } : { question: 'Clarification' }),
+      ...(answer ? { answer } : {}),
+    });
+  };
+  const zip = (qs, rawAnswer) => {
+    const questions = (Array.isArray(qs) ? qs : []).flatMap(splitJoinedQuestions).filter(Boolean);
+    if (!questions.length) {
+      push('Clarification', rawAnswer);
+      return;
+    }
+    const answers = splitAnswerParts(rawAnswer, questions.length);
+    questions.forEach((q, i) => push(q, answers[i] || (questions.length === 1 ? rawAnswer : '')));
   };
   for (let i = 0; i < msgs.length; i++) {
     if (msgs[i]?.role !== 'assistant') continue;
     const ansMsg = msgs.slice(i + 1).find((m) => m.role === 'user');
     if (!ansMsg) continue;
-    const qs = parseNumberedParts(msgs[i].content);
-    const as = parseNumberedParts(ansMsg.content);
-    if (qs.length && as.length) {
-      const n = Math.max(qs.length, as.length);
-      for (let k = 0; k < n; k++) {
-        push(qs[k] || qs[qs.length - 1] || 'Clarification', as[k] || as[as.length - 1]);
-      }
-    } else if (qs.length) {
-      push(qs.join(' / '), ansMsg.content);
-    } else {
-      const lines = String(msgs[i].content || '').split(/\n+/).map((l) => l.trim()).filter(Boolean);
-      const qLines = lines.filter((l) => /[?？]/.test(l));
-      const question = qLines.length ? qLines.join(' ') : lines.slice(-3).join(' ');
-      push(question, ansMsg.content);
+    const numberedQs = parseNumberedParts(msgs[i].content);
+    if (numberedQs.length) {
+      zip(numberedQs, ansMsg.content);
+      continue;
     }
+    const lines = String(msgs[i].content || '').split(/\n+/).map((l) => l.trim()).filter(Boolean);
+    const qLines = lines.filter((l) => /[?？]/.test(l));
+    zip(qLines.length ? qLines : [lines.slice(-3).join(' ')], ansMsg.content);
   }
-  return pairs;
+  return expandQaPairs(pairs);
 }
 
 /** Merge model context_qa with assistant→user pairs from the intake thread. */
@@ -206,7 +261,7 @@ export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
   const harvestedQa = harvestQaPairs(intakeMessages);
   const qa_pairs = [];
   const seen = new Set();
-  for (const p of [...(fromPrior.qa_pairs || []), ...(fromModel.qa_pairs || []), ...harvestedQa]) {
+  for (const p of expandQaPairs([...(fromPrior.qa_pairs || []), ...(fromModel.qa_pairs || []), ...harvestedQa])) {
     if (!p || typeof p !== 'object') continue;
     const question = String(p.question || '').trim();
     const answer = String(p.answer || '').trim();
@@ -219,21 +274,18 @@ export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
       ...(answer ? { answer } : {}),
     });
   }
-  const answerFacts = harvestedQa
-    .map((p) => p.answer)
-    .filter((a) => {
-      const t = String(a || '').trim();
-      if (t.length < 4 || t.length > 280) return false;
-      if (/^(yes|no|ok|okay|sure|thanks|looks good|that'?s (all|correct)|complete|done)[.!]?\s*$/i.test(t)) return false;
-      return true;
-    });
   return compactCapturedContext({
     ...fromPrior,
     ...fromModel,
     what_it_represents: fromModel.what_it_represents || fromPrior.what_it_represents,
     time_period: fromModel.time_period || fromPrior.time_period,
     interpretation_notes: fromModel.interpretation_notes || fromPrior.interpretation_notes,
-    key_facts: mergeContextLines(fromPrior.key_facts, fromModel.key_facts, answerFacts),
+    key_facts: mergeContextLines(fromPrior.key_facts, fromModel.key_facts, qa_pairs.map((p) => p.answer).filter((a) => {
+      const t = String(a || '').trim();
+      if (t.length < 4 || t.length > 280) return false;
+      if (/^(yes|no|ok|okay|sure|thanks|looks good|that'?s (all|correct)|complete|done)[.!]?\s*$/i.test(t)) return false;
+      return true;
+    })),
     key_metrics: mergeContextLines(fromPrior.key_metrics, fromModel.key_metrics),
     qa_pairs,
   });

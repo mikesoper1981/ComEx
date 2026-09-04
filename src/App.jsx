@@ -9385,6 +9385,7 @@ ${stepInstruction}`;
     if (!isThinContextExtract(extractBlob, file.name)) {
       try {
         job.onStatus?.('Capturing key facts…');
+        postChat('⏳ Capturing key facts from this file…');
         onboarding = await summarizeContextFile({ name: file.name, extractBlob, moduleId });
       } catch (err) {
         const why = err?.message || 'fact capture failed';
@@ -9398,6 +9399,7 @@ ${stepInstruction}`;
     let assistantMsg = '';
     try {
       job.onStatus?.('Asking clarifying questions…');
+      postChat('⏳ Checking what still needs clarifying in this file…');
       const probe = await runContextIntakeTurn({
         extractBlob: extractBlob || `File name: ${file.name}`,
         moduleLabel: moduleLabelFor(moduleId),
@@ -9454,7 +9456,7 @@ ${stepInstruction}`;
     pendingModuleContextIntakeRef.current = intake;
     setPendingModuleContextIntake(intake);
     if (fromChat) {
-      setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
+      setMessages((prev) => [...prev.filter((m) => m.kind !== 'intake-think'), { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
       setIsLoading(false);
     }
   };
@@ -9465,8 +9467,23 @@ ${stepInstruction}`;
     if (!rec) return;
     const nextMessages = [...(rec.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳')), { role: 'user', content: userText }];
     setContextIntakeBusy(true);
-    if (fromChat) setIsLoading(true);
-    const optimistic = patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, { intakeMessages: nextMessages });
+    if (fromChat) {
+      setIsLoading(true);
+      setMessages((prev) => {
+        const copy = [...prev];
+        const last = copy[copy.length - 1];
+        const think = { role: 'system', content: '⏳ Saving your answers as separate facts…', kind: 'intake-think' };
+        if (last?.kind === 'intake-think' || (last?.role === 'system' && String(last.content || '').startsWith('⏳'))) {
+          copy[copy.length - 1] = think;
+          return copy;
+        }
+        return [...copy, think];
+      });
+    }
+    const thinkLine = { role: 'system', content: '⏳ Saving your answers as separate facts…' };
+    const optimistic = patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, {
+      intakeMessages: [...nextMessages, thinkLine],
+    });
     setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
     try {
       const result = await runContextIntakeTurn({
@@ -9483,6 +9500,11 @@ ${stepInstruction}`;
       const qa = result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
       const mergedCtx = harvestModuleCapturedContext(rec.capturedContext, qa, withAssistant)
         || rec.capturedContext;
+      const storedFacts = (mergedCtx?.qa_pairs || []).filter((p) => String(p.answer || '').trim());
+      const intakeSteps = [
+        { type: 'thought', label: 'Read your reply', detail: String(userText || '').slice(0, 500) },
+        { type: 'context', label: `Stored ${storedFacts.length} fact${storedFacts.length === 1 ? '' : 's'}`, detail: storedFacts.map((p) => p.answer).join('\n') },
+      ];
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: withAssistant,
         intakeComplete: !!result.complete,
@@ -9490,7 +9512,10 @@ ${stepInstruction}`;
       });
       await persistContextFiles(patched);
       if (fromChat) {
-        setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
+        setMessages((prev) => [
+          ...prev.filter((m) => m.kind !== 'intake-think'),
+          { role: 'assistant', content: assistantMsg, kind: 'intake', steps: intakeSteps },
+        ]);
       }
       if (result.complete) {
         pendingModuleContextIntakeRef.current = null;
@@ -10147,6 +10172,20 @@ ${stepInstruction}`;
                               </div>
                             </div>
                           ))}
+                          {contextIntakeBusy && activeContextFileId === f.id ? (
+                            <div className="flex justify-start">
+                              <div className="bg-slate-800/60 border border-blue-400/20 text-blue-100 rounded-xl px-3 py-2 text-xs">
+                                ⏳ Saving your answers as separate facts…
+                              </div>
+                            </div>
+                          ) : null}
+                          {contextIntakeBusy && activeContextFileId === f.id ? (
+                            <div className="flex justify-start">
+                              <div className="bg-slate-800/60 border border-blue-400/20 text-blue-100 rounded-xl px-3 py-2 text-xs">
+                                ⏳ Saving your answers as separate facts…
+                              </div>
+                            </div>
+                          ) : null}
                         </div>
                         <div className="flex gap-2">
                           <textarea
@@ -12258,12 +12297,13 @@ ${stepInstruction}`;
   runWithStellaDataToolsRef.current = runWithStellaDataTools;
 
   // Collapsible "How Stella worked this out" reasoning trail.
-  const renderStellaSteps = (steps) => {
+  const renderStellaSteps = (steps, title) => {
     const iconFor = (t) => (t === 'query' ? '🔎' : t === 'inspect' ? '👁' : t === 'document' ? '📄' : t === 'context' ? '📋' : t === 'error' ? '⚠️' : '🧠');
+    const heading = title || 'How Stella worked this out';
     return (
       <details className="mt-3 bg-slate-900/50 border border-blue-400/20 rounded-lg overflow-hidden">
         <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-cyan-300/90 hover:bg-slate-800/50 flex items-center gap-2">
-          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> How Stella worked this out ({steps.length} step{steps.length === 1 ? '' : 's'})
+          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> {heading} ({steps.length} step{steps.length === 1 ? '' : 's'})
         </summary>
         <ol className="px-3 pb-3 pt-1 space-y-2 list-none">
           {steps.map((s, i) => (
@@ -13651,6 +13691,7 @@ ${stepInstruction}`;
                         <div className="text-sm leading-relaxed">
                           {message.role === 'user' ? <span className="whitespace-pre-wrap break-words">{message.content}</span> : formatMarkdown(message.content)}
                         </div>
+                        {message.role === 'assistant' && Array.isArray(message.steps) && message.steps.length > 0 && renderStellaSteps(message.steps, message.kind === 'intake' ? 'How this was captured' : undefined)}
                         {Array.isArray(message.imagePreviews) && message.imagePreviews.length > 0 && (
                           <div className="mt-3 flex flex-wrap gap-2">
                             {message.imagePreviews.map((img, i) => (
@@ -13773,6 +13814,12 @@ ${stepInstruction}`;
                           <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.1s'}}></span>
                           <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{animationDelay: '0.2s'}}></span>
                         </div>
+                        {(() => {
+                          const lastThink = [...messages].reverse().find((m) => m.kind === 'intake-think' || (m.role === 'system' && String(m.content || '').startsWith('⏳')));
+                          return lastThink ? (
+                            <div className="text-xs text-blue-200/80 mt-2">{String(lastThink.content).replace(/^⏳\s*/, '')}</div>
+                          ) : null;
+                        })()}
                       </div>
                     </div>
                   </div>
