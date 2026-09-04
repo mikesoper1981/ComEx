@@ -93,6 +93,12 @@ export async function extractSpreadsheetText(file) {
   return parts.join('\n\n').trim();
 }
 
+function compactStringList(val) {
+  if (Array.isArray(val)) return val.map((m) => usefulString(m)).filter(Boolean);
+  const s = usefulString(val);
+  return s ? [s] : [];
+}
+
 export function compactCapturedContext(ctx) {
   const base = ctx && typeof ctx === 'object' ? ctx : {};
   const qa = Array.isArray(base.qa_pairs)
@@ -108,15 +114,15 @@ export function compactCapturedContext(ctx) {
       })
       .filter(Boolean)
     : [];
-  const metrics = Array.isArray(base.key_metrics)
-    ? base.key_metrics.map((m) => usefulString(m)).filter(Boolean)
-    : (usefulString(base.key_metrics) ? [usefulString(base.key_metrics)] : []);
+  const metrics = compactStringList(base.key_metrics);
+  const facts = compactStringList(base.key_facts);
   const out = {};
   const represents = usefulString(base.what_it_represents);
   const period = usefulString(base.time_period);
   const notes = usefulString(base.interpretation_notes);
   if (represents) out.what_it_represents = represents;
   if (period) out.time_period = period;
+  if (facts.length) out.key_facts = facts;
   if (metrics.length) out.key_metrics = metrics;
   if (notes) out.interpretation_notes = notes;
   if (qa.length) out.qa_pairs = qa;
@@ -153,10 +159,25 @@ function normalizeContextFile(raw) {
       .filter((m) => m.role && m.content)
     : [];
   if (intakeMessages.length) rec.intakeMessages = intakeMessages;
-  if (raw.intakeComplete) rec.intakeComplete = true;
+  if (raw.intakeComplete === false) rec.intakeComplete = false;
+  else if (raw.intakeComplete) rec.intakeComplete = true;
   if (raw.processing) rec.processing = true;
   const captured = compactCapturedContext(raw.capturedContext);
   if (captured) rec.capturedContext = captured;
+  if (Array.isArray(raw.columns) && raw.columns.length) {
+    rec.columns = raw.columns
+      .filter((c) => c && usefulString(c.name || c))
+      .slice(0, 80)
+      .map((c) => (typeof c === 'string'
+        ? { name: usefulString(c) }
+        : {
+          name: usefulString(c.name),
+          ...(usefulString(c.description) ? { description: usefulString(c.description) } : {}),
+          ...(usefulString(c.type) ? { type: usefulString(c.type) } : {}),
+        }))
+      .filter((c) => c.name);
+    if (!rec.columns.length) delete rec.columns;
+  }
   const notes = [];
   const seenNoteIds = new Set();
   const pushNote = (id, text) => {
@@ -177,7 +198,7 @@ function normalizeContextFile(raw) {
     String(raw.userNotes).split(/\n\n+/).forEach((part, i) => pushNote(`note_${i + 1}`, part));
   }
   if (notes.length) rec.notes = notes;
-  if (!rec.intakeComplete && !rec.processing) {
+  if (rec.intakeComplete !== false && !rec.intakeComplete && !rec.processing) {
     const hasStoredContent = !!(
       rec.summary || rec.extractedText || rec.visionExtract || rec.structuredExtract
       || rec.capturedContext || rec.notes?.length
@@ -253,6 +274,7 @@ export function serializeContextFileForPersist(fileRec) {
   if (rec.imageCount) out.imageCount = rec.imageCount;
   if (rec.capturedContext) out.capturedContext = rec.capturedContext;
   if (rec.notes?.length) out.notes = rec.notes;
+  if (rec.columns?.length) out.columns = rec.columns;
   if (rec.intakeComplete) out.intakeComplete = true;
   return out;
 }
@@ -311,22 +333,16 @@ export function listModuleContextBlocks(f) {
   if (!f) return [];
   const ctx = f.capturedContext || {};
   const blocks = [];
-  if (!isEmptyContextValue(f.extractedText)) {
-    blocks.push({ id: 'extractedText', label: 'Detected from file', value: f.extractedText });
-  }
-  if (!isEmptyContextValue(f.structuredExtract)) {
-    blocks.push({ id: 'structuredExtract', label: 'Tables / charts', value: f.structuredExtract });
-  }
-  if (!isEmptyContextValue(f.visionExtract)) {
-    blocks.push({ id: 'visionExtract', label: 'From images', value: f.visionExtract });
-  }
-  if (!isEmptyContextValue(f.summary)) blocks.push({ id: 'summary', label: 'Summary', value: f.summary });
   if (!isEmptyContextValue(ctx.what_it_represents)) blocks.push({ id: 'represents', label: 'What it represents', value: ctx.what_it_represents, line: true });
   if (!isEmptyContextValue(ctx.time_period)) blocks.push({ id: 'period', label: 'Time period', value: ctx.time_period, line: true });
+  if (Array.isArray(ctx.key_facts) && ctx.key_facts.some((m) => !isEmptyContextValue(m))) {
+    blocks.push({ id: 'facts', label: 'Key facts', value: ctx.key_facts.filter((m) => !isEmptyContextValue(m)).join('\n') });
+  }
   if (Array.isArray(ctx.key_metrics) && ctx.key_metrics.some((m) => !isEmptyContextValue(m))) {
     blocks.push({ id: 'metrics', label: 'Key fields', value: ctx.key_metrics.filter((m) => !isEmptyContextValue(m)).join('\n') });
   }
   if (!isEmptyContextValue(ctx.interpretation_notes)) blocks.push({ id: 'interpretation', label: 'How to use', value: ctx.interpretation_notes });
+  if (!isEmptyContextValue(f.summary)) blocks.push({ id: 'summary', label: 'Summary', value: f.summary });
   if (Array.isArray(ctx.name_maps) && ctx.name_maps.some((m) => m && (m.from || m.to))) {
     const maps = ctx.name_maps
       .filter((m) => m && (m.from || m.to))
@@ -347,8 +363,17 @@ export function listModuleContextBlocks(f) {
   });
   (f.notes || []).forEach((n) => {
     if (!n || isEmptyContextValue(n.text)) return;
-    blocks.push({ id: `note:${n.id}`, label: 'Added context', value: n.text });
+    blocks.push({ id: `note:${n.id}`, label: 'Comment', value: n.text });
   });
+  if (!isEmptyContextValue(f.extractedText)) {
+    blocks.push({ id: 'extractedText', label: 'Detected from file', value: f.extractedText, source: true });
+  }
+  if (!isEmptyContextValue(f.structuredExtract)) {
+    blocks.push({ id: 'structuredExtract', label: 'Tables / charts', value: f.structuredExtract, source: true });
+  }
+  if (!isEmptyContextValue(f.visionExtract)) {
+    blocks.push({ id: 'visionExtract', label: 'From images', value: f.visionExtract, source: true });
+  }
   return blocks;
 }
 
@@ -593,6 +618,7 @@ export function listModuleLibraryFiles(settings, moduleId) {
 export function formatModuleLibraryIndexLine(f, moduleId) {
   const ctx = f?.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
   const purpose = oneSentence(ctx.what_it_represents)
+    || oneSentence((Array.isArray(ctx.key_facts) ? ctx.key_facts[0] : ''))
     || oneSentence(f?.summary)
     || oneSentence(f?.extractedText, 100)
     || (f?.fileType || 'document');

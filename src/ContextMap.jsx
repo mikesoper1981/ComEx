@@ -155,13 +155,16 @@ function previewLines(text, limit = 5) {
 }
 
 function contextFileSummary(file) {
+  const ctx = file?.capturedContext && typeof file.capturedContext === 'object' ? file.capturedContext : {};
   const blocks = listModuleContextBlocks(file) || [];
-  const highlights = blocks
-    .map((b) => {
-      if (b.qa) return clip(b.answer || b.question, 160);
-      return clip(b.value, 160);
-    })
-    .filter(Boolean);
+  const highlights = [
+    clip(ctx.what_it_represents, 160),
+    ...(Array.isArray(ctx.key_facts) ? ctx.key_facts : []).map((m) => clip(m, 140)),
+    ...(Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).map((m) => clip(m, 120)),
+    clip(ctx.interpretation_notes, 160),
+    clip(file?.summary, 160),
+    ...blocks.filter((b) => b.qa).map((b) => clip(b.answer || b.question, 160)),
+  ].filter(Boolean);
   const kind = kindOfFile(file);
   return {
     id: file.id,
@@ -194,6 +197,7 @@ function stellaFileSummary(file) {
     clip(ctx.what_it_represents, 160),
     clip(ctx.interpretation_notes, 160),
     clip(file?.extractedText || file?.structuredExtract || file?.visionExtract, 160),
+    ...(Array.isArray(ctx.key_facts) ? ctx.key_facts : []).map((m) => clip(m, 140)),
     ...(Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).map((m) => clip(m, 120)),
     ...qa.map((p) => clip(p.answer || p.question, 160)),
   ].filter(Boolean);

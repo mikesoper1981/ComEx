@@ -167,33 +167,35 @@ Rules:
 - Prefer relevant=true or "unsure" over dropping possible content.
 - relevant=false only when clearly logo / decoration / stock photo / icon.
 - Use the exact filename provided for each image.`,
-  contextContentSummaryPrompt: `You read ONE uploaded file, then we save it as context.
+  contextContentSummaryPrompt: `You extract FACTS from ONE uploaded file so later specialists can use it without rereading the whole document.
 
 Return ONLY valid JSON. No markdown.
 Schema:
 {
-  "summary": "2-4 sentences describing what THIS file contains, based only on its contents",
+  "summary": "one factual sentence of what THIS file is",
+  "what_it_represents": "what the file is for (one sentence, or empty)",
+  "time_period": "coverage dates / FY / months if stated, else empty",
+  "key_facts": ["one short factual bullet — names, numbers, rules, eligibility, products, territories"],
+  "key_metrics": ["field or metric = meaning, with units if known"],
   "columns": [{ "name": "exact column name", "description": "what this column represents" }],
+  "interpretation_notes": "how to use this file (definitions, caveats). Empty if nothing extra.",
   "suggestedQuestions": []
 }
 
-Process:
-1. Read the file contents provided.
-2. If something needed to interpret THIS file is missing or ambiguous, add a clarifying question about that gap. Questions must be about this file only.
-3. If the file is already understandable from its contents, return suggestedQuestions as [].
-4. Never use a fixed checklist of questions. Never ask about topics that are not in the file.
-5. Never ask about facts already visible in the extract.
-6. If column names are provided, describe them. If none, return an empty columns array.
-7. If there is nothing usable to describe, return "summary": "" and "suggestedQuestions": []. Empty fields must be empty strings, not explanations of emptiness. Never write filler such as "the file contained no text", "could not extract", "empty file", "n/a", or "unknown".
+Rules:
+- Pull facts that are IN the file. Do not write a slide-by-slide narrative or a marketing summary.
+- Each key_facts item is one discrete fact (≤25 words). Prefer 4–20 facts. Skip logos, decoration, and empty slides.
+- Never invent numbers or names. If unreadable, omit rather than guess.
+- suggestedQuestions only for a gap that would block using the file. Otherwise [].
+- Empty fields must be empty / []. Never write n/a, unknown, or "the file contained no text".
+{{moduleLabel}} is only the storage place — not a topic to ask about.`,
+  contextIntakePrompt: `You onboard ONE uploaded file. Detected facts may already be in the extract.
 
-{{moduleLabel}} is only the place this file will be stored — it is not a topic to ask about.`,
-  contextIntakePrompt: `You help onboard ONE uploaded file so it can be saved.
+Ask at most one question if something material is still ambiguous (year, currency, which plan, a definition). Otherwise set complete=true.
 
-Process: read the extract; ask one question only if something in THIS file is still unclear; otherwise set complete=true so the file is saved.
+Never use a fixed checklist. Never ask about other files or the module in general. Never ask about facts already visible in the extract.
 
-Never use a fixed checklist. Never ask about other files or about the module in general. Never ask about facts already visible in the extract.
-
-When the file is understandable, set complete=true and fill context_qa.
+When complete=true, fill context_qa with FACTS from the extract plus the user's answers — not a narrative rewrite.
 
 Return ONLY valid JSON — no markdown fences.
 Schema:
@@ -203,12 +205,13 @@ Schema:
   "context_qa": {
     "what_it_represents": "",
     "time_period": "",
-    "key_metrics": ["", ""],
+    "key_facts": ["short factual bullet"],
+    "key_metrics": ["field or metric = meaning"],
     "interpretation_notes": "",
     "qa_pairs": [{"question": "", "answer": ""}]
   }
 }
-When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked and the user's answer. Omit or leave empty any field with no real answer — do not write n/a, unknown, "the file contained no text", or similar filler.`,
+When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked and the user's answer. Omit or leave empty any field with no real answer — do not write n/a, unknown, or filler.`,
 };
 
 export const DEFAULT_STELLA_PROMPTS = {

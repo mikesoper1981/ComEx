@@ -125,7 +125,6 @@ import {
   connectedComponentIds,
   modulesAreConnected,
   MODULE_CONTEXT_LABELS,
-  listModuleContextBlocks,
   isThinContextExtract,
   knowledgeStemPattern,
   isEmptyContextValue,
@@ -4469,6 +4468,7 @@ function factsFromStellaCapturedContext(ctx) {
   push(ctx.what_it_represents);
   const period = String(ctx.time_period || '').trim();
   if (period.length >= 8) push(`This file covers ${period}`);
+  (Array.isArray(ctx.key_facts) ? ctx.key_facts : []).forEach((m) => push(m));
   (Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).forEach((m) => push(m));
   (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).forEach((p) => {
     const answer = String(p?.answer || '').replace(/\s+/g, ' ').trim();
@@ -4536,21 +4536,70 @@ function stellaContextText(value) {
   return s ? s : '';
 }
 
+function InlineCapturedText({ value, onSave, line }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(value || '');
+  useEffect(() => { setText(value || ''); }, [value]);
+  if (!onSave) return <span className="whitespace-pre-wrap break-words">{value}</span>;
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={() => setEditing(true)}
+        className="text-left w-full whitespace-pre-wrap break-words hover:bg-white/5 rounded px-0.5 -mx-0.5"
+        title="Click to edit"
+      >
+        {value}
+      </button>
+    );
+  }
+  const shared = 'w-full bg-slate-950/50 text-emerald-50 border border-emerald-400/30 rounded-lg px-2 py-1.5 text-xs outline-none focus:border-emerald-400';
+  const commit = () => {
+    setEditing(false);
+    if (text !== (value || '')) onSave(text);
+  };
+  if (line) {
+    return (
+      <input
+        autoFocus
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(false); }}
+        className={shared}
+      />
+    );
+  }
+  return (
+    <textarea
+      autoFocus
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => { if (e.key === 'Escape') setEditing(false); }}
+      rows={3}
+      className={`${shared} resize-y`}
+    />
+  );
+}
+
 function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
   if (!ctx || typeof ctx !== 'object') {
-    return <p className="text-xs text-emerald-200/70">No interpretive notes stored yet.</p>;
+    return <p className="text-xs text-emerald-200/70">No captured facts yet.</p>;
   }
   const maps = stellaCollectNameMaps(ctx);
   const metrics = stellaContextText(ctx.key_metrics);
   const metricList = Array.isArray(metrics) ? metrics : (metrics ? [metrics] : []);
+  const factRaw = stellaContextText(ctx.key_facts);
+  const factList = Array.isArray(factRaw) ? factRaw : (factRaw ? [factRaw] : []);
   const rels = (Array.isArray(ctx.relationships) ? ctx.relationships : []).filter((r) => r && (r.related_file || r.related_table));
   const qa = (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).filter((p) => p && (p.question || p.answer));
   const represents = String(ctx.what_it_represents || '').trim();
   const period = String(ctx.time_period || '').trim();
   const notes = String(ctx.interpretation_notes || '').trim();
-  const hasAny = represents || period || metricList.length || notes || maps.length || rels.length || qa.length;
+  const hasAny = represents || period || factList.length || metricList.length || notes || maps.length || rels.length || qa.length;
   if (!hasAny) {
-    return <p className="text-xs text-emerald-200/70">No interpretive notes stored yet.</p>;
+    return <p className="text-xs text-emerald-200/70">No captured facts yet.</p>;
   }
 
   const editable = typeof onPatch === 'function';
@@ -4577,11 +4626,13 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
     </div>
   );
 
+  const patchList = (key, list) => onPatch({ ...ctx, [key]: list });
+
   return (
     <div className="px-4 pb-4 space-y-3">
       {editable ? (
         <div className="flex items-center justify-between gap-2 pb-1">
-          <p className="text-[11px] text-emerald-200/60">Remove anything that is wrong. Stella will stop using it.</p>
+          <p className="text-[11px] text-emerald-200/60">Click text to update. Remove anything that is wrong — it will stop being used.</p>
           <button
             type="button"
             onClick={() => onPatch(null)}
@@ -4593,24 +4644,53 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
       ) : null}
       {represents ? (
         <Section title="What this file is" onRemove={() => onPatch({ ...ctx, what_it_represents: '' })}>
-          {represents}
+          <InlineCapturedText value={represents} onSave={editable ? (v) => onPatch({ ...ctx, what_it_represents: v }) : undefined} line />
         </Section>
       ) : null}
       {period ? (
         <Section title="Time period" onRemove={() => onPatch({ ...ctx, time_period: '' })}>
-          {period}
+          <InlineCapturedText value={period} onSave={editable ? (v) => onPatch({ ...ctx, time_period: v }) : undefined} line />
+        </Section>
+      ) : null}
+      {factList.length ? (
+        <Section title="Key facts" onRemove={() => onPatch({ ...ctx, key_facts: [] })}>
+          <ul className="list-disc pl-4 space-y-1">
+            {factList.map((m, i) => (
+              <li key={`${m}-${i}`} className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <InlineCapturedText
+                    value={m}
+                    onSave={editable ? (v) => patchList('key_facts', factList.map((x, idx) => (idx === i ? v : x)).filter((x) => String(x || '').trim())) : undefined}
+                    line
+                  />
+                </div>
+                <Remove onClick={() => patchList('key_facts', factList.filter((_, idx) => idx !== i))} label="Remove this fact" />
+              </li>
+            ))}
+          </ul>
         </Section>
       ) : null}
       {metricList.length ? (
         <Section title="Columns / contents" onRemove={() => onPatch({ ...ctx, key_metrics: [] })}>
-          <ul className="list-disc pl-4 space-y-0.5">
-            {metricList.map((m) => <li key={m}>{m}</li>)}
+          <ul className="list-disc pl-4 space-y-1">
+            {metricList.map((m, i) => (
+              <li key={`${m}-${i}`} className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <InlineCapturedText
+                    value={m}
+                    onSave={editable ? (v) => patchList('key_metrics', metricList.map((x, idx) => (idx === i ? v : x)).filter((x) => String(x || '').trim())) : undefined}
+                    line
+                  />
+                </div>
+                <Remove onClick={() => patchList('key_metrics', metricList.filter((_, idx) => idx !== i))} label="Remove this field" />
+              </li>
+            ))}
           </ul>
         </Section>
       ) : null}
       {notes ? (
         <Section title="How to read it" onRemove={() => onPatch({ ...ctx, interpretation_notes: '' })}>
-          {notes}
+          <InlineCapturedText value={notes} onSave={editable ? (v) => onPatch({ ...ctx, interpretation_notes: v }) : undefined} />
         </Section>
       ) : null}
       {maps.length ? (
@@ -4666,9 +4746,17 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
           <ol className="space-y-2">
             {qa.map((p, i) => (
               <li key={i} className="bg-slate-950/35 border border-emerald-400/15 rounded-lg px-3 py-2 flex items-start justify-between gap-2">
-                <div>
+                <div className="min-w-0 flex-1">
                   {p.question ? <div className="text-emerald-200/70 mb-1">{String(p.question)}</div> : null}
-                  {p.answer ? <div className="text-emerald-50">{String(p.answer)}</div> : null}
+                  {p.answer ? (
+                    <InlineCapturedText
+                      value={String(p.answer)}
+                      onSave={editable ? (v) => onPatch({
+                        ...ctx,
+                        qa_pairs: qa.map((row, idx) => (idx === i ? { ...row, answer: v } : row)),
+                      }) : undefined}
+                    />
+                  ) : null}
                 </div>
                 <Remove
                   onClick={() => onPatch({ ...ctx, qa_pairs: qa.filter((_, idx) => idx !== i) })}
@@ -5222,10 +5310,6 @@ function PayoutCurveChart({ curveData }) {
   );
 }
 
-function contextBlocksFromFile(f) {
-  return listModuleContextBlocks(f);
-}
-
 function EditableContextBlock({ label, value, question, answer, qa, line, onSave, onDelete }) {
   const [text, setText] = useState(value || '');
   const [q, setQ] = useState(question || '');
@@ -5378,6 +5462,8 @@ export default function CommercialExcellenceApp() {
   const proposalIngestRunningRef = useRef(false);
   const [pendingProposalIntake, setPendingProposalIntake] = useState(null);
   const pendingProposalIntakeRef = useRef(null);
+  const [pendingModuleContextIntake, setPendingModuleContextIntake] = useState(null);
+  const pendingModuleContextIntakeRef = useRef(null);
   const [contextIngestJob, setContextIngestJob] = useState(null);
   const contextIngestJobRef = useRef(null);
   const [activeContextFileId, setActiveContextFileId] = useState(null);
@@ -5525,6 +5611,7 @@ export default function CommercialExcellenceApp() {
   const [pptxOffers, setPptxOffers] = useState(null);
   const [pptxGenerating, setPptxGenerating] = useState(false);
   const [pptxClarifyPending, setPptxClarifyPending] = useState(false);
+  const [toolsPptxPick, setToolsPptxPick] = useState(false);
   const [hoveredCitation, setHoveredCitation] = useState(null);
 
   const messagesEndRef = useRef(null);
@@ -7379,6 +7466,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     setSuggestedPrompts([]);
     setPptxOffers(null);
     setPptxClarifyPending(false);
+    setToolsPptxPick(false);
     setShowLanding(false);
     setActiveTab(destTab);
     activeTabRef.current = destTab;
@@ -7649,6 +7737,23 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     fileInputRef.current?.click();
   };
 
+  const startUploadIcContext = () => {
+    goToIncentiveChat();
+    revealChatTools();
+    window.setTimeout(() => {
+      moduleContextFileInputRef.current?.setAttribute('data-module', 'incentives');
+      moduleContextFileInputRef.current?.setAttribute('data-source', 'chat');
+      moduleContextFileInputRef.current?.click();
+    }, 50);
+  };
+
+  const openIcContextSettings = () => {
+    setShowLanding(false);
+    setActiveTab('user-settings');
+    setUserSettingsPane('incentives');
+    setMobileChatToolsOpen(false);
+  };
+
   const startBestPractices = () => {
     goToIncentiveChat();
     window.setTimeout(() => {
@@ -7659,15 +7764,6 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
   const renderChatToolsBody = (kind) => {
     const isStella = kind === 'stella';
     const showQuick = !isStella && !waitingForPptxChoice;
-    const extraWorkflows = showQuick
-      ? (topics || []).filter((t) => (
-        t.status === 'active'
-        && t.id !== 'design_ic'
-        && t.id !== 'analyze_ic'
-        && t.id !== 'territory_assessment'
-        && !String(t.id || '').startsWith('territory')
-      ))
-      : [];
     const pptxClarifyOptions = !isStella && waitingForPptxChoice ? (getPptxClarify().options || []) : [];
     const threadMsgs = isStella ? stellaMessages : messages;
     const threadOffers = !isStella && pptxOffers && (pptxOffers.thread || 'chat') !== 'stella' ? pptxOffers : null;
@@ -7699,22 +7795,36 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
               <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">Start</div>
               <button type="button" onClick={startDesignScheme} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-blue-500/20 border border-blue-400/25 hover:border-blue-400/50 rounded-lg text-xs text-blue-200 text-left"><Target className="w-3.5 h-3.5 shrink-0" /> Design New Scheme</button>
               <button type="button" onClick={startAssessIc} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"><Upload className="w-3.5 h-3.5 shrink-0" /> Assess IC</button>
-              {extraWorkflows.map((topic) => (
-                <button
-                  key={topic.id}
-                  type="button"
-                  onClick={() => {
-                    goToIncentiveChat();
-                    window.setTimeout(() => {
-                      void launchWorkflowDirect(topic.id, `I want to start ${topic.name}`);
-                    }, 100);
-                  }}
-                  className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"
-                >
-                  <Sparkles className="w-3.5 h-3.5 shrink-0" /> {topic.name}
-                </button>
-              ))}
               <button type="button" onClick={startBestPractices} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-purple-500/20 border border-purple-400/25 hover:border-purple-400/50 rounded-lg text-xs text-purple-200 text-left"><Award className="w-3.5 h-3.5 shrink-0" /> Best Practices</button>
+            </div>
+          )}
+          {!isStella && (
+            <div className="p-3 space-y-2 border-b border-blue-400/15">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">IC context files</div>
+              <p className="text-[11px] text-blue-300/50 leading-relaxed">Upload supporting IC context</p>
+              <button type="button" onClick={startUploadIcContext} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"><Upload className="w-3.5 h-3.5 shrink-0" /> Upload context file</button>
+              {(userSettings.moduleContext?.incentives?.files || []).length === 0 ? (
+                <div className="text-[11px] text-blue-300/45">No context files yet.</div>
+              ) : (
+                <div className="space-y-1.5">
+                  {(userSettings.moduleContext?.incentives?.files || []).map((f) => {
+                    const n = Array.isArray(f.capturedContext?.key_facts) ? f.capturedContext.key_facts.length : 0;
+                    return (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={openIcContextSettings}
+                        className="w-full text-left px-2.5 py-2 bg-slate-900/40 hover:bg-slate-800/60 border border-blue-400/15 rounded-lg"
+                      >
+                        <div className="text-[11px] font-semibold text-blue-100 truncate">{f.name}</div>
+                        <div className="text-[10px] text-blue-300/50 mt-0.5">
+                          {f.processing ? 'Processing…' : f.intakeComplete ? (n ? `${n} fact${n === 1 ? '' : 's'}` : 'Ready') : 'Needs intake'}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
             <div className="p-3 space-y-2 border-b border-blue-400/15">
@@ -7768,7 +7878,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
                           type="button"
                           onClick={() => {
                             const dt = threadOffers.produced.deckType;
-                            if (!dt || dt === 'general') askPptxClarification();
+                            if (!dt || dt === 'general') setToolsPptxPick(true);
                             else handleGeneratePptx(threadOffers.produced, 'produced');
                           }}
                           className="mt-1 px-2.5 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/30 rounded-lg text-xs text-emerald-200 font-semibold"
@@ -7795,12 +7905,34 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
                   ))}
                 </div>
               )}
-              {canExportPptx && (
+              {toolsPptxPick && !waitingForPptxChoice && !pptxGenerating && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-[11px] text-blue-300/70 leading-relaxed">Choose a deck type:</div>
+                    <button type="button" onClick={() => setToolsPptxPick(false)} className="text-slate-500 hover:text-slate-300"><X className="w-3.5 h-3.5" /></button>
+                  </div>
+                  {(getPptxClarify().options || []).map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => {
+                        setMobileChatToolsOpen(false);
+                        const resolved = pptxOfferFromClarifyValue(opt.value);
+                        if (resolved?.mode && resolved.offer) handleGeneratePptx(resolved.offer, resolved.mode);
+                      }}
+                      className="w-full px-2.5 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/35 hover:border-cyan-400/55 rounded-lg text-xs text-cyan-100 font-semibold transition-all text-left leading-snug"
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {canExportPptx && !toolsPptxPick && (
                 <button type="button" onClick={startPptxExportFromUi} className="w-full flex items-center justify-center gap-1.5 px-2.5 py-2 bg-violet-500/10 hover:bg-violet-500/20 border border-violet-400/25 hover:border-violet-400/40 rounded-lg text-xs text-violet-200 font-semibold">
                   Export as PowerPoint
                 </button>
               )}
-              {!canExportPptx && !threadOffers && !pptxGenerating && !waitingForPptxChoice && (
+              {!canExportPptx && !threadOffers && !pptxGenerating && !waitingForPptxChoice && !toolsPptxPick && (
                 <div className="text-[11px] text-blue-300/50 leading-relaxed">
                   {currentWorkflow
                     ? 'Export is paused while a workflow is in progress.'
@@ -8665,7 +8797,10 @@ ${stepInstruction}`;
   };
 
   const summarizeContextFile = async ({ name, extractBlob, moduleId, columns = [] }) => {
-    const fallback = { summary: '', columns: [], suggestedQuestions: [] };
+    const fallback = {
+      summary: '', columns: [], suggestedQuestions: [],
+      what_it_represents: '', time_period: '', key_facts: [], key_metrics: [], interpretation_notes: '',
+    };
     if (isThinContextExtract(extractBlob, name)) return fallback;
     const rt = getWorkflowRuntime();
     const system = fillTemplate(rt.contextContentSummaryPrompt, {
@@ -8685,7 +8820,30 @@ ${stepInstruction}`;
     const columnsOut = (Array.isArray(parsed.columns) ? parsed.columns : [])
       .filter((c) => c && !isEmptyContextValue(c.name));
     const summary = isEmptyContextValue(parsed.summary) ? '' : String(parsed.summary).trim();
-    return { summary, columns: columnsOut, suggestedQuestions: questions };
+    const facts = (Array.isArray(parsed.key_facts) ? parsed.key_facts : [])
+      .map((f) => String(f || '').replace(/\s+/g, ' ').trim())
+      .filter((f) => f.length >= 8 && !isEmptyContextValue(f))
+      .slice(0, 24);
+    const metrics = (Array.isArray(parsed.key_metrics) ? parsed.key_metrics : [])
+      .map((m) => String(m || '').replace(/\s+/g, ' ').trim())
+      .filter((m) => m && !isEmptyContextValue(m))
+      .slice(0, 40);
+    if (!metrics.length && columnsOut.length) {
+      columnsOut.forEach((c) => {
+        const line = c.description ? `${c.name} = ${c.description}` : c.name;
+        if (line) metrics.push(line);
+      });
+    }
+    return {
+      summary,
+      columns: columnsOut,
+      suggestedQuestions: questions,
+      what_it_represents: isEmptyContextValue(parsed.what_it_represents) ? '' : String(parsed.what_it_represents).trim(),
+      time_period: isEmptyContextValue(parsed.time_period) ? '' : String(parsed.time_period).trim(),
+      key_facts: facts,
+      key_metrics: metrics,
+      interpretation_notes: isEmptyContextValue(parsed.interpretation_notes) ? '' : String(parsed.interpretation_notes).trim(),
+    };
   };
 
   const completeProposalIngest = async (job) => {
@@ -8968,12 +9126,14 @@ ${stepInstruction}`;
     await saveUserSettings({ moduleContext: mergeModuleContext(nextModuleContext) });
   };
 
-  const interpretContextImages = async (images, onStatus) => {
+  const interpretContextImages = async (images, onStatus, moduleId) => {
     if (!images?.length) return '';
     onStatus?.(`Reading ${Math.min(images.length, 8)} image(s)…`);
+    const rt = getWorkflowRuntime();
+    const prompt = moduleId === 'incentives' ? rt.proposalImageInterpretPrompt : rt.contextImageInterpretPrompt;
     return interpretProposalImages(
       images,
-      withUserSettings(getWorkflowRuntime().contextImageInterpretPrompt, { moduleContext: false, applyResponseLength: false }),
+      withUserSettings(prompt, { moduleContext: false, applyResponseLength: false }),
       {
         onProgress: (n, total, name) => onStatus?.(`Reading image ${n}/${total} (${name})…`),
       },
@@ -8987,25 +9147,61 @@ ${stepInstruction}`;
     const structuredText = job.structuredText || '';
     const images = Array.isArray(job.images) ? job.images : (job.included || []);
     const fileId = job.fileId || `ctx_${Date.now()}_${stellaNanoId()}`;
+    const fromChat = !!job.fromChat;
+    const postChat = (content, extra = {}) => {
+      if (!fromChat) return;
+      setMessages((prev) => [...prev, { role: extra.role || 'system', content, ...extra }]);
+    };
     let visionText = '';
     try {
-      if (images.length) visionText = await interpretContextImages(images, job.onStatus);
+      if (images.length) {
+        if (fromChat) {
+          postChat(`🖼️ Extracting content and key points from **${Math.min(images.length, 8)}** image(s)…`);
+        }
+        visionText = await interpretContextImages(images, (msg) => {
+          job.onStatus?.(msg);
+          if (fromChat) {
+            setMessages((prev) => {
+              const copy = [...prev];
+              const last = copy[copy.length - 1];
+              if (last?.role === 'system' && /Extracting content|Reading image/.test(String(last.content || ''))) {
+                copy[copy.length - 1] = { ...last, content: `🖼️ ${msg}` };
+                return copy;
+              }
+              return [...prev, { role: 'system', content: `🖼️ ${msg}` }];
+            });
+          }
+        }, moduleId);
+      }
     } catch (err) {
       job.onStatus?.(`Image reading skipped: ${err.message || 'vision failed'}`);
+      postChat(`⚠️ Image reading skipped: ${err.message || 'vision failed'}. Continuing with text extract.`);
     }
 
     const extractBlob = [extractedText, structuredText, visionText].filter((t) => !isEmptyContextValue(t)).join('\n\n');
-    let onboarding = { summary: '', suggestedQuestions: [] };
+    let onboarding = {
+      summary: '', suggestedQuestions: [], columns: [],
+      what_it_represents: '', time_period: '', key_facts: [], key_metrics: [], interpretation_notes: '',
+    };
     if (!isThinContextExtract(extractBlob, file.name)) {
       try {
+        job.onStatus?.('Capturing key facts…');
         onboarding = await summarizeContextFile({ name: file.name, extractBlob, moduleId });
       } catch { /* keep fallback */ }
     }
     const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+    const captured = compactCapturedContext({
+      what_it_represents: onboarding.what_it_represents,
+      time_period: onboarding.time_period,
+      key_facts: onboarding.key_facts,
+      key_metrics: onboarding.key_metrics,
+      interpretation_notes: onboarding.interpretation_notes,
+    });
     const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
+    const factCount = captured?.key_facts?.length || 0;
     const assistantMsg = questions.length
-      ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}\n\nTo use this correctly I need a little context:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
-      : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}`;
+      ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}\n\nI captured **${factCount}** key fact${factCount === 1 ? '' : 's'}. A few gaps still need you:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
+      : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}${factCount ? `\n\nCaptured **${factCount}** key fact${factCount === 1 ? '' : 's'} — review them under Incentive Comp context files.` : ''}`;
     const rec = {
       id: fileId,
       name: file.name,
@@ -9017,20 +9213,38 @@ ${stepInstruction}`;
       visionExtract: visionText,
       structuredExtract: structuredText,
       imageCount: images.length,
+      columns: onboarding.columns,
+      capturedContext: captured,
       intakeMessages: [{ role: 'assistant', content: assistantMsg }],
-      intakeComplete: true,
+      intakeComplete: questions.length === 0,
+      processing: false,
     };
     const nextCtx = upsertModuleContextFile(userSettingsRef.current.moduleContext, moduleId, rec);
     await persistContextFiles(nextCtx);
     setActiveContextFileId(fileId);
     contextIngestJobRef.current = null;
     setContextIngestJob(null);
-    if (questions.length === 0) {
-      job.onStatus?.('Stored — no extra questions needed.');
+    if (questions.length) {
+      const intake = { moduleId, fileId, fromChat };
+      pendingModuleContextIntakeRef.current = intake;
+      setPendingModuleContextIntake(intake);
+      if (fromChat) {
+        setMessages((prev) => [...prev, { role: 'assistant', content: assistantMsg, kind: 'intake' }]);
+        setIsLoading(false);
+      }
+    } else {
+      pendingModuleContextIntakeRef.current = null;
+      setPendingModuleContextIntake(null);
+      if (fromChat) {
+        postChat(assistantMsg.replace(/^✅ /, '✅ Context saved. '));
+        setIsLoading(false);
+      } else {
+        job.onStatus?.('Stored — no extra questions needed.');
+      }
     }
   };
 
-  const continueModuleContextIntake = async (moduleId, fileId, userText) => {
+  const continueModuleContextIntake = async (moduleId, fileId, userText, { fromChat = false } = {}) => {
     const files = userSettingsRef.current.moduleContext?.[moduleId]?.files || [];
     const rec = files.find((f) => f.id === fileId);
     if (!rec) return;
@@ -9038,6 +9252,9 @@ ${stepInstruction}`;
       setContextIntakeBusy(true);
       try {
         await appendContextFileNote(moduleId, fileId, userText);
+        if (fromChat) {
+          setMessages((prev) => [...prev, { role: 'system', content: '✅ Comment saved on this context file.' }]);
+        }
       } finally {
         setContextIntakeBusy(false);
       }
@@ -9045,6 +9262,7 @@ ${stepInstruction}`;
     }
     const nextMessages = [...(rec.intakeMessages || []), { role: 'user', content: userText }];
     setContextIntakeBusy(true);
+    if (fromChat) setIsLoading(true);
     const optimistic = patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, { intakeMessages: nextMessages });
     setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
     try {
@@ -9054,20 +9272,38 @@ ${stepInstruction}`;
         intakeMessages: nextMessages,
       });
       const withAssistant = [...nextMessages, { role: 'assistant', content: result.message }];
+      const mergedCtx = result.complete
+        ? compactCapturedContext({ ...(rec.capturedContext || {}), ...(result.context_qa || {}) })
+        : rec.capturedContext;
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: withAssistant,
-        intakeComplete: true,
-        capturedContext: result.complete ? (result.context_qa || rec.capturedContext) : rec.capturedContext,
+        intakeComplete: !!result.complete,
+        capturedContext: mergedCtx,
       });
       await persistContextFiles(patched);
+      if (fromChat) {
+        setMessages((prev) => [...prev, { role: 'assistant', content: result.message, kind: 'intake' }]);
+      }
+      if (result.complete) {
+        pendingModuleContextIntakeRef.current = null;
+        setPendingModuleContextIntake(null);
+      } else {
+        const next = { moduleId, fileId, fromChat };
+        pendingModuleContextIntakeRef.current = next;
+        setPendingModuleContextIntake(next);
+      }
     } catch (err) {
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: [...nextMessages, { role: 'system', content: `⚠️ ${err.message || 'Intake failed'}` }],
       });
       await persistContextFiles(patched);
+      if (fromChat) {
+        setMessages((prev) => [...prev, { role: 'system', content: `⚠️ Could not continue intake: ${err.message || 'error'}. Facts already captured are still saved.` }]);
+      }
     } finally {
       setContextIntakeBusy(false);
       setContextIntakeInput('');
+      if (fromChat) setIsLoading(false);
     }
   };
 
@@ -9116,6 +9352,8 @@ ${stepInstruction}`;
 
   const handleModuleContextUpload = async (event, moduleId) => {
     const file = event.target.files?.[0];
+    const fromChat = event.target.getAttribute('data-source') === 'chat';
+    event.target.removeAttribute('data-source');
     event.target.value = '';
     if (!file) return;
     const fileId = `ctx_${Date.now()}_${stellaNanoId()}`;
@@ -9131,10 +9369,24 @@ ${stepInstruction}`;
     const optimistic = upsertModuleContextFile(userSettingsRef.current.moduleContext, moduleId, placeholder);
     setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
     setActiveContextFileId(fileId);
-    setUserSettingsPane(moduleId === 'stella' ? 'stella' : moduleId === 'territory' ? 'territory' : 'incentives');
+    if (!fromChat) {
+      setUserSettingsPane(moduleId === 'stella' ? 'stella' : moduleId === 'territory' ? 'territory' : 'incentives');
+    } else {
+      setIsLoading(true);
+      setMessages((prev) => [...prev, {
+        role: 'system',
+        content: `⏳ Uploading **${file.name}** as Incentive Comp context — scanning text and images…`,
+      }]);
+    }
+    const classifyPrompt = withUserSettings(
+      moduleId === 'incentives'
+        ? getWorkflowRuntime().proposalImageClassifyPrompt
+        : getWorkflowRuntime().contextImageClassifyPrompt,
+      { moduleContext: false, applyResponseLength: false },
+    );
     try {
       const extracts = await extractDocumentForIngest(file, {
-        classifyPrompt: withUserSettings(getWorkflowRuntime().contextImageClassifyPrompt, { moduleContext: false, applyResponseLength: false }),
+        classifyPrompt,
         onStatus: (msg) => {
           setUserSettings((prev) => ({
             ...prev,
@@ -9142,12 +9394,24 @@ ${stepInstruction}`;
               intakeMessages: [{ role: 'assistant', content: `⏳ ${msg}` }],
             }),
           }));
+          if (fromChat) {
+            setMessages((prev) => {
+              const copy = [...prev];
+              const last = copy[copy.length - 1];
+              if (last?.role === 'system' && String(last.content || '').includes('⏳')) {
+                copy[copy.length - 1] = { ...last, content: `⏳ ${msg}` };
+                return copy;
+              }
+              return [...prev, { role: 'system', content: `⏳ ${msg}` }];
+            });
+          }
         },
       });
       const job = {
         moduleId,
         fileId,
         file,
+        fromChat,
         fileType: extracts.fileType,
         extractedText: extracts.extractedText,
         structuredText: extracts.structuredText,
@@ -9155,6 +9419,7 @@ ${stepInstruction}`;
         included: extracts.included,
         unsure: extracts.unsure,
         skipped: extracts.skipped,
+        ingestKind: 'moduleContext',
         onStatus: (msg) => {
           setUserSettings((prev) => ({
             ...prev,
@@ -9176,6 +9441,18 @@ ${stepInstruction}`;
             }],
           }),
         }));
+        if (fromChat) {
+          const previews = buildProposalImagePreviews(extracts.included, extracts.unsure, extracts.skipped);
+          pendingImageReviewRef.current = job;
+          setPendingImageReview(job);
+          setIsLoading(false);
+          setMessages((prev) => [...prev, {
+            role: 'system',
+            content: `🖼️ **${extracts.included.length}** scheme image(s) will be extracted. **${extracts.unsure.length}** still need a yes/no — include any that carry IC context (skip logos and decoration).`,
+            imagePreviews: previews,
+            imageReviewPending: true,
+          }]);
+        }
         return;
       }
       await completeModuleContextIngest({ ...job, images: extracts.included });
@@ -9185,6 +9462,13 @@ ${stepInstruction}`;
         intakeMessages: [{ role: 'system', content: `❌ Could not process ${file.name}: ${err.message || 'error'}` }],
       });
       await persistContextFiles(failed);
+      if (fromChat) {
+        setIsLoading(false);
+        setMessages((prev) => [...prev, {
+          role: 'system',
+          content: `❌ Could not process ${file.name}: ${err.message || 'error'}`,
+        }]);
+      }
     }
   };
 
@@ -9220,6 +9504,9 @@ ${stepInstruction}`;
     else if (blockId === 'metrics') {
       const metrics = empty ? [] : String(nextValue || '').split(/[\n;]+/).map((s) => s.trim()).filter(Boolean);
       patch.capturedContext = { ...ctx, key_metrics: metrics };
+    } else if (blockId === 'facts') {
+      const facts = empty ? [] : String(nextValue || '').split(/\n+/).map((s) => s.trim()).filter(Boolean);
+      patch.capturedContext = { ...ctx, key_facts: facts };
     } else if (blockId.startsWith('qa:')) {
       const idx = Number(blockId.slice(3));
       const qa = [...(ctx.qa_pairs || [])];
@@ -9260,7 +9547,6 @@ ${stepInstruction}`;
   const renderModuleContextPanel = (moduleId) => {
     const files = userSettings.moduleContext?.[moduleId]?.files || [];
     const active = files.find((f) => f.id === activeContextFileId) || files[files.length - 1] || null;
-    const contextBlocks = active && !active.processing ? contextBlocksFromFile(active) : [];
     const job = (contextIngestJob?.moduleId === moduleId) ? contextIngestJob : null;
     const imagePreviews = (job && !job.processing && (job.unsure?.length || job.included?.length || job.skipped?.length))
       ? buildProposalImagePreviews(job.included || [], job.unsure || [], job.skipped || [])
@@ -9285,7 +9571,7 @@ ${stepInstruction}`;
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
         <p className="text-xs text-blue-300/60 mb-2">
-          Upload a file and use the chat to add more context. Detected content from the file appears below so you can confirm, edit, or remove it. Only those saved fields are sent to the AI as guidance in {moduleLabelFor(moduleId)}.
+          PowerPoint, PDF, Excel, CSV, or text. Images are classified like Assess IC (logos skipped; unclear slides wait for you). Captured facts — not a deck narrative — are stored per file and shared with the incentive LLM and the context map.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
           File only: <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.
@@ -9402,17 +9688,36 @@ ${stepInstruction}`;
         {files.length === 0 ? (
           <div className="text-xs text-blue-300/50 bg-slate-900/30 border border-dashed border-blue-400/20 rounded-xl p-4">No context files yet for this module.</div>
         ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              {files.map((f) => (
-                <div key={f.id} className={`w-full bg-slate-900/40 border rounded-xl p-3 ${active?.id === f.id ? 'border-cyan-400/50' : 'border-blue-400/20'}`}>
-                  <div className="flex items-start justify-between gap-2">
-                    <button type="button" onClick={() => setActiveContextFileId(f.id)} className="min-w-0 text-left flex-1">
+          <div className="space-y-3">
+            {contextEditSaveStatus === 'saving' && <div className="text-[11px] text-blue-300/70">Saving…</div>}
+            {contextEditSaveStatus === 'saved' && <div className="text-[11px] text-green-400 font-semibold">Saved</div>}
+            {contextEditSaveStatus === 'error' && <div className="text-[11px] text-red-400 font-semibold">Save failed</div>}
+            {files.map((f) => {
+              const factN = Array.isArray(f.capturedContext?.key_facts) ? f.capturedContext.key_facts.length : 0;
+              const sourceBlocks = (f.extractedText || f.structuredExtract || f.visionExtract)
+                ? [
+                  f.extractedText && { id: 'extractedText', label: 'Detected from file', value: f.extractedText },
+                  f.structuredExtract && { id: 'structuredExtract', label: 'Tables / charts', value: f.structuredExtract },
+                  f.visionExtract && { id: 'visionExtract', label: 'From images', value: f.visionExtract },
+                ].filter(Boolean)
+                : [];
+              return (
+                <details
+                  key={f.id}
+                  open={active?.id === f.id || f.processing || !f.intakeComplete}
+                  className="bg-slate-900/40 border border-blue-400/20 rounded-xl overflow-hidden"
+                >
+                  <summary className="cursor-pointer select-none px-4 py-3 flex items-start gap-3 hover:bg-slate-800/40">
+                    <ChevronRight className="w-3.5 h-3.5 text-cyan-300 shrink-0 mt-1" />
+                    <div className="min-w-0 flex-1 text-left">
                       <div className="text-sm font-semibold text-white truncate">{f.name}</div>
-                      <div className="text-[11px] text-blue-300/55 mt-0.5">{f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}{f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : ''}</div>
-                      {f.summary && <div className="text-[11px] text-blue-200/75 mt-1 line-clamp-2">{f.summary}</div>}
-                    </button>
-                    <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                      <div className="text-[11px] text-blue-300/55 mt-0.5">
+                        {f.fileType}{f.sizeLabel ? ` · ${f.sizeLabel}` : ''}{f.imageCount ? ` · ${f.imageCount} image${f.imageCount === 1 ? '' : 's'}` : ''}
+                        {factN ? ` · ${factN} fact${factN === 1 ? '' : 's'}` : ''}
+                      </div>
+                      {f.summary ? <div className="text-[11px] text-blue-200/75 mt-1 line-clamp-2">{f.summary}</div> : null}
+                    </div>
+                    <div className="flex flex-col items-end gap-1 flex-shrink-0" onClick={(e) => e.preventDefault()}>
                       {f.processing ? (
                         job?.fileId === f.id && pendingImageCount > 0 ? (
                           <span className="px-2 py-0.5 bg-amber-500/15 text-amber-200 text-[10px] rounded border border-amber-400/25">Confirm images</span>
@@ -9424,72 +9729,120 @@ ${stepInstruction}`;
                       ) : (
                         <span className="px-2 py-0.5 bg-yellow-500/15 text-yellow-200 text-[10px] rounded border border-yellow-400/25">Intake</span>
                       )}
-                      <button type="button" onClick={() => handleRemoveModuleContextFile(moduleId, f.id)} className="p-1 hover:bg-red-500/20 rounded text-red-400" title="Remove"><Trash2 className="w-3.5 h-3.5" /></button>
+                      <button type="button" onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleRemoveModuleContextFile(moduleId, f.id); }} className="p-1 hover:bg-red-500/20 rounded text-red-400" title="Remove file"><Trash2 className="w-3.5 h-3.5" /></button>
                     </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="bg-slate-900/40 border border-blue-400/20 rounded-xl p-4">
-              {!active ? (
-                <div className="text-xs text-blue-300/50">Select a file to review or add context.</div>
-              ) : (
-                <div className="space-y-3">
-                  <div className="text-xs font-bold text-white">{active.intakeComplete ? 'Add context' : 'Intake'}</div>
-                  <div className="max-h-[240px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
-                    {(active.intakeMessages || []).map((m, i) => (
-                      <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                          <span className="whitespace-pre-wrap break-words">{m.content}</span>
+                  </summary>
+                  <div className="px-4 pb-4 space-y-3 border-t border-blue-400/10 pt-3">
+                    {!f.processing && (
+                      <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden" open>
+                        <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">
+                          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
+                        </summary>
+                        <StellaCapturedContextView
+                          ctx={f.capturedContext}
+                          onPatch={async (next) => {
+                            setContextEditSaveStatus('saving');
+                            try {
+                              await persistContextFiles(patchModuleContextFile(
+                                userSettingsRef.current.moduleContext,
+                                moduleId,
+                                f.id,
+                                { capturedContext: next || undefined, intakeComplete: true },
+                              ));
+                              setContextEditSaveStatus('saved');
+                              setTimeout(() => setContextEditSaveStatus('idle'), 2500);
+                            } catch {
+                              setContextEditSaveStatus('error');
+                            }
+                          }}
+                        />
+                      </details>
+                    )}
+                    {Array.isArray(f.columns) && f.columns.length > 0 && (
+                      <details className="bg-slate-900/40 border border-blue-400/15 rounded-xl overflow-hidden">
+                        <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-blue-300 hover:bg-slate-800/40 flex items-center gap-2">
+                          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Detected fields ({f.columns.length})
+                        </summary>
+                        <div className="px-4 pb-4 space-y-1">
+                          {f.columns.map((c, i) => (
+                            <div key={i} className="text-[11px] text-blue-200/80">
+                              <span className="text-cyan-300 font-semibold">{c.name}</span>
+                              {c.type ? <span className="text-blue-400/50"> [{c.type}]</span> : null}
+                              {c.description ? ` — ${c.description}` : ''}
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+                    {(f.notes || []).length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-bold uppercase tracking-wide text-cyan-400/80">Comments</div>
+                        {(f.notes || []).map((n) => (
+                          <EditableContextBlock
+                            key={n.id}
+                            label="Comment"
+                            value={n.text}
+                            onSave={(val) => persistContextBlock(moduleId, f.id, `note:${n.id}`, val)}
+                            onDelete={() => persistContextBlock(moduleId, f.id, `note:${n.id}`, '', true)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {!f.processing && (
+                      <div className="space-y-2">
+                        {!f.intakeComplete && (f.intakeMessages || []).length > 0 && (
+                          <div className="max-h-[180px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
+                            {(f.intakeMessages || []).map((m, i) => (
+                              <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                                  <span className="whitespace-pre-wrap break-words">{m.content}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex gap-2">
+                          <textarea
+                            value={active?.id === f.id ? contextIntakeInput : ''}
+                            onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeInput(e.target.value); }}
+                            onFocus={() => setActiveContextFileId(f.id)}
+                            placeholder={f.intakeComplete ? 'Add a comment for this file…' : 'Answer the intake questions…'}
+                            rows={2}
+                            className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
+                          />
+                          <button
+                            type="button"
+                            disabled={!contextIntakeInput.trim() || contextIntakeBusy || active?.id !== f.id}
+                            onClick={() => continueModuleContextIntake(moduleId, f.id, contextIntakeInput.trim())}
+                            className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
+                          >
+                            <Send className="w-3.5 h-3.5" /> {f.intakeComplete ? 'Add' : 'Send'}
+                          </button>
                         </div>
                       </div>
-                    ))}
+                    )}
+                    {sourceBlocks.length > 0 && (
+                      <details className="bg-slate-950/40 border border-blue-400/10 rounded-xl overflow-hidden">
+                        <summary className="cursor-pointer select-none px-4 py-2 text-[11px] font-semibold text-blue-300/70 hover:bg-slate-800/40">
+                          Source extract (raw)
+                        </summary>
+                        <div className="px-4 pb-3 space-y-2">
+                          {sourceBlocks.map((b) => (
+                            <EditableContextBlock
+                              key={b.id}
+                              label={b.label}
+                              value={b.value}
+                              onSave={(val) => persistContextBlock(moduleId, f.id, b.id, val)}
+                              onDelete={() => persistContextBlock(moduleId, f.id, b.id, '', true)}
+                            />
+                          ))}
+                        </div>
+                      </details>
+                    )}
                   </div>
-                  {!active.processing && (
-                    <div className="flex gap-2">
-                      <textarea
-                        value={contextIntakeInput}
-                        onChange={(e) => setContextIntakeInput(e.target.value)}
-                        placeholder={active.intakeComplete ? 'Add further context for this file…' : 'Answer the intake questions…'}
-                        rows={2}
-                        className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
-                      />
-                      <button
-                        type="button"
-                        disabled={!contextIntakeInput.trim() || contextIntakeBusy}
-                        onClick={() => continueModuleContextIntake(moduleId, active.id, contextIntakeInput.trim())}
-                        className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
-                      >
-                        <Send className="w-3.5 h-3.5" /> {active.intakeComplete ? 'Add' : 'Send'}
-                      </button>
-                    </div>
-                  )}
-                  {contextBlocks.length > 0 && (
-                    <div className="space-y-2 pt-2 border-t border-blue-400/15">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="text-[11px] font-semibold text-blue-200">Detected & saved context</div>
-                        {contextEditSaveStatus === 'saving' && <span className="text-[11px] text-blue-300/70">Saving…</span>}
-                        {contextEditSaveStatus === 'saved' && <span className="text-[11px] text-green-400 font-semibold">Saved</span>}
-                        {contextEditSaveStatus === 'error' && <span className="text-[11px] text-red-400 font-semibold">Save failed</span>}
-                      </div>
-                      {contextBlocks.map((b) => (
-                        <EditableContextBlock
-                          key={b.id}
-                          label={b.label}
-                          value={b.value}
-                          question={b.question}
-                          answer={b.answer}
-                          qa={!!b.qa}
-                          line={!!b.line}
-                          onSave={(val) => persistContextBlock(moduleId, active.id, b.id, val)}
-                          onDelete={() => persistContextBlock(moduleId, active.id, b.id, '', true)}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+                </details>
+              );
+            })}
           </div>
         )}
       </div>
@@ -9532,6 +9885,10 @@ ${stepInstruction}`;
     if (unsure.length) {
       pendingImageReviewRef.current = next;
       setPendingImageReview(next);
+      if (prev.ingestKind === 'moduleContext') {
+        contextIngestJobRef.current = next;
+        setContextIngestJob(next);
+      }
       const previews = buildProposalImagePreviews(included, unsure, skipped);
       setMessages((msgs) => {
         const copy = [...msgs];
@@ -9547,6 +9904,40 @@ ${stepInstruction}`;
         }
         return copy;
       });
+      return;
+    }
+    if (prev.ingestKind === 'moduleContext') {
+      pendingImageReviewRef.current = null;
+      setPendingImageReview(null);
+      contextIngestJobRef.current = { ...next, processing: true };
+      setContextIngestJob({ ...next, processing: true });
+      setIsLoading(true);
+      setMessages((msgs) => {
+        const copy = [...msgs];
+        for (let i = copy.length - 1; i >= 0; i--) {
+          if (copy[i].imageReviewPending) {
+            copy[i] = {
+              ...copy[i],
+              content: `🖼️ **${included.length}** image(s) selected for extract.`,
+              imageReviewPending: false,
+            };
+            break;
+          }
+        }
+        return [...copy, {
+          role: 'system',
+          content: `▶️ Confirmed **${included.length}** image(s). Capturing context facts…`,
+        }];
+      });
+      try {
+        await completeModuleContextIngest({ ...next, images: included, fromChat: true });
+      } catch (err) {
+        setIsLoading(false);
+        setMessages((prevMsgs) => [...prevMsgs, {
+          role: 'system',
+          content: `❌ Could not continue after image review: ${err.message || 'Unknown error'}`,
+        }]);
+      }
       return;
     }
     if (proposalIngestRunningRef.current) return;
@@ -11633,6 +12024,7 @@ ${stepInstruction}`;
     const thread = pptxExportThread();
     setPptxClarifyPending(true);
     setPptxOffers(null);
+    setToolsPptxPick(false);
     setSuggestedPrompts([]);
     appendPptxThreadMessage(thread, { role: 'assistant', content: getPptxClarify().prompt });
     revealChatTools();
@@ -11768,14 +12160,13 @@ ${stepInstruction}`;
     }
   };
 
-  const resolvePptxClarificationReply = async (messageContent) => {
-    const m = String(messageContent || '').toLowerCase().trim();
+  const pptxOfferFromClarifyValue = (value) => {
+    const m = String(value || '').toLowerCase().trim();
     const stella = pptxExportThread() === 'stella';
-    // Structural mapping to the numbered clarify UI options (labels live in settings pptxClarify).
-    if (/^(1|one)\b/.test(m)) {
+    if (/^(1|one)\b/.test(m) || /session summary/.test(m)) {
       return { mode: 'summary', offer: { title: 'Session Summary', description: 'Factual recap of this conversation' } };
     }
-    if (/^(2|two)\b/.test(m)) {
+    if (/^(2|two)\b/.test(m) || /one-pager|one pager/.test(m)) {
       return {
         mode: 'produced',
         offer: stella
@@ -11783,7 +12174,7 @@ ${stepInstruction}`;
           : { title: 'IC One-Pager', description: 'Simple one-page IC overview', deckType: 'ic_one_pager', hasRealData: true },
       };
     }
-    if (/^(3|three)\b/.test(m)) {
+    if (/^(3|three)\b/.test(m) || /documentation|doc pack|full ic/.test(m)) {
       return {
         mode: 'produced',
         offer: stella
@@ -11791,6 +12182,12 @@ ${stepInstruction}`;
           : { title: 'IC Documentation Pack', description: 'Full IC documentation from this conversation', deckType: 'ic_doc_pack', hasRealData: true },
       };
     }
+    return null;
+  };
+
+  const resolvePptxClarificationReply = async (messageContent) => {
+    const mapped = pptxOfferFromClarifyValue(messageContent);
+    if (mapped) return mapped;
     const classified = await classifyUserMessageIntent(messageContent);
     if (classified.kind === 'export' && classified.clear && classified.mode) {
       return { mode: classified.mode, offer: offerFromClassification(classified) };
@@ -11803,6 +12200,7 @@ ${stepInstruction}`;
     const savedOffers = pptxOffers;
     setPptxOffers(null);
     setPptxClarifyPending(false);
+    setToolsPptxPick(false);
     setPptxGenerating(true);
 
     const isSummary = mode === 'summary';
@@ -11925,8 +12323,10 @@ ${stepInstruction}`;
   };
 
   const startPptxExportFromUi = () => {
-    // Ambiguous export from the button → clarify in main chat.
-    askPptxClarification();
+    setPptxOffers(null);
+    setPptxClarifyPending(false);
+    setToolsPptxPick(true);
+    revealChatTools();
   };
 
   const handleTerritoryStructureUpload = (event) => {
@@ -11982,6 +12382,14 @@ ${stepInstruction}`;
       setInput('');
       setMessages((prev) => [...prev, { role: 'user', content: messageContent, kind: 'intake' }]);
       await continueProposalIntake(messageContent);
+      return;
+    }
+
+    if ((pendingModuleContextIntakeRef.current || pendingModuleContextIntake) && !currentWorkflow) {
+      const intake = pendingModuleContextIntakeRef.current || pendingModuleContextIntake;
+      setInput('');
+      setMessages((prev) => [...prev, { role: 'user', content: messageContent, kind: 'intake' }]);
+      await continueModuleContextIntake(intake.moduleId, intake.fileId, messageContent, { fromChat: true });
       return;
     }
 
@@ -12445,7 +12853,7 @@ ${stepInstruction}`;
     const submitPrompt = kind === 'stella' ? handleStellaChatSubmit : handleSubmit;
     const show = suggestionsEnabled && suggestedPrompts.length > 0
       && !pendingWorkflow && !memoryPendingFor(memKey) && (kind === 'stella' || !currentWorkflow)
-      && !pendingImageReview && !pendingProposalIntake && !loading
+      && !pendingImageReview && !pendingProposalIntake && !pendingModuleContextIntake && !loading
       && (kind === 'stella' || (!choiceButtons?.length && !clarifyingReplyHint));
     if (!show) {
       if (variant === 'panel') {
@@ -12580,6 +12988,17 @@ ${stepInstruction}`;
         </div>
       </header>
       <input ref={fileInputRef} type="file" accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md" onChange={handleFileUpload} className="hidden" />
+      <input
+        ref={moduleContextFileInputRef}
+        type="file"
+        accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md,.json"
+        className="hidden"
+        onChange={(e) => {
+          const raw = e.target.getAttribute('data-module') || userSettingsPane || 'incentives';
+          const id = ['incentives', 'territory', 'stella'].includes(raw) ? raw : 'incentives';
+          handleModuleContextUpload(e, id);
+        }}
+      />
 
       {/* Landing Page */}
       {showLanding ? (
@@ -13713,18 +14132,6 @@ ${stepInstruction}`;
                     </MessageErrorBoundary>
                   </>
                 )}
-
-                <input
-                  ref={moduleContextFileInputRef}
-                  type="file"
-                  accept=".pdf,.ppt,.pptx,.xlsx,.xls,.csv,.txt,.md,.json"
-                  className="hidden"
-                  onChange={(e) => {
-                    const raw = e.target.getAttribute('data-module') || userSettingsPane;
-                    const id = ['incentives', 'territory', 'stella'].includes(raw) ? raw : 'incentives';
-                    handleModuleContextUpload(e, id);
-                  }}
-                />
 
                 {!['stella', 'context-map'].includes(userSettingsPane) && (
                 <div className="flex flex-wrap items-center gap-3 mt-6">
