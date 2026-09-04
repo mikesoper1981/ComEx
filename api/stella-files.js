@@ -267,7 +267,7 @@ async function handler(req, res) {
 
   const { supabaseUrl, serviceKey } = supabaseConfig();
   if (!supabaseUrl || !serviceKey) {
-    return res.status(500).json({ error: { message: 'Supabase is not configured' } });
+    return res.status(500).json({ error: { message: !serviceKey ? 'SUPABASE_SERVICE_KEY is not configured. Add it to .env.local from Vercel (Production), then restart the dev server.' : 'SUPABASE_URL is not configured' } });
   }
 
   const user = await sessionUserFromRequest(req);

@@ -326,8 +326,10 @@ function slugFromSchema(schema) {
   return String(schema || '').replace(/^c_/, '');
 }
 
+const DATA_TABLE_RE = /^(stella_data_|territory_data_)[a-z0-9_]+$/;
+
 function quoteDataTable(name) {
-  if (!/^stella_data_[a-z0-9_]+$/.test(String(name || ''))) {
+  if (!DATA_TABLE_RE.test(String(name || ''))) {
     throw new Error('Invalid table name');
   }
   return `"${name}"`;
@@ -386,7 +388,7 @@ async function detachFilesInheritance(client, schema) {
 }
 
 async function moveExtractTable(client, schema, tableName) {
-  if (!/^stella_data_[a-z0-9_]+$/.test(String(tableName || ''))) return;
+  if (!DATA_TABLE_RE.test(String(tableName || ''))) return;
   const q = quoteIdent(schema);
   const t = quoteDataTable(tableName);
   const pub = await client.query('select to_regclass($1) is not null as ok', [`public.${tableName}`]);
@@ -640,4 +642,6 @@ module.exports = {
   getLastEnsureError,
   withPg,
   quoteIdent,
+  quoteDataTable,
+  DATA_TABLE_RE,
 };

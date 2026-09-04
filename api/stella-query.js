@@ -19,9 +19,9 @@
 
 const { sessionUserFromRequest } = require('./accounts-store');
 const { companyPgSchema, resolveUserCompany, ensureCompanyPgSchema, isCompanyPgSchema } = require('./company');
-const { withPg, quoteIdent } = require('./stella-db');
+const { withPg, quoteIdent, DATA_TABLE_RE } = require('./stella-db');
 
-const TABLE_NAME_RE = /^stella_data_[a-z0-9_]+$/;
+const TABLE_NAME_RE = DATA_TABLE_RE;
 const SELECT_RESULT_CAP = 500;
 
 function capSelectSql(sql) {

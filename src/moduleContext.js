@@ -555,10 +555,25 @@ function normalizeContextFile(raw) {
           name: usefulString(c.name),
           ...(usefulString(c.description) ? { description: usefulString(c.description) } : {}),
           ...(usefulString(c.type) ? { type: usefulString(c.type) } : {}),
+          ...(usefulString(c.original) ? { original: usefulString(c.original) } : {}),
         }))
       .filter((c) => c.name);
     if (!rec.columns.length) delete rec.columns;
   }
+  const tableName = usefulString(raw.tableName);
+  if (tableName && /^(stella_data_|territory_data_)[a-z0-9_]+$/.test(tableName)) rec.tableName = tableName;
+  if (raw.rowCount != null && Number.isFinite(Number(raw.rowCount))) rec.rowCount = Number(raw.rowCount);
+  const mapLayout = raw.mapLayout && typeof raw.mapLayout === 'object' ? {
+    ...(usefulString(raw.mapLayout.teamColumn) ? { teamColumn: usefulString(raw.mapLayout.teamColumn) } : {}),
+    ...(usefulString(raw.mapLayout.territoryColumn) ? { territoryColumn: usefulString(raw.mapLayout.territoryColumn) } : {}),
+    ...(usefulString(raw.mapLayout.geoColumn) ? { geoColumn: usefulString(raw.mapLayout.geoColumn) } : {}),
+    ...(usefulString(raw.mapLayout.geoKind) ? { geoKind: usefulString(raw.mapLayout.geoKind) } : {}),
+    ...(usefulString(raw.mapLayout.country) ? { country: usefulString(raw.mapLayout.country) } : {}),
+    ...(usefulString(raw.mapLayout.repColumn) ? { repColumn: usefulString(raw.mapLayout.repColumn) } : {}),
+  } : null;
+  if (mapLayout && Object.keys(mapLayout).length) rec.mapLayout = mapLayout;
+  const dataProfile = usefulString(raw.dataProfile, 8000);
+  if (dataProfile) rec.dataProfile = dataProfile;
   const notes = [];
   const seenNoteIds = new Set();
   const pushNote = (id, text) => {
@@ -653,6 +668,13 @@ export function serializeContextFileForPersist(fileRec) {
   if (rec.capturedContext) out.capturedContext = rec.capturedContext;
   if (rec.notes?.length) out.notes = rec.notes;
   if (rec.columns?.length) out.columns = rec.columns;
+  if (rec.tableName) out.tableName = rec.tableName;
+  if (rec.rowCount != null) out.rowCount = rec.rowCount;
+  if (rec.mapLayout) out.mapLayout = rec.mapLayout;
+  if (rec.dataProfile) out.dataProfile = rec.dataProfile;
+  if (rec.storagePath) out.storagePath = rec.storagePath;
+  if (rec.storageBucket && rec.storagePath) out.storageBucket = rec.storageBucket;
+  if (rec.processing) out.processing = true;
   if (rec.intakeComplete) out.intakeComplete = true;
   else if (rec.extractedText || rec.structuredExtract || rec.visionExtract || rec.capturedContext || rec.intakeMessages?.length) {
     out.intakeComplete = false;

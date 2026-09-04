@@ -17,6 +17,9 @@
     },
     "api/stella-sync.js": {
       "maxDuration": 60
+    },
+    "api/territory.js": {
+      "maxDuration": 30
     }
   },
   "crons": [

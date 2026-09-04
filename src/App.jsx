@@ -133,16 +133,23 @@ import {
   intakePairFact,
   contextFileExtractBlob,
 } from './moduleContext';
+import {
+  inferTerritoryLayout,
+  mergeTerritoryLayout,
+  normalizeMapLayout,
+  buildTerritoryPointsMapHTML,
+  hashTerritoryColour,
+  formatTerritoryAssessContext,
+  scoreTerritorySheet,
+} from './territoryGeo';
 
 // Recharts is loaded lazily so it can never affect initial page load.
 const StellaChart = lazy(() => import('./StellaChart'));
 
-const MANAGER_COLOURS = ['#34d399', '#60a5fa', '#a78bfa'];
-
 const STELLA_QUERY_API_PATH = '/api/stella-query';
 const STELLA_FILES_API_PATH = '/api/stella-files';
 const STELLA_SYNC_API_PATH = '/api/stella-sync';
-const MANAGER_COLOURS_BORDER = ['#059669', '#2563eb', '#7c3aed'];
+const TERRITORY_API_PATH = '/api/territory';
 
 const CHAT_API_PATH = '/api/chat';
 
@@ -5085,235 +5092,33 @@ function stellaIntakeNeedsJsonSalvage(f) {
   return !!(last && intakeChatLooksLikeJson(last.content));
 }
 
-function guessCountry(structure) {
-  const name = (structure.name || '').toLowerCase();
-  if (name.includes('uk') || name.includes('united kingdom') || name.includes('britain')) return 'United Kingdom';
-  if (name.includes('france') || name.includes('french')) return 'France';
-  if (name.includes('germany')) return 'Germany';
-  if (name.includes('spain')) return 'Spain';
-  if (name.includes('italy')) return 'Italy';
-  const counties = structure.territories.flatMap(t => t.counties || []).join(' ').toLowerCase();
-  if (counties.includes('yorkshire') || counties.includes('surrey') || counties.includes('kent') || counties.includes('fife')) return 'United Kingdom';
-  return '';
-}
-
-function buildMapHTML(structure, selectedTerritoryId) {
-  const country = guessCountry(structure);
-  const managerIds = structure.managers.map(m => m.id);
-
-  const territoryData = structure.territories.map(t => {
-    const mgrIdx = managerIds.indexOf(t.managerId);
-    const mgr = structure.managers.find(m => m.id === t.managerId);
-    return {
-      id: t.id,
-      name: t.name,
-      rep: t.rep,
-      manager: mgr?.name || '',
-      region: mgr?.region || '',
-      managerId: t.managerId,
-      mgrIdx,
-      colour: MANAGER_COLOURS[mgrIdx] || '#94a3b8',
-      border: MANAGER_COLOURS_BORDER[mgrIdx] || '#475569',
-      counties: t.counties || [],
-      hcps: t.hcps,
-      total: t.hcps.A + t.hcps.B + t.hcps.C,
-      selected: t.id === selectedTerritoryId,
-      searchTerm: (t.counties?.[0] || t.name) + (country ? `, ${country}` : ''),
-    };
-  });
-
-  const managersData = structure.managers.map((m, i) => ({
-    name: m.name,
-    region: m.region,
-    colour: MANAGER_COLOURS[i] || '#94a3b8',
-  }));
-
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"><\/script>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; background: #0f172a; font-family: system-ui, sans-serif; }
-    #map { width: 100%; height: 100%; }
-    .legend {
-      background: rgba(15,23,42,0.92);
-      border: 1px solid rgba(96,165,250,0.25);
-      border-radius: 8px;
-      padding: 10px 12px;
-      font-size: 11px;
-      line-height: 1.6;
-      backdrop-filter: blur(4px);
-    }
-    .legend-title { color: #60a5fa; font-weight: 700; font-size: 10px; letter-spacing: .05em; margin-bottom: 6px; }
-    .legend-item { display: flex; align-items: center; gap: 7px; color: #cbd5e1; margin-bottom: 3px; }
-    .legend-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
-    .legend-sub { color: #64748b; font-size: 10px; margin-top: 6px; padding-top: 6px; border-top: 1px solid #1e293b; }
-    #progress {
-      position: fixed; inset: 0; background: #0f172a;
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
-      gap: 12px; z-index: 9999;
-    }
-    #progress-text { color: #94a3b8; font-size: 13px; }
-    #progress-bar-wrap { width: 200px; height: 5px; background: #1e293b; border-radius: 999px; overflow: hidden; }
-    #progress-bar { height: 100%; background: #60a5fa; border-radius: 999px; transition: width 0.3s; width: 0%; }
-    .spinner { width: 28px; height: 28px; border: 2.5px solid #1e3a5f; border-top-color: #60a5fa; border-radius: 50%; animation: spin 0.8s linear infinite; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .leaflet-popup-content-wrapper { background: #fff; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
-    .leaflet-popup-content { margin: 10px 14px; }
-    .popup-title { font-weight: 700; font-size: 13px; color: #0f172a; margin-bottom: 4px; }
-    .popup-rep { font-size: 11px; color: #475569; margin-bottom: 2px; }
-    .popup-hcps { display: flex; gap: 10px; font-size: 11px; margin-top: 6px; }
-    .popup-counties { font-size: 10px; color: #94a3b8; margin-top: 5px; }
-  </style>
-</head>
-<body>
-  <div id="progress">
-    <div class="spinner"></div>
-    <div id="progress-text">Locating territories…</div>
-    <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
-  </div>
-  <div id="map"></div>
-
-  <script>
-    const territories = ${JSON.stringify(territoryData)};
-    const managers = ${JSON.stringify(managersData)};
-
-    const map = L.map('map', { zoomControl: true });
-
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-      maxZoom: 19,
-    }).addTo(map);
-
-    map.setView([54, -2], 6);
-
-    async function geocode(query) {
-      try {
-        const r = await fetch(
-          'https://nominatim.openstreetmap.org/search?q=' + encodeURIComponent(query) + '&format=json&limit=1',
-          { headers: { 'Accept-Language': 'en', 'User-Agent': 'TerritoryMapApp/1.0' } }
-        );
-        const d = await r.json();
-        return d[0] ? [parseFloat(d[0].lat), parseFloat(d[0].lon)] : null;
-      } catch { return null; }
-    }
-
-    async function loadMarkers() {
-      const bounds = [];
-      const bar = document.getElementById('progress-bar');
-      const txt = document.getElementById('progress-text');
-      let done = 0;
-
-      for (const t of territories) {
-        const searchTerms = [...(t.counties.slice(0,3)), t.name].map(s => s + ', ' + '${country}');
-        let coords = null;
-        for (const term of searchTerms) {
-          coords = await geocode(term);
-          if (coords) break;
-          await new Promise(r => setTimeout(r, 150));
-        }
-
-        if (coords) {
-          bounds.push(coords);
-          const total = t.total;
-          const r = Math.max(16, Math.min(34, 10 + total / 13));
-          const isSelected = t.selected;
-
-          const icon = L.divIcon({
-            className: '',
-            iconSize: [r*2, r*2],
-            iconAnchor: [r, r],
-            html: \`<div style="
-              width:\${r*2}px;height:\${r*2}px;border-radius:50%;
-              background:\${isSelected ? t.colour : t.colour + '77'};
-              border:\${isSelected ? 3 : 1.5}px solid \${t.border};
-              display:flex;align-items:center;justify-content:center;
-              box-shadow:\${isSelected ? '0 0 14px ' + t.colour + '99' : '0 2px 6px rgba(0,0,0,0.4)'};
-              cursor:pointer;
-            "><span style="font-size:\${r>22?9:7}px;font-weight:700;color:\${isSelected?'#fff':t.colour};text-shadow:0 1px 3px #000c;">\${t.id}</span></div>\`
-          });
-
-          const marker = L.marker(coords, { icon });
-          marker.bindPopup(\`
-            <div class="popup-title">\${t.id} — \${t.name}</div>
-            <div class="popup-rep">Rep: \${t.rep}</div>
-            <div class="popup-rep">Manager: \${t.manager} (\${t.region})</div>
-            <div class="popup-hcps">
-              <span style="color:#059669;font-weight:600;">A: \${t.hcps.A}</span>
-              <span style="color:#2563eb;font-weight:600;">B: \${t.hcps.B}</span>
-              <span style="color:#64748b;font-weight:600;">C: \${t.hcps.C}</span>
-              <span style="font-weight:700;">= \${total} HCPs</span>
-            </div>
-            \${t.counties.length ? '<div class="popup-counties">' + t.counties.join(', ') + '</div>' : ''}
-          \`, { maxWidth: 260 });
-
-          marker.on('click', () => {
-            window.parent.postMessage({ type: 'territory-select', id: t.id }, '*');
-          });
-
-          marker.addTo(map);
-        }
-
-        done++;
-        const pct = Math.round(done / territories.length * 100);
-        bar.style.width = pct + '%';
-        txt.textContent = 'Locating territories… ' + pct + '%';
-      }
-
-      document.getElementById('progress').style.display = 'none';
-
-      if (bounds.length > 1) {
-        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 9 });
-      } else if (bounds.length === 1) {
-        map.setView(bounds[0], 8);
-      }
-
-      const legend = L.control({ position: 'bottomleft' });
-      legend.onAdd = () => {
-        const div = L.DomUtil.create('div', 'legend');
-        div.innerHTML = '<div class="legend-title">MANAGERS</div>' +
-          managers.map(m => \`<div class="legend-item"><div class="legend-dot" style="background:\${m.colour}"></div><span>\${m.name} — \${m.region}</span></div>\`).join('') +
-          '<div class="legend-sub">Circle size = total HCPs<br>Click marker to inspect</div>';
-        return div;
-      };
-      legend.addTo(map);
-    }
-
-    loadMarkers();
-  <\/script>
-</body>
-</html>`;
-}
-
-function TerritoryMap({ structure, selectedTerritory, onSelectTerritory }) {
+function TerritoryMap({ points, selectedTerritory, onSelectTerritory }) {
   const iframeRef = useRef(null);
   const [iframeKey, setIframeKey] = useState(0);
+  const selectedId = selectedTerritory?.id || selectedTerritory?.territory || null;
 
   useEffect(() => {
-    setIframeKey(k => k + 1);
-  }, [structure?.name]);
+    const sig = (points || []).map((p) => `${p.id}:${Number(p.lat)}:${Number(p.lng)}`).join('|');
+    setIframeKey((k) => k + 1);
+    void sig;
+  }, [points]);
 
   useEffect(() => {
     const handler = (event) => {
-      if (event.data?.type === 'territory-select') {
-        const t = structure?.territories.find(t => t.id === event.data.id);
-        if (t) onSelectTerritory(selectedTerritory?.id === t.id ? null : t);
-      }
+      if (event.data?.type !== 'territory-select') return;
+      const hit = (points || []).find((p) => p.id === event.data.id || p.territory === event.data.territory);
+      if (hit) onSelectTerritory(selectedTerritory?.id === hit.id ? null : hit);
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
-  }, [structure, selectedTerritory, onSelectTerritory]);
+  }, [points, selectedTerritory, onSelectTerritory]);
 
   const html = useMemo(
-    () => (structure ? buildMapHTML(structure, selectedTerritory?.id || null) : ''),
-    [structure, selectedTerritory?.id]
+    () => (points?.length ? buildTerritoryPointsMapHTML(points, selectedId) : ''),
+    [points, selectedId],
   );
 
-  if (!structure) return null;
+  if (!points?.length) return null;
 
   return (
     <div className="rounded-xl overflow-hidden border border-blue-400/20" style={{ height: 520 }}>
@@ -5733,43 +5538,15 @@ export default function CommercialExcellenceApp() {
 
   const [orchestratorDecision, setOrchestratorDecision] = useState(null);
   const [pendingButtonAction, setPendingButtonAction] = useState(null);
-  const [selectedTerritoryStructure, setSelectedTerritoryStructure] = useState(null);
+  const [selectedTerritoryFileId, setSelectedTerritoryFileId] = useState(null);
+  const [selectedTerritoryTeam, setSelectedTerritoryTeam] = useState('');
   const [selectedTerritory, setSelectedTerritory] = useState(null);
   const [territoryView, setTerritoryView] = useState('map');
-  const [territoryStructures, setTerritoryStructures] = useState([
-    {
-      id: 'uk_primary_care_2025',
-      name: 'UK Primary Care 2025',
-      uploadedAt: '2025-01-15',
-      managers: [
-        { id: 'mgr1', name: 'Sarah Mitchell', region: 'North' },
-        { id: 'mgr2', name: 'James Thornton', region: 'Midlands & Wales' },
-        { id: 'mgr3', name: 'Rachel Davies', region: 'South' }
-      ],
-      territories: [
-        { id: 'T01', name: 'Scotland North', rep: 'Ewan Fraser', managerId: 'mgr1', counties: ['Highland','Moray','Aberdeenshire','Aberdeen City'], hcps: { A: 18, B: 42, C: 95 }, notes: 'Large geography, low density' },
-        { id: 'T02', name: 'Scotland Central', rep: 'Fiona Campbell', managerId: 'mgr1', counties: ['Glasgow City','Lanarkshire','Renfrewshire','East Dunbartonshire'], hcps: { A: 34, B: 78, C: 140 }, notes: 'Urban core, high HCP density' },
-        { id: 'T03', name: 'Scotland East', rep: 'Alasdair Murray', managerId: 'mgr1', counties: ['Edinburgh','Lothian','Fife','Dundee City'], hcps: { A: 29, B: 61, C: 118 }, notes: 'Mixed urban/suburban' },
-        { id: 'T04', name: 'North East England', rep: 'Derek Armstrong', managerId: 'mgr1', counties: ['Northumberland','Tyne and Wear','Durham','Tees Valley'], hcps: { A: 31, B: 69, C: 122 }, notes: 'Industrial corridor' },
-        { id: 'T05', name: 'Yorkshire North', rep: 'Helen Booth', managerId: 'mgr1', counties: ['North Yorkshire','East Riding','York'], hcps: { A: 27, B: 58, C: 104 }, notes: 'Rural/market towns' },
-        { id: 'T06', name: 'Yorkshire South & West', rep: 'Marcus Singh', managerId: 'mgr1', counties: ['West Yorkshire','South Yorkshire'], hcps: { A: 38, B: 84, C: 152 }, notes: 'Dense urban, Leeds/Sheffield' },
-        { id: 'T07', name: 'North West', rep: 'Claire Donnelly', managerId: 'mgr2', counties: ['Greater Manchester','Cheshire','Halton','Warrington'], hcps: { A: 41, B: 91, C: 165 }, notes: 'Manchester metro focus' },
-        { id: 'T08', name: 'Lancashire & Cumbria', rep: 'Tom Whitfield', managerId: 'mgr2', counties: ['Lancashire','Cumbria'], hcps: { A: 24, B: 53, C: 98 }, notes: 'Mixed density' },
-        { id: 'T09', name: 'East Midlands', rep: 'Priya Patel', managerId: 'mgr2', counties: ['Nottinghamshire','Derbyshire','Leicestershire','Rutland'], hcps: { A: 33, B: 72, C: 131 }, notes: '' },
-        { id: 'T10', name: 'West Midlands', rep: 'David Okafor', managerId: 'mgr2', counties: ['West Midlands','Staffordshire','Shropshire'], hcps: { A: 39, B: 87, C: 158 }, notes: 'Birmingham metro' },
-        { id: 'T11', name: 'Wales North & Mid', rep: 'Sian Hughes', managerId: 'mgr2', counties: ['Gwynedd','Conwy','Denbighshire','Powys','Ceredigion'], hcps: { A: 16, B: 38, C: 82 }, notes: 'Sparse, bilingual territory' },
-        { id: 'T12', name: 'Wales South', rep: 'Gareth Evans', managerId: 'mgr2', counties: ['Cardiff','Swansea','Newport','Vale of Glamorgan','Rhondda Cynon Taf'], hcps: { A: 28, B: 63, C: 114 }, notes: 'Urban South Wales' },
-        { id: 'T13', name: 'East of England North', rep: 'Lucy Hargreaves', managerId: 'mgr3', counties: ['Lincolnshire','Northamptonshire','Cambridgeshire'], hcps: { A: 26, B: 57, C: 103 }, notes: '' },
-        { id: 'T14', name: 'East of England South', rep: 'Ben Cartwright', managerId: 'mgr3', counties: ['Norfolk','Suffolk','Essex North'], hcps: { A: 23, B: 51, C: 96 }, notes: 'Coastal/rural' },
-        { id: 'T15', name: 'London North', rep: 'Amara Diallo', managerId: 'mgr3', counties: ['Enfield','Haringey','Barnet','Brent','Harrow'], hcps: { A: 44, B: 98, C: 178 }, notes: 'High density, diverse' },
-        { id: 'T16', name: 'London Central', rep: 'Oliver Stratton', managerId: 'mgr3', counties: ['Westminster','Camden','Islington','Hackney','Tower Hamlets'], hcps: { A: 47, B: 104, C: 189 }, notes: 'Highest density territory' },
-        { id: 'T17', name: 'London South', rep: 'Natasha Brown', managerId: 'mgr3', counties: ['Lambeth','Southwark','Lewisham','Greenwich','Bromley'], hcps: { A: 42, B: 93, C: 171 }, notes: '' },
-        { id: 'T18', name: 'London West & Surrey', rep: 'Daniel Chu', managerId: 'mgr3', counties: ['Richmond','Kingston','Hounslow','Surrey'], hcps: { A: 36, B: 80, C: 147 }, notes: 'Affluent suburban' },
-        { id: 'T19', name: 'South East', rep: 'Emma Patterson', managerId: 'mgr3', counties: ['Kent','East Sussex','West Sussex'], hcps: { A: 32, B: 71, C: 129 }, notes: 'Coastal & commuter belt' },
-        { id: 'T20', name: 'South West', rep: 'James Worthington', managerId: 'mgr3', counties: ['Hampshire','Dorset','Wiltshire','Somerset','Devon','Cornwall'], hcps: { A: 30, B: 67, C: 121 }, notes: 'Large geography, lower density' }
-      ]
-    }
-  ]);
+  const [territoryMapPayload, setTerritoryMapPayload] = useState(null);
+  const [territoryMapBusy, setTerritoryMapBusy] = useState(false);
+  const [territoryMapError, setTerritoryMapError] = useState('');
+  const [territoryIntakeInput, setTerritoryIntakeInput] = useState('');
+  const [territoryIntakeBusy, setTerritoryIntakeBusy] = useState(false);
   const [activityLog, setActivityLog] = useState([]);
   const [showActivityLog, setShowActivityLog] = useState(false);
   const [adminSection, setAdminSection] = useState('knowledge');
@@ -5811,6 +5588,7 @@ export default function CommercialExcellenceApp() {
   const fileInputRef = useRef(null);
   const adminFileInputRef = useRef(null);
   const territoryFileInputRef = useRef(null);
+  const territoryMapAbortRef = useRef(0);
   const stellaDataFileInputRef = useRef(null);
   const [stellaSyncBusy, setStellaSyncBusy] = useState(false);
   const stellaIntakeDeepLinkRef = useRef(readStellaIntakeDeepLink());
@@ -8865,13 +8643,15 @@ ${proposalExcerpt || '(no proposal extract)'}
 
 ${stepInstruction}`;
         }
-      } else if (isTerritoryWorkflow && isStructureStep && territoryStructures.length > 0) {
-        const activeStruct = territoryStructures.find(s => s.id === selectedTerritoryStructure) || territoryStructures[0];
+      } else if (isTerritoryWorkflow && isStructureStep) {
+        const territoryFiles = (userSettingsRef.current.moduleContext?.territory?.files || []).filter((f) => f?.tableName);
+        const activeFile = territoryFiles.find((f) => f.id === selectedTerritoryFileId) || territoryFiles[0];
         if (focusedContext) {
           taskBriefing = `${focusedContext}\n\nINSTRUCTION: The user wants to assess the FOCUS TERRITORY marked above. Begin by presenting a brief profile then ask what specific aspects the user wants to explore.`;
-        } else {
-          const structSummary = `LOADED TERRITORY STRUCTURE: "${activeStruct.name}"\nManagers: ${activeStruct.managers.map(m => `${m.name} (${m.region})`).join(', ')}\nTerritories (${activeStruct.territories.length} total):\n${activeStruct.territories.slice(0, 20).map(t => `  ${t.id} ${t.name} | Rep: ${t.rep} | HCPs: A=${t.hcps.A} B=${t.hcps.B} C=${t.hcps.C} Total=${t.hcps.A+t.hcps.B+t.hcps.C}`).join('\n')}`;
-          taskBriefing = `${structSummary}\n\nUser request: ${userMessage}\n\nAsk: (1) Use this structure or provide a different one? (2) Cover all territories or focus on specific region?`;
+        } else if (activeFile) {
+          const layout = activeFile.mapLayout || {};
+          const structSummary = `LOADED TERRITORY FILE: "${activeFile.name}"\nRows: ${activeFile.rowCount ?? 'unknown'}\nTeam column: ${layout.teamColumn || '(none)'}\nTerritory column: ${layout.territoryColumn || '(none)'}\nGeo column: ${layout.geoColumn || '(none)'} (${layout.geoKind || 'unknown'})${layout.country ? `\nCountry: ${layout.country}` : ''}`;
+          taskBriefing = `${structSummary}\n\nUser request: ${userMessage}\n\nAsk: (1) Use this uploaded structure or provide a different one? (2) Cover all territories or focus on a specific team/region?`;
         }
       } else if (workflowContext.length > 0) {
         const contextSummary = workflowContext.map(c => `[${c.step}] ${c.agent}: ${c.output}`).join('\n\n');
@@ -9723,6 +9503,18 @@ ${stepInstruction}`;
     const optimistic = upsertModuleContextFile(userSettingsRef.current.moduleContext, moduleId, placeholder);
     setUserSettings((prev) => ({ ...prev, moduleContext: optimistic }));
     setActiveContextFileId(fileId);
+    const lowerName = file.name.toLowerCase();
+    if (moduleId === 'territory' && /\.(csv|xlsx|xls|json)$/i.test(lowerName)) {
+      try {
+        await ingestTerritoryTabularFile(file, { fileId });
+      } catch (err) {
+        await persistContextFiles(patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, {
+          processing: false,
+          intakeMessages: [{ role: 'system', content: `❌ Upload failed: ${err.message || 'error'}` }],
+        }));
+      }
+      return;
+    }
     if (!fromChat) {
       setUserSettingsPane(moduleId === 'stella' ? 'stella' : moduleId === 'territory' ? 'territory' : 'incentives');
     } else {
@@ -9852,6 +9644,9 @@ ${stepInstruction}`;
       try {
         await supabase.storage.from('intelligence').remove([rec.storagePath, `${rec.storagePath}.extracted.txt`]);
       } catch { /* ignore */ }
+    }
+    if (rec?.tableName) {
+      try { await stellaTableApi({ action: 'drop', tableName: rec.tableName }); } catch { /* ignore */ }
     }
     const next = removeModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId);
     await persistContextFiles(next);
@@ -10828,6 +10623,236 @@ ${stepInstruction}`;
     }
   };
 
+  const territoryApi = async (payload) => {
+    const res = await fetch(TERRITORY_API_PATH, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `Territory request failed (${res.status})`);
+    return data;
+  };
+
+  const persistTerritoryFile = async (rec) => {
+    const next = upsertModuleContextFile(userSettingsRef.current.moduleContext, 'territory', rec);
+    userSettingsRef.current = { ...userSettingsRef.current, moduleContext: next };
+    setUserSettings((prev) => ({ ...prev, moduleContext: next }));
+    try {
+      await persistContextFiles(next);
+    } catch (err) {
+      console.warn('Territory file save lagged:', err?.message || err);
+    }
+    return next;
+  };
+
+  const patchTerritoryFile = async (fileId, patch) => {
+    const rec = (userSettingsRef.current.moduleContext?.territory?.files || []).find((f) => f.id === fileId);
+    if (!rec) return;
+    await persistTerritoryFile({ ...rec, ...patch, id: fileId });
+  };
+
+  const runTerritoryIntakeTurn = async (fileRec) => {
+    if (!fileRec) return fileRec;
+    const layout = normalizeMapLayout(fileRec.mapLayout) || inferTerritoryLayout(fileRec.columns || [], fileRec.previewRows || []);
+    const colsBlob = (fileRec.columns || []).map((c) => (
+      `- ${c.name}${c.original && c.original !== c.name ? ` (header "${c.original}")` : ''}${c.type ? ` [${c.type}]` : ''}`
+    )).join('\n') || '(no columns)';
+    const guessed = [
+      layout.teamColumn ? `team = ${layout.teamColumn}` : 'team = (none found)',
+      layout.territoryColumn ? `territory = ${layout.territoryColumn}` : 'territory = (none found)',
+      layout.geoColumn ? `geo = ${layout.geoColumn} (${layout.geoKind || 'unknown'})` : 'geo = (none found)',
+      layout.country ? `country = ${layout.country}` : '',
+    ].filter(Boolean).join('\n');
+    const rt = getWorkflowRuntime();
+    const system = fillTemplate(rt.territoryIntakePrompt || '', {
+      dataProfile: fileRec.dataProfile ? `\n\nDATA PROFILE:\n${fileRec.dataProfile}` : '',
+    });
+    const convo = [
+      {
+        role: 'user',
+        content: `You are onboarding: "${fileRec.name}".\nSQL TABLE: ${fileRec.tableName || ''}\nROWS: ${fileRec.rowCount ?? ''}\nCOLUMNS (use these exact SQL names):\n${colsBlob}\n\nCOLUMN GUESSES:\n${guessed}\n\nSAMPLE ROWS:\n${JSON.stringify((fileRec.previewRows || []).slice(0, 8), null, 2).slice(0, 6000)}`,
+      },
+      ...((fileRec.intakeMessages || [])
+        .filter((m) => !String(m.content || '').startsWith('⏳'))
+        .map((m) => ({
+        role: toAnthropicRole(m.role),
+        content: m.role === 'assistant'
+          ? (stripJsonFromIntakeMessage(m.content) || 'Thanks — noted.')
+          : String(m.content || ''),
+      }))),
+    ];
+    let parsed = {};
+    try {
+      const raw = await callAnthropic(system, convo, 1200);
+      parsed = extractJsonObject(raw) || {};
+    } catch { /* fall through */ }
+    const hasUserReply = (fileRec.intakeMessages || []).some((m) => m.role === 'user');
+    const nextLayout = mergeTerritoryLayout(layout, parsed.layout);
+    let complete = !!parsed.complete;
+    let message = stripJsonFromIntakeMessage(parsed.message);
+    if (!hasUserReply) {
+      complete = false;
+      if (!intakeMessageLooksLikeAsk(message)) {
+        message = nextLayout.geoColumn
+          ? `I mapped this file as team **${nextLayout.teamColumn || '(none)'}**, territory **${nextLayout.territoryColumn || '(none)'}**, geo **${nextLayout.geoColumn}** (${nextLayout.geoKind || 'region'}). Is that correct?`
+          : 'Which column holds the geography to plot (postcode/zip, city, county, or region)?';
+      }
+    } else if (!intakeMessageLooksLikeAsk(message) || complete) {
+      complete = true;
+      message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(fileRec.name, 'Territory Design');
+    }
+    const context_qa = complete ? harvestModuleCapturedContext(
+      fileRec.capturedContext,
+      pickIntakeContextQa(parsed),
+      [...(fileRec.intakeMessages || []), { role: 'assistant', content: message }],
+      { extract: fileRec.dataProfile || '' },
+    ) : fileRec.capturedContext;
+    const next = {
+      ...fileRec,
+      mapLayout: nextLayout,
+      capturedContext: context_qa || fileRec.capturedContext,
+      intakeMessages: [...(fileRec.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳')), { role: 'assistant', content: message }],
+      intakeComplete: complete,
+      processing: false,
+    };
+    await patchTerritoryFile(fileRec.id, {
+      mapLayout: next.mapLayout,
+      capturedContext: next.capturedContext,
+      intakeMessages: next.intakeMessages,
+      intakeComplete: next.intakeComplete,
+      processing: false,
+    });
+    return next;
+  };
+
+  const ingestTerritoryTabularFile = async (file, { fileId: existingId } = {}) => {
+    const fileId = existingId || `ctx_${Date.now()}_${stellaNanoId()}`;
+    const lower = file.name.toLowerCase();
+    const kind =
+      lower.endsWith('.csv') ? 'csv'
+      : (lower.endsWith('.xlsx') || lower.endsWith('.xls')) ? 'excel'
+      : lower.endsWith('.json') ? 'json'
+      : '';
+    if (!kind) throw new Error('Please upload Excel, CSV, or a JSON table of rows.');
+
+    const placeholder = {
+      id: fileId,
+      name: file.name,
+      fileType: kind,
+      sizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
+      processing: true,
+      intakeComplete: false,
+      intakeMessages: [{ role: 'assistant', content: `⏳ Loading **${file.name}** into Territory…` }],
+    };
+    await persistTerritoryFile(placeholder);
+    setSelectedTerritoryFileId(fileId);
+    setSelectedTerritory(null);
+    setSelectedTerritoryTeam('');
+    setTerritoryMapPayload(null);
+    setTerritoryMapError('');
+    setActiveTab('territory');
+
+    try {
+      const { records, sheetName } = await parseTerritoryTabular(file, kind);
+      if (!Array.isArray(records) || !records.length) {
+        throw new Error('No data rows found. Upload an Excel/CSV with a header row and territory records.');
+      }
+      const payload = stellaBuildTabularPayload(records);
+      const tableName = `territory_data_${stellaNanoId()}`;
+      await stellaCreateAndLoadTable(tableName, payload.columns, payload.rows);
+      const mapLayout = inferTerritoryLayout(payload.columns, records.slice(0, 40));
+      const dataProfile = [
+        sheetName ? `Excel sheet used: ${sheetName}` : '',
+        stellaProfileRecords(records),
+      ].filter(Boolean).join('\n');
+      let storagePath = null;
+      let storageBucket = null;
+      try {
+        const cleanName = sanitizeStorageName(file.name);
+        const up = await stellaUploadToStorage(`territory_${Date.now()}_${cleanName}`, file, file.type || undefined);
+        storagePath = up.objectPath;
+        storageBucket = up.bucket;
+      } catch { /* table is the source of truth */ }
+      const rec = {
+        id: fileId,
+        name: file.name,
+        fileType: kind,
+        sizeLabel: `${payload.rowCount} rows`,
+        tableName,
+        rowCount: payload.rowCount,
+        columns: payload.columns,
+        previewRows: records.slice(0, 8),
+        dataProfile,
+        mapLayout,
+        storagePath,
+        storageBucket,
+        uploadedAt: new Date().toISOString(),
+        processing: false,
+        intakeComplete: false,
+        intakeMessages: [{ role: 'assistant', content: `⏳ Loaded **${payload.rowCount}** rows. Checking the territory columns…` }],
+        summary: `Territory file with ${payload.rowCount} rows${sheetName ? ` from sheet "${sheetName}"` : ''}.`,
+      };
+      await persistTerritoryFile(rec);
+      setSelectedTerritoryFileId(fileId);
+      try {
+        await runTerritoryIntakeTurn(rec);
+      } catch (err) {
+        await patchTerritoryFile(fileId, {
+          intakeMessages: [{
+            role: 'assistant',
+            content: `Loaded **${payload.rowCount}** rows. I could not finish intake (${err.message || 'error'}). Confirm the team, territory, and geography columns if the map looks wrong.`,
+          }],
+        });
+      }
+    } catch (err) {
+      const message = err?.message || 'Upload failed';
+      setTerritoryMapError(message);
+      await patchTerritoryFile(fileId, {
+        processing: false,
+        intakeMessages: [{ role: 'system', content: `❌ Upload failed: ${message}` }],
+      });
+      throw err;
+    }
+  };
+
+  const loadTerritoryMapForFile = async (file, team) => {
+    if (!file?.tableName || !file?.mapLayout?.geoColumn) {
+      setTerritoryMapPayload(null);
+      return;
+    }
+    const gen = ++territoryMapAbortRef.current;
+    setTerritoryMapBusy(true);
+    setTerritoryMapError('');
+    try {
+      let nextTeam = team;
+      for (let i = 0; i < 40; i += 1) {
+        const data = await territoryApi({
+          action: 'map',
+          tableName: file.tableName,
+          layout: file.mapLayout,
+          team: nextTeam || undefined,
+          geocode: true,
+        });
+        if (gen !== territoryMapAbortRef.current) return;
+        if (!nextTeam && Array.isArray(data.teams) && data.teams.length) {
+          nextTeam = data.teams[0];
+          setSelectedTerritoryTeam(nextTeam);
+          continue;
+        }
+        setTerritoryMapPayload(data);
+        if (!data.pending) break;
+        await new Promise((r) => setTimeout(r, 1200));
+        if (gen !== territoryMapAbortRef.current) return;
+      }
+    } catch (err) {
+      if (gen !== territoryMapAbortRef.current) return;
+      setTerritoryMapError(err.message || 'Could not load the territory map');
+    } finally {
+      if (gen === territoryMapAbortRef.current) setTerritoryMapBusy(false);
+    }
+  };
+
   const stellaRemoveStorage = async (objectPath, { bucket } = {}) => {
     if (!objectPath) return;
     const buckets = [...new Set([bucket, 'intelligence', 'stella-data'].filter(Boolean))];
@@ -11289,6 +11314,34 @@ ${stepInstruction}`;
     const sheetName = wb.SheetNames?.[0];
     const ws = sheetName ? wb.Sheets[sheetName] : null;
     return ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
+  };
+
+  const parseTerritoryTabular = async (file, kind) => {
+    if (kind === 'json') {
+      const records = await stellaParseTabular(file, kind);
+      return { records: records || [], sheetName: null };
+    }
+    const xlsxMod = await import('xlsx');
+    const XLSX = xlsxMod?.default || xlsxMod;
+    let wb;
+    if (kind === 'csv') {
+      const txt = await stellaReadAsText(file);
+      wb = XLSX.read(txt, { type: 'string' });
+    } else {
+      const buf = await file.arrayBuffer();
+      wb = XLSX.read(buf, { type: 'array' });
+    }
+    const names = wb.SheetNames || [];
+    let best = { score: -1, name: names[0] || '', records: [] };
+    for (const name of names) {
+      const ws = wb.Sheets[name];
+      const records = ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
+      if (!records.length) continue;
+      const payload = stellaBuildTabularPayload(records.slice(0, 40));
+      const score = scoreTerritorySheet(payload.columns, records.slice(0, 40));
+      if (score > best.score) best = { score, name, records };
+    }
+    return { records: best.records, sheetName: best.name || null };
   };
 
   const composeStellaOpeningIntake = async (fileRec, {
@@ -12907,22 +12960,61 @@ ${stepInstruction}`;
     revealChatTools();
   };
 
-  const handleTerritoryStructureUpload = (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const parsed = JSON.parse(e.target.result);
-        if (!parsed.name || !parsed.territories) { alert('Invalid territory structure file.'); return; }
-        const newStructure = { ...parsed, id: `ts_${Date.now()}`, uploadedAt: new Date().toISOString().split('T')[0] };
-        setTerritoryStructures(prev => [...prev, newStructure]);
-        setSelectedTerritoryStructure(newStructure.id);
-      } catch { alert('Could not parse file. Please upload a valid JSON territory structure.'); }
-    };
-    reader.readAsText(file);
+  const handleTerritoryDataUpload = async (event) => {
+    const file = event.target.files?.[0];
     event.target.value = '';
+    if (!file) return;
+    try {
+      await ingestTerritoryTabularFile(file);
+    } catch (err) {
+      setTerritoryMapError(err.message || 'Upload failed');
+    }
   };
+
+  const handleTerritoryIntakeSend = async () => {
+    const text = territoryIntakeInput.trim();
+    if (!text || territoryIntakeBusy) return;
+    const files = userSettingsRef.current.moduleContext?.territory?.files || [];
+    const rec = files.find((f) => f.id === selectedTerritoryFileId) || files.find((f) => f.tableName);
+    if (!rec || rec.processing) return;
+    setTerritoryIntakeInput('');
+    setTerritoryIntakeBusy(true);
+    const nextMessages = [...(rec.intakeMessages || []), { role: 'user', content: text }];
+    await patchTerritoryFile(rec.id, { intakeMessages: nextMessages });
+    try {
+      await runTerritoryIntakeTurn({ ...rec, intakeMessages: nextMessages });
+    } finally {
+      setTerritoryIntakeBusy(false);
+    }
+  };
+
+  const territoryMapFiles = (userSettings.moduleContext?.territory?.files || []).filter(Boolean);
+  const activeTerritoryFile = territoryMapFiles.find((f) => f.id === selectedTerritoryFileId)
+    || territoryMapFiles.find((f) => f.tableName && !f.processing)
+    || territoryMapFiles[0]
+    || null;
+  const territoryLayoutKey = activeTerritoryFile
+    ? [
+      activeTerritoryFile.id,
+      activeTerritoryFile.tableName,
+      activeTerritoryFile.mapLayout?.teamColumn,
+      activeTerritoryFile.mapLayout?.territoryColumn,
+      activeTerritoryFile.mapLayout?.geoColumn,
+      activeTerritoryFile.mapLayout?.geoKind,
+      activeTerritoryFile.mapLayout?.country,
+    ].join('|')
+    : '';
+
+  useEffect(() => {
+    const file = (userSettingsRef.current.moduleContext?.territory?.files || []).find((f) => f.id === activeTerritoryFile?.id);
+    if (!file?.tableName || !file?.mapLayout?.geoColumn) {
+      if (!file?.processing) setTerritoryMapPayload(null);
+      return undefined;
+    }
+    if (file.id && !selectedTerritoryFileId) setSelectedTerritoryFileId(file.id);
+    void loadTerritoryMapForFile(file, selectedTerritoryTeam);
+    return () => { territoryMapAbortRef.current += 1; };
+  }, [territoryLayoutKey, selectedTerritoryTeam]);
 
   const handleSubmit = async (e, overrideInput = null, isFileAnalysis = false) => {
     if (e) e.preventDefault();
@@ -14098,21 +14190,25 @@ ${stepInstruction}`;
             <div className="flex flex-col h-full overflow-hidden">
               <div className="bg-gradient-to-r from-emerald-600 to-teal-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-4">
                 <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3"><MapIcon className="w-6 h-6" /><div><h2 className="text-xl font-bold">Territory Design</h2><p className="text-emerald-100 text-xs">Assess, design and optimise your sales territory structure</p></div></div>
-                  <button onClick={() => territoryFileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-semibold transition-all"><Upload className="w-4 h-4" /> Upload Structure</button>
-                  <input ref={territoryFileInputRef} type="file" accept=".json" onChange={handleTerritoryStructureUpload} className="hidden" />
+                  <div className="flex items-center gap-3"><MapIcon className="w-6 h-6" /><div><h2 className="text-xl font-bold">Territory Design</h2><p className="text-emerald-100 text-xs">Upload a territory file to see the structure on a map</p></div></div>
+                  <button onClick={() => territoryFileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-semibold transition-all"><Upload className="w-4 h-4" /> Upload territory file</button>
+                  <input ref={territoryFileInputRef} type="file" accept=".xlsx,.xls,.csv,.json" onChange={handleTerritoryDataUpload} className="hidden" />
                 </div>
               </div>
 
-              {territoryStructures.length > 0 && (
+              {territoryMapFiles.length > 0 && (
                 <div className="flex-shrink-0 mb-3 flex items-center gap-3 flex-wrap">
-                  <span className="text-xs text-blue-300/70 whitespace-nowrap">Loaded:</span>
-                  <div className="flex gap-2 flex-wrap flex-1">
-                    {territoryStructures.map(s => (
-                      <button key={s.id} onClick={() => { setSelectedTerritoryStructure(s.id); setSelectedTerritory(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${selectedTerritoryStructure === s.id ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>{s.name}</button>
-                    ))}
-                  </div>
-                  <div className="flex gap-1">
+                  {territoryMapFiles.length > 1 && (
+                    <>
+                      <span className="text-xs text-blue-300/70 whitespace-nowrap">File:</span>
+                      <div className="flex gap-2 flex-wrap">
+                        {territoryMapFiles.map((s) => (
+                          <button key={s.id} onClick={() => { setSelectedTerritoryFileId(s.id); setSelectedTerritory(null); setSelectedTerritoryTeam(''); setTerritoryMapPayload(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${activeTerritoryFile?.id === s.id ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>{s.name}</button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                  <div className="flex gap-1 ml-auto">
                     <button onClick={() => setTerritoryView('map')} className={`px-3 py-1.5 rounded-lg text-xs border transition-all ${territoryView === 'map' ? 'bg-blue-500/30 border-blue-400/60 text-blue-200' : 'bg-slate-800/50 border-slate-600 text-slate-400 hover:text-slate-300'}`}>🗺 Map</button>
                     <button onClick={() => setTerritoryView('list')} className={`px-3 py-1.5 rounded-lg text-xs border transition-all ${territoryView === 'list' ? 'bg-blue-500/30 border-blue-400/60 text-blue-200' : 'bg-slate-800/50 border-slate-600 text-slate-400 hover:text-slate-300'}`}>☰ List</button>
                   </div>
@@ -14120,103 +14216,139 @@ ${stepInstruction}`;
               )}
 
               {(() => {
-                const activeStructure = territoryStructures.find(s => s.id === selectedTerritoryStructure) || territoryStructures[0];
-                if (!activeStructure) return <div className="flex-1 flex items-center justify-center text-blue-300/50 text-sm">No territory structure loaded.</div>;
+                const teams = territoryMapPayload?.teams || [];
+                const points = territoryMapPayload?.points || [];
+                const mappedPoints = points.filter((p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)));
+                const pendingIntake = !!(activeTerritoryFile && !activeTerritoryFile.processing && !activeTerritoryFile.intakeComplete);
+                const grouped = [];
+                const byTerr = new Map();
+                for (const p of points) {
+                  const key = p.territory || p.geo || p.id;
+                  const prev = byTerr.get(key);
+                  if (prev) {
+                    prev.count += Number(p.count) || 0;
+                    if (p.geo && !prev.geos.includes(p.geo)) prev.geos.push(p.geo);
+                  } else {
+                    byTerr.set(key, { id: p.id, territory: key, team: p.team, count: Number(p.count) || 0, geos: p.geo ? [p.geo] : [], lat: p.lat, lng: p.lng });
+                  }
+                }
+                grouped.push(...byTerr.values());
+                if (!activeTerritoryFile) {
+                  return (
+                    <div className="flex-1 flex items-center justify-center">
+                      <div className="text-center max-w-md">
+                        <MapPin className="w-10 h-10 text-emerald-400/70 mx-auto mb-3" />
+                        <div className="text-white font-semibold mb-1">No territory file loaded</div>
+                        <p className="text-sm text-blue-300/60 mb-4">Upload an Excel or CSV with team, territory, and geography columns (postcode/zip, city, or region). We will store the rows, geocode them, and draw the structure on the map.</p>
+                        {territoryMapError && <p className="text-sm text-rose-300 mb-4">{territoryMapError}</p>}
+                        <button onClick={() => territoryFileInputRef.current?.click()} className="px-4 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/40 rounded-lg text-sm text-emerald-200 font-semibold">Upload Excel / CSV</button>
+                      </div>
+                    </div>
+                  );
+                }
                 return (
-                  <div className="flex-1 overflow-hidden flex gap-4 min-h-0">
+                  <div className="flex-1 overflow-hidden flex flex-col gap-3 min-h-0">
+                    {teams.length > 0 && (
+                      <div className="flex-shrink-0 flex items-center gap-2 flex-wrap">
+                        <span className="text-xs text-blue-300/70 whitespace-nowrap">Team:</span>
+                        {teams.map((team) => (
+                          <button key={team} onClick={() => { setSelectedTerritoryTeam(team); setSelectedTerritory(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${selectedTerritoryTeam === team ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>{team}</button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="flex-1 overflow-hidden flex gap-4 min-h-0">
                     <div className={`overflow-y-auto custom-scrollbar ${selectedTerritory ? 'w-1/2' : 'w-full'} transition-all`}>
                       {territoryView === 'map' ? (
                         <div className="bg-slate-800/40 border border-blue-400/20 rounded-xl p-3">
-                          <div className="flex items-center justify-between mb-2">
-                            <span className="text-xs text-blue-300/70 font-semibold">{activeStructure.name} — {activeStructure.territories.length} territories</span>
-                            <span className="text-xs text-blue-300/40">{activeStructure.managers.length} managers · Click a territory to inspect</span>
+                          <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+                            <span className="text-xs text-blue-300/70 font-semibold">{activeTerritoryFile.name}{activeTerritoryFile.rowCount != null ? ` — ${activeTerritoryFile.rowCount} rows` : ''}</span>
+                            <span className="text-xs text-blue-300/40">
+                              {territoryMapBusy || territoryMapPayload?.pending
+                                ? `Geocoding… ${mappedPoints.length} placed${territoryMapPayload?.pending ? `, ${territoryMapPayload.pending} remaining` : ''}`
+                                : `${mappedPoints.length} locations · Click a marker to inspect`}
+                            </span>
                           </div>
-                          <TerritoryMap structure={activeStructure} selectedTerritory={selectedTerritory} onSelectTerritory={setSelectedTerritory} />
+                          {territoryMapError && <div className="text-xs text-rose-300 mb-2">{territoryMapError}</div>}
+                          {mappedPoints.length ? (
+                            <TerritoryMap points={mappedPoints} selectedTerritory={selectedTerritory} onSelectTerritory={setSelectedTerritory} />
+                          ) : (
+                            <div className="h-[320px] flex items-center justify-center text-sm text-blue-300/50">
+                              {activeTerritoryFile.processing || territoryMapBusy ? 'Loading territory points…' : (activeTerritoryFile.mapLayout?.geoColumn ? 'Waiting for geocoded locations…' : 'Confirm the geography column in intake below to draw the map.')}
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <div className="space-y-2">
-                          {activeStructure.managers.map((mgr, mgrIdx) => (
-                            <div key={mgr.id} className="bg-slate-800/40 border border-blue-400/20 rounded-xl overflow-hidden">
-                              <div className="px-4 py-2 flex items-center gap-2" style={{ background: `${MANAGER_COLOURS[mgrIdx]}18` }}>
-                                <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: MANAGER_COLOURS[mgrIdx] }} />
-                                <span className="text-sm font-semibold text-white">{mgr.name}</span>
-                                <span className="text-xs text-blue-300/60">— {mgr.region}</span>
-                                <span className="ml-auto text-xs text-blue-300/40">{activeStructure.territories.filter(t => t.managerId === mgr.id).length} territories</span>
+                          {grouped.map((t) => {
+                            const colour = hashTerritoryColour(t.territory).colour;
+                            return (
+                              <div key={t.id || t.territory} onClick={() => setSelectedTerritory(selectedTerritory?.id === t.id ? null : t)} className={`bg-slate-800/40 border border-blue-400/20 rounded-xl px-4 py-2.5 cursor-pointer transition-all flex items-center gap-3 ${selectedTerritory?.id === t.id ? 'bg-blue-500/10' : 'hover:bg-slate-700/30'}`}>
+                                <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: colour }} />
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm text-white truncate">{t.territory}</div>
+                                  <div className="text-xs text-blue-300/50 truncate">{t.geos.slice(0, 4).join(', ')}{t.geos.length > 4 ? '…' : ''}</div>
+                                </div>
+                                <span className="text-xs text-white font-bold">{t.count}</span>
                               </div>
-                              <div className="divide-y divide-slate-700/40">
-                                {activeStructure.territories.filter(t => t.managerId === mgr.id).map(t => (
-                                  <div key={t.id} onClick={() => setSelectedTerritory(selectedTerritory?.id === t.id ? null : t)} className={`px-4 py-2.5 cursor-pointer transition-all flex items-center gap-3 ${selectedTerritory?.id === t.id ? 'bg-blue-500/10' : 'hover:bg-slate-700/30'}`}>
-                                    <span className="text-xs font-bold text-blue-400 w-8 flex-shrink-0">{t.id}</span>
-                                    <div className="flex-1 min-w-0"><div className="text-sm text-white truncate">{t.name}</div><div className="text-xs text-blue-300/50 truncate">{t.rep}</div></div>
-                                    <div className="flex gap-2 text-xs flex-shrink-0">
-                                      <span className="text-emerald-400 font-semibold">A:{t.hcps.A}</span>
-                                      <span className="text-blue-400">B:{t.hcps.B}</span>
-                                      <span className="text-slate-400">C:{t.hcps.C}</span>
-                                      <span className="text-white font-bold ml-1">{t.hcps.A+t.hcps.B+t.hcps.C}</span>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          ))}
+                            );
+                          })}
+                          {!grouped.length && <div className="text-sm text-blue-300/50 py-8 text-center">No territory rows in this team yet.</div>}
                         </div>
                       )}
                     </div>
 
-                    {selectedTerritory && (() => {
-                      const mgr = activeStructure.managers.find(m => m.id === selectedTerritory.managerId);
-                      const mgrIdx = activeStructure.managers.indexOf(mgr);
-                      const total = selectedTerritory.hcps.A + selectedTerritory.hcps.B + selectedTerritory.hcps.C;
-                      return (
-                        <div className="w-1/2 overflow-y-auto custom-scrollbar">
-                          <div className="bg-slate-800/60 border border-blue-400/30 rounded-xl p-4 space-y-4">
-                            <div className="flex items-start justify-between">
-                              <div>
-                                <div className="flex items-center gap-2 mb-1 flex-wrap">
-                                  <span className="text-xs font-bold text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded">{selectedTerritory.id}</span>
-                                  <span className="text-xs px-2 py-0.5 rounded" style={{ background: `${MANAGER_COLOURS[mgrIdx]}22`, color: MANAGER_COLOURS[mgrIdx] }}>{mgr?.name}</span>
-                                </div>
-                                <h3 className="text-lg font-bold text-white">{selectedTerritory.name}</h3>
-                                <p className="text-sm text-blue-300/70">Rep: {selectedTerritory.rep}</p>
-                              </div>
-                              <button onClick={() => setSelectedTerritory(null)} className="text-slate-500 hover:text-slate-300 transition-all flex-shrink-0"><X className="w-4 h-4" /></button>
-                            </div>
+                    {selectedTerritory && (
+                      <div className="w-1/2 overflow-y-auto custom-scrollbar">
+                        <div className="bg-slate-800/60 border border-blue-400/30 rounded-xl p-4 space-y-4">
+                          <div className="flex items-start justify-between">
                             <div>
-                              <div className="text-xs text-blue-300/60 mb-2 font-semibold uppercase tracking-wide">HCP Universe</div>
-                              {[['A — High value prescribers', selectedTerritory.hcps.A, '#34d399'], ['B — Medium value', selectedTerritory.hcps.B, '#60a5fa'], ['C — Low / awareness', selectedTerritory.hcps.C, '#64748b']].map(([label, count, colour]) => {
-                                const pct = Math.round(count / total * 100);
-                                return (
-                                  <div key={label} className="mb-2">
-                                    <div className="flex justify-between text-xs mb-1"><span className="text-blue-200/80">{label}</span><span className="font-bold" style={{ color: colour }}>{count} ({pct}%)</span></div>
-                                    <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden"><div className="h-full rounded-full" style={{ width: `${pct}%`, background: colour }} /></div>
-                                  </div>
-                                );
-                              })}
-                              <div className="mt-2 pt-2 border-t border-slate-700/50 flex justify-between text-xs"><span className="text-blue-300/60">Total HCPs</span><span className="text-white font-bold">{total}</span></div>
+                              {selectedTerritory.team && <div className="text-xs text-emerald-300 mb-1">{selectedTerritory.team}</div>}
+                              <h3 className="text-lg font-bold text-white">{selectedTerritory.territory || selectedTerritory.id}</h3>
+                              {selectedTerritory.geo && <p className="text-sm text-blue-300/70">{selectedTerritory.geo}</p>}
                             </div>
-                            <div>
-                              <div className="text-xs text-blue-300/60 mb-2 font-semibold uppercase tracking-wide">Counties / Areas</div>
-                              <div className="flex flex-wrap gap-1">{selectedTerritory.counties.map(c => (<span key={c} className="text-xs bg-slate-700/60 text-blue-200/70 px-2 py-0.5 rounded-full">{c}</span>))}</div>
-                            </div>
-                            {selectedTerritory.notes && (<div className="bg-amber-500/10 border border-amber-400/20 rounded-lg p-3"><div className="text-xs text-amber-400 font-semibold mb-1">Notes</div><p className="text-xs text-amber-200/80">{selectedTerritory.notes}</p></div>)}
-                            <button onClick={() => {
-                              const t = selectedTerritory;
-                              const mgr = activeStructure.managers.find(m => m.id === t.managerId);
-                              const allTerritories = activeStructure.territories;
-                              const totalHCPs = allTerritories.map(x => x.hcps.A + x.hcps.B + x.hcps.C);
-                              const avgTotal = Math.round(totalHCPs.reduce((a,b) => a+b,0) / allTerritories.length);
-                              const mgrTerritories = allTerritories.filter(x => x.managerId === t.managerId);
-                              const avgMgrTotal = Math.round(mgrTerritories.map(x => x.hcps.A+x.hcps.B+x.hcps.C).reduce((a,b)=>a+b,0) / mgrTerritories.length);
-                              const focusTotal = t.hcps.A + t.hcps.B + t.hcps.C;
-                              const allTerritoriesStr = allTerritories.map(x => { const xTotal = x.hcps.A+x.hcps.B+x.hcps.C; const xMgr = activeStructure.managers.find(m=>m.id===x.managerId); return `  ${x.id === t.id ? '>>> FOCUS: ' : ''}${x.id} ${x.name} | Rep: ${x.rep} | Manager: ${xMgr?.name} | HCPs: A=${x.hcps.A} B=${x.hcps.B} C=${x.hcps.C} Total=${xTotal}${x.id === t.id ? ' <<<' : ''}`; }).join('\n');
-                              const focusedContext = `TERRITORY ASSESSMENT — FOCUS TERRITORY: ${t.id} ${t.name}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nFOCUS TERRITORY DETAIL:\n  ID: ${t.id} | Name: ${t.name}\n  Rep: ${t.rep} | Manager: ${mgr?.name} (${mgr?.region})\n  Counties: ${t.counties.join(', ')}\n  HCPs: Segment A=${t.hcps.A}, B=${t.hcps.B}, C=${t.hcps.C}, Total=${focusTotal}\n  ${t.notes ? `Notes: ${t.notes}` : ''}\n\nBENCHMARKS:\n  National avg total HCPs: ${avgTotal}\n  Manager region avg (${mgr?.region}): ${avgMgrTotal}\n  Focus vs national: ${focusTotal > avgTotal ? '+' : ''}${focusTotal - avgTotal} (${Math.round((focusTotal/avgTotal-1)*100)}%)\n  Focus vs region: ${focusTotal > avgMgrTotal ? '+' : ''}${focusTotal - avgMgrTotal} (${Math.round((focusTotal/avgMgrTotal-1)*100)}%)\n\nALL TERRITORIES:\n${allTerritoriesStr}`;
-                              setActiveTab('chat');
-                              setTimeout(() => launchWorkflowDirect('territory_assessment', `Assess territory ${t.id} — ${t.name}`, focusedContext), 100);
-                            }} className="w-full py-2.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/30 rounded-lg text-sm text-emerald-300 font-semibold transition-all">🔍 Assess this territory →</button>
+                            <button onClick={() => setSelectedTerritory(null)} className="text-slate-500 hover:text-slate-300 transition-all flex-shrink-0"><X className="w-4 h-4" /></button>
                           </div>
+                          <div className="flex justify-between text-xs pt-2 border-t border-slate-700/50">
+                            <span className="text-blue-300/60">Rows</span>
+                            <span className="text-white font-bold">{selectedTerritory.count ?? (selectedTerritory.geos ? grouped.find((g) => g.id === selectedTerritory.id)?.count : '—')}</span>
+                          </div>
+                          {(selectedTerritory.geos || []).length > 0 && (
+                            <div>
+                              <div className="text-xs text-blue-300/60 mb-2 font-semibold uppercase tracking-wide">Geo keys</div>
+                              <div className="flex flex-wrap gap-1">{selectedTerritory.geos.map((c) => (<span key={c} className="text-xs bg-slate-700/60 text-blue-200/70 px-2 py-0.5 rounded-full">{c}</span>))}</div>
+                            </div>
+                          )}
+                          <button onClick={() => {
+                            const focusedContext = formatTerritoryAssessContext({
+                              file: activeTerritoryFile,
+                              team: selectedTerritoryTeam,
+                              territory: selectedTerritory,
+                              points,
+                            });
+                            setActiveTab('chat');
+                            setTimeout(() => launchWorkflowDirect('territory_assessment', `Assess territory ${selectedTerritory.territory || selectedTerritory.id}`, focusedContext), 100);
+                          }} className="w-full py-2.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/30 rounded-lg text-sm text-emerald-300 font-semibold transition-all">🔍 Assess this territory →</button>
                         </div>
-                      );
-                    })()}
+                      </div>
+                    )}
+                    </div>
+
+                    {pendingIntake && (
+                      <div className="flex-shrink-0 bg-slate-800/50 border border-emerald-400/25 rounded-xl p-3">
+                        <div className="text-[10px] uppercase tracking-wide text-emerald-300/80 font-semibold mb-2">Territory intake</div>
+                        <div className="max-h-32 overflow-y-auto custom-scrollbar space-y-2 mb-2">
+                          {(activeTerritoryFile.intakeMessages || []).slice(-6).map((m, i) => (
+                            <div key={i} className={`text-xs ${m.role === 'user' ? 'text-cyan-200' : 'text-blue-100'}`}>
+                              {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}
+                            </div>
+                          ))}
+                        </div>
+                        <div className="flex gap-2">
+                          <textarea value={territoryIntakeInput} onChange={(e) => setTerritoryIntakeInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleTerritoryIntakeSend(); } }} placeholder="Answer the intake questions…" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-none" rows={2} />
+                          <button onClick={handleTerritoryIntakeSend} disabled={!territoryIntakeInput.trim() || territoryIntakeBusy} className="px-4 py-2 bg-emerald-500/30 hover:bg-emerald-500/40 disabled:opacity-40 text-white font-semibold rounded-lg text-sm">Send</button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })()}

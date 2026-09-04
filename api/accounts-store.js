@@ -28,6 +28,15 @@ function supabaseConfig() {
   return { supabaseUrl, serviceKey };
 }
 
+function missingSupabaseMessage() {
+  const { supabaseUrl, serviceKey } = supabaseConfig();
+  if (!serviceKey) {
+    return 'SUPABASE_SERVICE_KEY is not configured. Add it to .env.local from Vercel (Production), then restart the dev server.';
+  }
+  if (!supabaseUrl) return 'SUPABASE_URL is not configured';
+  return 'Supabase is not configured';
+}
+
 function storageHeaders(serviceKey, extra = {}) {
   return {
     Authorization: `Bearer ${serviceKey}`,
@@ -182,7 +191,7 @@ function seedUsersFromEnv() {
 async function downloadObject(path) {
   const { supabaseUrl, serviceKey } = supabaseConfig();
   if (!supabaseUrl || !serviceKey) {
-    throw new Error('Supabase is not configured');
+    throw new Error(missingSupabaseMessage());
   }
   const url = `${supabaseUrl}/storage/v1/object/intelligence/${encodeObjectPath(path)}`;
   const upstream = await fetch(url, { headers: storageHeaders(serviceKey) });
@@ -198,7 +207,7 @@ async function downloadObject(path) {
 async function uploadObject(path, doc) {
   const { supabaseUrl, serviceKey } = supabaseConfig();
   if (!supabaseUrl || !serviceKey) {
-    throw new Error('Supabase is not configured');
+    throw new Error(missingSupabaseMessage());
   }
   const body = JSON.stringify(doc, null, 2);
   const url = `${supabaseUrl}/storage/v1/object/intelligence/${encodeObjectPath(path)}`;
@@ -298,7 +307,7 @@ async function removeObjects(paths) {
   if (!unique.length) return;
   const { supabaseUrl, serviceKey } = supabaseConfig();
   if (!supabaseUrl || !serviceKey) {
-    throw new Error('Supabase is not configured');
+    throw new Error(missingSupabaseMessage());
   }
   const headers = storageHeaders(serviceKey, { 'Content-Type': 'application/json' });
   for (let i = 0; i < unique.length; i += 100) {
@@ -429,8 +438,29 @@ function issueToken(user, extra = {}) {
   return { token: `${body}.${sig}`, expiresAt: payload.exp };
 }
 
+function bearerToken(req) {
+  return String(req?.headers?.authorization || req?.headers?.Authorization || '')
+    .replace(/^Bearer\s+/i, '')
+    .trim();
+}
+
+/** PasswordGate uses token "local-dev" on localhost. Never honour that on Vercel. */
+function isLocalDevSessionToken(token) {
+  if (token !== 'local-dev') return false;
+  if (process.env.COMEX_LOCAL_API === '1') return true;
+  return !process.env.VERCEL;
+}
+
 async function sessionUserFromRequest(req) {
-  const payload = verifyToken(req?.headers?.authorization || req?.headers?.Authorization);
+  const token = bearerToken(req);
+  if (isLocalDevSessionToken(token)) {
+    const accounts = await loadAccounts();
+    return findAccount(accounts, 'default')
+      || findAccount(accounts, null, 'Admin')
+      || (accounts?.users || []).find((u) => u.role === 'admin')
+      || { id: 'default', name: 'Admin', role: 'admin', company: 'ComEx' };
+  }
+  const payload = verifyToken(token);
   if (!payload?.id || payload.purpose === 'change-password') return null;
   const accounts = await loadAccounts();
   return findAccount(accounts, payload.id);
