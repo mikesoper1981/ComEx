@@ -7925,21 +7925,21 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
     fileInputRef.current?.click();
   };
 
-  const startUploadIcContext = () => {
-    goToIncentiveChat();
-    revealChatTools();
-    window.setTimeout(() => {
-      moduleContextFileInputRef.current?.setAttribute('data-module', 'incentives');
-      moduleContextFileInputRef.current?.setAttribute('data-source', 'chat');
-      moduleContextFileInputRef.current?.click();
-    }, 50);
-  };
-
   const openIcContextSettings = () => {
     setShowLanding(false);
     setActiveTab('user-settings');
     setUserSettingsPane('incentives');
     setMobileChatToolsOpen(false);
+  };
+
+  const startUploadIcContext = () => {
+    openIcContextSettings();
+    window.setTimeout(() => {
+      document.getElementById('module-context-files-incentives')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      moduleContextFileInputRef.current?.setAttribute('data-module', 'incentives');
+      moduleContextFileInputRef.current?.removeAttribute('data-source');
+      moduleContextFileInputRef.current?.click();
+    }, 150);
   };
 
   const startBestPractices = () => {
@@ -7989,7 +7989,7 @@ MEMORY UPDATES: Never say you updated, saved, locked in, or remembered a fact. D
           {!isStella && (
             <div className="p-3 space-y-2 border-b border-blue-400/15">
               <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-300/70">IC context files</div>
-              <p className="text-[11px] text-blue-300/50 leading-relaxed">Load external files so IC design can use them as context</p>
+              <p className="text-[11px] text-blue-300/50 leading-relaxed">Uploads open in User Settings → Incentive Compensation, where intake runs as normal.</p>
               <button type="button" onClick={startUploadIcContext} className="w-full flex items-center gap-2 px-2.5 py-2 bg-slate-800/60 hover:bg-cyan-500/20 border border-cyan-400/25 hover:border-cyan-400/50 rounded-lg text-xs text-cyan-200 text-left"><Upload className="w-3.5 h-3.5 shrink-0" /> Upload context file</button>
               {(userSettings.moduleContext?.incentives?.files || []).length === 0 ? (
                 <div className="text-[11px] text-blue-300/45">No context files yet.</div>
@@ -9958,7 +9958,7 @@ ${stepInstruction}`;
       });
     };
     return (
-      <div className="mt-8 pt-6 border-t border-blue-400/15">
+      <div id={`module-context-files-${moduleId}`} className="mt-8 pt-6 border-t border-blue-400/15">
         <h3 className="text-sm font-bold text-white mb-1 flex items-center gap-2">
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
