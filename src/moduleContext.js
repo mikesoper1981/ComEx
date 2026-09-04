@@ -199,11 +199,7 @@ function normalizeContextFile(raw) {
   }
   if (notes.length) rec.notes = notes;
   if (rec.intakeComplete !== false && !rec.intakeComplete && !rec.processing) {
-    const hasStoredContent = !!(
-      rec.summary || rec.extractedText || rec.visionExtract || rec.structuredExtract
-      || rec.capturedContext || rec.notes?.length
-    );
-    if (hasStoredContent) rec.intakeComplete = true;
+    if (rec.capturedContext || rec.notes?.length) rec.intakeComplete = true;
   }
   return rec;
 }
@@ -276,6 +272,9 @@ export function serializeContextFileForPersist(fileRec) {
   if (rec.notes?.length) out.notes = rec.notes;
   if (rec.columns?.length) out.columns = rec.columns;
   if (rec.intakeComplete) out.intakeComplete = true;
+  else if (rec.extractedText || rec.structuredExtract || rec.visionExtract || rec.capturedContext) {
+    out.intakeComplete = false;
+  }
   return out;
 }
 

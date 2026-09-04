@@ -363,12 +363,18 @@ export function mergeWorkflowRuntime(partial) {
   if (contextSummary.includes('simple team list')
     || contextSummary.includes('incentive design, payouts')
     || contextSummary.includes('2-4 sentences describing')
+    || contextSummary.includes('suggestedQuestions only for a gap that would block')
     || !/key_facts/i.test(contextSummary)
-    || !/Never use a fixed checklist/i.test(contextSummary)
+    || !/same idea as Assess IC/i.test(contextSummary)
     || !/key_facts/i.test(contextIntake)
+    || !/until the file is clear enough to store/i.test(contextIntake)
     || !/Omit or leave empty any field with no real answer/i.test(contextIntake)) {
     out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
     out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;
+  }
+  const contextClassify = String(out.contextImageClassifyPrompt || '');
+  if (!/AUTO-INCLUDE/i.test(contextClassify) || !/strategy or IC/i.test(contextClassify)) {
+    out.contextImageClassifyPrompt = DEFAULT_WORKFLOW_RUNTIME.contextImageClassifyPrompt;
   }
   return out;
 }

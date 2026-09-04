@@ -304,6 +304,21 @@ function extractJsonObject(text) {
   return null;
 }
 
+function parseContextSummaryResponse(raw) {
+  const parsed = extractJsonObject(raw);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  const facts = [];
+  const match = String(raw || '').match(/"key_facts"\s*:\s*\[([\s\S]*?)(?:\]|$)/);
+  if (match) {
+    for (const item of match[1].matchAll(/"((?:\\.|[^"\\])*)"/g)) {
+      const t = item[1].replace(/\\n/g, ' ').replace(/\\"/g, '"').replace(/\s+/g, ' ').trim();
+      if (t) facts.push(t);
+    }
+  }
+  if (!facts.length) return null;
+  return { summary: '', what_it_represents: '', time_period: '', key_facts: facts, key_metrics: [], suggestedQuestions: [] };
+}
+
 // Remove any SQL blocks so they are never shown to the end user.
 function stellaStripSqlBlocks(text) {
   return String(text || '')
@@ -8767,8 +8782,9 @@ ${stepInstruction}`;
           purpose: classByName[img.name]?.purpose || img.purpose || 'scheme_content',
           reason: classByName[img.name]?.reason || img.reason,
         }));
-      } catch (err) {
+        } catch (err) {
         imageNotes = [err.message || 'Image scan skipped'];
+        console.warn('Context image scan failed:', err);
       }
     }
     return { kind, fileType: label, extractedText, structuredText, included, unsure, skipped, imageNotes };
@@ -8807,12 +8823,31 @@ ${stepInstruction}`;
       moduleLabel: moduleLabelFor(moduleId),
     });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map((c) => `- ${c.name}`).join('\n')}` : '';
-    const raw = await callAnthropic(system, [{
-      role: 'user',
-      content: `FILE NAME: ${name}\nStored under: ${moduleLabelFor(moduleId)} (storage location only — not a topic to ask about).${colText}\n\nFILE CONTENTS:\n${String(extractBlob || '').slice(0, 18000)}`,
-    }], 1000);
-    const parsed = extractJsonObject(raw);
-    if (!parsed || typeof parsed !== 'object') return fallback;
+    const ask = async (extra = '') => {
+      const raw = await callAnthropic(system, [{
+        role: 'user',
+        content: `FILE NAME: ${name}\nStored under: ${moduleLabelFor(moduleId)} (storage location only — not a topic to ask about).${colText}\n\nFILE CONTENTS:\n${String(extractBlob || '').slice(0, 18000)}\n\nReturn the JSON object now. key_facts must list discrete facts from FILE CONTENTS (prefer 4–20).${extra}`,
+      }], 3500);
+      return parseContextSummaryResponse(raw);
+    };
+    let parsed = null;
+    try {
+      parsed = await ask();
+    } catch (err) {
+      console.warn('Context summary failed:', err);
+    }
+    const factCount = Array.isArray(parsed?.key_facts) ? parsed.key_facts.filter((f) => String(f || '').trim().length >= 4).length : 0;
+    if (!parsed || typeof parsed !== 'object' || !factCount) {
+      try {
+        parsed = await ask('\nThe previous reply was empty or invalid. Extract key_facts from the file text above — do not return empty arrays if facts are present.');
+      } catch (err) {
+        console.warn('Context summary retry failed:', err);
+        if (!parsed) throw err;
+      }
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Could not parse captured facts from the model response.');
+    }
     const questions = (Array.isArray(parsed.suggestedQuestions) ? parsed.suggestedQuestions : [])
       .map((q) => String(q || '').replace(/\s+/g, ' ').trim())
       .filter((q) => q.length >= 8 && !isEmptyContextValue(q))
@@ -8822,7 +8857,7 @@ ${stepInstruction}`;
     const summary = isEmptyContextValue(parsed.summary) ? '' : String(parsed.summary).trim();
     const facts = (Array.isArray(parsed.key_facts) ? parsed.key_facts : [])
       .map((f) => String(f || '').replace(/\s+/g, ' ').trim())
-      .filter((f) => f.length >= 8 && !isEmptyContextValue(f))
+      .filter((f) => f.length >= 4 && !isEmptyContextValue(f))
       .slice(0, 24);
     const metrics = (Array.isArray(parsed.key_metrics) ? parsed.key_metrics : [])
       .map((m) => String(m || '').replace(/\s+/g, ' ').trim())
@@ -9130,7 +9165,7 @@ ${stepInstruction}`;
     if (!images?.length) return '';
     onStatus?.(`Reading ${Math.min(images.length, 8)} image(s)…`);
     const rt = getWorkflowRuntime();
-    const prompt = moduleId === 'incentives' ? rt.proposalImageInterpretPrompt : rt.contextImageInterpretPrompt;
+    const prompt = rt.contextImageInterpretPrompt;
     return interpretProposalImages(
       images,
       withUserSettings(prompt, { moduleContext: false, applyResponseLength: false }),
@@ -9187,9 +9222,14 @@ ${stepInstruction}`;
       try {
         job.onStatus?.('Capturing key facts…');
         onboarding = await summarizeContextFile({ name: file.name, extractBlob, moduleId });
-      } catch { /* keep fallback */ }
+      } catch (err) {
+        const why = err?.message || 'fact capture failed';
+        console.warn('Context fact capture failed:', err);
+        job.onStatus?.(`Fact capture failed: ${why}`);
+        postChat(`⚠️ Could not capture facts automatically: ${why}. The raw extract is saved — you can add facts under Incentive Comp context files.`);
+      }
     }
-    const questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+    let questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
     const captured = compactCapturedContext({
       what_it_represents: onboarding.what_it_represents,
       time_period: onboarding.time_period,
@@ -9199,6 +9239,9 @@ ${stepInstruction}`;
     });
     const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
     const factCount = captured?.key_facts?.length || 0;
+    if (!questions.length && !isThinContextExtract(extractBlob, file.name) && !factCount) {
+      questions = ['What should I treat as the primary context from this file (year, plan/product, audience), or is the extract already complete?'];
+    }
     const assistantMsg = questions.length
       ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}\n\nI captured **${factCount}** key fact${factCount === 1 ? '' : 's'}. A few gaps still need you:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
       : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}${factCount ? `\n\nCaptured **${factCount}** key fact${factCount === 1 ? '' : 's'} — review them under Incentive Comp context files.` : ''}`;
@@ -9216,7 +9259,7 @@ ${stepInstruction}`;
       columns: onboarding.columns,
       capturedContext: captured,
       intakeMessages: [{ role: 'assistant', content: assistantMsg }],
-      intakeComplete: questions.length === 0,
+      intakeComplete: questions.length === 0 && !!captured,
       processing: false,
     };
     const nextCtx = upsertModuleContextFile(userSettingsRef.current.moduleContext, moduleId, rec);
@@ -9272,8 +9315,28 @@ ${stepInstruction}`;
         intakeMessages: nextMessages,
       });
       const withAssistant = [...nextMessages, { role: 'assistant', content: result.message }];
-      const mergedCtx = result.complete
-        ? compactCapturedContext({ ...(rec.capturedContext || {}), ...(result.context_qa || {}) })
+      const qa = result.complete && result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
+      const prior = rec.capturedContext || {};
+      const mergeLines = (a, b) => {
+        const seen = new Set();
+        const out = [];
+        [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].forEach((item) => {
+          const t = String(item || '').replace(/\s+/g, ' ').trim();
+          if (!t) return;
+          const key = t.toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          out.push(t);
+        });
+        return out;
+      };
+      const mergedCtx = qa
+        ? compactCapturedContext({
+          ...prior,
+          ...qa,
+          key_facts: mergeLines(prior.key_facts, qa.key_facts),
+          key_metrics: mergeLines(prior.key_metrics, qa.key_metrics),
+        })
         : rec.capturedContext;
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: withAssistant,
@@ -9379,9 +9442,7 @@ ${stepInstruction}`;
       }]);
     }
     const classifyPrompt = withUserSettings(
-      moduleId === 'incentives'
-        ? getWorkflowRuntime().proposalImageClassifyPrompt
-        : getWorkflowRuntime().contextImageClassifyPrompt,
+      getWorkflowRuntime().contextImageClassifyPrompt,
       { moduleContext: false, applyResponseLength: false },
     );
     try {
@@ -9407,6 +9468,15 @@ ${stepInstruction}`;
           }
         },
       });
+      if (extracts.imageNotes?.length && fromChat) {
+        const scanErr = extracts.imageNotes.find((n) => /fail|error|skipped/i.test(String(n)));
+        if (scanErr) {
+          setMessages((prev) => [...prev, { role: 'system', content: `⚠️ Image scan: ${scanErr}` }]);
+        }
+      }
+      const included = extracts.included || [];
+      const unsure = extracts.unsure || [];
+      const skipped = extracts.skipped || [];
       const job = {
         moduleId,
         fileId,
@@ -9416,9 +9486,9 @@ ${stepInstruction}`;
         extractedText: extracts.extractedText,
         structuredText: extracts.structuredText,
         imageNotes: extracts.imageNotes,
-        included: extracts.included,
-        unsure: extracts.unsure,
-        skipped: extracts.skipped,
+        included,
+        unsure,
+        skipped,
         ingestKind: 'moduleContext',
         onStatus: (msg) => {
           setUserSettings((prev) => ({
@@ -9429,33 +9499,43 @@ ${stepInstruction}`;
           }));
         },
       };
-      if (extracts.unsure.length) {
+      const previews = buildProposalImagePreviews(included, unsure, skipped);
+      const ignoredPurpose = skipped.filter((s) =>
+        ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
+      );
+      if (fromChat && previews.length) {
+        setMessages((prev) => [...prev, {
+          role: 'system',
+          content: unsure.length
+            ? `🖼️ **${included.length}** strategy/IC image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry strategy or IC context (skip logos and decoration).`
+            : included.length
+              ? `🖼️ **${included.length}** strategy/IC image(s) will be extracted${ignoredPurpose.length ? `; ${ignoredPurpose.length} logo/decoration skipped` : ''}.`
+              : `⚠️ No strategy/IC images for vision${ignoredPurpose.length ? ` (${ignoredPurpose.length} logo/decorative skipped)` : ''}.`,
+          imagePreviews: previews,
+          imageReviewPending: unsure.length > 0,
+        }]);
+      }
+      if (unsure.length) {
         contextIngestJobRef.current = job;
         setContextIngestJob(job);
         setUserSettings((prev) => ({
           ...prev,
           moduleContext: patchModuleContextFile(prev.moduleContext, moduleId, fileId, {
+            processing: true,
             intakeMessages: [{
               role: 'assistant',
-              content: `🖼️ **${extracts.unsure.length}** image(s) need a yes/no — include any that carry useful context. Click a thumbnail to enlarge.`,
+              content: `🖼️ **${included.length}** strategy/IC image(s) auto-included. **${unsure.length}** need a yes/no — click a thumbnail to enlarge.`,
             }],
           }),
         }));
         if (fromChat) {
-          const previews = buildProposalImagePreviews(extracts.included, extracts.unsure, extracts.skipped);
           pendingImageReviewRef.current = job;
           setPendingImageReview(job);
           setIsLoading(false);
-          setMessages((prev) => [...prev, {
-            role: 'system',
-            content: `🖼️ **${extracts.included.length}** scheme image(s) will be extracted. **${extracts.unsure.length}** still need a yes/no — include any that carry IC context (skip logos and decoration).`,
-            imagePreviews: previews,
-            imageReviewPending: true,
-          }]);
         }
         return;
       }
-      await completeModuleContextIngest({ ...job, images: extracts.included });
+      await completeModuleContextIngest({ ...job, images: included });
     } catch (err) {
       const failed = patchModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId, {
         processing: false,
@@ -9571,7 +9651,7 @@ ${stepInstruction}`;
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
         <p className="text-xs text-blue-300/60 mb-2">
-          PowerPoint, PDF, Excel, CSV, or text. Images are classified like Assess IC (logos skipped; unclear slides wait for you). Captured facts — not a deck narrative — are stored per file and shared with the incentive LLM and the context map.
+          PowerPoint, PDF, Excel, CSV, or text. Strategy and IC images are auto-included (logos skipped; unclear slides wait for you, same as Assess IC). Captured facts are stored per file after any clarifying questions, and shared with the incentive LLM and the context map.
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
           File only: <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.

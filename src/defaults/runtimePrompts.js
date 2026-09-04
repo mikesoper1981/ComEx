@@ -142,30 +142,29 @@ Rules:
 - Be faithful to what is visible — do not invent numbers or names.
 - If a cell or label is unreadable, write [unclear].
 - Return ONLY the extracted markdown (no preamble).`,
-  contextImageClassifyPrompt: `You classify images from an uploaded business-context file (PowerPoint/PDF: strategy, goals, products, territories, teams, or incentive materials).
+  contextImageClassifyPrompt: `You classify images from an uploaded IC / commercial-context file (PowerPoint/PDF: strategy decks, goals, products, territories, teams, or incentive materials).
 
-Decide whether each image carries content the AI would lose if ignored.
+AUTO-INCLUDE (relevant=true) — strategy or IC topics. Do not ask the user about these:
+- Strategy, goals, priorities, launch plans, brand / product portfolios
+- Org charts, teams, roles, territories, labelled maps
+- Tables, charts, process diagrams, timelines that carry business meaning
+- Incentive / scheme content (payout, eligibility, governance, comms)
 
-RELEVANT (relevant=true) — any business meaning, including:
-- Strategy, goals, priorities, product lists, brand portfolios
-- Org charts, teams, roles, territories, maps with labels
-- Tables, charts, process diagrams, timelines
-- Incentive / scheme content (payout, eligibility, comms)
-
-NOT RELEVANT (relevant=false) — no business meaning:
+NOT RELEVANT (relevant=false) — skip without asking:
 - Logos, brand marks, partner badges
 - Decorative backgrounds, gradients, abstract shapes
 - Stock photos with no labels or data
 - Icons, bullets, separators, clip-art used as chrome
 
-UNSURE (relevant="unsure") — might contain useful context but you cannot tell. The user will confirm.
+UNSURE (relevant="unsure") — only when you cannot tell if it is strategy/IC content vs decoration. The user will confirm, same as Assess IC.
 
 Return ONLY a JSON array (no markdown fences):
-[{"name":"<exact filename>","purpose":"table|chart|diagram|map|org_chart|process|strategy|products|timeline|comms|logo|decorative|stock_photo|icon|other","relevant":true|false|"unsure","reason":"≤12 words"}]
+[{"name":"<exact filename>","purpose":"strategy|products|table|chart|diagram|map|org_chart|process|timeline|comms|scheme_diagram|payment_scale|eligibility|governance|logo|decorative|stock_photo|icon|other","relevant":true|false|"unsure","reason":"≤12 words"}]
 
 Rules:
-- Prefer relevant=true or "unsure" over dropping possible content.
+- Strategy or IC content → relevant=true (auto-flag). Do not mark those unsure.
 - relevant=false only when clearly logo / decoration / stock photo / icon.
+- relevant="unsure" only when mixed or unreadable.
 - Use the exact filename provided for each image.`,
   contextContentSummaryPrompt: `You extract FACTS from ONE uploaded file so later specialists can use it without rereading the whole document.
 
@@ -186,22 +185,20 @@ Rules:
 - Pull facts that are IN the file. Do not write a slide-by-slide narrative or a marketing summary.
 - Each key_facts item is one discrete fact (≤25 words). Prefer 4–20 facts. Skip logos, decoration, and empty slides.
 - Never invent numbers or names. If unreadable, omit rather than guess.
-- suggestedQuestions only for a gap that would block using the file. Otherwise [].
+- If something is still unclear after the extract (year, plan/product, audience, currency, a definition, whose numbers), put 1–5 numbered clarifying questions in suggestedQuestions — same idea as Assess IC. If the extract is already clear, [].
 - Empty fields must be empty / []. Never write n/a, unknown, or "the file contained no text".
 {{moduleLabel}} is only the storage place — not a topic to ask about.`,
-  contextIntakePrompt: `You onboard ONE uploaded file. Detected facts may already be in the extract.
+  contextIntakePrompt: `You onboard ONE uploaded file, the same way Assess IC clarifies a proposal before storing it.
 
-Ask at most one question if something material is still ambiguous (year, currency, which plan, a definition). Otherwise set complete=true.
+Detected facts may already be in the extract. Ask about anything still ambiguous (year, currency, which plan/product, audience, a definition). Number questions 1. 2. 3. when you ask more than one. Never use a fixed checklist. Never ask about other files or the module in general. Never ask about facts already visible in the extract.
 
-Never use a fixed checklist. Never ask about other files or the module in general. Never ask about facts already visible in the extract.
-
-When complete=true, fill context_qa with FACTS from the extract plus the user's answers — not a narrative rewrite.
+Do not set complete=true until the file is clear enough to store. When the user has answered (or the extract was already clear), set complete=true and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite.
 
 Return ONLY valid JSON — no markdown fences.
 Schema:
 {
   "complete": true | false,
-  "message": "the single next question (complete=false) OR a one-line confirmation (complete=true)",
+  "message": "clarifying question(s) (complete=false) OR a one-line confirmation that context is stored (complete=true)",
   "context_qa": {
     "what_it_represents": "",
     "time_period": "",
