@@ -376,6 +376,7 @@ export function mergeWorkflowRuntime(partial) {
     || !/FIRST TURN/i.test(contextIntake)
     || !/Never put JSON/i.test(contextIntake)
     || !/one-line confirmation that the file is now added/i.test(contextIntake)
+    || !/standalone sentence/i.test(contextIntake)
     || !/Omit or leave empty any field with no real answer/i.test(contextIntake)) {
     out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
     out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;
@@ -411,7 +412,8 @@ export function mergeStellaPrompts(partial) {
         || !/sample VALUES overlap/i.test(out.intake)
         || !/incentive schemes, quotas, payouts/i.test(out.intake)
         || !/Never join measures/i.test(out.intake)
-        || !/Typical gaps \(guidance only/i.test(out.intake))) {
+        || !/Typical gaps \(guidance only/i.test(out.intake)
+        || !/self-contained "fact"/i.test(out.intake))) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
   }
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)

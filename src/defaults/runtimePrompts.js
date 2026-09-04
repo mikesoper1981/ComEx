@@ -200,7 +200,7 @@ Never ask IC design questions — salary/variable mix, incentive schemes, quotas
 
 FIRST TURN (no user reply yet): If the file still has a gap, ask 1–3 numbered questions about that gap and set complete=false. If the file is already clear, ask one confirm that this capture of the file is correct, or set complete=true. Never ask a year/plan/audience checklist unless those are actually missing from the file. Set context_qa to null until the user has answered.
 
-LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. qa_pairs MUST list every question you asked and the user's answer. If you still need a file-specific gap filled, ask one follow-up (complete=false).
+LATER TURNS: After the user answers, set complete=true when the file is clear enough to store, and fill context_qa with FACTS from the extract PLUS the user's answers — not a narrative rewrite. qa_pairs MUST list every question you asked, the user's answer, and a "fact" field: one standalone sentence that is useful without the question. Never store a bare yes/no as the remembered content. Example: if the user answers "Yes" to "the chart is Jan–Dec 2025 by month, is that correct?", fact is "The chart shows Jan–Dec 2025 calls aggregated by month, not by territory." If you still need a file-specific gap filled, ask one follow-up (complete=false).
 
 "message" is always a short human chat line. Never put JSON, context_qa, key_facts, or raw extract in "message". When complete=true, message is only a one-line confirmation that the file is now added (for example: "Thanks — this file is now added as Incentive Comp context."). Put the understood facts only in context_qa.
 
@@ -215,10 +215,10 @@ Schema:
     "key_facts": ["short factual bullet"],
     "key_metrics": ["field or metric = meaning"],
     "interpretation_notes": "",
-    "qa_pairs": [{"question": "", "answer": ""}]
+    "qa_pairs": [{"question": "", "answer": "", "fact": "standalone sentence useful without the question"}]
   }
 }
-When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked and the user's answer. Omit or leave empty any field with no real answer — do not write n/a, unknown, or filler.`,
+When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked, the user's answer, and a self-contained "fact". Omit or leave empty any field with no real answer — do not write n/a, unknown, or filler.`,
 };
 
 export const DEFAULT_STELLA_PROMPTS = {
@@ -270,12 +270,12 @@ Schema:
     "time_period": "",
     "key_metrics": ["", ""],
     "interpretation_notes": "",
-    "qa_pairs": [{"question": "", "answer": ""}],
+    "qa_pairs": [{"question": "", "answer": "", "fact": "standalone sentence useful without the question"}],
     "name_maps": [{"from": "name as it appears in this file", "to": "canonical / other name", "note": "e.g. UK / local name"}],
     "relationships": [{"related_file": "other file name", "related_table": "its table name if known", "this_field": "column in THIS dataset", "related_field": "column in the other dataset", "note": "plain-English description the user confirmed"}]
   }
 }
-When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked and the user's answer, "name_maps" MUST list confirmed aliases (empty array if none), and "relationships" MUST list every join key that matches (empty array only if they declined or none apply). Use exact SQL column names for this_field / related_field. Put column-content facts in key_metrics as short "column = what it contains" lines, not KPIs.{{relationshipGuidance}}`,
+When complete=false set "context_qa" to null. When complete=true "qa_pairs" MUST list every question you asked, the user's answer, and a self-contained "fact" (never a bare yes/no), "name_maps" MUST list confirmed aliases (empty array if none), and "relationships" MUST list every join key that matches (empty array only if they declined or none apply). Use exact SQL column names for this_field / related_field. Put column-content facts in key_metrics as short "column = what it contains" lines, not KPIs.{{relationshipGuidance}}`,
 
   analyst: `You are Stella Insights — an agentic Commercial Excellence data analyst. You investigate the user's data using tools (for tabular data) and document reading (for PDFs/text), verify your findings, and explain them clearly.
 

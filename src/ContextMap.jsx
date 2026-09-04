@@ -17,6 +17,7 @@ import { activeMemoryItems, formatMemoryStamp, MEMORY_CAP } from './chatMemory';
 import {
   connectedModuleIds,
   harvestModuleCapturedContext,
+  intakePairFact,
   listModuleContextBlocks,
   MODULE_CONTEXT_LABELS,
 } from './moduleContext';
@@ -165,7 +166,7 @@ function contextFileSummary(file) {
     ...(Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).map((m) => clip(m, 120)),
     clip(ctx.interpretation_notes, 160),
     clip(file?.summary, 160),
-    ...blocks.filter((b) => b.qa).map((b) => clip(b.answer || b.question, 160)),
+    ...blocks.filter((b) => b.qa).map((b) => clip(b.fact || b.value || b.answer || b.question, 160)),
   ].filter(Boolean);
   const kind = kindOfFile(file);
   return {
@@ -201,7 +202,7 @@ function stellaFileSummary(file) {
     clip(file?.extractedText || file?.structuredExtract || file?.visionExtract, 160),
     ...(Array.isArray(ctx.key_facts) ? ctx.key_facts : []).map((m) => clip(m, 140)),
     ...(Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).map((m) => clip(m, 120)),
-    ...qa.map((p) => clip(p.answer || p.question, 160)),
+    ...qa.map((p) => clip(intakePairFact(p), 160)),
   ].filter(Boolean);
   const previewRows = Array.isArray(file.previewRows) && file.previewRows.length
     ? file.previewRows.slice(0, 3)

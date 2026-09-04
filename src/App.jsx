@@ -130,6 +130,7 @@ import {
   isEmptyContextValue,
   compactCapturedContext,
   harvestModuleCapturedContext,
+  intakePairFact,
 } from './moduleContext';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -2599,7 +2600,7 @@ function stellaCapturedContextIsEmpty(ctx) {
     && !metrics.some((m) => String(m || '').trim())
     && !maps.length
     && !rels.length
-    && !qa.some((p) => p && (p.question || p.answer));
+    && !qa.some((p) => p && (intakePairFact(p) || p.question || p.answer));
 }
 
 function stellaDedupeRelationships(list) {
@@ -4615,10 +4616,7 @@ function factsFromStellaCapturedContext(ctx) {
   (Array.isArray(ctx.key_facts) ? ctx.key_facts : []).forEach((m) => push(m));
   (Array.isArray(ctx.key_metrics) ? ctx.key_metrics : []).forEach((m) => push(m));
   (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).forEach((p) => {
-    const answer = String(p?.answer || '').replace(/\s+/g, ' ').trim();
-    const question = String(p?.question || '').replace(/\s+/g, ' ').trim();
-    push(answer);
-    if (question && answer) push(`${question} ${answer}`);
+    push(intakePairFact(p));
   });
   (Array.isArray(ctx.relationships) ? ctx.relationships : []).forEach((r) => {
     const tf = String(r?.this_field || '').trim();
@@ -4667,8 +4665,11 @@ function stellaFormatContextQa(ctx) {
     });
   }
   if (Array.isArray(ctx.qa_pairs) && ctx.qa_pairs.length) {
-    lines.push('Intake Q&A:');
-    ctx.qa_pairs.forEach(qa => { if (qa && (qa.question || qa.answer)) lines.push(`  Q: ${qa.question || ''}\n  A: ${qa.answer || ''}`); });
+    const facts = ctx.qa_pairs.map((p) => intakePairFact(p)).filter(Boolean);
+    if (facts.length) {
+      lines.push('Intake facts:');
+      facts.forEach((fact) => lines.push(`  - ${fact}`));
+    }
   }
   return lines.length ? lines.join('\n') : '(no interpretive context captured yet)';
 }
@@ -4737,7 +4738,7 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
   const factRaw = stellaContextText(ctx.key_facts);
   const factList = Array.isArray(factRaw) ? factRaw : (factRaw ? [factRaw] : []);
   const rels = (Array.isArray(ctx.relationships) ? ctx.relationships : []).filter((r) => r && (r.related_file || r.related_table));
-  const qa = (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).filter((p) => p && (p.question || p.answer));
+  const qa = (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).filter((p) => p && (intakePairFact(p) || p.question || p.answer));
   const represents = String(ctx.what_it_represents || '').trim();
   const period = String(ctx.time_period || '').trim();
   const notes = String(ctx.interpretation_notes || '').trim();
@@ -4886,28 +4887,29 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
         </Section>
       ) : null}
       {qa.length ? (
-        <Section title="Intake answers">
+        <Section title="Intake facts">
           <ol className="space-y-2">
-            {qa.map((p, i) => (
-              <li key={i} className="bg-slate-950/35 border border-emerald-400/15 rounded-lg px-3 py-2 flex items-start justify-between gap-2">
-                <div className="min-w-0 flex-1">
-                  {p.question ? <div className="text-emerald-200/70 mb-1">{String(p.question)}</div> : null}
-                  {p.answer ? (
+            {qa.map((p, i) => {
+              const fact = intakePairFact(p);
+              if (!fact) return null;
+              return (
+                <li key={i} className="bg-slate-950/35 border border-emerald-400/15 rounded-lg px-3 py-2 flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
                     <InlineCapturedText
-                      value={String(p.answer)}
+                      value={fact}
                       onSave={editable ? (v) => onPatch({
                         ...ctx,
-                        qa_pairs: qa.map((row, idx) => (idx === i ? { ...row, answer: v } : row)),
+                        qa_pairs: qa.map((row, idx) => (idx === i ? { ...row, fact: v, answer: v } : row)),
                       }) : undefined}
                     />
-                  ) : null}
-                </div>
-                <Remove
-                  onClick={() => onPatch({ ...ctx, qa_pairs: qa.filter((_, idx) => idx !== i) })}
-                  label="Remove this answer"
-                />
-              </li>
-            ))}
+                  </div>
+                  <Remove
+                    onClick={() => onPatch({ ...ctx, qa_pairs: qa.filter((_, idx) => idx !== i) })}
+                    label="Remove this fact"
+                  />
+                </li>
+              );
+            })}
           </ol>
         </Section>
       ) : null}
@@ -9228,7 +9230,7 @@ ${stepInstruction}`;
     setPendingProposalIntake(null);
     const ctx = compactCapturedContext(capturedContext) || {};
     const qa = Array.isArray(ctx.qa_pairs)
-      ? ctx.qa_pairs.filter((p) => p?.question || p?.answer).map((p) => `Q: ${p.question}\nA: ${p.answer}`).join('\n')
+      ? ctx.qa_pairs.map((p) => intakePairFact(p)).filter(Boolean).map((f) => `- ${f}`).join('\n')
       : '';
     const clarifications = [
       !isEmptyContextValue(ctx.what_it_represents) ? `Represents: ${ctx.what_it_represents}` : '',
@@ -9500,10 +9502,10 @@ ${stepInstruction}`;
       const qa = result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
       const mergedCtx = harvestModuleCapturedContext(rec.capturedContext, qa, withAssistant)
         || rec.capturedContext;
-      const storedFacts = (mergedCtx?.qa_pairs || []).filter((p) => String(p.answer || '').trim());
+      const storedFacts = (mergedCtx?.qa_pairs || []).map((p) => intakePairFact(p)).filter(Boolean);
       const intakeSteps = [
         { type: 'thought', label: 'Read your reply', detail: String(userText || '').slice(0, 500) },
-        { type: 'context', label: `Stored ${storedFacts.length} fact${storedFacts.length === 1 ? '' : 's'}`, detail: storedFacts.map((p) => p.answer).join('\n') },
+        { type: 'context', label: `Stored ${storedFacts.length} fact${storedFacts.length === 1 ? '' : 's'}`, detail: storedFacts.join('\n') },
       ];
       const patched = patchModuleContextFile(optimistic, moduleId, fileId, {
         intakeMessages: withAssistant,
@@ -9854,7 +9856,15 @@ ${stepInstruction}`;
       const idx = Number(blockId.slice(3));
       const qa = [...(ctx.qa_pairs || [])];
       if (empty || idx < 0 || idx >= qa.length) qa.splice(idx, 1);
-      else qa[idx] = { question: nextValue.question || '', answer: nextValue.answer || '' };
+      else if (nextValue && typeof nextValue === 'object') {
+        qa[idx] = {
+          question: nextValue.question || qa[idx].question || '',
+          answer: nextValue.answer || qa[idx].answer || '',
+          fact: nextValue.fact || intakePairFact({ ...qa[idx], ...nextValue }),
+        };
+      } else {
+        qa[idx] = { ...qa[idx], fact: nextValue, answer: nextValue };
+      }
       patch.capturedContext = { ...ctx, qa_pairs: qa };
     } else if (blockId.startsWith('note:')) {
       const nid = blockId.slice(5);
@@ -10849,8 +10859,8 @@ ${stepInstruction}`;
   // Normalize the intake agent's context_qa into the canonical shape.
   const normalizeContextQa = (ctx, intakeMessages) => {
     const base = ctx && typeof ctx === 'object' ? ctx : {};
-    let qa = Array.isArray(base.qa_pairs) ? base.qa_pairs.filter(p => p && (p.question || p.answer)) : [];
-    const seen = new Set(qa.map((p) => `${String(p.question || '').trim()}|${String(p.answer || '').trim()}`.toLowerCase()));
+    let qa = Array.isArray(base.qa_pairs) ? base.qa_pairs.filter(p => p && (p.question || p.answer || p.fact)) : [];
+    const seen = new Set(qa.map((p) => `${String(p.question || '').trim()}|${String(p.answer || p.fact || '').trim()}`.toLowerCase()));
     const msgs = intakeMessages || [];
     for (let i = 0; i < msgs.length; i++) {
       if (msgs[i].role !== 'assistant') continue;
@@ -10873,12 +10883,16 @@ ${stepInstruction}`;
       : [];
     const withQa = { ...base, qa_pairs: qa };
     const name_maps = stellaCollectNameMaps(withQa, msgs);
+    const qaWithFacts = qa.map((p) => {
+      const fact = intakePairFact(p);
+      return fact ? { ...p, fact } : p;
+    });
     return {
       what_it_represents: base.what_it_represents || '',
       time_period: base.time_period || '',
       key_metrics: Array.isArray(base.key_metrics) ? base.key_metrics : (base.key_metrics ? [String(base.key_metrics)] : []),
       interpretation_notes: base.interpretation_notes || '',
-      qa_pairs: qa,
+      qa_pairs: qaWithFacts,
       relationships,
       ...(name_maps.length ? { name_maps } : {}),
     };
@@ -10889,7 +10903,15 @@ ${stepInstruction}`;
     const nextCtx = ctx && typeof ctx === 'object'
       ? (maps.length ? { ...ctx, name_maps: maps } : { ...ctx })
       : ctx;
-    if (nextCtx && typeof nextCtx === 'object') delete nextCtx.schema_changed;
+    if (nextCtx && typeof nextCtx === 'object') {
+      delete nextCtx.schema_changed;
+      if (Array.isArray(nextCtx.qa_pairs)) {
+        nextCtx.qa_pairs = nextCtx.qa_pairs.map((p) => {
+          const fact = intakePairFact(p);
+          return fact ? { ...p, fact } : p;
+        });
+      }
+    }
     stellaPatchLocal(fileRec.id, { intakeMessages, capturedContext: nextCtx, intakeComplete: true });
     setStellaIntakeMinimized(true);
     try {
@@ -10902,7 +10924,15 @@ ${stepInstruction}`;
 
   const persistStellaFileContext = async (fileRec, nextCtx) => {
     const ctx = stellaCapturedContextIsEmpty(nextCtx) ? null : { ...nextCtx };
-    if (ctx) delete ctx.schema_changed;
+    if (ctx) {
+      delete ctx.schema_changed;
+      if (Array.isArray(ctx.qa_pairs)) {
+        ctx.qa_pairs = ctx.qa_pairs.map((p) => {
+          const fact = intakePairFact(p);
+          return fact ? { ...p, fact } : p;
+        });
+      }
+    }
     stellaPatchLocal(fileRec.id, { capturedContext: ctx, intakeComplete: !!ctx });
     try {
       if (fileRec.dbId) await stellaUpdateRegistry(fileRec.dbId, { context_qa: ctx });

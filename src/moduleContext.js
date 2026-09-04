@@ -101,6 +101,68 @@ function compactStringList(val) {
   return s ? [s] : [];
 }
 
+function isBareAffirmation(value) {
+  const t = String(value || '').toLowerCase().replace(/[.!]+$/g, '').trim();
+  return /^(yes|y|yeah|yep|correct|right|that's right|thats right|true|confirmed|agreed|no|n|nope|incorrect|wrong|false|not really|negative|ok|okay|sure)$/i.test(t);
+}
+
+function finishFactStatement(value) {
+  let t = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  t = t.replace(/^(got it|ok|okay|thanks)[—.:,\s]+/i, '').trim();
+  if (!t) return '';
+  t = t.charAt(0).toUpperCase() + t.slice(1);
+  if (!/[.!?]$/.test(t)) t += '.';
+  return t;
+}
+
+function lastClaimFromQuestion(question) {
+  let t = String(question || '').replace(/\s+/g, ' ').trim().replace(/[?？]\s*$/, '');
+  t = t.replace(/[,.\s]+(?:is that|is this|does that)(?:\s+sound)?\s*(?:correct|right)$/i, '').trim();
+  t = t.replace(/^(got it|ok|okay|thanks)[—.:,\s]+/i, '').trim();
+  const sentences = t.split(/(?<=[.!])\s+/).map((s) => s.trim()).filter(Boolean);
+  let claim = sentences.length ? sentences[sentences.length - 1] : t;
+  claim = claim.replace(/^(so|then|and)\s+/i, '').trim();
+  claim = claim.replace(/^(is|are|does|do|was|were)\s+/i, '').trim();
+  return claim;
+}
+
+/** Turn a Q/A pair into one standalone fact the LLM can use without the question. */
+export function contextualizeIntakeFact(question, answer) {
+  const q = String(question || '').replace(/\s+/g, ' ').trim();
+  const a = String(answer || '').replace(/\s+/g, ' ').trim();
+  if (!a && !q) return '';
+  if (!q) return finishFactStatement(a);
+  if (!a) return '';
+  const aLow = a.toLowerCase().replace(/[.!]+$/g, '').trim();
+  const yes = /^(yes|y|yeah|yep|correct|right|that's right|thats right|true|confirmed|agreed)$/i.test(aLow);
+  const no = /^(no|n|nope|incorrect|wrong|false|not really|negative)$/i.test(aLow);
+  const stem = q.replace(/[?？]\s*$/, '').trim();
+  const confirm = /(?:is that|is this|does that)(?:\s+sound)?\s*(?:correct|right)$/i.test(stem);
+  if (yes) {
+    const claim = lastClaimFromQuestion(q);
+    return finishFactStatement(claim || a);
+  }
+  if (no) {
+    const claim = lastClaimFromQuestion(q);
+    if (confirm && claim) return finishFactStatement(`Not the case: ${claim.replace(/\.$/, '')}`);
+    return finishFactStatement(`${a} — ${lastClaimFromQuestion(q) || stem}`);
+  }
+  if (a.length >= 12 && /\b(is|are|was|were|equals?|means?|covers?|represents?|per |across )\b/i.test(a)) {
+    return finishFactStatement(a);
+  }
+  const claim = lastClaimFromQuestion(q) || stem;
+  const topic = claim.length > 180 ? `${claim.slice(0, 177)}…` : claim;
+  return finishFactStatement(`${a} — ${topic}`);
+}
+
+export function intakePairFact(p) {
+  if (!p || typeof p !== 'object') return '';
+  const stored = String(p.fact || '').replace(/\s+/g, ' ').trim();
+  if (stored && !isBareAffirmation(stored)) return stored;
+  return contextualizeIntakeFact(p.question, p.answer);
+}
+
 export function compactCapturedContext(ctx) {
   const base = ctx && typeof ctx === 'object' ? ctx : {};
   const qa = Array.isArray(base.qa_pairs)
@@ -110,8 +172,10 @@ export function compactCapturedContext(ctx) {
         const row = {};
         const q = usefulString(p.question);
         const a = usefulString(p.answer);
+        const fact = intakePairFact({ ...p, question: q, answer: a });
         if (q) row.question = q;
         if (a) row.answer = a;
+        if (fact) row.fact = fact;
         return Object.keys(row).length ? row : null;
       })
       .filter(Boolean)
@@ -269,9 +333,11 @@ export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
     const key = `${question.toLowerCase()}|${answer.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    const fact = intakePairFact({ question, answer, fact: p.fact });
     qa_pairs.push({
       ...(question ? { question } : {}),
       ...(answer ? { answer } : {}),
+      ...(fact ? { fact } : {}),
     });
   }
   return compactCapturedContext({
@@ -280,10 +346,10 @@ export function harvestModuleCapturedContext(prior, modelQa, intakeMessages) {
     what_it_represents: fromModel.what_it_represents || fromPrior.what_it_represents,
     time_period: fromModel.time_period || fromPrior.time_period,
     interpretation_notes: fromModel.interpretation_notes || fromPrior.interpretation_notes,
-    key_facts: mergeContextLines(fromPrior.key_facts, fromModel.key_facts, qa_pairs.map((p) => p.answer).filter((a) => {
+    key_facts: mergeContextLines(fromPrior.key_facts, fromModel.key_facts, qa_pairs.map((p) => intakePairFact(p)).filter((a) => {
       const t = String(a || '').trim();
-      if (t.length < 4 || t.length > 280) return false;
-      if (/^(yes|no|ok|okay|sure|thanks|looks good|that'?s (all|correct)|complete|done)[.!]?\s*$/i.test(t)) return false;
+      if (t.length < 12 || t.length > 280) return false;
+      if (isBareAffirmation(t)) return false;
       return true;
     })),
     key_metrics: mergeContextLines(fromPrior.key_metrics, fromModel.key_metrics),
@@ -552,8 +618,17 @@ export function listModuleContextBlocks(f) {
     if (joins) blocks.push({ id: 'joins', label: 'Joins', value: joins });
   }
   (ctx.qa_pairs || []).forEach((p, i) => {
-    if (isEmptyContextValue(p?.question) && isEmptyContextValue(p?.answer)) return;
-    blocks.push({ id: `qa:${i}`, label: 'Clarification', qa: true, question: p.question || '', answer: p.answer || '' });
+    const fact = intakePairFact(p);
+    if (!fact && isEmptyContextValue(p?.question) && isEmptyContextValue(p?.answer)) return;
+    blocks.push({
+      id: `qa:${i}`,
+      label: 'Intake fact',
+      qa: true,
+      fact,
+      value: fact,
+      question: p.question || '',
+      answer: p.answer || '',
+    });
   });
   (f.notes || []).forEach((n) => {
     if (!n || isEmptyContextValue(n.text)) return;
@@ -573,10 +648,9 @@ export function listModuleContextBlocks(f) {
 
 function formatBlockForPrompt(b) {
   if (b.qa) {
-    return [
-      !isEmptyContextValue(b.question) ? `${b.label} — Q: ${b.question}` : b.label,
-      !isEmptyContextValue(b.answer) ? `A: ${b.answer}` : '',
-    ].filter(Boolean).join('\n');
+    const fact = String(b.fact || b.value || '').trim() || contextualizeIntakeFact(b.question, b.answer);
+    if (!fact || isEmptyContextValue(fact)) return '';
+    return `${b.label}: ${fact}`;
   }
   const value = String(b.value || '').trim();
   if (!value) return '';
@@ -756,7 +830,7 @@ export function formatStellaFileContextCard(f, { maxChars = 8000 } = {}) {
       .map((r) => `  - ${r.this_field} = ${r.related_file || r.related_table}.${r.related_field}${r.note ? ` — ${r.note}` : ''}`)
     : [];
   const qa = Array.isArray(ctx.qa_pairs)
-    ? ctx.qa_pairs.filter((p) => p && (p.question || p.answer)).slice(0, 12).map((p) => `  Q: ${p.question || ''}\n  A: ${p.answer || ''}`)
+    ? ctx.qa_pairs.map((p) => intakePairFact(p)).filter(Boolean).slice(0, 12).map((f) => `  - ${f}`)
     : [];
   const location = f.tableName
     ? `SQL table: ${f.tableName}`
@@ -774,7 +848,7 @@ export function formatStellaFileContextCard(f, { maxChars = 8000 } = {}) {
     maps.length ? `NAME MAPS (authoritative — treat mapped names as the same; apply in queries):\n${maps.join('\n')}` : '',
     joins.length ? `Confirmed joins:\n${joins.join('\n')}` : '',
     !isEmptyContextValue(ctx.interpretation_notes) ? `Interpretation notes: ${String(ctx.interpretation_notes).replace(/\s+/g, ' ').trim()}` : '',
-    qa.length ? `Intake Q&A:\n${qa.join('\n')}` : '',
+    qa.length ? `Intake facts:\n${qa.join('\n')}` : '',
     (!f.tableName && !isEmptyContextValue(f.extractedText))
       ? `Extract (partial): ${String(f.extractedText).replace(/\s+/g, ' ').trim().slice(0, 1200)}`
       : '',
