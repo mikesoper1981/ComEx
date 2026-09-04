@@ -123,9 +123,13 @@ async function ensureGeocodeCache(schema) {
       lng double precision,
       display_name text,
       status text,
+      geojson jsonb,
       updated_at timestamptz default now()
     )
   `));
+  await withPg((client) => client.query(
+    `alter table ${q}.geocode_cache add column if not exists geojson jsonb`,
+  ));
 }
 
 async function tableColumns(schema, tableName) {
@@ -138,7 +142,7 @@ async function tableColumns(schema, tableName) {
 }
 
 async function nominatimSearch(query) {
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`;
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1&polygon_geojson=1`;
   const res = await fetch(url, {
     headers: {
       Accept: 'application/json',
@@ -153,14 +157,51 @@ async function nominatimSearch(query) {
   const lat = parseFloat(hit.lat);
   const lng = parseFloat(hit.lon);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  return { lat, lng, display_name: String(hit.display_name || '').slice(0, 240) };
+  return {
+    lat,
+    lng,
+    display_name: String(hit.display_name || '').slice(0, 240),
+    geojson: geometryFromNominatim(hit),
+  };
+}
+
+function capRing(ring, maxPts = 80) {
+  if (!Array.isArray(ring) || ring.length <= maxPts) return ring;
+  const step = Math.ceil(ring.length / maxPts);
+  const out = ring.filter((_, i) => i % step === 0);
+  const first = ring[0];
+  const last = out[out.length - 1];
+  if (first && (!last || last[0] !== first[0] || last[1] !== first[1])) out.push(first);
+  return out;
+}
+
+function geometryFromNominatim(hit) {
+  const g = hit?.geojson;
+  if (g && (g.type === 'Polygon' || g.type === 'MultiPolygon')) {
+    if (g.type === 'Polygon') return { type: 'Polygon', coordinates: (g.coordinates || []).map((r) => capRing(r)) };
+    return { type: 'MultiPolygon', coordinates: (g.coordinates || []).map((poly) => (poly || []).map((r) => capRing(r))) };
+  }
+  const bb = hit?.boundingbox;
+  if (Array.isArray(bb) && bb.length === 4) {
+    const south = parseFloat(bb[0]);
+    const north = parseFloat(bb[1]);
+    const west = parseFloat(bb[2]);
+    const east = parseFloat(bb[3]);
+    if ([south, north, west, east].every(Number.isFinite) && (north - south) > 0.015 && (east - west) > 0.015) {
+      return {
+        type: 'Polygon',
+        coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]],
+      };
+    }
+  }
+  return null;
 }
 
 async function loadCached(schema, keys) {
   if (!keys.length) return new Map();
   const q = requireCompanySchema(schema);
   const { rows } = await withPg((client) => client.query(
-    `select query_key, lat, lng, display_name, status from ${q}.geocode_cache where query_key = any($1::text[])`,
+    `select query_key, lat, lng, display_name, status, geojson from ${q}.geocode_cache where query_key = any($1::text[])`,
     [keys],
   ));
   const map = new Map();
@@ -174,10 +215,10 @@ async function upsertCache(schema, rows) {
   if (!rows.length) return;
   const q = requireCompanySchema(schema);
   await withPg((client) => client.query(
-    `insert into ${q}.geocode_cache (query_key, query_text, lat, lng, display_name, status, updated_at)
-     select query_key, query_text, lat, lng, display_name, status, now()
+    `insert into ${q}.geocode_cache (query_key, query_text, lat, lng, display_name, status, geojson, updated_at)
+     select query_key, query_text, lat, lng, display_name, status, geojson, now()
      from jsonb_to_recordset($1::jsonb) as x(
-       query_key text, query_text text, lat double precision, lng double precision, display_name text, status text
+       query_key text, query_text text, lat double precision, lng double precision, display_name text, status text, geojson jsonb
      )
      on conflict (query_key) do update set
        query_text = excluded.query_text,
@@ -185,6 +226,7 @@ async function upsertCache(schema, rows) {
        lng = excluded.lng,
        display_name = excluded.display_name,
        status = excluded.status,
+       geojson = excluded.geojson,
        updated_at = now()`,
     [JSON.stringify(rows)],
   ));
@@ -211,6 +253,7 @@ async function geocodeMisses(schema, misses, kind, country) {
       lng: hit?.lng ?? null,
       display_name: hit?.display_name || '',
       status: hit ? 'ok' : 'miss',
+      geojson: hit?.geojson || null,
     });
     if (i < misses.length - 1) await sleep(NOMINATIM_PAUSE_MS);
   }
@@ -309,7 +352,7 @@ async function executeTerritoryAction(user, body) {
     return { status: 400, json: { error: { message: 'Invalid table name' } } };
   }
   const layout = normalizeLayout(body.layout);
-  if (!layout.geoColumn) {
+  if (action !== 'teams' && !layout.geoColumn) {
     return { status: 400, json: { error: { message: 'A geography column is required to map this file' } } };
   }
 
@@ -376,6 +419,7 @@ async function executeTerritoryAction(user, body) {
       count: row.count,
       lat: okHit ? lat : null,
       lng: okHit ? lng : null,
+      geojson: okHit ? (hit.geojson || null) : null,
     });
   }
 

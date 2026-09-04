@@ -221,11 +221,15 @@ Schema:
 When complete=false set "context_qa" to null. When complete=true, "qa_pairs" MUST list every question you asked, the user's answer, and a self-contained "fact". Omit or leave empty any field with no real answer — do not write n/a, unknown, or filler.`,
   territoryIntakePrompt: `You onboard ONE uploaded territory file (typically Excel/CSV) so it can be mapped. Harvest facts from THIS file only. Do not design, split, or optimise territories.
 
-Ask only about gaps in THIS file that block mapping: which column is the team/field force, which is the territory, which column holds geography (postcode/zip, city, county, or region), and the country if that is not obvious. Number questions 1. 2. 3. when you ask more than one. Never use a fixed checklist. Never ask about incentive schemes, quotas, alignments, or how to design a territory.
+Ask only about gaps that block mapping. Number questions 1. 2. 3. when you ask more than one. Never use a fixed checklist. Never ask about incentive schemes, quotas, alignments, or how to design a territory.
 
-FIRST TURN: If team, territory, and geo columns are already obvious from COLUMN GUESSES / DATA PROFILE, ask one short confirm (complete=false) naming those columns. If a required column is missing or ambiguous, ask only about that gap. Set context_qa to null until the user has answered.
+EXCEL TABS: When EXCEL SHEETS lists more than one tab, you MUST ask which tab to load before anything else. Name the tabs and their row counts. Do not guess a tab. Do not set complete=true until the user has named a tab. After a tab is chosen, only then ask about columns.
 
-LATER TURNS: After the user answers, set complete=true when the map columns are clear. Fill layout with the exact SQL column names from COLUMNS. Fill context_qa facts as standalone sentences that include the real column names and sample values from the file.
+COLUMNS: Ask which column is the team/field force (if any), which is the territory, which holds geography (postcode/zip, city, county, or region), and the country if that is not obvious. If COLUMN GUESSES already name those columns from the chosen tab, ask one short confirm. If a required column is missing or the profile looks empty, say so and ask the user to pick the right tab or columns — do not invent data.
+
+FIRST TURN: If multiple tabs exist and none is chosen, ask only which tab. If a tab is already chosen (or there is only one), ask the column confirm or the missing-column gap. Set context_qa to null until the user has answered.
+
+LATER TURNS: After the user answers, set complete=true only when the sheet and map columns are clear. Fill layout with the exact SQL column names from COLUMNS and sheet_name with the chosen tab. Fill context_qa facts as standalone sentences that include the real column names and sample values from the file.
 
 "message" is always a short human chat line. Never put JSON in "message". When complete=true, message is only a one-line confirmation that the file is now added.
 
@@ -235,6 +239,7 @@ Schema:
   "complete": true | false,
   "message": "clarifying question(s) (complete=false) OR a one-line confirmation (complete=true)",
   "layout": {
+    "sheet_name": "excel tab name or empty",
     "team_column": "sql column or empty if none",
     "territory_column": "sql column",
     "geo_column": "sql column used to place points",

@@ -140,7 +140,8 @@ import {
   buildTerritoryPointsMapHTML,
   hashTerritoryColour,
   formatTerritoryAssessContext,
-  scoreTerritorySheet,
+  aoaToRecords,
+  matchTerritorySheetName,
 } from './territoryGeo';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -5106,8 +5107,16 @@ function TerritoryMap({ points, selectedTerritory, onSelectTerritory }) {
   useEffect(() => {
     const handler = (event) => {
       if (event.data?.type !== 'territory-select') return;
-      const hit = (points || []).find((p) => p.id === event.data.id || p.territory === event.data.territory);
-      if (hit) onSelectTerritory(selectedTerritory?.id === hit.id ? null : hit);
+      const hit = (points || []).find((p) => p.territory === event.data.territory || p.id === event.data.id);
+      if (!hit) return;
+      const same = selectedTerritory?.territory === hit.territory || selectedTerritory?.id === hit.id;
+      const groupedHit = (points || []).reduce((acc, p) => {
+        if (p.territory !== hit.territory && p.id !== hit.id) return acc;
+        acc.count += Number(p.count) || 0;
+        if (p.geo && !acc.geos.includes(p.geo)) acc.geos.push(p.geo);
+        return acc;
+      }, { id: hit.territory || hit.id, territory: hit.territory, team: hit.team, count: 0, geos: [] });
+      onSelectTerritory(same ? null : groupedHit);
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
@@ -5589,6 +5598,7 @@ export default function CommercialExcellenceApp() {
   const adminFileInputRef = useRef(null);
   const territoryFileInputRef = useRef(null);
   const territoryMapAbortRef = useRef(0);
+  const territoryUploadBlobRef = useRef({});
   const stellaDataFileInputRef = useRef(null);
   const [stellaSyncBusy, setStellaSyncBusy] = useState(false);
   const stellaIntakeDeepLinkRef = useRef(readStellaIntakeDeepLink());
@@ -10652,28 +10662,135 @@ ${stepInstruction}`;
     await persistTerritoryFile({ ...rec, ...patch, id: fileId });
   };
 
+  const listTerritorySheets = async (file, kind) => {
+    if (kind === 'json') {
+      const records = await stellaParseTabular(file, kind);
+      const payload = stellaBuildTabularPayload(records || []);
+      return [{
+        name: 'JSON',
+        rowCount: (records || []).length,
+        headers: payload.columns.map((c) => c.original || c.name),
+        records: records || [],
+      }];
+    }
+    const xlsxMod = await import('xlsx');
+    const XLSX = xlsxMod?.default || xlsxMod;
+    let wb;
+    if (kind === 'csv') {
+      const txt = await stellaReadAsText(file);
+      wb = XLSX.read(txt, { type: 'string' });
+    } else {
+      const buf = await file.arrayBuffer();
+      wb = XLSX.read(buf, { type: 'array' });
+    }
+    const sheets = [];
+    for (const name of wb.SheetNames || []) {
+      const ws = wb.Sheets[name];
+      const aoa = ws ? XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) : [];
+      const parsed = aoaToRecords(aoa);
+      sheets.push({
+        name,
+        rowCount: parsed.records.length,
+        headers: parsed.headers,
+        records: parsed.records,
+      });
+    }
+    return sheets;
+  };
+
+  const materializeTerritorySheet = async (fileRec, sheetName) => {
+    let blob = territoryUploadBlobRef.current[fileRec.id];
+    if (!blob && fileRec.storagePath) {
+      blob = await stellaDownloadStorageBlob(fileRec.storagePath);
+    }
+    if (!blob) throw new Error('Could not re-read the uploaded file. Please upload it again.');
+    const kind = fileRec.fileType === 'csv' || fileRec.fileType === 'json' ? fileRec.fileType : 'excel';
+    const sheets = await listTerritorySheets(blob, kind);
+    const wanted = String(sheetName || '').trim().toLowerCase();
+    const picked = sheets.find((s) => String(s.name).toLowerCase() === wanted)
+      || sheets.find((s) => wanted && String(s.name).toLowerCase().includes(wanted))
+      || sheets.find((s) => s.rowCount)
+      || sheets[0];
+    if (!picked?.records?.length) {
+      throw new Error(`Sheet "${sheetName || 'selected'}" has no data rows.`);
+    }
+    const payload = stellaBuildTabularPayload(picked.records);
+    if (fileRec.tableName) {
+      try { await stellaTableApi({ action: 'drop', tableName: fileRec.tableName }); } catch { /* replace */ }
+    }
+    const tableName = `territory_data_${stellaNanoId()}`;
+    await stellaCreateAndLoadTable(tableName, payload.columns, payload.rows);
+    const mapLayout = inferTerritoryLayout(payload.columns, picked.records.slice(0, 40));
+    const dataProfile = [
+      `Excel sheet used: ${picked.name}`,
+      `Detected ${payload.rowCount} data rows.`,
+      stellaProfileRecords(picked.records),
+    ].filter(Boolean).join('\n');
+    const next = {
+      ...fileRec,
+      sheetName: picked.name,
+      tableName,
+      rowCount: payload.rowCount,
+      columns: payload.columns,
+      previewRows: picked.records.slice(0, 8),
+      dataProfile,
+      mapLayout,
+      sizeLabel: `${payload.rowCount} rows`,
+      summary: `Territory file with ${payload.rowCount} rows from sheet "${picked.name}".`,
+      processing: false,
+    };
+    await persistTerritoryFile(next);
+    return next;
+  };
+
   const runTerritoryIntakeTurn = async (fileRec) => {
     if (!fileRec) return fileRec;
-    const layout = normalizeMapLayout(fileRec.mapLayout) || inferTerritoryLayout(fileRec.columns || [], fileRec.previewRows || []);
-    const colsBlob = (fileRec.columns || []).map((c) => (
+    let rec = fileRec;
+    const sheets = Array.isArray(rec.sheets) ? rec.sheets : [];
+    const lastUser = [...(rec.intakeMessages || [])].reverse().find((m) => m.role === 'user');
+    const hasUserReply = !!lastUser;
+    let sheetName = rec.sheetName || matchTerritorySheetName(lastUser?.content, sheets);
+
+    if (sheetName && !rec.tableName) {
+      try {
+        rec = await materializeTerritorySheet(rec, sheetName);
+      } catch (err) {
+        const message = `I could not load that tab (${err.message || 'error'}). Which Excel tab should I use?`;
+        await patchTerritoryFile(rec.id, {
+          intakeMessages: [
+            ...(rec.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳')),
+            { role: 'assistant', content: message },
+          ],
+          intakeComplete: false,
+          processing: false,
+        });
+        return rec;
+      }
+    }
+
+    const layout = normalizeMapLayout(rec.mapLayout) || inferTerritoryLayout(rec.columns || [], rec.previewRows || []);
+    const colsBlob = (rec.columns || []).map((c) => (
       `- ${c.name}${c.original && c.original !== c.name ? ` (header "${c.original}")` : ''}${c.type ? ` [${c.type}]` : ''}`
-    )).join('\n') || '(no columns)';
+    )).join('\n') || '(no columns yet — a tab has not been loaded)';
     const guessed = [
       layout.teamColumn ? `team = ${layout.teamColumn}` : 'team = (none found)',
       layout.territoryColumn ? `territory = ${layout.territoryColumn}` : 'territory = (none found)',
       layout.geoColumn ? `geo = ${layout.geoColumn} (${layout.geoKind || 'unknown'})` : 'geo = (none found)',
       layout.country ? `country = ${layout.country}` : '',
     ].filter(Boolean).join('\n');
+    const sheetsBlob = sheets.length
+      ? sheets.map((s, i) => `${i + 1}. "${s.name}" — ${s.rowCount} rows; columns: ${(s.headers || []).slice(0, 12).join(', ') || '(none detected)'}`).join('\n')
+      : '(single table / CSV)';
     const rt = getWorkflowRuntime();
     const system = fillTemplate(rt.territoryIntakePrompt || '', {
-      dataProfile: fileRec.dataProfile ? `\n\nDATA PROFILE:\n${fileRec.dataProfile}` : '',
+      dataProfile: rec.dataProfile ? `\n\nDATA PROFILE:\n${rec.dataProfile}` : '',
     });
     const convo = [
       {
         role: 'user',
-        content: `You are onboarding: "${fileRec.name}".\nSQL TABLE: ${fileRec.tableName || ''}\nROWS: ${fileRec.rowCount ?? ''}\nCOLUMNS (use these exact SQL names):\n${colsBlob}\n\nCOLUMN GUESSES:\n${guessed}\n\nSAMPLE ROWS:\n${JSON.stringify((fileRec.previewRows || []).slice(0, 8), null, 2).slice(0, 6000)}`,
+        content: `You are onboarding: "${rec.name}".\nSQL TABLE: ${rec.tableName || '(not loaded until a tab is chosen)'}\nROWS: ${rec.rowCount ?? ''}\nCHOSEN TAB: ${rec.sheetName || '(none yet)'}\nEXCEL SHEETS:\n${sheetsBlob}\n\nCOLUMNS (use these exact SQL names):\n${colsBlob}\n\nCOLUMN GUESSES:\n${guessed}\n\nSAMPLE ROWS:\n${JSON.stringify((rec.previewRows || []).slice(0, 8), null, 2).slice(0, 6000)}`,
       },
-      ...((fileRec.intakeMessages || [])
+      ...((rec.intakeMessages || [])
         .filter((m) => !String(m.content || '').startsWith('⏳'))
         .map((m) => ({
         role: toAnthropicRole(m.role),
@@ -10687,43 +10804,68 @@ ${stepInstruction}`;
       const raw = await callAnthropic(system, convo, 1200);
       parsed = extractJsonObject(raw) || {};
     } catch { /* fall through */ }
-    const hasUserReply = (fileRec.intakeMessages || []).some((m) => m.role === 'user');
-    const nextLayout = mergeTerritoryLayout(layout, parsed.layout);
-    let complete = !!parsed.complete;
+
+    const parsedSheet = matchTerritorySheetName(parsed.layout?.sheet_name || parsed.layout?.sheetName, sheets);
+    if (parsedSheet && parsedSheet !== rec.sheetName) {
+      try {
+        rec = await materializeTerritorySheet(rec, parsedSheet);
+      } catch { /* keep asking */ }
+    }
+
+    const nextLayout = mergeTerritoryLayout(
+      normalizeMapLayout(rec.mapLayout) || layout,
+      parsed.layout,
+    );
+    const justChoseSheet = !!(hasUserReply && rec.sheetName && matchTerritorySheetName(lastUser.content, sheets));
+    const needSheet = (rec.fileType === 'excel' || sheets.length > 1) && !rec.sheetName;
+    const needGeo = !nextLayout.geoColumn;
+    let complete = !!parsed.complete && !needSheet && !needGeo && !!rec.tableName && !justChoseSheet;
     let message = stripJsonFromIntakeMessage(parsed.message);
-    if (!hasUserReply) {
+
+    if (needSheet) {
+      complete = false;
+      if (!intakeMessageLooksLikeAsk(message) || !/\b(tab|sheet)\b/i.test(message)) {
+        message = sheets.length
+          ? `This workbook has **${sheets.length} tabs**. Which one is the territory structure to map?\n\n${sheets.map((s, i) => `${i + 1}. **${s.name}** — ${s.rowCount} rows${s.headers?.length ? ` (${s.headers.slice(0, 6).join(', ')})` : ''}`).join('\n')}`
+          : 'Which Excel tab should I use?';
+      }
+    } else if (justChoseSheet || !hasUserReply) {
       complete = false;
       if (!intakeMessageLooksLikeAsk(message)) {
         message = nextLayout.geoColumn
-          ? `I mapped this file as team **${nextLayout.teamColumn || '(none)'}**, territory **${nextLayout.territoryColumn || '(none)'}**, geo **${nextLayout.geoColumn}** (${nextLayout.geoKind || 'region'}). Is that correct?`
-          : 'Which column holds the geography to plot (postcode/zip, city, county, or region)?';
+          ? `Using tab **${rec.sheetName}**. I mapped team **${nextLayout.teamColumn || '(none)'}**, territory **${nextLayout.territoryColumn || '(none)'}**, geo **${nextLayout.geoColumn}** (${nextLayout.geoKind || 'region'}). Is that correct?`
+          : `Using tab **${rec.sheetName}**. Which column holds the geography to plot (postcode/zip, city, county, or region)?`;
+      }
+    } else if (needGeo) {
+      complete = false;
+      if (!intakeMessageLooksLikeAsk(message)) {
+        message = 'Which column holds the geography to plot (postcode/zip, city, county, or region)?';
       }
     } else if (!intakeMessageLooksLikeAsk(message) || complete) {
       complete = true;
-      message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(fileRec.name, 'Territory Design');
+      message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(rec.name, 'Territory Design');
     }
+
     const context_qa = complete ? harvestModuleCapturedContext(
-      fileRec.capturedContext,
+      rec.capturedContext,
       pickIntakeContextQa(parsed),
-      [...(fileRec.intakeMessages || []), { role: 'assistant', content: message }],
-      { extract: fileRec.dataProfile || '' },
-    ) : fileRec.capturedContext;
-    const next = {
-      ...fileRec,
+      [...(rec.intakeMessages || []), { role: 'assistant', content: message }],
+      { extract: rec.dataProfile || '' },
+    ) : rec.capturedContext;
+    await patchTerritoryFile(rec.id, {
       mapLayout: nextLayout,
-      capturedContext: context_qa || fileRec.capturedContext,
-      intakeMessages: [...(fileRec.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳')), { role: 'assistant', content: message }],
+      sheetName: rec.sheetName,
+      tableName: rec.tableName,
+      rowCount: rec.rowCount,
+      columns: rec.columns,
+      previewRows: rec.previewRows,
+      dataProfile: rec.dataProfile,
+      capturedContext: context_qa || rec.capturedContext,
+      intakeMessages: [...(rec.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳')), { role: 'assistant', content: message }],
       intakeComplete: complete,
       processing: false,
-    };
-    await patchTerritoryFile(fileRec.id, {
-      mapLayout: next.mapLayout,
-      capturedContext: next.capturedContext,
-      intakeMessages: next.intakeMessages,
-      intakeComplete: next.intakeComplete,
-      processing: false,
     });
-    return next;
+    return rec;
   };
 
   const ingestTerritoryTabularFile = async (file, { fileId: existingId } = {}) => {
@@ -10746,6 +10888,7 @@ ${stepInstruction}`;
       intakeMessages: [{ role: 'assistant', content: `⏳ Loading **${file.name}** into Territory…` }],
     };
     await persistTerritoryFile(placeholder);
+    territoryUploadBlobRef.current[fileId] = file;
     setSelectedTerritoryFileId(fileId);
     setSelectedTerritory(null);
     setSelectedTerritoryTeam('');
@@ -10754,18 +10897,11 @@ ${stepInstruction}`;
     setActiveTab('territory');
 
     try {
-      const { records, sheetName } = await parseTerritoryTabular(file, kind);
-      if (!Array.isArray(records) || !records.length) {
-        throw new Error('No data rows found. Upload an Excel/CSV with a header row and territory records.');
+      const sheetsRaw = await listTerritorySheets(file, kind);
+      const sheets = sheetsRaw.map((s) => ({ name: s.name, rowCount: s.rowCount, headers: s.headers }));
+      if (!sheets.some((s) => s.rowCount > 0) && kind !== 'json') {
+        throw new Error('No data rows found on any tab. Check there is a header row and territory records.');
       }
-      const payload = stellaBuildTabularPayload(records);
-      const tableName = `territory_data_${stellaNanoId()}`;
-      await stellaCreateAndLoadTable(tableName, payload.columns, payload.rows);
-      const mapLayout = inferTerritoryLayout(payload.columns, records.slice(0, 40));
-      const dataProfile = [
-        sheetName ? `Excel sheet used: ${sheetName}` : '',
-        stellaProfileRecords(records),
-      ].filter(Boolean).join('\n');
       let storagePath = null;
       let storageBucket = null;
       try {
@@ -10773,27 +10909,35 @@ ${stepInstruction}`;
         const up = await stellaUploadToStorage(`territory_${Date.now()}_${cleanName}`, file, file.type || undefined);
         storagePath = up.objectPath;
         storageBucket = up.bucket;
-      } catch { /* table is the source of truth */ }
-      const rec = {
+      } catch { /* table is the source of truth after a tab is chosen */ }
+
+      let rec = {
         id: fileId,
         name: file.name,
         fileType: kind,
-        sizeLabel: `${payload.rowCount} rows`,
-        tableName,
-        rowCount: payload.rowCount,
-        columns: payload.columns,
-        previewRows: records.slice(0, 8),
-        dataProfile,
-        mapLayout,
+        sizeLabel: `${(file.size / 1024).toFixed(1)} KB`,
+        sheets,
         storagePath,
         storageBucket,
         uploadedAt: new Date().toISOString(),
         processing: false,
         intakeComplete: false,
-        intakeMessages: [{ role: 'assistant', content: `⏳ Loaded **${payload.rowCount}** rows. Checking the territory columns…` }],
-        summary: `Territory file with ${payload.rowCount} rows${sheetName ? ` from sheet "${sheetName}"` : ''}.`,
+        intakeMessages: [{ role: 'assistant', content: `⏳ Loaded **${file.name}**. Checking which tab to use…` }],
+        summary: `Territory workbook with ${sheets.length} tab${sheets.length === 1 ? '' : 's'}.`,
       };
-      await persistTerritoryFile(rec);
+
+      if (kind !== 'excel') {
+        rec.sheetName = sheets[0]?.name || (kind === 'json' ? 'JSON' : 'Sheet1');
+        rec = await materializeTerritorySheet(rec, rec.sheetName);
+        rec = {
+          ...rec,
+          intakeMessages: [{ role: 'assistant', content: `⏳ Loaded **${rec.rowCount}** rows. Checking the territory columns…` }],
+        };
+        await persistTerritoryFile(rec);
+      } else {
+        await persistTerritoryFile(rec);
+      }
+
       setSelectedTerritoryFileId(fileId);
       try {
         await runTerritoryIntakeTurn(rec);
@@ -10801,7 +10945,7 @@ ${stepInstruction}`;
         await patchTerritoryFile(fileId, {
           intakeMessages: [{
             role: 'assistant',
-            content: `Loaded **${payload.rowCount}** rows. I could not finish intake (${err.message || 'error'}). Confirm the team, territory, and geography columns if the map looks wrong.`,
+            content: `Loaded **${file.name}**. I could not finish intake (${err.message || 'error'}). Tell me which Excel tab to use, then the team, territory, and geography columns.`,
           }],
         });
       }
@@ -10818,28 +10962,23 @@ ${stepInstruction}`;
 
   const loadTerritoryMapForFile = async (file, team) => {
     if (!file?.tableName || !file?.mapLayout?.geoColumn) {
-      setTerritoryMapPayload(null);
+      setTerritoryMapPayload((prev) => (prev?.teams ? { ...prev, points: [] } : null));
       return;
     }
     const gen = ++territoryMapAbortRef.current;
     setTerritoryMapBusy(true);
     setTerritoryMapError('');
     try {
-      let nextTeam = team;
+      const teamFilter = team && team !== '__all__' ? team : undefined;
       for (let i = 0; i < 40; i += 1) {
         const data = await territoryApi({
           action: 'map',
           tableName: file.tableName,
           layout: file.mapLayout,
-          team: nextTeam || undefined,
+          team: teamFilter,
           geocode: true,
         });
         if (gen !== territoryMapAbortRef.current) return;
-        if (!nextTeam && Array.isArray(data.teams) && data.teams.length) {
-          nextTeam = data.teams[0];
-          setSelectedTerritoryTeam(nextTeam);
-          continue;
-        }
         setTerritoryMapPayload(data);
         if (!data.pending) break;
         await new Promise((r) => setTimeout(r, 1200));
@@ -10850,6 +10989,24 @@ ${stepInstruction}`;
       setTerritoryMapError(err.message || 'Could not load the territory map');
     } finally {
       if (gen === territoryMapAbortRef.current) setTerritoryMapBusy(false);
+    }
+  };
+
+  const loadTerritoryTeamsForFile = async (file) => {
+    if (!file?.tableName) return;
+    try {
+      const data = await territoryApi({
+        action: 'teams',
+        tableName: file.tableName,
+        layout: file.mapLayout || {},
+      });
+      setTerritoryMapPayload((prev) => ({
+        teams: data.teams || [],
+        points: prev?.points || [],
+        pending: prev?.pending || 0,
+      }));
+    } catch (err) {
+      setTerritoryMapError(err.message || 'Could not list teams');
     }
   };
 
@@ -11317,31 +11474,9 @@ ${stepInstruction}`;
   };
 
   const parseTerritoryTabular = async (file, kind) => {
-    if (kind === 'json') {
-      const records = await stellaParseTabular(file, kind);
-      return { records: records || [], sheetName: null };
-    }
-    const xlsxMod = await import('xlsx');
-    const XLSX = xlsxMod?.default || xlsxMod;
-    let wb;
-    if (kind === 'csv') {
-      const txt = await stellaReadAsText(file);
-      wb = XLSX.read(txt, { type: 'string' });
-    } else {
-      const buf = await file.arrayBuffer();
-      wb = XLSX.read(buf, { type: 'array' });
-    }
-    const names = wb.SheetNames || [];
-    let best = { score: -1, name: names[0] || '', records: [] };
-    for (const name of names) {
-      const ws = wb.Sheets[name];
-      const records = ws ? XLSX.utils.sheet_to_json(ws, { defval: null }) : [];
-      if (!records.length) continue;
-      const payload = stellaBuildTabularPayload(records.slice(0, 40));
-      const score = scoreTerritorySheet(payload.columns, records.slice(0, 40));
-      if (score > best.score) best = { score, name, records };
-    }
-    return { records: best.records, sheetName: best.name || null };
+    const sheets = await listTerritorySheets(file, kind);
+    const best = sheets.find((s) => s.rowCount) || sheets[0];
+    return { records: best?.records || [], sheetName: best?.name || null };
   };
 
   const composeStellaOpeningIntake = async (fileRec, {
@@ -12997,6 +13132,7 @@ ${stepInstruction}`;
     ? [
       activeTerritoryFile.id,
       activeTerritoryFile.tableName,
+      activeTerritoryFile.intakeComplete ? '1' : '0',
       activeTerritoryFile.mapLayout?.teamColumn,
       activeTerritoryFile.mapLayout?.territoryColumn,
       activeTerritoryFile.mapLayout?.geoColumn,
@@ -13007,11 +13143,15 @@ ${stepInstruction}`;
 
   useEffect(() => {
     const file = (userSettingsRef.current.moduleContext?.territory?.files || []).find((f) => f.id === activeTerritoryFile?.id);
-    if (!file?.tableName || !file?.mapLayout?.geoColumn) {
+    if (file?.id && !selectedTerritoryFileId) setSelectedTerritoryFileId(file.id);
+    if (!file?.tableName || !file?.mapLayout?.geoColumn || !file.intakeComplete) {
       if (!file?.processing) setTerritoryMapPayload(null);
       return undefined;
     }
-    if (file.id && !selectedTerritoryFileId) setSelectedTerritoryFileId(file.id);
+    if (!selectedTerritoryTeam) {
+      void loadTerritoryTeamsForFile(file);
+      return undefined;
+    }
     void loadTerritoryMapForFile(file, selectedTerritoryTeam);
     return () => { territoryMapAbortRef.current += 1; };
   }, [territoryLayoutKey, selectedTerritoryTeam]);
@@ -14190,7 +14330,7 @@ ${stepInstruction}`;
             <div className="flex flex-col h-full overflow-hidden">
               <div className="bg-gradient-to-r from-emerald-600 to-teal-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-4">
                 <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3"><MapIcon className="w-6 h-6" /><div><h2 className="text-xl font-bold">Territory Design</h2><p className="text-emerald-100 text-xs">Upload a territory file to see the structure on a map</p></div></div>
+                  <div className="flex items-center gap-3"><MapIcon className="w-6 h-6" /><div><h2 className="text-xl font-bold">Territory Design</h2><p className="text-emerald-100 text-xs">Choose the Excel tab, confirm columns, then select a structure to draw</p></div></div>
                   <button onClick={() => territoryFileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-semibold transition-all"><Upload className="w-4 h-4" /> Upload territory file</button>
                   <input ref={territoryFileInputRef} type="file" accept=".xlsx,.xls,.csv,.json" onChange={handleTerritoryDataUpload} className="hidden" />
                 </div>
@@ -14208,10 +14348,12 @@ ${stepInstruction}`;
                       </div>
                     </>
                   )}
+                  {!!selectedTerritoryTeam && (
                   <div className="flex gap-1 ml-auto">
                     <button onClick={() => setTerritoryView('map')} className={`px-3 py-1.5 rounded-lg text-xs border transition-all ${territoryView === 'map' ? 'bg-blue-500/30 border-blue-400/60 text-blue-200' : 'bg-slate-800/50 border-slate-600 text-slate-400 hover:text-slate-300'}`}>🗺 Map</button>
                     <button onClick={() => setTerritoryView('list')} className={`px-3 py-1.5 rounded-lg text-xs border transition-all ${territoryView === 'list' ? 'bg-blue-500/30 border-blue-400/60 text-blue-200' : 'bg-slate-800/50 border-slate-600 text-slate-400 hover:text-slate-300'}`}>☰ List</button>
                   </div>
+                  )}
                 </div>
               )}
 
@@ -14220,6 +14362,7 @@ ${stepInstruction}`;
                 const points = territoryMapPayload?.points || [];
                 const mappedPoints = points.filter((p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)));
                 const pendingIntake = !!(activeTerritoryFile && !activeTerritoryFile.processing && !activeTerritoryFile.intakeComplete);
+                const structureSelected = !!selectedTerritoryTeam;
                 const grouped = [];
                 const byTerr = new Map();
                 for (const p of points) {
@@ -14229,7 +14372,7 @@ ${stepInstruction}`;
                     prev.count += Number(p.count) || 0;
                     if (p.geo && !prev.geos.includes(p.geo)) prev.geos.push(p.geo);
                   } else {
-                    byTerr.set(key, { id: p.id, territory: key, team: p.team, count: Number(p.count) || 0, geos: p.geo ? [p.geo] : [], lat: p.lat, lng: p.lng });
+                    byTerr.set(key, { id: key, territory: key, team: p.team, count: Number(p.count) || 0, geos: p.geo ? [p.geo] : [], lat: p.lat, lng: p.lng });
                   }
                 }
                 grouped.push(...byTerr.values());
@@ -14239,7 +14382,7 @@ ${stepInstruction}`;
                       <div className="text-center max-w-md">
                         <MapPin className="w-10 h-10 text-emerald-400/70 mx-auto mb-3" />
                         <div className="text-white font-semibold mb-1">No territory file loaded</div>
-                        <p className="text-sm text-blue-300/60 mb-4">Upload an Excel or CSV with team, territory, and geography columns (postcode/zip, city, or region). We will store the rows, geocode them, and draw the structure on the map.</p>
+                        <p className="text-sm text-blue-300/60 mb-4">Upload an Excel or CSV. We will ask which tab to use, then you pick the structure to draw as shapes on the map.</p>
                         {territoryMapError && <p className="text-sm text-rose-300 mb-4">{territoryMapError}</p>}
                         <button onClick={() => territoryFileInputRef.current?.click()} className="px-4 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/40 rounded-lg text-sm text-emerald-200 font-semibold">Upload Excel / CSV</button>
                       </div>
@@ -14248,32 +14391,43 @@ ${stepInstruction}`;
                 }
                 return (
                   <div className="flex-1 overflow-hidden flex flex-col gap-3 min-h-0">
-                    {teams.length > 0 && (
+                    {activeTerritoryFile.intakeComplete && (
                       <div className="flex-shrink-0 flex items-center gap-2 flex-wrap">
-                        <span className="text-xs text-blue-300/70 whitespace-nowrap">Team:</span>
+                        <span className="text-xs text-blue-300/70 whitespace-nowrap">Structure:</span>
                         {teams.map((team) => (
                           <button key={team} onClick={() => { setSelectedTerritoryTeam(team); setSelectedTerritory(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${selectedTerritoryTeam === team ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>{team}</button>
                         ))}
+                        {!teams.length && (
+                          <button onClick={() => { setSelectedTerritoryTeam('__all__'); setSelectedTerritory(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${selectedTerritoryTeam === '__all__' ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>Show this file on the map</button>
+                        )}
                       </div>
                     )}
                     <div className="flex-1 overflow-hidden flex gap-4 min-h-0">
                     <div className={`overflow-y-auto custom-scrollbar ${selectedTerritory ? 'w-1/2' : 'w-full'} transition-all`}>
-                      {territoryView === 'map' ? (
+                      {!structureSelected ? (
+                        <div className="h-[320px] flex items-center justify-center text-sm text-blue-300/60 px-6 text-center">
+                          {pendingIntake
+                            ? 'Finish intake below — choose the Excel tab and columns first.'
+                            : (activeTerritoryFile.intakeComplete
+                              ? 'Select a territory structure above to draw it on the map.'
+                              : 'Upload a file to start.')}
+                        </div>
+                      ) : territoryView === 'map' ? (
                         <div className="bg-slate-800/40 border border-blue-400/20 rounded-xl p-3">
                           <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
                             <span className="text-xs text-blue-300/70 font-semibold">{activeTerritoryFile.name}{activeTerritoryFile.rowCount != null ? ` — ${activeTerritoryFile.rowCount} rows` : ''}</span>
                             <span className="text-xs text-blue-300/40">
                               {territoryMapBusy || territoryMapPayload?.pending
                                 ? `Geocoding… ${mappedPoints.length} placed${territoryMapPayload?.pending ? `, ${territoryMapPayload.pending} remaining` : ''}`
-                                : `${mappedPoints.length} locations · Click a marker to inspect`}
+                                : `${mappedPoints.length} locations · Shapes from confirmed geography · Click to inspect`}
                             </span>
                           </div>
                           {territoryMapError && <div className="text-xs text-rose-300 mb-2">{territoryMapError}</div>}
                           {mappedPoints.length ? (
-                            <TerritoryMap points={mappedPoints} selectedTerritory={selectedTerritory} onSelectTerritory={setSelectedTerritory} />
+                            <TerritoryMap points={points.filter((p) => Number.isFinite(Number(p.lat)) || p.geojson)} selectedTerritory={selectedTerritory} onSelectTerritory={setSelectedTerritory} />
                           ) : (
                             <div className="h-[320px] flex items-center justify-center text-sm text-blue-300/50">
-                              {activeTerritoryFile.processing || territoryMapBusy ? 'Loading territory points…' : (activeTerritoryFile.mapLayout?.geoColumn ? 'Waiting for geocoded locations…' : 'Confirm the geography column in intake below to draw the map.')}
+                              {activeTerritoryFile.processing || territoryMapBusy ? 'Drawing territory shapes…' : (activeTerritoryFile.mapLayout?.geoColumn ? 'Waiting for geocoded locations…' : 'Confirm the geography column in intake below to draw the map.')}
                             </div>
                           )}
                         </div>
@@ -14336,7 +14490,7 @@ ${stepInstruction}`;
                     {pendingIntake && (
                       <div className="flex-shrink-0 bg-slate-800/50 border border-emerald-400/25 rounded-xl p-3">
                         <div className="text-[10px] uppercase tracking-wide text-emerald-300/80 font-semibold mb-2">Territory intake</div>
-                        <div className="max-h-32 overflow-y-auto custom-scrollbar space-y-2 mb-2">
+                        <div className="max-h-52 overflow-y-auto custom-scrollbar space-y-2 mb-2">
                           {(activeTerritoryFile.intakeMessages || []).slice(-6).map((m, i) => (
                             <div key={i} className={`text-xs ${m.role === 'user' ? 'text-cyan-200' : 'text-blue-100'}`}>
                               {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}

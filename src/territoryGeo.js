@@ -130,6 +130,179 @@ export function scoreTerritorySheet(columns, sampleRows = []) {
   return score;
 }
 
+export function findTerritoryHeaderRow(aoa, maxScan = 30) {
+  const rows = Array.isArray(aoa) ? aoa : [];
+  let best = { i: 0, score: -1 };
+  const limit = Math.min(rows.length, maxScan);
+  for (let i = 0; i < limit; i += 1) {
+    const filled = (rows[i] || []).map((c) => String(c ?? '').trim()).filter(Boolean);
+    if (filled.length < 2) continue;
+    const numeric = filled.filter((c) => /^[\d.,%£$€-]+$/.test(c)).length;
+    if (numeric >= filled.length * 0.6) continue;
+    const named = filled.filter((c) => /[A-Za-z]{2,}/.test(c)).length;
+    const score = filled.length * 2 + named;
+    if (score > best.score) best = { i, score };
+  }
+  return best.score >= 0 ? best.i : 0;
+}
+
+export function aoaToRecords(aoa) {
+  const rows = Array.isArray(aoa) ? aoa : [];
+  if (!rows.length) return { records: [], headerRow: 1, headers: [] };
+  const headerIdx = findTerritoryHeaderRow(rows);
+  const used = new Set();
+  const headers = (rows[headerIdx] || []).map((c, i) => {
+    const base = String(c ?? '').trim() || `column_${i + 1}`;
+    let key = base;
+    let n = 2;
+    while (used.has(key)) {
+      key = `${base}_${n}`;
+      n += 1;
+    }
+    used.add(key);
+    return key;
+  });
+  const records = [];
+  for (let i = headerIdx + 1; i < rows.length; i += 1) {
+    const row = rows[i] || [];
+    if (!row.some((c) => String(c ?? '').trim() !== '')) continue;
+    const rec = {};
+    let any = false;
+    headers.forEach((key, j) => {
+      const v = row[j];
+      rec[key] = v == null || String(v).trim() === '' ? null : v;
+      if (rec[key] != null) any = true;
+    });
+    if (any) records.push(rec);
+  }
+  return { records, headerRow: headerIdx + 1, headers };
+}
+
+export function matchTerritorySheetName(answer, sheets = []) {
+  const list = Array.isArray(sheets) ? sheets : [];
+  const t = String(answer || '').trim().toLowerCase().replace(/^["']|["']$/g, '');
+  if (!t || !list.length) return '';
+  const exact = list.find((s) => String(s.name || '').toLowerCase() === t);
+  if (exact) return exact.name;
+  const contained = list.filter((s) => {
+    const n = String(s.name || '').toLowerCase();
+    return n && (t.includes(n) || n.includes(t));
+  });
+  if (contained.length === 1) return contained[0].name;
+  const quoted = t.match(/["']([^"']+)["']/);
+  if (quoted) {
+    const hit = list.find((s) => String(s.name || '').toLowerCase() === quoted[1].toLowerCase());
+    if (hit) return hit.name;
+  }
+  const num = t.match(/\b(?:sheet|tab)\s*(\d+)\b/) || t.match(/^\s*(\d+)[\.)]?\s*$/);
+  if (num) {
+    const i = Number(num[1]) - 1;
+    if (list[i]) return list[i].name;
+  }
+  return '';
+}
+
+function crossLngLat(o, a, b) {
+  return (a[1] - o[1]) * (b[0] - o[0]) - (a[0] - o[0]) * (b[1] - o[1]);
+}
+
+export function convexHullLatLng(points) {
+  const uniq = [];
+  const seen = new Set();
+  for (const p of points || []) {
+    const lat = Number(p?.[0]);
+    const lng = Number(p?.[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const k = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push([lat, lng]);
+  }
+  if (uniq.length <= 2) return uniq;
+  const sorted = [...uniq].sort((a, b) => (a[1] - b[1]) || (a[0] - b[0]));
+  const lower = [];
+  for (const p of sorted) {
+    while (lower.length >= 2 && crossLngLat(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = sorted.length - 1; i >= 0; i -= 1) {
+    const p = sorted[i];
+    while (upper.length >= 2 && crossLngLat(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+export function capGeoJson(geometry, maxRing = 80) {
+  if (!geometry || typeof geometry !== 'object') return null;
+  const capRing = (ring) => {
+    if (!Array.isArray(ring) || ring.length <= maxRing) return ring;
+    const step = Math.ceil(ring.length / maxRing);
+    const out = ring.filter((_, i) => i % step === 0);
+    const first = ring[0];
+    const last = out[out.length - 1];
+    if (first && (!last || last[0] !== first[0] || last[1] !== first[1])) out.push(first);
+    return out;
+  };
+  if (geometry.type === 'Polygon') {
+    return { type: 'Polygon', coordinates: (geometry.coordinates || []).map(capRing) };
+  }
+  if (geometry.type === 'MultiPolygon') {
+    return { type: 'MultiPolygon', coordinates: (geometry.coordinates || []).map((poly) => (poly || []).map(capRing)) };
+  }
+  return null;
+}
+
+export function groupTerritoryShapes(points) {
+  const byKey = new Map();
+  for (const p of points || []) {
+    const key = p.territory || p.id;
+    if (!key) continue;
+    let g = byKey.get(key);
+    if (!g) {
+      g = {
+        id: p.id || key,
+        territory: key,
+        team: p.team || '',
+        count: 0,
+        geos: [],
+        coords: [],
+        polygons: [],
+      };
+      byKey.set(key, g);
+    }
+    g.count += Number(p.count) || 0;
+    if (p.geo && !g.geos.includes(p.geo)) g.geos.push(p.geo);
+    const lat = Number(p.lat);
+    const lng = Number(p.lng);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) g.coords.push([lat, lng]);
+    const geom = capGeoJson(typeof p.geojson === 'string' ? (() => { try { return JSON.parse(p.geojson); } catch { return null; } })() : p.geojson);
+    if (geom) g.polygons.push(geom);
+  }
+  return [...byKey.values()].map((g) => {
+    const colours = hashTerritoryColour(g.territory);
+    const hull = convexHullLatLng(g.coords);
+    const lat = g.coords.length ? g.coords.reduce((s, c) => s + c[0], 0) / g.coords.length : null;
+    const lng = g.coords.length ? g.coords.reduce((s, c) => s + c[1], 0) / g.coords.length : null;
+    return {
+      id: g.id,
+      territory: g.territory,
+      team: g.team,
+      count: g.count,
+      geos: g.geos,
+      colour: colours.colour,
+      border: colours.border,
+      hull: hull.length >= 3 ? hull : [],
+      polygons: g.polygons,
+      lat,
+      lng,
+    };
+  }).filter((g) => g.polygons.length || g.hull.length || (Number.isFinite(g.lat) && Number.isFinite(g.lng)));
+}
+
 export function mergeTerritoryLayout(base, overlay) {
   const a = normalizeMapLayout(base) || {};
   const b = normalizeMapLayout(overlay) || {};
@@ -167,33 +340,12 @@ export function formatTerritoryAssessContext({ file, team, territory, points = [
 }
 
 export function buildTerritoryPointsMapHTML(points, selectedId) {
-  const mapped = (points || [])
-    .filter((p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)))
-    .map((p) => {
-      const colours = hashTerritoryColour(p.territory || p.id);
-      return {
-        id: p.id,
-        territory: p.territory || '',
-        team: p.team || '',
-        geo: p.geo || '',
-        count: Number(p.count) || 0,
-        lat: Number(p.lat),
-        lng: Number(p.lng),
-        colour: colours.colour,
-        border: colours.border,
-        selected: p.id === selectedId || p.territory === selectedId,
-      };
-    });
-
-  const legendItems = [];
-  const seen = new Set();
-  for (const p of mapped) {
-    const key = p.territory || p.id;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    legendItems.push({ name: key, colour: p.colour });
-    if (legendItems.length >= 12) break;
-  }
+  const shapes = groupTerritoryShapes(points).map((g) => ({
+    ...g,
+    selected: g.id === selectedId || g.territory === selectedId,
+  }));
+  const legendItems = shapes.slice(0, 12).map((s) => ({ name: s.territory, colour: s.colour }));
+  const payload = JSON.stringify(shapes).replace(/</g, '\\u003c');
 
   return `<!DOCTYPE html>
 <html>
@@ -230,7 +382,7 @@ export function buildTerritoryPointsMapHTML(points, selectedId) {
 <body>
   <div id="map"></div>
   <script>
-    const points = ${JSON.stringify(mapped)};
+    const shapes = ${payload};
     const legendItems = ${JSON.stringify(legendItems)};
     const esc = (v) => String(v || '').replace(/[&<>]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
     const map = L.map('map', { zoomControl: true });
@@ -240,40 +392,69 @@ export function buildTerritoryPointsMapHTML(points, selectedId) {
     }).addTo(map);
     map.setView([54, -2], 6);
     const bounds = [];
-    const counts = points.map((p) => p.count);
-    const minC = counts.length ? Math.min.apply(null, counts.concat([1])) : 1;
-    const maxC = counts.length ? Math.max.apply(null, counts.concat([1])) : 1;
-    for (const p of points) {
-      const span = Math.max(1, maxC - minC);
-      const r = Math.max(10, Math.min(28, 10 + ((p.count - minC) / span) * 16));
-      const icon = L.divIcon({
-        className: '',
-        iconSize: [r*2, r*2],
-        iconAnchor: [r, r],
-        html: '<div style="width:' + (r*2) + 'px;height:' + (r*2) + 'px;border-radius:50%;background:' + (p.selected ? p.colour : p.colour + '99') + ';border:' + (p.selected ? 3 : 1.5) + 'px solid ' + p.border + ';box-shadow:' + (p.selected ? '0 0 14px ' + p.colour + '99' : '0 2px 6px rgba(0,0,0,0.4)') + ';cursor:pointer;"></div>'
-      });
-      const marker = L.marker([p.lat, p.lng], { icon });
-      marker.bindPopup(
-        '<div class="popup-title">' + esc(p.territory || p.geo) + '</div>' +
-        (p.team ? '<div class="popup-rep">Team: ' + esc(p.team) + '</div>' : '') +
-        (p.geo ? '<div class="popup-rep">' + esc(p.geo) + '</div>' : '') +
-        '<div class="popup-rep">Rows: ' + p.count + '</div>',
-        { maxWidth: 260 }
-      );
-      marker.on('click', () => {
-        window.parent.postMessage({ type: 'territory-select', id: p.id, territory: p.territory }, '*');
-      });
-      marker.addTo(map);
-      bounds.push([p.lat, p.lng]);
+    const remember = (layer) => {
+      const b = layer.getBounds && layer.getBounds();
+      if (b && b.isValid()) bounds.push(b);
+    };
+    for (const s of shapes) {
+      const fill = s.selected ? 0.55 : 0.32;
+      const weight = s.selected ? 3 : 1.5;
+      const popup = '<div class="popup-title">' + esc(s.territory) + '</div>' +
+        (s.team ? '<div class="popup-rep">Team: ' + esc(s.team) + '</div>' : '') +
+        (s.geos && s.geos.length ? '<div class="popup-rep">' + esc(s.geos.slice(0, 8).join(', ')) + (s.geos.length > 8 ? '…' : '') + '</div>' : '') +
+        '<div class="popup-rep">Rows: ' + s.count + '</div>';
+      const onClick = () => {
+        window.parent.postMessage({ type: 'territory-select', id: s.id, territory: s.territory }, '*');
+      };
+      let drawn = false;
+      if (s.polygons && s.polygons.length) {
+        for (const geom of s.polygons) {
+          const layer = L.geoJSON(geom, {
+            style: { color: s.border, weight, fillColor: s.colour, fillOpacity: fill },
+          });
+          layer.bindPopup(popup, { maxWidth: 260 });
+          layer.on('click', onClick);
+          layer.addTo(map);
+          remember(layer);
+          drawn = true;
+        }
+      }
+      if (!drawn && s.hull && s.hull.length >= 3) {
+        const layer = L.polygon(s.hull, { color: s.border, weight, fillColor: s.colour, fillOpacity: fill });
+        layer.bindPopup(popup, { maxWidth: 260 });
+        layer.on('click', onClick);
+        layer.addTo(map);
+        remember(layer);
+        drawn = true;
+      }
+      if (!drawn && Number.isFinite(s.lat) && Number.isFinite(s.lng)) {
+        const layer = L.circleMarker([s.lat, s.lng], {
+          radius: s.selected ? 14 : 10,
+          color: s.border,
+          weight,
+          fillColor: s.colour,
+          fillOpacity: fill,
+        });
+        layer.bindPopup(popup, { maxWidth: 260 });
+        layer.on('click', onClick);
+        layer.addTo(map);
+        bounds.push(L.latLngBounds([[s.lat, s.lng], [s.lat, s.lng]]));
+      }
     }
-    if (bounds.length > 1) map.fitBounds(bounds, { padding: [50, 50], maxZoom: 9 });
-    else if (bounds.length === 1) map.setView(bounds[0], 8);
+    const valid = bounds.filter((b) => b && b.isValid && b.isValid());
+    if (valid.length > 1) {
+      const all = valid[0];
+      for (let i = 1; i < valid.length; i += 1) all.extend(valid[i]);
+      map.fitBounds(all, { padding: [40, 40], maxZoom: 9 });
+    } else if (valid.length === 1) {
+      map.fitBounds(valid[0], { padding: [40, 40], maxZoom: 10 });
+    }
     const legend = L.control({ position: 'bottomleft' });
     legend.onAdd = () => {
       const div = L.DomUtil.create('div', 'legend');
       div.innerHTML = '<div class="legend-title">TERRITORIES</div>' +
         legendItems.map((m) => '<div class="legend-item"><div class="legend-dot" style="background:' + m.colour + '"></div><span>' + esc(m.name) + '</span></div>').join('') +
-        '<div class="legend-sub">Circle size = row count<br>Click a marker to inspect</div>';
+        '<div class="legend-sub">Shapes follow the confirmed geography<br>Click a territory to inspect</div>';
       return div;
     };
     legend.addTo(map);

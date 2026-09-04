@@ -388,6 +388,10 @@ export function mergeWorkflowRuntime(partial) {
   if (!/AUTO-INCLUDE/i.test(contextClassify) || !/strategy or IC/i.test(contextClassify)) {
     out.contextImageClassifyPrompt = DEFAULT_WORKFLOW_RUNTIME.contextImageClassifyPrompt;
   }
+  if (!/EXCEL TABS/i.test(String(out.territoryIntakePrompt || ''))
+    || !/sheet_name/i.test(String(out.territoryIntakePrompt || ''))) {
+    out.territoryIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.territoryIntakePrompt;
+  }
   return out;
 }
 

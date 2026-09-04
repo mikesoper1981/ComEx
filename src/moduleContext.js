@@ -542,7 +542,11 @@ function normalizeContextFile(raw) {
   if (captured) rec.capturedContext = captured;
   const hasUserIntake = intakeMessages.some((m) => m.role === 'user');
   const lastAssistant = [...intakeMessages].reverse().find((m) => m.role === 'assistant');
-  if (hasUserIntake && rec.intakeComplete === false && !intakeAssistantStillAsking(lastAssistant?.content)) {
+  const territoryPending = Array.isArray(raw.sheets)
+    || raw.mapLayout
+    || /^territory_data_/.test(String(raw.tableName || ''))
+    || !!usefulString(raw.sheetName);
+  if (hasUserIntake && rec.intakeComplete === false && !intakeAssistantStillAsking(lastAssistant?.content) && !territoryPending) {
     rec.intakeComplete = true;
   }
   if (Array.isArray(raw.columns) && raw.columns.length) {
@@ -560,9 +564,22 @@ function normalizeContextFile(raw) {
       .filter((c) => c.name);
     if (!rec.columns.length) delete rec.columns;
   }
+  if (Array.isArray(raw.previewRows) && raw.previewRows.length) {
+    rec.previewRows = raw.previewRows.slice(0, 8);
+  }
   const tableName = usefulString(raw.tableName);
   if (tableName && /^(stella_data_|territory_data_)[a-z0-9_]+$/.test(tableName)) rec.tableName = tableName;
   if (raw.rowCount != null && Number.isFinite(Number(raw.rowCount))) rec.rowCount = Number(raw.rowCount);
+  const sheetName = usefulString(raw.sheetName);
+  if (sheetName) rec.sheetName = sheetName;
+  if (Array.isArray(raw.sheets) && raw.sheets.length) {
+    rec.sheets = raw.sheets.slice(0, 40).map((s) => ({
+      name: usefulString(s?.name),
+      rowCount: Number.isFinite(Number(s?.rowCount)) ? Number(s.rowCount) : 0,
+      headers: Array.isArray(s?.headers) ? s.headers.map((h) => usefulString(h)).filter(Boolean).slice(0, 40) : [],
+    })).filter((s) => s.name);
+    if (!rec.sheets.length) delete rec.sheets;
+  }
   const mapLayout = raw.mapLayout && typeof raw.mapLayout === 'object' ? {
     ...(usefulString(raw.mapLayout.teamColumn) ? { teamColumn: usefulString(raw.mapLayout.teamColumn) } : {}),
     ...(usefulString(raw.mapLayout.territoryColumn) ? { territoryColumn: usefulString(raw.mapLayout.territoryColumn) } : {}),
@@ -668,8 +685,11 @@ export function serializeContextFileForPersist(fileRec) {
   if (rec.capturedContext) out.capturedContext = rec.capturedContext;
   if (rec.notes?.length) out.notes = rec.notes;
   if (rec.columns?.length) out.columns = rec.columns;
+  if (rec.previewRows?.length) out.previewRows = rec.previewRows;
   if (rec.tableName) out.tableName = rec.tableName;
   if (rec.rowCount != null) out.rowCount = rec.rowCount;
+  if (rec.sheetName) out.sheetName = rec.sheetName;
+  if (rec.sheets?.length) out.sheets = rec.sheets;
   if (rec.mapLayout) out.mapLayout = rec.mapLayout;
   if (rec.dataProfile) out.dataProfile = rec.dataProfile;
   if (rec.storagePath) out.storagePath = rec.storagePath;
