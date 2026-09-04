@@ -142,6 +142,8 @@ import {
   formatTerritoryAssessContext,
   aoaToRecords,
   matchTerritorySheetName,
+  extractTerritoryTeamName,
+  shouldSplitByTeamColumn,
 } from './territoryGeo';
 
 // Recharts is loaded lazily so it can never affect initial page load.
@@ -10773,9 +10775,11 @@ ${stepInstruction}`;
       `- ${c.name}${c.original && c.original !== c.name ? ` (header "${c.original}")` : ''}${c.type ? ` [${c.type}]` : ''}`
     )).join('\n') || '(no columns yet — a tab has not been loaded)';
     const guessed = [
-      layout.teamColumn ? `team = ${layout.teamColumn}` : 'team = (none found)',
+      layout.teamName ? `team name = ${layout.teamName}` : 'team name = (ask the user — one field team, not each rep)',
+      layout.teamColumn ? `team column = ${layout.teamColumn}` : 'team column = (none — do not treat reps as teams)',
       layout.territoryColumn ? `territory = ${layout.territoryColumn}` : 'territory = (none found)',
       layout.geoColumn ? `geo = ${layout.geoColumn} (${layout.geoKind || 'unknown'})` : 'geo = (none found)',
+      layout.repColumn ? `rep = ${layout.repColumn}` : '',
       layout.country ? `country = ${layout.country}` : '',
     ].filter(Boolean).join('\n');
     const sheetsBlob = sheets.length
@@ -10812,14 +10816,19 @@ ${stepInstruction}`;
       } catch { /* keep asking */ }
     }
 
+    const justChoseSheet = !!(hasUserReply && rec.sheetName && matchTerritorySheetName(lastUser.content, sheets));
+    const needSheet = (rec.fileType === 'excel' || sheets.length > 1) && !rec.sheetName;
     const nextLayout = mergeTerritoryLayout(
       normalizeMapLayout(rec.mapLayout) || layout,
       parsed.layout,
     );
-    const justChoseSheet = !!(hasUserReply && rec.sheetName && matchTerritorySheetName(lastUser.content, sheets));
-    const needSheet = (rec.fileType === 'excel' || sheets.length > 1) && !rec.sheetName;
+    if (!nextLayout.teamName && hasUserReply && !justChoseSheet && !needSheet) {
+      const fromUser = extractTerritoryTeamName(lastUser.content);
+      if (fromUser) nextLayout.teamName = fromUser;
+    }
     const needGeo = !nextLayout.geoColumn;
-    let complete = !!parsed.complete && !needSheet && !needGeo && !!rec.tableName && !justChoseSheet;
+    const needTeamName = !nextLayout.teamName;
+    let complete = !!parsed.complete && !needSheet && !needGeo && !needTeamName && !!rec.tableName && !justChoseSheet;
     let message = stripJsonFromIntakeMessage(parsed.message);
 
     if (needSheet) {
@@ -10833,8 +10842,13 @@ ${stepInstruction}`;
       complete = false;
       if (!intakeMessageLooksLikeAsk(message)) {
         message = nextLayout.geoColumn
-          ? `Using tab **${rec.sheetName}**. I mapped team **${nextLayout.teamColumn || '(none)'}**, territory **${nextLayout.territoryColumn || '(none)'}**, geo **${nextLayout.geoColumn}** (${nextLayout.geoKind || 'region'}). Is that correct?`
-          : `Using tab **${rec.sheetName}**. Which column holds the geography to plot (postcode/zip, city, county, or region)?`;
+          ? `Using tab **${rec.sheetName}**. This looks like one field team of reps. What is the team called? I’ll map all of their territories together.\n\nI’ll use territory **${nextLayout.territoryColumn || '(none)'}** and geo **${nextLayout.geoColumn}** (${nextLayout.geoKind || 'region'}). Say if those columns are wrong.`
+          : `Using tab **${rec.sheetName}**. What is this field team called, and which column holds the geography to plot (postcode/zip, city, county, or region)?`;
+      }
+    } else if (needTeamName) {
+      complete = false;
+      if (!intakeMessageLooksLikeAsk(message) || !/\bteam\b/i.test(message)) {
+        message = 'What is the name of this field team? I’ll treat the file as that one team and draw every territory on the same map.';
       }
     } else if (needGeo) {
       complete = false;
@@ -10844,6 +10858,10 @@ ${stepInstruction}`;
     } else if (!intakeMessageLooksLikeAsk(message) || complete) {
       complete = true;
       message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(rec.name, 'Territory Design');
+    }
+
+    if (complete) {
+      setSelectedTerritoryTeam(nextLayout.teamName || '__all__');
     }
 
     const context_qa = complete ? harvestModuleCapturedContext(
@@ -13134,6 +13152,7 @@ ${stepInstruction}`;
       activeTerritoryFile.tableName,
       activeTerritoryFile.intakeComplete ? '1' : '0',
       activeTerritoryFile.mapLayout?.teamColumn,
+      activeTerritoryFile.mapLayout?.teamName,
       activeTerritoryFile.mapLayout?.territoryColumn,
       activeTerritoryFile.mapLayout?.geoColumn,
       activeTerritoryFile.mapLayout?.geoKind,
@@ -13148,11 +13167,16 @@ ${stepInstruction}`;
       if (!file?.processing) setTerritoryMapPayload(null);
       return undefined;
     }
-    if (!selectedTerritoryTeam) {
+    const split = shouldSplitByTeamColumn(file.mapLayout, territoryMapPayload?.teams);
+    if (split && !selectedTerritoryTeam) {
       void loadTerritoryTeamsForFile(file);
       return undefined;
     }
-    void loadTerritoryMapForFile(file, selectedTerritoryTeam);
+    if (!split && !selectedTerritoryTeam) {
+      setSelectedTerritoryTeam(file.mapLayout?.teamName || '__all__');
+      return undefined;
+    }
+    void loadTerritoryMapForFile(file, split ? selectedTerritoryTeam : '__all__');
     return () => { territoryMapAbortRef.current += 1; };
   }, [territoryLayoutKey, selectedTerritoryTeam]);
 
@@ -14382,7 +14406,7 @@ ${stepInstruction}`;
                       <div className="text-center max-w-md">
                         <MapPin className="w-10 h-10 text-emerald-400/70 mx-auto mb-3" />
                         <div className="text-white font-semibold mb-1">No territory file loaded</div>
-                        <p className="text-sm text-blue-300/60 mb-4">Upload an Excel or CSV. We will ask which tab to use, then you pick the structure to draw as shapes on the map.</p>
+                        <p className="text-sm text-blue-300/60 mb-4">Upload an Excel or CSV. We will ask which tab to use and what the team is called, then geocode every territory onto one map.</p>
                         {territoryMapError && <p className="text-sm text-rose-300 mb-4">{territoryMapError}</p>}
                         <button onClick={() => territoryFileInputRef.current?.click()} className="px-4 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/40 rounded-lg text-sm text-emerald-200 font-semibold">Upload Excel / CSV</button>
                       </div>
@@ -14393,13 +14417,13 @@ ${stepInstruction}`;
                   <div className="flex-1 overflow-hidden flex flex-col gap-3 min-h-0">
                     {activeTerritoryFile.intakeComplete && (
                       <div className="flex-shrink-0 flex items-center gap-2 flex-wrap">
-                        <span className="text-xs text-blue-300/70 whitespace-nowrap">Structure:</span>
-                        {teams.map((team) => (
+                        <span className="text-xs text-blue-300/70 whitespace-nowrap">Team:</span>
+                        <span className="px-3 py-1.5 rounded-lg text-xs font-semibold border bg-emerald-500/20 border-emerald-400/40 text-emerald-200">
+                          {activeTerritoryFile.mapLayout?.teamName || 'Whole file'}
+                        </span>
+                        {shouldSplitByTeamColumn(activeTerritoryFile.mapLayout, teams) && teams.map((team) => (
                           <button key={team} onClick={() => { setSelectedTerritoryTeam(team); setSelectedTerritory(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${selectedTerritoryTeam === team ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>{team}</button>
                         ))}
-                        {!teams.length && (
-                          <button onClick={() => { setSelectedTerritoryTeam('__all__'); setSelectedTerritory(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${selectedTerritoryTeam === '__all__' ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>Show this file on the map</button>
-                        )}
                       </div>
                     )}
                     <div className="flex-1 overflow-hidden flex gap-4 min-h-0">
@@ -14407,9 +14431,9 @@ ${stepInstruction}`;
                       {!structureSelected ? (
                         <div className="h-[320px] flex items-center justify-center text-sm text-blue-300/60 px-6 text-center">
                           {pendingIntake
-                            ? 'Finish intake below — choose the Excel tab and columns first.'
+                            ? 'Finish intake below — choose the Excel tab, team name, and columns first.'
                             : (activeTerritoryFile.intakeComplete
-                              ? 'Select a territory structure above to draw it on the map.'
+                              ? 'Geocoding this team’s territories…'
                               : 'Upload a file to start.')}
                         </div>
                       ) : territoryView === 'map' ? (

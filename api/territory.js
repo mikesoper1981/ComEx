@@ -54,6 +54,7 @@ function normalizeLayout(raw) {
     geoKind: GEO_KINDS.has(kind) ? kind : 'region',
     country: String(src.country || '').trim().slice(0, 80),
     repColumn: col(src.repColumn || src.rep_column),
+    teamName: String(src.teamName || src.team_name || '').trim().slice(0, 80),
   };
 }
 
@@ -141,8 +142,18 @@ async function tableColumns(schema, tableName) {
   return new Set((rows || []).map((r) => String(r.column_name)));
 }
 
-async function nominatimSearch(query) {
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1&polygon_geojson=1`;
+async function nominatimSearch(query, extra = {}) {
+  const params = new URLSearchParams({
+    format: 'json',
+    limit: '1',
+    polygon_geojson: '1',
+  });
+  if (query) params.set('q', query);
+  for (const [key, value] of Object.entries(extra)) {
+    if (key === 'q' || value == null || value === '') continue;
+    params.set(key, String(value));
+  }
+  const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
   const res = await fetch(url, {
     headers: {
       Accept: 'application/json',
@@ -187,7 +198,7 @@ function geometryFromNominatim(hit) {
     const north = parseFloat(bb[1]);
     const west = parseFloat(bb[2]);
     const east = parseFloat(bb[3]);
-    if ([south, north, west, east].every(Number.isFinite) && (north - south) > 0.015 && (east - west) > 0.015) {
+    if ([south, north, west, east].every(Number.isFinite) && (north - south) > 0.002 && (east - west) > 0.002) {
       return {
         type: 'Polygon',
         coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]],
@@ -236,19 +247,24 @@ async function geocodeMisses(schema, misses, kind, country) {
   const written = [];
   for (let i = 0; i < misses.length && i < GEOCODE_BATCH; i += 1) {
     const item = misses[i];
-    const queries = [searchQuery(item.geo, kind, country)];
+    const queries = [];
+    if (kind === 'postcode') {
+      queries.push({ postalcode: item.geo, country: country || 'United Kingdom', countrycodes: 'gb' });
+    }
+    queries.push({ q: searchQuery(item.geo, kind, country), ...(kind === 'postcode' || /united kingdom|uk/i.test(country) ? { countrycodes: 'gb' } : {}) });
     if (kind === 'postcode' && item.geo.includes(' ')) {
-      queries.push(searchQuery(outwardPostcode(item.geo), kind, country || 'United Kingdom'));
+      queries.push({ postalcode: outwardPostcode(item.geo), country: country || 'United Kingdom', countrycodes: 'gb' });
+      queries.push({ q: searchQuery(outwardPostcode(item.geo), kind, country || 'United Kingdom'), countrycodes: 'gb' });
     }
     let hit = null;
-    for (const q of queries.filter(Boolean)) {
-      hit = await nominatimSearch(q);
+    for (const q of queries) {
+      hit = await nominatimSearch(q.q || '', q);
       if (hit) break;
       await sleep(NOMINATIM_PAUSE_MS);
     }
     written.push({
       query_key: item.key,
-      query_text: queries[0] || item.geo,
+      query_text: (queries[0] && (queries[0].q || queries[0].postalcode)) || item.geo,
       lat: hit?.lat ?? null,
       lng: hit?.lng ?? null,
       display_name: hit?.display_name || '',
@@ -273,7 +289,9 @@ async function distinctTeams(schema, tableName, layout) {
      order by 1
      limit 80`,
   ));
-  return (rows || []).map((r) => String(r.team || '').trim()).filter(Boolean);
+  const list = (rows || []).map((r) => String(r.team || '').trim()).filter(Boolean);
+  if (list.length > 8) return [];
+  return list;
 }
 
 function collapseGrouped(rows, kind) {

@@ -389,7 +389,8 @@ export function mergeWorkflowRuntime(partial) {
     out.contextImageClassifyPrompt = DEFAULT_WORKFLOW_RUNTIME.contextImageClassifyPrompt;
   }
   if (!/EXCEL TABS/i.test(String(out.territoryIntakePrompt || ''))
-    || !/sheet_name/i.test(String(out.territoryIntakePrompt || ''))) {
+    || !/sheet_name/i.test(String(out.territoryIntakePrompt || ''))
+    || !/team_name/i.test(String(out.territoryIntakePrompt || ''))) {
     out.territoryIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.territoryIntakePrompt;
   }
   return out;

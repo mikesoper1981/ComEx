@@ -58,12 +58,14 @@ export function normalizeMapLayout(raw) {
   const rep = col(raw.repColumn || raw.rep_column);
   const kind = String(raw.geoKind || raw.geo_kind || '').trim().toLowerCase();
   const country = String(raw.country || '').trim().slice(0, 80);
+  const teamName = String(raw.teamName || raw.team_name || '').trim().slice(0, 80);
   if (team) out.teamColumn = team;
   if (territory) out.territoryColumn = territory;
   if (geo) out.geoColumn = geo;
   if (rep) out.repColumn = rep;
   if (GEO_KINDS.has(kind)) out.geoKind = kind;
   if (country) out.country = country;
+  if (teamName) out.teamName = teamName;
   return Object.keys(out).length ? out : null;
 }
 
@@ -92,8 +94,38 @@ function inferCountry(geoKind, geoColumn, sampleRows) {
   return '';
 }
 
+export function isRosterLikeColumn(colName, sampleRows = []) {
+  const key = String(colName || '').toLowerCase();
+  if (/\b(rep|representative|salesperson|employee|person|forename|surname|full.?name)\b/.test(key)) return true;
+  const vals = [...new Set((sampleRows || []).map((r) => String(r?.[colName] ?? '').trim()).filter(Boolean))];
+  if (vals.length >= 8 && vals.length >= Math.max(6, (sampleRows || []).length * 0.35)) return true;
+  const people = vals.filter((v) => /^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}$/.test(v) || /\b(mr|mrs|ms|dr)\b/i.test(v)).length;
+  return vals.length >= 3 && people >= vals.length * 0.5;
+}
+
+export function extractTerritoryTeamName(answer) {
+  const t = String(answer || '').trim().replace(/^["']|["']$/g, '');
+  if (!t || t.length > 80) return '';
+  if (/^(yes|y|ok|okay|correct|no|nope)\b/i.test(t)) return '';
+  if (/^\d+$/.test(t)) return '';
+  const m = t.match(/(?:team(?:\s+name)?|field\s*force|call(?:ed)?(?:\s+it)?|name(?:\s+it)?|it(?:'s| is))\s*(?:is|:)?\s+(.+)/i);
+  const raw = (m ? m[1] : t).replace(/[.?!]+$/, '').trim();
+  if (!raw || raw.length < 2) return '';
+  if (!m && /\b(tab|sheet|column|postcode|zip|geo)\b/i.test(raw)) return '';
+  if (raw.split(/\s+/).length > 10) return '';
+  return raw.slice(0, 80);
+}
+
+export function shouldSplitByTeamColumn(layout, teams) {
+  const list = Array.isArray(teams) ? teams : [];
+  if (!layout?.teamColumn) return false;
+  if (layout.repColumn && layout.teamColumn === layout.repColumn) return false;
+  if (list.length < 2 || list.length > 12) return false;
+  return true;
+}
+
 export function inferTerritoryLayout(columns, sampleRows = []) {
-  const teamColumn = pickColumn(columns, [
+  let teamColumn = pickColumn(columns, [
     /\b(team|field.?force|sales.?force|franchise|business.?unit|\bbu\b)\b/,
   ]);
   const territoryColumn = pickColumn(columns, [
@@ -106,9 +138,13 @@ export function inferTerritoryLayout(columns, sampleRows = []) {
   ]);
   if (!geoColumn && territoryColumn) geoColumn = territoryColumn;
   const geoKind = geoColumn ? inferGeoKind(geoColumn, columns, sampleRows) : 'region';
-  const repColumn = pickColumn(columns, [
+  let repColumn = pickColumn(columns, [
     /\b(rep|representative|salesperson|account.?exec)\b/,
   ]);
+  if (teamColumn && isRosterLikeColumn(teamColumn, sampleRows)) {
+    if (!repColumn) repColumn = teamColumn;
+    teamColumn = '';
+  }
   const country = inferCountry(geoKind, geoColumn, sampleRows);
   return normalizeMapLayout({
     teamColumn,
@@ -295,7 +331,7 @@ export function groupTerritoryShapes(points) {
       geos: g.geos,
       colour: colours.colour,
       border: colours.border,
-      hull: hull.length >= 3 ? hull : [],
+      hull: hull.length >= 2 ? hull : [],
       polygons: g.polygons,
       lat,
       lng,
@@ -407,7 +443,14 @@ export function buildTerritoryPointsMapHTML(points, selectedId) {
         window.parent.postMessage({ type: 'territory-select', id: s.id, territory: s.territory }, '*');
       };
       let drawn = false;
-      if (s.polygons && s.polygons.length) {
+      if (s.hull && s.hull.length >= 3) {
+        const layer = L.polygon(s.hull, { color: s.border, weight, fillColor: s.colour, fillOpacity: fill });
+        layer.bindPopup(popup, { maxWidth: 260 });
+        layer.on('click', onClick);
+        layer.addTo(map);
+        remember(layer);
+        drawn = true;
+      } else if (s.polygons && s.polygons.length) {
         for (const geom of s.polygons) {
           const layer = L.geoJSON(geom, {
             style: { color: s.border, weight, fillColor: s.colour, fillOpacity: fill },
@@ -418,9 +461,8 @@ export function buildTerritoryPointsMapHTML(points, selectedId) {
           remember(layer);
           drawn = true;
         }
-      }
-      if (!drawn && s.hull && s.hull.length >= 3) {
-        const layer = L.polygon(s.hull, { color: s.border, weight, fillColor: s.colour, fillOpacity: fill });
+      } else if (s.hull && s.hull.length === 2) {
+        const layer = L.polyline(s.hull, { color: s.colour, weight: 8, opacity: 0.85 });
         layer.bindPopup(popup, { maxWidth: 260 });
         layer.on('click', onClick);
         layer.addTo(map);
@@ -428,8 +470,8 @@ export function buildTerritoryPointsMapHTML(points, selectedId) {
         drawn = true;
       }
       if (!drawn && Number.isFinite(s.lat) && Number.isFinite(s.lng)) {
-        const layer = L.circleMarker([s.lat, s.lng], {
-          radius: s.selected ? 14 : 10,
+        const layer = L.circle([s.lat, s.lng], {
+          radius: 7000,
           color: s.border,
           weight,
           fillColor: s.colour,
@@ -438,7 +480,7 @@ export function buildTerritoryPointsMapHTML(points, selectedId) {
         layer.bindPopup(popup, { maxWidth: 260 });
         layer.on('click', onClick);
         layer.addTo(map);
-        bounds.push(L.latLngBounds([[s.lat, s.lng], [s.lat, s.lng]]));
+        remember(layer);
       }
     }
     const valid = bounds.filter((b) => b && b.isValid && b.isValid());

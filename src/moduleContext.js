@@ -587,6 +587,7 @@ function normalizeContextFile(raw) {
     ...(usefulString(raw.mapLayout.geoKind) ? { geoKind: usefulString(raw.mapLayout.geoKind) } : {}),
     ...(usefulString(raw.mapLayout.country) ? { country: usefulString(raw.mapLayout.country) } : {}),
     ...(usefulString(raw.mapLayout.repColumn) ? { repColumn: usefulString(raw.mapLayout.repColumn) } : {}),
+    ...(usefulString(raw.mapLayout.teamName) ? { teamName: usefulString(raw.mapLayout.teamName) } : {}),
   } : null;
   if (mapLayout && Object.keys(mapLayout).length) rec.mapLayout = mapLayout;
   const dataProfile = usefulString(raw.dataProfile, 8000);
