@@ -3954,6 +3954,26 @@ function buildProposalImagePreviews(included, unsure, skipped) {
   ];
 }
 
+function compactImageInventory(included, unsure, skipped) {
+  const row = (img, status) => {
+    const name = String(img?.name || '').trim();
+    if (!name) return null;
+    const purpose = String(img.purpose || img.kind || '').trim();
+    const reason = String(img.reason || '').trim();
+    return {
+      name,
+      status,
+      ...(purpose ? { purpose } : {}),
+      ...(reason ? { reason: reason.slice(0, 200) } : {}),
+    };
+  };
+  return [
+    ...(included || []).map((img) => row(img, 'included')),
+    ...(unsure || []).map((img) => row(img, 'pending')),
+    ...(skipped || []).map((img) => row(img, 'skipped')),
+  ].filter(Boolean).slice(0, 80);
+}
+
 /** Pull numeric/category caches from native PowerPoint chart XML (not an image). */
 function parsePptxChartXml(xml, chartName) {
   const seriesBlocks = [...String(xml).matchAll(/<c:ser\b[\s\S]*?<\/c:ser>/gi)];
@@ -9258,6 +9278,7 @@ ${stepInstruction}`;
       imageCount: images.length,
       columns: onboarding.columns,
       capturedContext: captured,
+      imageInventory: compactImageInventory(images, [], job.skipped || []),
       intakeMessages: [{ role: 'assistant', content: assistantMsg }],
       intakeComplete: questions.length === 0 && !!captured,
       processing: false,
@@ -9500,19 +9521,13 @@ ${stepInstruction}`;
         },
       };
       const previews = buildProposalImagePreviews(included, unsure, skipped);
-      const ignoredPurpose = skipped.filter((s) =>
-        ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
-      );
-      if (fromChat && previews.length) {
+      const inventory = compactImageInventory(included, unsure, skipped);
+      if (fromChat && unsure.length) {
         setMessages((prev) => [...prev, {
           role: 'system',
-          content: unsure.length
-            ? `🖼️ **${included.length}** strategy/IC image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry strategy or IC context (skip logos and decoration).`
-            : included.length
-              ? `🖼️ **${included.length}** strategy/IC image(s) will be extracted${ignoredPurpose.length ? `; ${ignoredPurpose.length} logo/decoration skipped` : ''}.`
-              : `⚠️ No strategy/IC images for vision${ignoredPurpose.length ? ` (${ignoredPurpose.length} logo/decorative skipped)` : ''}.`,
-          imagePreviews: previews,
-          imageReviewPending: unsure.length > 0,
+          content: `🖼️ **${included.length}** strategy/IC image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry strategy or IC context (skip logos and decoration).`,
+          imagePreviews: previews.filter((img) => img.pending),
+          imageReviewPending: true,
         }]);
       }
       if (unsure.length) {
@@ -9522,6 +9537,7 @@ ${stepInstruction}`;
           ...prev,
           moduleContext: patchModuleContextFile(prev.moduleContext, moduleId, fileId, {
             processing: true,
+            imageInventory: inventory,
             intakeMessages: [{
               role: 'assistant',
               content: `🖼️ **${included.length}** strategy/IC image(s) auto-included. **${unsure.length}** need a yes/no — click a thumbnail to enlarge.`,
@@ -9682,89 +9698,6 @@ ${stepInstruction}`;
         {job?.error && (
           <div className="mb-3 text-xs text-red-300 flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5" /> {job.error}</div>
         )}
-        {imagePreviews.length > 0 && (
-          <div className="mb-4 bg-slate-900/40 border border-amber-400/25 rounded-xl p-4">
-            <div className="text-xs font-semibold text-amber-200 mb-1">
-              {pendingImageCount > 0
-                ? `${pendingImageCount} image${pendingImageCount === 1 ? '' : 's'} might contain useful context — click to enlarge, then include or skip.`
-                : 'Review extracted images. Click a thumbnail to enlarge.'}
-            </div>
-            <p className="text-[11px] text-blue-300/55 mb-3">
-              Auto-kept images are marked included. Logos and decoration are skipped. Anything unclear waits for you.
-            </p>
-            <div className="flex flex-wrap gap-2">
-              {imagePreviews.map((img, i) => (
-                <figure
-                  key={`${img.name}-${i}`}
-                  role={img.src ? 'button' : undefined}
-                  tabIndex={img.src ? 0 : undefined}
-                  onClick={() => openContextImageLightbox(img)}
-                  onKeyDown={(e) => {
-                    if (!img.src) return;
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      openContextImageLightbox(img);
-                    }
-                  }}
-                  className={`rounded-lg overflow-hidden border text-left ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''} ${
-                    img.pending
-                      ? 'border-amber-400/70 bg-amber-950/40'
-                      : img.included
-                      ? 'border-emerald-400/40 bg-slate-900/40'
-                      : ['logo', 'decorative', 'icon', 'stock_photo'].includes(img.kind || img.purpose)
-                        ? 'border-slate-500/50 bg-slate-900/30'
-                        : 'border-amber-400/40 bg-amber-950/30'
-                  }`}
-                  title={img.src ? `Click to enlarge — ${img.pending ? (img.reason || 'Confirm') : img.included ? (img.reason || 'Included') : (img.reason || 'Skipped')}` : (img.reason || 'Skipped')}
-                >
-                  {img.src ? (
-                    <img
-                      src={img.src}
-                      alt={img.name}
-                      className={`block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50 ${img.included || img.pending ? '' : 'opacity-60 grayscale-[35%]'}`}
-                    />
-                  ) : (
-                    <div className="h-20 w-[120px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
-                      {img.kind === 'vector' ? 'Convert failed' : (img.reason || 'Skipped')}
-                    </div>
-                  )}
-                  <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px]">
-                    <div className="truncate">{img.pending ? '? ' : img.included ? '✓ ' : '✗ '}{img.name}</div>
-                    <div className={`truncate ${img.pending ? 'text-amber-300' : img.included ? 'text-emerald-300/90' : 'text-slate-400'}`}>
-                      {purposeLabel(img.purpose || img.kind)}
-                      {img.sourceFormat ? ` · from ${String(img.sourceFormat).toUpperCase()}` : ''}
-                      {img.bytes ? ` · ${(img.bytes / 1024).toFixed(0)}KB` : ''}
-                    </div>
-                    {img.pending && (
-                      <div className="flex gap-1 mt-1">
-                        <button
-                          type="button"
-                          className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100 text-[10px] font-semibold"
-                          onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, true); }}
-                        >
-                          Include
-                        </button>
-                        <button
-                          type="button"
-                          className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 hover:bg-slate-500/70 text-slate-100 text-[10px] font-semibold"
-                          onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, false); }}
-                        >
-                          Skip
-                        </button>
-                      </div>
-                    )}
-                  </figcaption>
-                </figure>
-              ))}
-            </div>
-            {pendingImageCount > 0 && (
-              <div className="flex flex-wrap gap-2 mt-3">
-                <button type="button" onClick={() => applyContextUnsureImageDecision('*', true)} className="px-3 py-1.5 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold">Include all unsure</button>
-                <button type="button" onClick={() => applyContextUnsureImageDecision('*', false)} className="px-3 py-1.5 bg-slate-600/50 hover:bg-slate-500/60 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold">Skip all unsure</button>
-              </div>
-            )}
-          </div>
-        )}
         {files.length === 0 ? (
           <div className="text-xs text-blue-300/50 bg-slate-900/30 border border-dashed border-blue-400/20 rounded-xl p-4">No context files yet for this module.</div>
         ) : (
@@ -9781,6 +9714,13 @@ ${stepInstruction}`;
                   f.visionExtract && { id: 'visionExtract', label: 'From images', value: f.visionExtract },
                 ].filter(Boolean)
                 : [];
+              const fileJob = job?.fileId === f.id ? job : null;
+              const pendingThumbs = fileJob ? imagePreviews.filter((img) => img.pending) : [];
+              const inventory = fileJob
+                ? compactImageInventory(fileJob.included || [], [], fileJob.skipped || [])
+                : (Array.isArray(f.imageInventory) ? f.imageInventory.filter((row) => row.status !== 'pending') : []);
+              const includedN = inventory.filter((r) => r.status === 'included').length;
+              const skippedN = inventory.filter((r) => r.status === 'skipped').length;
               return (
                 <details
                   key={f.id}
@@ -9813,6 +9753,85 @@ ${stepInstruction}`;
                     </div>
                   </summary>
                   <div className="px-4 pb-4 space-y-3 border-t border-blue-400/10 pt-3">
+                    {pendingThumbs.length > 0 && (
+                      <div className="bg-slate-900/40 border border-amber-400/25 rounded-xl p-4">
+                        <div className="text-xs font-semibold text-amber-200 mb-1">
+                          {pendingThumbs.length} image{pendingThumbs.length === 1 ? '' : 's'} might contain strategy or IC context — include or skip.
+                        </div>
+                        <p className="text-[11px] text-blue-300/55 mb-3">
+                          Strategy and IC images are already included. Logos and decoration are skipped.
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          {pendingThumbs.map((img, i) => (
+                            <figure
+                              key={`${img.name}-${i}`}
+                              role={img.src ? 'button' : undefined}
+                              tabIndex={img.src ? 0 : undefined}
+                              onClick={() => openContextImageLightbox(img)}
+                              onKeyDown={(e) => {
+                                if (!img.src) return;
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  openContextImageLightbox(img);
+                                }
+                              }}
+                              className={`rounded-lg overflow-hidden border text-left border-amber-400/70 bg-amber-950/40 ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''}`}
+                              title={img.src ? `Click to enlarge — ${img.reason || 'Confirm'}` : (img.reason || 'Confirm')}
+                            >
+                              {img.src ? (
+                                <img src={img.src} alt={img.name} className="block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50" />
+                              ) : (
+                                <div className="h-20 w-[120px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
+                                  {img.reason || 'Confirm'}
+                                </div>
+                              )}
+                              <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px]">
+                                <div className="truncate">? {img.name}</div>
+                                <div className="truncate text-amber-300">{purposeLabel(img.purpose || img.kind)}</div>
+                                <div className="flex gap-1 mt-1">
+                                  <button
+                                    type="button"
+                                    className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100 text-[10px] font-semibold"
+                                    onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, true); }}
+                                  >
+                                    Include
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 hover:bg-slate-500/70 text-slate-100 text-[10px] font-semibold"
+                                    onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, false); }}
+                                  >
+                                    Skip
+                                  </button>
+                                </div>
+                              </figcaption>
+                            </figure>
+                          ))}
+                        </div>
+                        <div className="flex flex-wrap gap-2 mt-3">
+                          <button type="button" onClick={() => applyContextUnsureImageDecision('*', true)} className="px-3 py-1.5 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold">Include all unsure</button>
+                          <button type="button" onClick={() => applyContextUnsureImageDecision('*', false)} className="px-3 py-1.5 bg-slate-600/50 hover:bg-slate-500/60 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold">Skip all unsure</button>
+                        </div>
+                      </div>
+                    )}
+                    {inventory.length > 0 && (
+                      <details className="bg-slate-950/40 border border-blue-400/10 rounded-xl overflow-hidden">
+                        <summary className="cursor-pointer select-none px-4 py-2 text-[11px] font-semibold text-blue-300/70 hover:bg-slate-800/40">
+                          Images · {includedN} included · {skippedN} skipped
+                        </summary>
+                        <div className="px-4 pb-3 space-y-1">
+                          {inventory.map((row, i) => (
+                            <div key={`${row.name}-${i}`} className="text-[11px] text-blue-200/80 flex gap-2 min-w-0">
+                              <span className={row.status === 'included' ? 'text-emerald-300 shrink-0' : 'text-slate-400 shrink-0'}>
+                                {row.status === 'included' ? '✓' : '✗'}
+                              </span>
+                              <span className="truncate">{row.name}</span>
+                              <span className="text-blue-400/50 truncate">{row.purpose ? purposeLabel(row.purpose) : (row.reason || '')}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
                     {!f.processing && (
                       <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden" open>
                         <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">

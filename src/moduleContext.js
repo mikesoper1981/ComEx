@@ -152,6 +152,24 @@ function normalizeContextFile(raw) {
   if (structuredExtract) rec.structuredExtract = structuredExtract;
   const imageCount = Number(raw.imageCount) || 0;
   if (imageCount > 0) rec.imageCount = imageCount;
+  if (Array.isArray(raw.imageInventory) && raw.imageInventory.length) {
+    rec.imageInventory = raw.imageInventory
+      .slice(0, 80)
+      .map((row) => {
+        if (!row || typeof row !== 'object') return null;
+        const n = usefulString(row.name);
+        if (!n) return null;
+        const status = ['included', 'skipped', 'pending'].includes(row.status) ? row.status : 'skipped';
+        return {
+          name: n,
+          status,
+          ...(usefulString(row.purpose) ? { purpose: usefulString(row.purpose) } : {}),
+          ...(usefulString(row.reason, 200) ? { reason: usefulString(row.reason, 200) } : {}),
+        };
+      })
+      .filter(Boolean);
+    if (!rec.imageInventory.length) delete rec.imageInventory;
+  }
   const intakeMessages = Array.isArray(raw.intakeMessages)
     ? raw.intakeMessages
       .slice(-24)
@@ -255,7 +273,7 @@ export function mergeModuleContextPreferRich(a, b) {
   return out;
 }
 
-/** Disk shape: detected file content + curated blocks. Never intake chat. */
+/** Disk shape: detected file content + curated blocks. Keep unfinished intake so Settings can continue it. */
 export function serializeContextFileForPersist(fileRec) {
   const rec = normalizeContextFile(fileRec);
   if (!rec) return null;
@@ -268,12 +286,14 @@ export function serializeContextFileForPersist(fileRec) {
   if (rec.structuredExtract) out.structuredExtract = rec.structuredExtract;
   if (rec.visionExtract) out.visionExtract = rec.visionExtract;
   if (rec.imageCount) out.imageCount = rec.imageCount;
+  if (rec.imageInventory?.length) out.imageInventory = rec.imageInventory;
   if (rec.capturedContext) out.capturedContext = rec.capturedContext;
   if (rec.notes?.length) out.notes = rec.notes;
   if (rec.columns?.length) out.columns = rec.columns;
   if (rec.intakeComplete) out.intakeComplete = true;
-  else if (rec.extractedText || rec.structuredExtract || rec.visionExtract || rec.capturedContext) {
+  else if (rec.extractedText || rec.structuredExtract || rec.visionExtract || rec.capturedContext || rec.intakeMessages?.length) {
     out.intakeComplete = false;
+    if (rec.intakeMessages?.length) out.intakeMessages = rec.intakeMessages;
   }
   return out;
 }
