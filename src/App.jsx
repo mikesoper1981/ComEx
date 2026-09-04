@@ -5501,6 +5501,7 @@ export default function CommercialExcellenceApp() {
   const pendingModuleContextIntakeRef = useRef(null);
   const [contextIngestJob, setContextIngestJob] = useState(null);
   const contextIngestJobRef = useRef(null);
+  const [contextImagePreviews, setContextImagePreviews] = useState(null); // { fileId, previews } session-only clickable thumbs
   const [activeContextFileId, setActiveContextFileId] = useState(null);
   const [contextIntakeInput, setContextIntakeInput] = useState('');
   const [contextIntakeBusy, setContextIntakeBusy] = useState(false);
@@ -8868,10 +8869,9 @@ ${stepInstruction}`;
     if (!parsed || typeof parsed !== 'object') {
       throw new Error('Could not parse captured facts from the model response.');
     }
-    const questions = (Array.isArray(parsed.suggestedQuestions) ? parsed.suggestedQuestions : [])
-      .map((q) => String(q || '').replace(/\s+/g, ' ').trim())
-      .filter((q) => q.length >= 8 && !isEmptyContextValue(q))
-      .slice(0, 5);
+    const questions = stellaNormalizeIntakeQuestions(
+      parsed.suggestedQuestions != null ? parsed.suggestedQuestions : parsed.questions
+    ).filter((q) => !isEmptyContextValue(q));
     const columnsOut = (Array.isArray(parsed.columns) ? parsed.columns : [])
       .filter((c) => c && !isEmptyContextValue(c.name));
     const summary = isEmptyContextValue(parsed.summary) ? '' : String(parsed.summary).trim();
@@ -9249,7 +9249,54 @@ ${stepInstruction}`;
         postChat(`⚠️ Could not capture facts automatically: ${why}. The raw extract is saved — you can add facts under Incentive Comp context files.`);
       }
     }
-    let questions = Array.isArray(onboarding.suggestedQuestions) ? onboarding.suggestedQuestions.slice(0, 5) : [];
+    let questions = stellaNormalizeIntakeQuestions(onboarding.suggestedQuestions);
+    if (!isThinContextExtract(extractBlob, file.name)) {
+      try {
+        job.onStatus?.('Checking what still needs clarifying…');
+        const facts = (onboarding.key_facts || []).map((f, i) => `${i + 1}. ${f}`).join('\n') || '(none yet)';
+        const probe = await runContextIntakeTurn({
+          extractBlob,
+          moduleLabel: moduleLabelFor(moduleId),
+          intakeMessages: [{
+            role: 'assistant',
+            content: `Facts captured from **${file.name}**:\n${facts}\n\nAsk numbered clarifying questions if anything a later IC specialist could still misread (year, plan/product, audience, currency, a definition). If the extract looks complete, still ask the user to confirm the capture is correct.`,
+          }],
+        });
+        if (!probe.complete && probe.message) {
+          const msg = String(probe.message || '').replace(/\s+/g, ' ').trim();
+          if (msg.length >= 8 && !questions.length) questions = [msg];
+        }
+        if (probe.context_qa && typeof probe.context_qa === 'object') {
+          const qa = probe.context_qa;
+          const mergeLines = (a, b) => {
+            const seen = new Set();
+            const out = [];
+            [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].forEach((item) => {
+              const t = String(item || '').replace(/\s+/g, ' ').trim();
+              if (!t) return;
+              const key = t.toLowerCase();
+              if (seen.has(key)) return;
+              seen.add(key);
+              out.push(t);
+            });
+            return out;
+          };
+          onboarding = {
+            ...onboarding,
+            what_it_represents: qa.what_it_represents || onboarding.what_it_represents,
+            time_period: qa.time_period || onboarding.time_period,
+            key_facts: mergeLines(onboarding.key_facts, qa.key_facts),
+            key_metrics: mergeLines(onboarding.key_metrics, qa.key_metrics),
+            interpretation_notes: qa.interpretation_notes || onboarding.interpretation_notes,
+          };
+        }
+      } catch (err) {
+        console.warn('Context intake probe failed:', err);
+      }
+      if (!questions.length) {
+        questions = ['Please confirm this capture is correct, or tell me what to add or change (time period, plan/product, audience, or any missing fact).'];
+      }
+    }
     const captured = compactCapturedContext({
       what_it_represents: onboarding.what_it_represents,
       time_period: onboarding.time_period,
@@ -9259,9 +9306,6 @@ ${stepInstruction}`;
     });
     const summaryLine = onboarding.summary ? `\n\n${onboarding.summary}` : '';
     const factCount = captured?.key_facts?.length || 0;
-    if (!questions.length && !isThinContextExtract(extractBlob, file.name) && !factCount) {
-      questions = ['What should I treat as the primary context from this file (year, plan/product, audience), or is the extract already complete?'];
-    }
     const assistantMsg = questions.length
       ? `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}\n\nI captured **${factCount}** key fact${factCount === 1 ? '' : 's'}. A few gaps still need you:\n${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n\nYou can answer them together or one at a time.`
       : `✅ Uploaded **${file.name}** for ${moduleLabelFor(moduleId)}.${summaryLine}${factCount ? `\n\nCaptured **${factCount}** key fact${factCount === 1 ? '' : 's'} — review them under Incentive Comp context files.` : ''}`;
@@ -9419,6 +9463,7 @@ ${stepInstruction}`;
       unsure = unsure.filter((i) => i.name !== nameOrAll);
     }
     const next = { ...prev, included, unsure, skipped };
+    setContextImagePreviews({ fileId: prev.fileId, previews: buildProposalImagePreviews(included, unsure, skipped) });
     if (unsure.length) {
       contextIngestJobRef.current = next;
       setContextIngestJob(next);
@@ -9522,12 +9567,20 @@ ${stepInstruction}`;
       };
       const previews = buildProposalImagePreviews(included, unsure, skipped);
       const inventory = compactImageInventory(included, unsure, skipped);
-      if (fromChat && unsure.length) {
+      if (previews.length) setContextImagePreviews({ fileId, previews });
+      const ignoredPurpose = skipped.filter((s) =>
+        ['logo', 'decorative', 'icon', 'stock_photo'].includes(s.kind || s.purpose),
+      );
+      if (fromChat && previews.length) {
         setMessages((prev) => [...prev, {
           role: 'system',
-          content: `🖼️ **${included.length}** strategy/IC image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry strategy or IC context (skip logos and decoration).`,
-          imagePreviews: previews.filter((img) => img.pending),
-          imageReviewPending: true,
+          content: unsure.length
+            ? `🖼️ **${included.length}** strategy/IC image(s) will be extracted. **${unsure.length}** still need a yes/no — include any that carry strategy or IC context (skip logos and decoration).`
+            : included.length
+              ? `🖼️ **${included.length}** strategy/IC image(s) will be read for context${ignoredPurpose.length ? `; ${ignoredPurpose.length} logo/decoration skipped` : ''}.`
+              : `⚠️ **No strategy/IC images** for vision${ignoredPurpose.length ? ` (${ignoredPurpose.length} logo/decorative skipped)` : ''} — click a thumbnail to inspect.`,
+          imagePreviews: previews,
+          imageReviewPending: unsure.length > 0,
         }]);
       }
       if (unsure.length) {
@@ -9540,7 +9593,7 @@ ${stepInstruction}`;
             imageInventory: inventory,
             intakeMessages: [{
               role: 'assistant',
-              content: `🖼️ **${included.length}** strategy/IC image(s) auto-included. **${unsure.length}** need a yes/no — click a thumbnail to enlarge.`,
+              content: `🖼️ **${included.length}** strategy/IC image(s) will be read. **${unsure.length}** need a yes/no — click a thumbnail to enlarge, then include or skip.`,
             }],
           }),
         }));
@@ -9578,6 +9631,7 @@ ${stepInstruction}`;
     const next = removeModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId);
     await persistContextFiles(next);
     if (activeContextFileId === fileId) setActiveContextFileId(null);
+    setContextImagePreviews((prev) => (prev?.fileId === fileId ? null : prev));
   };
 
   const persistContextBlock = async (moduleId, fileId, blockId, nextValue, remove = false) => {
@@ -9715,9 +9769,12 @@ ${stepInstruction}`;
                 ].filter(Boolean)
                 : [];
               const fileJob = job?.fileId === f.id ? job : null;
-              const pendingThumbs = fileJob ? imagePreviews.filter((img) => img.pending) : [];
+              const thumbs = (contextImagePreviews?.fileId === f.id)
+                ? (contextImagePreviews.previews || [])
+                : (fileJob && !fileJob.processing ? imagePreviews : []);
+              const pendingThumbs = thumbs.filter((img) => img.pending);
               const inventory = fileJob
-                ? compactImageInventory(fileJob.included || [], [], fileJob.skipped || [])
+                ? compactImageInventory(fileJob.included || [], fileJob.unsure || [], fileJob.skipped || [])
                 : (Array.isArray(f.imageInventory) ? f.imageInventory.filter((row) => row.status !== 'pending') : []);
               const includedN = inventory.filter((r) => r.status === 'included').length;
               const skippedN = inventory.filter((r) => r.status === 'skipped').length;
@@ -9753,16 +9810,15 @@ ${stepInstruction}`;
                     </div>
                   </summary>
                   <div className="px-4 pb-4 space-y-3 border-t border-blue-400/10 pt-3">
-                    {pendingThumbs.length > 0 && (
-                      <div className="bg-slate-900/40 border border-amber-400/25 rounded-xl p-4">
-                        <div className="text-xs font-semibold text-amber-200 mb-1">
-                          {pendingThumbs.length} image{pendingThumbs.length === 1 ? '' : 's'} might contain strategy or IC context — include or skip.
+                    {thumbs.length > 0 && (
+                      <div className={`rounded-xl p-3 ${pendingThumbs.length ? 'bg-slate-900/40 border border-amber-400/25' : 'bg-slate-950/40 border border-blue-400/10'}`}>
+                        <div className="text-[11px] font-semibold text-blue-200/80 mb-2">
+                          {pendingThumbs.length
+                            ? `${pendingThumbs.length} image${pendingThumbs.length === 1 ? '' : 's'} need a yes/no — include any that carry strategy or IC context, then they will be read.`
+                            : 'Images from this file — click to enlarge.'}
                         </div>
-                        <p className="text-[11px] text-blue-300/55 mb-3">
-                          Strategy and IC images are already included. Logos and decoration are skipped.
-                        </p>
                         <div className="flex flex-wrap gap-2">
-                          {pendingThumbs.map((img, i) => (
+                          {thumbs.map((img, i) => (
                             <figure
                               key={`${img.name}-${i}`}
                               role={img.src ? 'button' : undefined}
@@ -9775,46 +9831,59 @@ ${stepInstruction}`;
                                   openContextImageLightbox(img);
                                 }
                               }}
-                              className={`rounded-lg overflow-hidden border text-left border-amber-400/70 bg-amber-950/40 ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''}`}
-                              title={img.src ? `Click to enlarge — ${img.reason || 'Confirm'}` : (img.reason || 'Confirm')}
+                              className={`rounded-lg overflow-hidden border text-left ${img.src ? 'cursor-zoom-in hover:ring-2 hover:ring-cyan-400/50' : ''} ${
+                                img.pending
+                                  ? 'border-amber-400/70 bg-amber-950/40'
+                                  : img.included
+                                  ? 'border-emerald-400/40 bg-slate-900/40'
+                                  : 'border-slate-500/50 bg-slate-900/30'
+                              }`}
+                              title={img.src ? `Click to enlarge — ${img.pending ? (img.reason || 'Confirm') : img.included ? (img.reason || 'Included') : (img.reason || 'Skipped')}` : (img.reason || '')}
                             >
                               {img.src ? (
-                                <img src={img.src} alt={img.name} className="block h-20 w-auto max-w-[140px] object-contain bg-slate-950/50" />
+                                <img
+                                  src={img.src}
+                                  alt={img.name}
+                                  className={`block h-16 w-auto max-w-[110px] object-contain bg-slate-950/50 ${img.included || img.pending ? '' : 'opacity-60 grayscale-[35%]'}`}
+                                />
                               ) : (
-                                <div className="h-20 w-[120px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
-                                  {img.reason || 'Confirm'}
+                                <div className="h-16 w-[100px] flex items-center justify-center px-2 text-[10px] text-amber-200/90 text-center leading-snug">
+                                  {img.reason || img.name}
                                 </div>
                               )}
-                              <figcaption className="px-1.5 py-1 text-[10px] leading-tight text-slate-300 max-w-[140px]">
-                                <div className="truncate">? {img.name}</div>
-                                <div className="truncate text-amber-300">{purposeLabel(img.purpose || img.kind)}</div>
-                                <div className="flex gap-1 mt-1">
-                                  <button
-                                    type="button"
-                                    className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100 text-[10px] font-semibold"
-                                    onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, true); }}
-                                  >
-                                    Include
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 hover:bg-slate-500/70 text-slate-100 text-[10px] font-semibold"
-                                    onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, false); }}
-                                  >
-                                    Skip
-                                  </button>
-                                </div>
+                              <figcaption className="px-1 py-1 text-[10px] leading-tight text-slate-300 max-w-[110px]">
+                                <div className="truncate">{img.pending ? '? ' : img.included ? '✓ ' : '✗ '}{img.name}</div>
+                                {img.pending && (
+                                  <div className="flex gap-1 mt-1">
+                                    <button
+                                      type="button"
+                                      className="flex-1 px-1 py-0.5 rounded bg-emerald-500/30 hover:bg-emerald-500/50 text-emerald-100 text-[10px] font-semibold"
+                                      onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, true); }}
+                                    >
+                                      Include
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="flex-1 px-1 py-0.5 rounded bg-slate-600/60 hover:bg-slate-500/70 text-slate-100 text-[10px] font-semibold"
+                                      onClick={(e) => { e.stopPropagation(); applyContextUnsureImageDecision(img.name, false); }}
+                                    >
+                                      Skip
+                                    </button>
+                                  </div>
+                                )}
                               </figcaption>
                             </figure>
                           ))}
                         </div>
-                        <div className="flex flex-wrap gap-2 mt-3">
-                          <button type="button" onClick={() => applyContextUnsureImageDecision('*', true)} className="px-3 py-1.5 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold">Include all unsure</button>
-                          <button type="button" onClick={() => applyContextUnsureImageDecision('*', false)} className="px-3 py-1.5 bg-slate-600/50 hover:bg-slate-500/60 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold">Skip all unsure</button>
-                        </div>
+                        {pendingThumbs.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mt-3">
+                            <button type="button" onClick={() => applyContextUnsureImageDecision('*', true)} className="px-3 py-1.5 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/40 rounded-lg text-xs text-emerald-100 font-semibold">Include all unsure</button>
+                            <button type="button" onClick={() => applyContextUnsureImageDecision('*', false)} className="px-3 py-1.5 bg-slate-600/50 hover:bg-slate-500/60 border border-slate-400/30 rounded-lg text-xs text-slate-100 font-semibold">Skip all unsure</button>
+                          </div>
+                        )}
                       </div>
                     )}
-                    {inventory.length > 0 && (
+                    {thumbs.length === 0 && inventory.length > 0 && (
                       <details className="bg-slate-950/40 border border-blue-400/10 rounded-xl overflow-hidden">
                         <summary className="cursor-pointer select-none px-4 py-2 text-[11px] font-semibold text-blue-300/70 hover:bg-slate-800/40">
                           Images · {includedN} included · {skippedN} skipped
@@ -9831,6 +9900,45 @@ ${stepInstruction}`;
                           ))}
                         </div>
                       </details>
+                    )}
+                    {f.processing && (f.intakeMessages || []).length > 0 && (
+                      <div className="text-[11px] text-amber-200/90 bg-amber-500/10 border border-amber-400/20 rounded-lg px-3 py-2">
+                        {(f.intakeMessages[f.intakeMessages.length - 1] || {}).content}
+                      </div>
+                    )}
+                    {!f.processing && !f.intakeComplete && (
+                      <div className="space-y-2 bg-amber-500/10 border border-amber-400/25 rounded-xl p-3">
+                        <div className="text-[11px] font-semibold text-amber-200">Clarifying questions — answer here to store context</div>
+                        {(f.intakeMessages || []).length > 0 && (
+                          <div className="max-h-[220px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
+                            {(f.intakeMessages || []).map((m, i) => (
+                              <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                                  <span className="whitespace-pre-wrap break-words">{m.content}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex gap-2">
+                          <textarea
+                            value={active?.id === f.id ? contextIntakeInput : ''}
+                            onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeInput(e.target.value); }}
+                            onFocus={() => setActiveContextFileId(f.id)}
+                            placeholder="Answer the intake questions…"
+                            rows={2}
+                            className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
+                          />
+                          <button
+                            type="button"
+                            disabled={!contextIntakeInput.trim() || contextIntakeBusy || active?.id !== f.id}
+                            onClick={() => continueModuleContextIntake(moduleId, f.id, contextIntakeInput.trim())}
+                            className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
+                          >
+                            <Send className="w-3.5 h-3.5" /> Send
+                          </button>
+                        </div>
+                      </div>
                     )}
                     {!f.processing && (
                       <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden" open>
@@ -9887,37 +9995,24 @@ ${stepInstruction}`;
                         ))}
                       </div>
                     )}
-                    {!f.processing && (
-                      <div className="space-y-2">
-                        {!f.intakeComplete && (f.intakeMessages || []).length > 0 && (
-                          <div className="max-h-[180px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
-                            {(f.intakeMessages || []).map((m, i) => (
-                              <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                                  <span className="whitespace-pre-wrap break-words">{m.content}</span>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        <div className="flex gap-2">
-                          <textarea
-                            value={active?.id === f.id ? contextIntakeInput : ''}
-                            onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeInput(e.target.value); }}
-                            onFocus={() => setActiveContextFileId(f.id)}
-                            placeholder={f.intakeComplete ? 'Add a comment for this file…' : 'Answer the intake questions…'}
-                            rows={2}
-                            className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
-                          />
-                          <button
-                            type="button"
-                            disabled={!contextIntakeInput.trim() || contextIntakeBusy || active?.id !== f.id}
-                            onClick={() => continueModuleContextIntake(moduleId, f.id, contextIntakeInput.trim())}
-                            className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
-                          >
-                            <Send className="w-3.5 h-3.5" /> {f.intakeComplete ? 'Add' : 'Send'}
-                          </button>
-                        </div>
+                    {!f.processing && f.intakeComplete && (
+                      <div className="flex gap-2">
+                        <textarea
+                          value={active?.id === f.id ? contextIntakeInput : ''}
+                          onChange={(e) => { setActiveContextFileId(f.id); setContextIntakeInput(e.target.value); }}
+                          onFocus={() => setActiveContextFileId(f.id)}
+                          placeholder="Add a comment for this file…"
+                          rows={2}
+                          className="flex-1 bg-slate-800/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-xs outline-none focus:border-blue-400 resize-none"
+                        />
+                        <button
+                          type="button"
+                          disabled={!contextIntakeInput.trim() || contextIntakeBusy || active?.id !== f.id}
+                          onClick={() => continueModuleContextIntake(moduleId, f.id, contextIntakeInput.trim())}
+                          className="px-3 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center gap-1"
+                        >
+                          <Send className="w-3.5 h-3.5" /> Add
+                        </button>
                       </div>
                     )}
                     {sourceBlocks.length > 0 && (
@@ -9981,6 +10076,9 @@ ${stepInstruction}`;
     }
 
     const next = { ...prev, included, unsure, skipped };
+    if (prev.ingestKind === 'moduleContext') {
+      setContextImagePreviews({ fileId: prev.fileId, previews: buildProposalImagePreviews(included, unsure, skipped) });
+    }
     if (unsure.length) {
       pendingImageReviewRef.current = next;
       setPendingImageReview(next);

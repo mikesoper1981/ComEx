@@ -185,7 +185,7 @@ Rules:
 - Pull facts that are IN the file. Do not write a slide-by-slide narrative or a marketing summary.
 - Each key_facts item is one discrete fact (≤25 words). Prefer 4–20 facts. Skip logos, decoration, and empty slides.
 - Never invent numbers or names. If unreadable, omit rather than guess.
-- If something is still unclear after the extract (year, plan/product, audience, currency, a definition, whose numbers), put 1–5 numbered clarifying questions in suggestedQuestions — same idea as Assess IC. If the extract is already clear, [].
+- Always put 1–3 clarifying questions in suggestedQuestions (year, plan/product, audience, currency, a definition, or “is this capture complete?”). Only use [] when the file is empty or unreadable.
 - Empty fields must be empty / []. Never write n/a, unknown, or "the file contained no text".
 {{moduleLabel}} is only the storage place — not a topic to ask about.`,
   contextIntakePrompt: `You onboard ONE uploaded file, the same way Assess IC clarifies a proposal before storing it.
