@@ -379,6 +379,7 @@ export function groupTerritoryShapes(points) {
         geos: [],
         coords: [],
         polygons: [],
+        linked: [],
       };
       byKey.set(key, g);
     }
@@ -389,6 +390,16 @@ export function groupTerritoryShapes(points) {
     if (Number.isFinite(lat) && Number.isFinite(lng)) g.coords.push([lat, lng]);
     const geom = capGeoJson(typeof p.geojson === 'string' ? (() => { try { return JSON.parse(p.geojson); } catch { return null; } })() : p.geojson);
     if (geom && !geometryTooLarge(geom)) g.polygons.push(geom);
+    for (const item of Array.isArray(p.linked) ? p.linked : []) {
+      const file = String(item.file || item.related_file || '').trim();
+      if (!file) continue;
+      let row = g.linked.find((x) => x.file === file);
+      if (!row) {
+        row = { file, n: 0 };
+        g.linked.push(row);
+      }
+      row.n += Number(item.n) || 0;
+    }
   }
   return [...byKey.values()].map((g) => {
     const colours = hashTerritoryColour(g.territory);
@@ -402,6 +413,7 @@ export function groupTerritoryShapes(points) {
       team: g.team,
       count: g.count,
       geos: g.geos,
+      linked: g.linked.filter((x) => x.n > 0),
       colour: colours.colour,
       border: colours.border,
       hull: hull.length >= 2 ? hull : [],
@@ -457,6 +469,18 @@ export function formatTerritoryAssessContext({ file, team, territory, points = [
   const geos = [...new Set(rows.map((p) => p.geo).filter(Boolean))];
   const count = rows.reduce((n, p) => n + (Number(p.count) || 0), 0);
   const allTerritories = [...new Set((points || []).map((p) => p.territory).filter(Boolean))];
+  const joins = Array.isArray(file?.capturedContext?.relationships)
+    ? file.capturedContext.relationships.filter((r) => r && r.this_field && r.related_field)
+    : [];
+  const linked = [];
+  for (const p of rows) {
+    for (const item of Array.isArray(p.linked) ? p.linked : []) {
+      if (!item?.file || !item.n) continue;
+      const prev = linked.find((x) => x.file === item.file);
+      if (prev) prev.n += Number(item.n) || 0;
+      else linked.push({ file: item.file, n: Number(item.n) || 0 });
+    }
+  }
   return [
     `TERRITORY ASSESSMENT — FOCUS: ${territory?.territory || territory?.id || 'selected'}`,
     `File: ${file?.name || ''}`,
@@ -464,6 +488,10 @@ export function formatTerritoryAssessContext({ file, team, territory, points = [
     `Rows in focus: ${count}`,
     geos.length ? `Geo keys: ${geos.slice(0, 40).join(', ')}${geos.length > 40 ? '…' : ''}` : '',
     `Territories in view (${allTerritories.length}): ${allTerritories.slice(0, 40).join(', ')}`,
+    joins.length
+      ? `Confirmed joins:\n${joins.map((r) => `- ${r.this_field} = ${r.related_file || r.related_table}.${r.related_field}${r.link_type ? ` (${r.link_type})` : ''}`).join('\n')}`
+      : '',
+    linked.length ? `Joined activity in focus:\n${linked.map((l) => `- ${l.file}: ${l.n} rows`).join('\n')}` : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -530,7 +558,10 @@ export function buildTerritoryPointsMapHTML(points, selectedId) {
       const popup = '<div class="popup-title">' + esc(s.territory) + '</div>' +
         (s.team ? '<div class="popup-rep">Team: ' + esc(s.team) + '</div>' : '') +
         (s.geos && s.geos.length ? '<div class="popup-rep">' + esc(s.geos.slice(0, 8).join(', ')) + (s.geos.length > 8 ? '…' : '') + '</div>' : '') +
-        '<div class="popup-rep">Rows: ' + s.count + '</div>';
+        '<div class="popup-rep">Rows: ' + s.count + '</div>' +
+        (s.linked && s.linked.length
+          ? s.linked.map((l) => '<div class="popup-rep">Linked ' + esc(l.file) + ': ' + l.n + ' rows</div>').join('')
+          : '');
       const onClick = () => {
         window.parent.postMessage({ type: 'territory-select', id: s.id, territory: s.territory }, '*');
       };

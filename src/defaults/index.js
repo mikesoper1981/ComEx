@@ -19,6 +19,12 @@ import {
   DEFAULT_WORKFLOW_RUNTIME,
   DEFAULT_STELLA_PROMPTS,
 } from './runtimePrompts';
+import {
+  composeFileIntakePrompt,
+  looksLikeFullIntakePrompt,
+  TERRITORY_MAP_INTAKE_RULES,
+  FILE_INTAKE_GOALS,
+} from './fileIntake';
 
 export {
   DEFAULT_SYSTEM_PROMPT,
@@ -34,6 +40,10 @@ export {
   DEFAULT_SUGGESTIONS,
   DEFAULT_WORKFLOW_RUNTIME,
   DEFAULT_STELLA_PROMPTS,
+  composeFileIntakePrompt,
+  looksLikeFullIntakePrompt,
+  TERRITORY_MAP_INTAKE_RULES,
+  FILE_INTAKE_GOALS,
   WORKFLOW_BUILDER_WELCOME,
   WORKFLOW_BUILDER_WELCOME_AGENT,
   WORKFLOW_BUILDER_WELCOME_EDIT,
@@ -359,41 +369,37 @@ export function mergeWorkflowRuntime(partial) {
     out.proposalImageInterpretPrompt = DEFAULT_WORKFLOW_RUNTIME.proposalImageInterpretPrompt;
   }
   const contextSummary = String(out.contextContentSummaryPrompt || '');
-  const contextIntake = String(out.contextIntakePrompt || '');
   if (contextSummary.includes('simple team list')
     || contextSummary.includes('incentive design, payouts')
     || contextSummary.includes('2-4 sentences describing')
     || contextSummary.includes('suggestedQuestions only for a gap that would block')
     || contextSummary.includes('Always put 1–3 clarifying questions')
     || contextSummary.includes('year, plan/product, audience, currency')
-    || contextIntake.includes('which plan/product, audience')
-    || contextIntake.includes('Never set complete=true')
     || !/key_facts/i.test(contextSummary)
-    || !/Never ask IC design/i.test(contextIntake)
-    || !/harvest facts from this file/i.test(contextIntake)
-    || !/incentive schemes/i.test(contextIntake)
-    || !/key_facts/i.test(contextIntake)
-    || !/FIRST TURN/i.test(contextIntake)
-    || !/Never put JSON/i.test(contextIntake)
-    || !/one-line confirmation that the file is now added/i.test(contextIntake)
-    || !/standalone sentence/i.test(contextIntake)
-    || !/will NOT see the slide/i.test(contextIntake)
-    || !/going-forward channel mix/i.test(contextIntake)
-    || !/actual names, numbers, weights/i.test(contextSummary)
-    || !/Omit or leave empty any field with no real answer/i.test(contextIntake)) {
+    || !/actual names, numbers, weights/i.test(contextSummary)) {
     out.contextContentSummaryPrompt = DEFAULT_WORKFLOW_RUNTIME.contextContentSummaryPrompt;
-    out.contextIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.contextIntakePrompt;
   }
   const contextClassify = String(out.contextImageClassifyPrompt || '');
   if (!/AUTO-INCLUDE/i.test(contextClassify) || !/strategy or IC/i.test(contextClassify)) {
     out.contextImageClassifyPrompt = DEFAULT_WORKFLOW_RUNTIME.contextImageClassifyPrompt;
   }
-  if (!/EXCEL TABS/i.test(String(out.territoryIntakePrompt || ''))
-    || !/sheet_name/i.test(String(out.territoryIntakePrompt || ''))
-    || !/team_name/i.test(String(out.territoryIntakePrompt || ''))
-    || !/Postcode Area/i.test(String(out.territoryIntakePrompt || ''))) {
-    out.territoryIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.territoryIntakePrompt;
+  if (!/\{\{goal\}\}/.test(String(out.fileIntakePrompt || ''))) {
+    out.fileIntakePrompt = DEFAULT_WORKFLOW_RUNTIME.fileIntakePrompt;
   }
+  for (const key of ['intakeGoalIncentives', 'intakeGoalTerritory', 'intakeGoalStella']) {
+    if (looksLikeFullIntakePrompt(out[key]) || !String(out[key] || '').trim()) {
+      out[key] = DEFAULT_WORKFLOW_RUNTIME[key];
+    }
+  }
+  out.contextIntakePrompt = composeFileIntakePrompt('incentives', {
+    runtime: out,
+    moduleLabel: 'Incentive Comp',
+  });
+  out.territoryIntakePrompt = composeFileIntakePrompt('territory', {
+    runtime: out,
+    moduleLabel: 'Territory Design',
+    extraRules: TERRITORY_MAP_INTAKE_RULES,
+  });
   return out;
 }
 
@@ -409,22 +415,12 @@ export function mergeStellaPrompts(partial) {
         || /units, time period, definitions, or caveats/i.test(out.contentSummary)
         || /meaning and INTENT/i.test(out.contentSummary)
         || /Ask only about file structure/i.test(out.contentSummary)
+        || /Do NOT ask about linking this file to other hub modules/i.test(out.contentSummary)
         || !/Prefer an empty list over padding/i.test(out.contentSummary)
         || !/Never use a fixed list of must-ask questions/i.test(out.contentSummary))) {
     out.contentSummary = DEFAULT_STELLA_PROMPTS.contentSummary;
   }
-  if (/You are the Stella Insights data intake agent/i.test(out.intake)
-      && (/key metrics \/ important fields/i.test(out.intake)
-        || /how the data should be interpreted/i.test(out.intake)
-        || /Concentrate only on/i.test(out.intake)
-        || !/name_maps/i.test(out.intake)
-        || !/sample VALUES overlap/i.test(out.intake)
-        || !/incentive schemes, quotas, payouts/i.test(out.intake)
-        || !/Never join measures/i.test(out.intake)
-        || !/Typical gaps \(guidance only/i.test(out.intake)
-        || !/self-contained "fact"/i.test(out.intake)
-        || !/Never put JSON/i.test(out.intake)
-        || !/drops the file's actual values/i.test(out.intake))) {
+  if (looksLikeFullIntakePrompt(out.intake)) {
     out.intake = DEFAULT_STELLA_PROMPTS.intake;
   }
   if (/Use ## headers, bullet points, concise explanations/i.test(out.analyst)

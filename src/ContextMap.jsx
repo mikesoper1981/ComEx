@@ -1093,20 +1093,40 @@ export default function ContextMap({
     const accountFields = filledAccountFields(userSettings);
     const generalMemory = memoryFor(userSettings, '');
     const stellaFiles = (stellaDataFiles || []).filter((f) => f && !f.processing);
-    const joins = stellaJoinEdges(stellaFiles);
+    const territoryFiles = (userSettings?.moduleContext?.territory?.files || []).filter((f) => f && !f.processing);
+    const incentiveFiles = (userSettings?.moduleContext?.incentives?.files || []).filter((f) => f && !f.processing);
+    const hubJoinFiles = [
+      ...stellaFiles,
+      ...territoryFiles,
+      ...incentiveFiles.filter((f) => f.tableName),
+    ];
+    const hubJoins = stellaJoinEdges(hubJoinFiles);
     const name = String(userName || '').trim() || 'You';
     const company = String(companyName || '').trim();
     const modules = catalog.map((mod) => {
       const files = (userSettings?.moduleContext?.[mod.id]?.files || []).filter((f) => f && !f.processing);
       const linked = connectedModuleIds(connections, mod.id);
+      const ownIds = new Set(files.map((f) => f.id));
+      if (mod.dataFiles) stellaFiles.forEach((f) => ownIds.add(f.id));
+      const joins = hubJoins.filter((j) => ownIds.has(j.fromId) || ownIds.has(j.toId));
+      const partnerIds = new Set();
+      for (const j of joins) {
+        if (!ownIds.has(j.fromId)) partnerIds.add(j.fromId);
+        if (!ownIds.has(j.toId)) partnerIds.add(j.toId);
+      }
+      const partners = hubJoinFiles.filter((f) => partnerIds.has(f.id)).map((f) => (
+        f.tableName && String(f.tableName).startsWith('stella_data_')
+          ? stellaFileSummary(f)
+          : contextFileSummary(f)
+      ));
       return {
         ...mod,
         files: files.map(contextFileSummary),
         memory: memoryFor(userSettings, mod.id),
         linked,
         goals: mod.goalsKey ? String(userSettings?.stellaBusinessContext?.[mod.goalsKey] || '').trim() : '',
-        stellaFiles: mod.dataFiles ? stellaFiles.map(stellaFileSummary) : [],
-        joins: mod.dataFiles ? joins : [],
+        stellaFiles: mod.dataFiles ? stellaFiles.map(stellaFileSummary) : partners,
+        joins,
       };
     });
     return {

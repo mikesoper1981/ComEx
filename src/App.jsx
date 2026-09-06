@@ -88,6 +88,8 @@ import {
   mergeKnowledgeAccess,
   knowledgeFileFlags,
   filterKnowledgeDocuments,
+  composeFileIntakePrompt,
+  TERRITORY_MAP_INTAKE_RULES,
   WORKFLOW_BUILDER_WELCOME,
   WORKFLOW_BUILDER_WELCOME_EDIT,
   buildWorkflowBuilderCatalog,
@@ -1627,6 +1629,24 @@ function isModuleContextCaptured(file) {
   return !intakeMessageLooksLikeAsk(last.content);
 }
 
+function isTerritoryMapFile(file) {
+  if (!file) return false;
+  if (file.mapLayout) return true;
+  if (Array.isArray(file.sheets) && file.sheets.length) return true;
+  return /^territory_data_/.test(String(file.tableName || ''));
+}
+
+function capturedJoinPointsAtFile(rel, file) {
+  if (!rel || !file) return false;
+  const name = String(file.name || '').toLowerCase();
+  const table = String(file.tableName || '').toLowerCase();
+  const rf = String(rel.related_file || '').toLowerCase();
+  const rt = String(rel.related_table || '').toLowerCase();
+  if (table && rt && rt === table) return true;
+  if (name && rf && rf === name) return true;
+  return false;
+}
+
 function pickStellaIntakeQuestions(onboarding) {
   const raw = onboarding && typeof onboarding === 'object' ? onboarding : {};
   return stellaNormalizeIntakeQuestions(
@@ -2406,7 +2426,9 @@ function stellaFilterJoinRels(rels, thisFile, otherFiles) {
 }
 
 function stellaGuessJoinCandidates(thisFile, otherFiles) {
-  const others = (otherFiles || []).filter((f) => f && f.id !== thisFile?.id && f.tableName);
+  const others = (otherFiles || []).filter((f) => (
+    f && f.id !== thisFile?.id && (f.tableName || (Array.isArray(f.columns) && f.columns.length))
+  ));
   const dimByFamily = new Map();
   for (const f of others) {
     const role = stellaFileJoinRole(f);
@@ -2503,8 +2525,43 @@ function stellaGuessJoinCandidates(thisFile, otherFiles) {
   return out;
 }
 
+function hubJoinQuestion(candidates, otherFiles, homeLabel = 'this workspace') {
+  return stellaJoinQuestion(candidates, otherFiles)
+    .replace(/Stella uses these/g, `${homeLabel} uses these`)
+    .replace(/Stella can still/g, `${homeLabel} can still`)
+    .replace(/Stella will link/g, `${homeLabel} will link`);
+}
+
+const HUB_SQL_IDENT = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const HUB_DATA_TABLE = /^(stella_data_|territory_data_)[a-z0-9_]+$/;
+
+function lookupJoinCount(byKey, values) {
+  const map = new Map(Object.entries(byKey || {}).map(([k, v]) => [String(k).trim().toLowerCase(), Number(v) || 0]));
+  let n = 0;
+  const seen = new Set();
+  for (const v of values) {
+    const k = String(v || '').trim().toLowerCase();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    n += map.get(k) || 0;
+  }
+  return n;
+}
+
+function attachLinkedCountsToPoints(points, joinStats) {
+  return (points || []).map((p) => {
+    const values = [p.territory, p.geo, p.team].filter(Boolean);
+    const linked = [];
+    for (const js of joinStats || []) {
+      const n = lookupJoinCount(js.byKey, values);
+      if (n > 0) linked.push({ file: js.related_file || js.related_table, n });
+    }
+    return linked.length ? { ...p, linked } : p;
+  });
+}
+
 function stellaJoinQuestion(candidates, otherFiles) {
-  const others = (otherFiles || []).filter((f) => f?.tableName);
+  const others = (otherFiles || []).filter((f) => f?.tableName || (Array.isArray(f.columns) && f.columns.length));
   if (!others.length) return '';
   if (candidates.length) {
     // Separate structural links (master list ↔ transactions) from comparison links (transactions ↔ transactions)
@@ -2565,7 +2622,7 @@ function stellaLooksLikeJoinAccept(text) {
 function stellaIntakeAskedJoin(messages) {
   return (messages || []).some((m) => (
     m?.role === 'assistant'
-    && /\b(join|joined|share an id, territory|correct keys|should not be joined)\b/i.test(String(m.content || ''))
+    && /\b(join|joined|structural links|comparison links|share an id, territory|correct keys|should not be joined|are these links correct)\b/i.test(String(m.content || ''))
   ));
 }
 
@@ -2676,6 +2733,42 @@ function stellaNormalizeStoredRelationships(raw, thisFile, otherFiles) {
       link_type: r.link_type || r.linkType || (other ? stellaJoinLinkType(thisFile, other) : 'comparison'),
     };
   }).filter(Boolean));
+}
+
+function resolveIntakeJoins({ modelRels, lastUserText, file, partners, candidates, priorRels }) {
+  const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
+  const acceptedJoin = stellaLooksLikeJoinAccept(lastUserText);
+  let rels = (partners || []).length
+    ? stellaNormalizeStoredRelationships(modelRels, file, partners)
+    : [];
+  if (declinedJoin) rels = [];
+  else if ((candidates || []).length && acceptedJoin) {
+    const strong = candidates.filter((c) => c.score >= 70);
+    rels = stellaDedupeRelationships([
+      ...rels,
+      ...stellaNormalizeStoredRelationships(strong, file, partners),
+    ]);
+  }
+  const prior = stellaNormalizeStoredRelationships(priorRels, file, partners);
+  if (prior.length && !declinedJoin) rels = stellaDedupeRelationships([...prior, ...rels]);
+  const filteredJoins = (partners || []).length
+    ? stellaFilterJoinRels(rels, file, partners)
+    : { keep: rels, dropped: [] };
+  rels = declinedJoin ? [] : filteredJoins.keep;
+  return { rels, declinedJoin, acceptedJoin, filteredJoins };
+}
+
+function formatIntakeJoinFollowup(message, { complete, tableName, rels, dropped, declinedJoin }) {
+  let out = String(message || '');
+  if (complete && !declinedJoin && (rels || []).length && !/\bstored join/i.test(out)) {
+    const joinLines = rels.map((r) => `- ${tableName}.${r.this_field} = ${r.related_table || r.related_file}.${r.related_field}${r.related_file ? ` (${r.related_file})` : ''}`);
+    out = `${out}\n\nStored joins for queries:\n${joinLines.join('\n')}`;
+  }
+  if (!declinedJoin && (dropped || []).length) {
+    const lines = dropped.map((d) => `- ${d.r.this_field} ↔ ${d.r.related_field || d.r.related_file}: ${d.why}`);
+    out = `${out}\n\nI did not store these joins because they do not look like matching keys:\n${lines.join('\n')}`;
+  }
+  return out;
 }
 
 function stellaFormatConfirmedJoins(files) {
@@ -5102,7 +5195,7 @@ function TerritoryMap({ points, selectedTerritory, onSelectTerritory }) {
   const selectedId = selectedTerritory?.id || selectedTerritory?.territory || null;
 
   useEffect(() => {
-    const sig = (points || []).map((p) => `${p.id}:${Number(p.lat)}:${Number(p.lng)}`).join('|');
+    const sig = (points || []).map((p) => `${p.id}:${Number(p.lat)}:${Number(p.lng)}:${(p.linked || []).map((l) => `${l.file}:${l.n}`).join(',')}`).join('|');
     setIframeKey((k) => k + 1);
     void sig;
   }, [points]);
@@ -5117,8 +5210,14 @@ function TerritoryMap({ points, selectedTerritory, onSelectTerritory }) {
         if (p.territory !== hit.territory && p.id !== hit.id) return acc;
         acc.count += Number(p.count) || 0;
         if (p.geo && !acc.geos.includes(p.geo)) acc.geos.push(p.geo);
+        for (const item of Array.isArray(p.linked) ? p.linked : []) {
+          if (!item?.file) continue;
+          const row = acc.linked.find((x) => x.file === item.file);
+          if (row) row.n += Number(item.n) || 0;
+          else acc.linked.push({ file: item.file, n: Number(item.n) || 0 });
+        }
         return acc;
-      }, { id: hit.territory || hit.id, territory: hit.territory, team: hit.team, count: 0, geos: [] });
+      }, { id: hit.territory || hit.id, territory: hit.territory, team: hit.team, count: 0, geos: [], linked: [] });
       onSelectTerritory(same ? null : groupedHit);
     };
     window.addEventListener('message', handler);
@@ -5559,6 +5658,7 @@ export default function CommercialExcellenceApp() {
   const [territoryMapError, setTerritoryMapError] = useState('');
   const [territoryIntakeInput, setTerritoryIntakeInput] = useState('');
   const [territoryIntakeBusy, setTerritoryIntakeBusy] = useState(false);
+  const [territoryIntakeMinimized, setTerritoryIntakeMinimized] = useState(false);
   const [activityLog, setActivityLog] = useState([]);
   const [showActivityLog, setShowActivityLog] = useState(false);
   const [adminSection, setAdminSection] = useState('knowledge');
@@ -8766,38 +8866,103 @@ ${stepInstruction}`;
     return { kind, fileType: label, extractedText, structuredText, included, unsure, skipped, imageNotes };
   };
 
-  const runContextIntakeTurn = async ({ extractBlob, moduleLabel: label, intakeMessages, fileName }) => {
+  const runContextIntakeTurn = async ({ extractBlob, moduleId = 'incentives', moduleLabel: label, intakeMessages, fileName, fileRec = null }) => {
+    const rec = fileRec || { name: fileName, columns: [] };
+    const canJoin = !!(rec.tableName || (Array.isArray(rec.columns) && rec.columns.length));
+    let joinPartners = [];
+    let joinCandidates = [];
+    if (canJoin && rec.id) {
+      joinPartners = hubJoinPartnerFiles(moduleId, rec.id);
+      if (joinPartners.length) {
+        try {
+          await stellaHydrateColumnValueProfiles(
+            joinPartners.filter((f) => HUB_DATA_TABLE.test(String(f.tableName || ''))),
+          );
+        } catch { /* preview samples still help */ }
+        joinPartners = hubJoinPartnerFiles(moduleId, rec.id);
+        joinCandidates = stellaGuessJoinCandidates(
+          withPreviewJoinSamples({ ...rec, hubModule: moduleId }),
+          joinPartners,
+        );
+      }
+    }
+    const relationshipGuidance = joinPartners.length
+      ? stellaRelationshipIntakeHint(withPreviewJoinSamples({ ...rec, hubModule: moduleId }), joinPartners)
+      : '';
     const rt = getWorkflowRuntime();
-    const system = fillTemplate(rt.contextIntakePrompt, { moduleLabel: label });
+    const intakeModule = moduleId === 'territory' || moduleId === 'stella' ? moduleId : 'incentives';
+    const system = composeFileIntakePrompt(intakeModule, {
+      runtime: rt,
+      moduleLabel: label,
+      goalOverride: intakeModule === 'stella' ? getStellaPrompts().intake : '',
+      relationshipGuidance,
+    });
+    const colsBlob = (rec.columns || []).map((c) => `- ${c.name}${c.type ? ` [${c.type}]` : ''}`).join('\n');
     const convo = [
-      { role: 'user', content: `THIS FILE ONLY (do not ask about anything else):\n${String(extractBlob || '').slice(0, 16000)}` },
+      { role: 'user', content: `THIS FILE ONLY (do not ask about anything else):\n${String(extractBlob || '').slice(0, 16000)}${colsBlob ? `\n\nCOLUMNS:\n${colsBlob}` : ''}` },
       ...(intakeMessages || []).map((m) => ({ role: toAnthropicRole(m.role), content: m.content })),
     ];
     let parsed = {};
-    let raw = '';
     try {
-      raw = await callAnthropic(system, convo, 900);
+      const raw = await callAnthropic(system, convo, joinPartners.length ? 1600 : 900);
       parsed = extractJsonObject(raw) || {};
     } catch { /* fall through */ }
     const hasUserReply = (intakeMessages || []).some((m) => m.role === 'user');
     let complete = !!parsed.complete;
     const context_qa = pickIntakeContextQa(parsed);
     let message = stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(parsed.message));
+    const lastUserText = [...(intakeMessages || [])].reverse().find((m) => m.role === 'user')?.content || '';
+    const { rels, declinedJoin, filteredJoins } = resolveIntakeJoins({
+      modelRels: (context_qa && context_qa.relationships) || [],
+      lastUserText,
+      file: withPreviewJoinSamples({ ...rec, hubModule: moduleId }),
+      partners: joinPartners,
+      candidates: joinCandidates,
+      priorRels: rec.capturedContext?.relationships,
+    });
+    const joinAskCount = (intakeMessages || []).filter((m) => (
+      m?.role === 'assistant'
+      && /\b(join|joined|structural links|comparison links|are these links correct|should not be joined)\b/i.test(String(m.content || ''))
+    )).length;
+    let forceJoinQuestion = false;
+    if (hasUserReply && joinPartners.length && !rels.length && !declinedJoin && joinAskCount < 2) {
+      if (complete || !stellaIntakeAskedJoin(intakeMessages)) {
+        complete = false;
+        forceJoinQuestion = true;
+      }
+    }
     if (!hasUserReply) {
       complete = false;
       if (!intakeMessageLooksLikeAsk(message) || String(message || '').replace(/\s+/g, ' ').trim().length < 12) {
         message = CONTEXT_FILE_CONFIRM_QUESTION;
       }
+    } else if (forceJoinQuestion) {
+      complete = false;
+      message = hubJoinQuestion(joinCandidates, joinPartners, label)
+        || `This ${label} workspace is linked to other modules. Does this file share territory, rep, account, or product IDs with those files, or should it stay independent?`;
     } else if (!intakeMessageLooksLikeAsk(message) || complete) {
       complete = true;
       message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(fileName, label);
     } else if (!message) {
       message = 'Is anything in this file still unclear?';
     }
+    message = formatIntakeJoinFollowup(message, {
+      complete: complete && !forceJoinQuestion,
+      tableName: rec.tableName || rec.name,
+      rels,
+      dropped: filteredJoins.dropped,
+      declinedJoin,
+    });
+    const qaOut = context_qa && typeof context_qa === 'object'
+      ? { ...context_qa, relationships: declinedJoin ? [] : (rels.length ? rels : (context_qa.relationships || rec.capturedContext?.relationships || [])) }
+      : (rels.length ? { relationships: rels } : context_qa);
     return {
       complete,
       message,
-      context_qa,
+      context_qa: qaOut,
+      rels: declinedJoin ? [] : rels,
+      declinedJoin,
+      joinPartners,
     };
   };
 
@@ -9123,6 +9288,7 @@ ${stepInstruction}`;
     try {
       const result = await runContextIntakeTurn({
         extractBlob: intake.extractBlob,
+        moduleId: 'incentives',
         moduleLabel: 'Incentive Compensation proposal',
         intakeMessages: nextMessages,
       });
@@ -9237,9 +9403,11 @@ ${stepInstruction}`;
       postChat('⏳ Checking what still needs clarifying in this file…');
       const probe = await runContextIntakeTurn({
         extractBlob: extractBlob || `File name: ${file.name}`,
+        moduleId,
         moduleLabel: moduleLabelFor(moduleId),
         fileName: file.name,
         intakeMessages: [],
+        fileRec: { id: fileId, name: file.name, columns: onboarding.columns || [], hubModule: moduleId },
       });
       assistantMsg = stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(probe.message));
       if (questions.length && !/\n\s*1[\.)]\s/.test(assistantMsg)) {
@@ -9301,6 +9469,18 @@ ${stepInstruction}`;
     const rec = files.find((f) => f.id === fileId);
     if (!rec) return;
     const nextMessages = [...(rec.intakeMessages || []).filter((m) => !String(m.content || '').startsWith('⏳')), { role: 'user', content: userText }];
+    if (moduleId === 'territory' && isTerritoryMapFile(rec)) {
+      setContextIntakeBusy(true);
+      setActiveContextFileId(fileId);
+      await patchTerritoryFile(fileId, { intakeMessages: nextMessages });
+      try {
+        await runTerritoryIntakeTurn({ ...rec, intakeMessages: nextMessages });
+      } finally {
+        setContextIntakeBusy(false);
+        setContextIntakeByFile((prev) => ({ ...prev, [fileId]: '' }));
+      }
+      return;
+    }
     setContextIntakeBusy(true);
     if (fromChat) {
       setIsLoading(true);
@@ -9323,20 +9503,26 @@ ${stepInstruction}`;
     try {
       const result = await runContextIntakeTurn({
         extractBlob: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter((t) => !isEmptyContextValue(t)).join('\n\n'),
+        moduleId,
         moduleLabel: moduleLabelFor(moduleId),
         fileName: rec.name,
         intakeMessages: nextMessages,
+        fileRec: rec,
       });
       const confirm = contextFileAddedConfirm(rec.name, moduleLabelFor(moduleId));
       const assistantMsg = result.complete
-        ? confirm
+        ? (stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(result.message)) || confirm)
         : (stripOffTopicIntakeQuestions(stripJsonFromIntakeMessage(result.message)) || 'Is anything in this file still unclear?');
       const withAssistant = [...nextMessages, { role: 'assistant', content: assistantMsg }];
       const qa = result.context_qa && typeof result.context_qa === 'object' ? result.context_qa : null;
-      const mergedCtx = harvestModuleCapturedContext(rec.capturedContext, qa, withAssistant, {
-        extract: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter((t) => !isEmptyContextValue(t)).join('\n\n'),
-      })
-        || rec.capturedContext;
+      const mergedCtx = {
+        ...(harvestModuleCapturedContext(rec.capturedContext, qa, withAssistant, {
+          extract: [rec.extractedText, rec.structuredExtract, rec.visionExtract].filter((t) => !isEmptyContextValue(t)).join('\n\n'),
+        }) || rec.capturedContext || {}),
+        relationships: result.declinedJoin
+          ? []
+          : (result.rels?.length ? result.rels : (qa?.relationships || rec.capturedContext?.relationships || [])),
+      };
       const storedFacts = (mergedCtx?.qa_pairs || []).map((p) => intakePairFact(p)).filter(Boolean);
       const intakeSteps = [
         { type: 'thought', label: 'Read your reply', detail: String(userText || '').slice(0, 500) },
@@ -9348,6 +9534,9 @@ ${stepInstruction}`;
         capturedContext: mergedCtx,
       });
       await persistContextFiles(patched);
+      if (result.complete && !result.declinedJoin && result.rels?.length) {
+        await writeReverseIntakeJoins({ ...rec, hubModule: moduleId }, result.rels, result.joinPartners);
+      }
       if (fromChat) {
         setMessages((prev) => [
           ...prev.filter((m) => m.kind !== 'intake-think'),
@@ -9661,14 +9850,56 @@ ${stepInstruction}`;
     if (rec?.tableName) {
       try { await stellaTableApi({ action: 'drop', tableName: rec.tableName }); } catch { /* ignore */ }
     }
-    const next = removeModuleContextFile(userSettingsRef.current.moduleContext, moduleId, fileId);
+    if (rec) {
+      for (const f of (stellaDataFilesRef.current || [])) {
+        const rels = Array.isArray(f.capturedContext?.relationships) ? f.capturedContext.relationships : [];
+        const nextRels = rels.filter((r) => !capturedJoinPointsAtFile(r, rec));
+        if (nextRels.length === rels.length) continue;
+        const nextCtx = { ...(f.capturedContext || {}), relationships: nextRels };
+        stellaPatchLocal(f.id, { capturedContext: nextCtx });
+        try {
+          if (f.dbId) await stellaUpdateRegistry(f.dbId, { context_qa: nextCtx });
+        } catch { /* keep local */ }
+      }
+    }
+    let next = userSettingsRef.current.moduleContext;
+    if (rec) {
+      for (const mid of Object.keys(next || {})) {
+        const files = next?.[mid]?.files;
+        if (!Array.isArray(files)) continue;
+        for (const f of files) {
+          if (f.id === fileId) continue;
+          const rels = Array.isArray(f.capturedContext?.relationships) ? f.capturedContext.relationships : [];
+          const nextRels = rels.filter((r) => !capturedJoinPointsAtFile(r, rec));
+          if (nextRels.length === rels.length) continue;
+          next = patchModuleContextFile(next, mid, f.id, {
+            capturedContext: { ...(f.capturedContext || {}), relationships: nextRels },
+          });
+        }
+      }
+    }
+    next = removeModuleContextFile(next, moduleId, fileId);
     await persistContextFiles(next);
     if (activeContextFileId === fileId) setActiveContextFileId(null);
+    if (moduleId === 'territory') {
+      delete territoryUploadBlobRef.current[fileId];
+      territoryMapAbortRef.current += 1;
+      const remaining = next?.territory?.files || [];
+      if (selectedTerritoryFileId === fileId || !remaining.some((f) => f.id === selectedTerritoryFileId)) {
+        setSelectedTerritoryFileId(remaining[0]?.id || null);
+        setSelectedTerritory(null);
+        setSelectedTerritoryTeam('');
+        setTerritoryMapPayload(null);
+        setTerritoryMapError('');
+        setTerritoryIntakeInput('');
+        setTerritoryIntakeMinimized(false);
+      }
+    }
     setContextImagePreviewsByFile((prev) => {
       if (!prev?.[fileId]) return prev;
-      const next = { ...prev };
-      delete next[fileId];
-      return next;
+      const copy = { ...prev };
+      delete copy[fileId];
+      return copy;
     });
     if (contextImageAssetsRef.current[fileId]) delete contextImageAssetsRef.current[fileId];
     setContextFileDeleteConfirm((prev) => (prev?.fileId === fileId ? null : prev));
@@ -9676,7 +9907,13 @@ ${stepInstruction}`;
 
   const requestRemoveModuleContextFile = (moduleId, file) => {
     if (!file?.id) return;
-    setContextFileDeleteConfirm({ moduleId, fileId: file.id, name: file.name || 'this file' });
+    setContextFileDeleteConfirm({
+      moduleId,
+      fileId: file.id,
+      name: file.name || 'this file',
+      teamName: file.mapLayout?.teamName || '',
+      isTerritoryMap: moduleId === 'territory' && isTerritoryMapFile(file),
+    });
   };
 
   const persistContextBlock = async (moduleId, fileId, blockId, nextValue, remove = false) => {
@@ -9776,7 +10013,9 @@ ${stepInstruction}`;
           <FileText className="w-4 h-4 text-cyan-400" /> {moduleLabelFor(moduleId)} context files
         </h3>
         <p className="text-xs text-blue-300/60 mb-2">
-          PowerPoint, PDF, Excel, CSV, or text. Intake harvests facts from the file — it does not design schemes. Strategy and IC images are auto-included (logos skipped; unclear slides wait for you). Captured facts are stored per file and shared with later IC design, the incentive LLM, and the context map.
+          {moduleId === 'territory'
+            ? 'PowerPoint, PDF, Excel, CSV, or text. Intake asks, confirms, and saves facts the same way as Stella and Incentive Compensation. Map workbooks also capture team, geography, and joins when modules are connected. Captured facts stay on this file and are shared with Territory chat and any linked hub modules.'
+            : 'PowerPoint, PDF, Excel, CSV, or text. Intake harvests facts from the file — it does not design schemes. Strategy and IC images are auto-included (logos skipped; unclear slides wait for you). Captured facts are stored per file and shared with later IC design, the incentive LLM, and the context map.'}
         </p>
         <p className="text-[11px] text-blue-300/45 mb-4">
           File only: <code className="text-cyan-300/70">intelligence/{userSettingsRemotePath(currentUser)}</code>.
@@ -10034,13 +10273,6 @@ ${stepInstruction}`;
                               </div>
                             </div>
                           ))}
-                          {contextIntakeBusy && activeContextFileId === f.id ? (
-                            <div className="flex justify-start">
-                              <div className="bg-slate-800/60 border border-blue-400/20 text-blue-100 rounded-xl px-3 py-2 text-xs">
-                                ⏳ Saving your answers as separate facts…
-                              </div>
-                            </div>
-                          ) : null}
                           {contextIntakeBusy && activeContextFileId === f.id ? (
                             <div className="flex justify-start">
                               <div className="bg-slate-800/60 border border-blue-400/20 text-blue-100 rounded-xl px-3 py-2 text-xs">
@@ -10569,10 +10801,10 @@ ${stepInstruction}`;
         const samples = Array.isArray(c.samples) && c.samples.length ? ` e.g. ${c.samples.slice(0, 3).join(', ')}` : '';
         return `${label}${samples}`;
       }).filter(Boolean).join('; ');
-      return `- "${x.name}" (table ${x.tableName}) columns: ${cols || '(unknown)'}`;
+      return `- "${x.name}"${x.tableName ? ` (table ${x.tableName})` : (x.hubModule ? ` (${x.hubModule})` : '')} columns: ${cols || '(unknown)'}`;
     }).join('\n');
     const candidateBlob = candidates.length
-      ? `\n\nMATCHING JOIN KEYS (entity keys only — not sales/transaction/row IDs):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
+      ? `\n\nMATCHING JOIN KEYS (entity keys only — not sales/transaction/row IDs):\n${candidates.map((c) => `- this.${c.this_field} = ${c.related_table || c.related_file}.${c.related_field}  (${c.related_file}, ${c.reason})`).join('\n')}`
       : '\n\nMATCHING JOIN KEYS: none. Do not invent joins on id, sales_id, record_id, or transaction_id.';
     const grainCols = [thisFile, ...otherTabular].flatMap((f) => (
       (f?.columns || []).filter((c) => stellaLooksLikeFactGrainId(c, f)).map((c) => `${f.name}.${c.name || c.original}`)
@@ -10580,11 +10812,15 @@ ${stepInstruction}`;
     const grainBlob = grainCols.length
       ? `\n\nNOT JOIN KEYS (independent per file/year — never propose these): ${grainCols.join(', ')}`
       : '';
-    const knownJoins = stellaFormatConfirmedJoins(otherTabular);
+    const knownJoins = stellaFormatConfirmedJoins([thisFile, ...otherTabular]);
     const knownBlob = knownJoins
       ? `\n\nALREADY STORED JOINS among previously loaded files:\n${knownJoins}`
       : '';
-    return `\n\nRELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.\n\nLINK HIERARCHY (most to least preferred):\n1. STRUCTURAL (preferred) — one file is a master/reference list and the other is a fact/transaction file that references those IDs. Propose when a dimension PK matches a fact FK. The master list defines what the ID means.\n2. COMPARISON (fallback only) — both files are fact/transaction datasets with no master list to join through. Do NOT propose comparison links on an entity when a master/reference list for that entity is already uploaded — propose structural links to the master instead. Only propose comparison links when no master exists. They are NOT row-to-row joins; they only capture shared entity IDs so Stella can group or compare across files.\n\nONE PAIR PER ENTITY: Between two files, propose at most one column pair for each shared entity. A master file's other attributes (names, owners, labels) are not extra join keys for the same entity. If MATCHING JOIN KEYS lists more than one pair for the same entity, keep only the best name-aligned pair.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, engagement_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
+    const hubBits = otherTabular.filter((x) => x.hubModule && x.hubModule !== (thisFile?.hubModule || '')).map((x) => x.hubModule);
+    const header = hubBits.length
+      ? `CONNECTED FILES: Hub modules are linked. Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.`
+      : `RELATIONSHIPS: Other datasets already exist (listed below). You MUST ask whether this file joins to them before complete=true.`;
+    return `\n\n${header}\n\nLINK HIERARCHY (most to least preferred):\n1. STRUCTURAL (preferred) — one file is a master/reference list and the other is a fact/transaction file that references those IDs. Propose when a dimension PK matches a fact FK. The master list defines what the ID means.\n2. COMPARISON (fallback only) — both files are fact/transaction datasets with no master list to join through. Do NOT propose comparison links on an entity when a master/reference list for that entity is already uploaded — propose structural links to the master instead. Only propose comparison links when no master exists. They are NOT row-to-row joins; they only capture shared entity IDs so queries can group or compare across files.\n\nONE PAIR PER ENTITY: Between two files, propose at most one column pair for each shared entity. A master file's other attributes (names, owners, labels) are not extra join keys for the same entity. If MATCHING JOIN KEYS lists more than one pair for the same entity, keep only the best name-aligned pair.\n\nNEVER propose: row/transaction/record IDs (id, record_id, sales_id, sale_id, transaction_id, invoice_id, engagement_id, order_id) — each file's own row IDs are independent and meaningless across files. Never join measures (revenue, qty, units). Never join from name or data type alone.\n\nStore confirmed links in context_qa.relationships. Use empty array if the user says unrelated or rejects all links.\n\nOTHER DATASETS:\n${otherFilesBlob}${candidateBlob}${grainBlob}${knownBlob}`;
   };
 
   const stellaTableApi = async (payload) => {
@@ -10663,6 +10899,114 @@ ${stepInstruction}`;
     const rec = (userSettingsRef.current.moduleContext?.territory?.files || []).find((f) => f.id === fileId);
     if (!rec) return;
     await persistTerritoryFile({ ...rec, ...patch, id: fileId });
+  };
+
+  const withPreviewJoinSamples = (file) => {
+    if (!file) return file;
+    const rows = Array.isArray(file.previewRows) ? file.previewRows : [];
+    if (!rows.length) return file;
+    return { ...file, columns: stellaApplyRowSampleToColumns(file.columns, rows) };
+  };
+
+  const hubJoinPartnerFiles = (homeId, exceptId) => {
+    const settings = userSettingsRef.current || {};
+    const home = homeId === 'stella' || homeId === 'territory' || homeId === 'incentives' ? homeId : 'incentives';
+    const linked = connectedComponentIds(settings.moduleConnections, home);
+    const except = new Set([exceptId, String(exceptId || '')].filter(Boolean));
+    const out = [];
+    const seen = new Set();
+    const push = (f, hubModule) => {
+      if (!f || f.processing || except.has(f.id) || except.has(f.dbId)) return;
+      if (!f.tableName && !(Array.isArray(f.columns) && f.columns.length)) return;
+      const key = `${hubModule}|${f.tableName || f.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(withPreviewJoinSamples({ ...f, hubModule }));
+    };
+    if (home === 'stella' || linked.includes('stella')) {
+      for (const f of (stellaDataFilesRef.current || [])) push(f, 'stella');
+    }
+    if (home === 'territory' || linked.includes('territory')) {
+      for (const f of (settings.moduleContext?.territory?.files || [])) push(f, 'territory');
+    }
+    if (home === 'incentives' || linked.includes('incentives')) {
+      for (const f of (settings.moduleContext?.incentives?.files || [])) push(f, 'incentives');
+    }
+    return out;
+  };
+  const territoryJoinPartnerFiles = (exceptId) => hubJoinPartnerFiles('territory', exceptId);
+
+  const persistHubFileContext = async (file, capturedContext) => {
+    if (!file?.id) return;
+    const hub = file.hubModule
+      || (/^stella_data_/.test(String(file.tableName || '')) ? 'stella' : '')
+      || (/^territory_data_/.test(String(file.tableName || '')) ? 'territory' : '')
+      || 'incentives';
+    if (hub === 'stella' || file.dbId) {
+      stellaPatchLocal(file.id, { capturedContext });
+      try {
+        if (file.dbId) await stellaUpdateRegistry(file.dbId, { context_qa: capturedContext });
+      } catch { /* keep local mirror */ }
+      return;
+    }
+    const next = patchModuleContextFile(userSettingsRef.current.moduleContext, hub, file.id, { capturedContext });
+    userSettingsRef.current = { ...userSettingsRef.current, moduleContext: next };
+    setUserSettings((prev) => ({ ...prev, moduleContext: next }));
+    try {
+      await persistContextFiles(next);
+    } catch { /* local state is already updated */ }
+  };
+
+  const writeReverseIntakeJoins = async (file, rels, partners) => {
+    if (!file || !Array.isArray(rels) || !rels.length) return;
+    for (const r of rels) {
+      const other = (partners || []).find((x) => (
+        (r.related_table && x.tableName === r.related_table)
+        || (r.related_file && String(x.name || '').toLowerCase() === String(r.related_file || '').toLowerCase())
+      ));
+      if (!other) continue;
+      const reverse = {
+        related_file: file.name,
+        related_table: file.tableName || '',
+        this_field: r.related_field,
+        related_field: r.this_field,
+        note: r.note || '',
+        link_type: r.link_type || stellaJoinLinkType(other, file),
+      };
+      const existing = Array.isArray(other.capturedContext?.relationships) ? other.capturedContext.relationships : [];
+      const nextRels = stellaDedupeRelationships([...existing, reverse]);
+      if (nextRels.length === existing.length) continue;
+      await persistHubFileContext(other, { ...(other.capturedContext || {}), relationships: nextRels });
+    }
+  };
+
+  const loadTerritoryJoinStats = async (file) => {
+    const rels = Array.isArray(file?.capturedContext?.relationships) ? file.capturedContext.relationships : [];
+    const stats = [];
+    for (const r of rels) {
+      const table = String(r.related_table || '').trim();
+      const field = String(r.related_field || '').trim();
+      if (!HUB_DATA_TABLE.test(table) || !HUB_SQL_IDENT.test(field)) continue;
+      try {
+        const data = await stellaTableApi({
+          sql: `SELECT btrim(${field}::text) AS key, count(*)::int AS n FROM ${table} WHERE ${field} IS NOT NULL AND btrim(${field}::text) <> '' GROUP BY 1 ORDER BY n DESC LIMIT 400`,
+        });
+        const byKey = {};
+        for (const row of data.rows || []) {
+          const k = String(row.key || '').trim();
+          if (k) byKey[k] = Number(row.n) || 0;
+        }
+        stats.push({
+          related_file: r.related_file || table,
+          related_table: table,
+          related_field: field,
+          this_field: r.this_field,
+          link_type: r.link_type || r.linkType || '',
+          byKey,
+        });
+      } catch { /* joined table may not be queryable */ }
+    }
+    return stats;
   };
 
   const listTerritorySheets = async (file, kind) => {
@@ -10786,9 +11130,30 @@ ${stepInstruction}`;
     const sheetsBlob = sheets.length
       ? sheets.map((s, i) => `${i + 1}. "${s.name}" — ${s.rowCount} rows; columns: ${(s.headers || []).slice(0, 12).join(', ') || '(none detected)'}`).join('\n')
       : '(single table / CSV)';
+    let joinPartners = [];
+    let joinCandidates = [];
+    if (rec.tableName) {
+      joinPartners = territoryJoinPartnerFiles(rec.id);
+      if (joinPartners.length) {
+        try {
+          await stellaHydrateColumnValueProfiles(
+            joinPartners.filter((f) => /^stella_data_/.test(String(f.tableName || ''))),
+          );
+        } catch { /* samples still help from preview rows */ }
+        joinPartners = territoryJoinPartnerFiles(rec.id);
+        joinCandidates = stellaGuessJoinCandidates(withPreviewJoinSamples(rec), joinPartners);
+      }
+    }
+    const relationshipGuidance = joinPartners.length
+      ? stellaRelationshipIntakeHint(withPreviewJoinSamples(rec), joinPartners)
+      : '';
     const rt = getWorkflowRuntime();
-    const system = fillTemplate(rt.territoryIntakePrompt || '', {
+    const system = composeFileIntakePrompt('territory', {
+      runtime: rt,
+      moduleLabel: 'Territory Design',
+      extraRules: TERRITORY_MAP_INTAKE_RULES,
       dataProfile: rec.dataProfile ? `\n\nDATA PROFILE:\n${rec.dataProfile}` : '',
+      relationshipGuidance,
     });
     const convo = [
       {
@@ -10806,7 +11171,7 @@ ${stepInstruction}`;
     ];
     let parsed = {};
     try {
-      const raw = await callAnthropic(system, convo, 1200);
+      const raw = await callAnthropic(system, convo, joinPartners.length ? 2000 : 1200);
       parsed = extractJsonObject(raw) || {};
     } catch { /* fall through */ }
 
@@ -10833,7 +11198,22 @@ ${stepInstruction}`;
     }
     const needGeo = !nextLayout.geoColumn;
     const needTeamName = !nextLayout.teamName;
-    let complete = !!parsed.complete && !needSheet && !needGeo && !needTeamName && !!rec.tableName && !justChoseSheet;
+    const mappingReady = !needSheet && !needGeo && !needTeamName && !!rec.tableName && !justChoseSheet;
+    const lastUserText = String(lastUser?.content || '');
+    const qaFromModel = pickIntakeContextQa(parsed) || {};
+    const { rels, declinedJoin, filteredJoins } = resolveIntakeJoins({
+      modelRels: qaFromModel.relationships,
+      lastUserText,
+      file: withPreviewJoinSamples(rec),
+      partners: joinPartners,
+      candidates: joinCandidates,
+      priorRels: rec.capturedContext?.relationships,
+    });
+    const joinAskCount = (rec.intakeMessages || []).filter((m) => (
+      m?.role === 'assistant'
+      && /\b(join|joined|structural links|comparison links|are these links correct|should not be joined)\b/i.test(String(m.content || ''))
+    )).length;
+    let complete = !!parsed.complete && mappingReady;
     let message = stripJsonFromIntakeMessage(parsed.message);
 
     if (needSheet) {
@@ -10860,21 +11240,37 @@ ${stepInstruction}`;
       if (!intakeMessageLooksLikeAsk(message)) {
         message = 'Which column holds the geography to plot (postcode/zip, city, county, or region)?';
       }
+    } else if (joinPartners.length && !rels.length && !declinedJoin && joinAskCount < 2) {
+      complete = false;
+      message = hubJoinQuestion(joinCandidates, joinPartners, 'Territory Design')
+        || 'This Territory workspace is linked to other modules. Does this file share territory, rep, or account IDs with those files, or should it stay independent?';
     } else if (!intakeMessageLooksLikeAsk(message) || complete) {
       complete = true;
       message = stripJsonFromIntakeMessage(message) || contextFileAddedConfirm(rec.name, 'Territory Design');
     }
 
+    message = formatIntakeJoinFollowup(message, {
+      complete,
+      tableName: rec.tableName,
+      rels,
+      dropped: filteredJoins.dropped,
+      declinedJoin,
+    });
+
     if (complete) {
       setSelectedTerritoryTeam(nextLayout.teamName || '__all__');
     }
 
-    const context_qa = complete ? harvestModuleCapturedContext(
+    const harvested = harvestModuleCapturedContext(
       rec.capturedContext,
-      pickIntakeContextQa(parsed),
+      qaFromModel,
       [...(rec.intakeMessages || []), { role: 'assistant', content: message }],
-      { extract: rec.dataProfile || '' },
-    ) : rec.capturedContext;
+      { extract: rec.dataProfile || rec.summary || '' },
+    ) || rec.capturedContext || {};
+    const context_qa = {
+      ...harvested,
+      relationships: declinedJoin ? [] : (rels.length ? rels : (harvested.relationships || rec.capturedContext?.relationships || [])),
+    };
     await patchTerritoryFile(rec.id, {
       mapLayout: nextLayout,
       sheetName: rec.sheetName,
@@ -10888,6 +11284,10 @@ ${stepInstruction}`;
       intakeComplete: complete,
       processing: false,
     });
+    setTerritoryIntakeMinimized(!!complete);
+    if (complete && !declinedJoin && rels.length) {
+      await writeReverseIntakeJoins(rec, rels, joinPartners);
+    }
     return rec;
   };
 
@@ -10917,6 +11317,7 @@ ${stepInstruction}`;
     setSelectedTerritoryTeam('');
     setTerritoryMapPayload(null);
     setTerritoryMapError('');
+    setTerritoryIntakeMinimized(false);
     setActiveTab('territory');
 
     try {
@@ -11001,6 +11402,8 @@ ${stepInstruction}`;
     setTerritoryMapError('');
     try {
       const teamFilter = team && team !== '__all__' ? team : undefined;
+      const joinStatsPromise = loadTerritoryJoinStats(file);
+      let joinStats = [];
       for (let i = 0; i < 40; i += 1) {
         const data = await territoryApi({
           action: 'map',
@@ -11010,7 +11413,11 @@ ${stepInstruction}`;
           geocode: true,
         });
         if (gen !== territoryMapAbortRef.current) return;
-        setTerritoryMapPayload(data);
+        if (i === 0) {
+          try { joinStats = await joinStatsPromise; } catch { joinStats = []; }
+        }
+        const points = attachLinkedCountsToPoints(data.points || [], joinStats);
+        setTerritoryMapPayload({ ...data, points, joinStats });
         if (!data.pending) break;
         await new Promise((r) => setTimeout(r, 1200));
         if (gen !== territoryMapAbortRef.current) return;
@@ -11315,11 +11722,11 @@ ${stepInstruction}`;
     const system = withUserSettings(getStellaPrompts().contentSummary, { moduleContext: false, applyResponseLength: false });
     const colText = columns.length ? `\n\nDETECTED COLUMNS:\n${columns.map(c => `- ${c.name}`).join('\n')}` : '';
     const profileText = profile ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${profile}` : '';
-    const others = (stellaDataFilesRef.current || []).filter((f) => f && f.tableName && !f.processing);
+    const others = hubJoinPartnerFiles('stella');
     const otherHint = others.length
-      ? `\n\nOTHER STELLA DATASETS already loaded:\n${others.map((f) => `- ${f.name}${f.tableName ? ` (table ${f.tableName})` : ''}: ${(f.columns || []).slice(0, 10).map((c) => c.name || c).filter(Boolean).join(', ')}`).join('\n')}`
+      ? `\n\nOTHER DATASETS already loaded:\n${others.map((f) => `- ${f.name}${f.tableName ? ` (table ${f.tableName})` : ''}${f.hubModule && f.hubModule !== 'stella' ? ` [${f.hubModule}]` : ''}: ${(f.columns || []).slice(0, 10).map((c) => c.name || c).filter(Boolean).join(', ')}`).join('\n')}`
       : '';
-    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}${otherHint}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions only if something in THIS file is still unclear (ambiguous fields, codes, grain, or a possible join). If the extract already makes the file understandable, return []. Never use a fixed checklist. Do not ask about schemes, other hub modules, or how to analyse the numbers.`;
+    const user = `FILE:\n- name: ${name}\n- type: ${type}${colText}${profileText}${otherHint}\n\nCONTENT SAMPLE (may be truncated):\n${textSample}\n\nINTAKE: suggestedQuestions only if something in THIS file is still unclear (ambiguous fields, codes, grain, or a possible join to listed datasets). If the extract already makes the file understandable, return []. Never use a fixed checklist. Do not ask about schemes or how to analyse the numbers.`;
     const raw = await callAnthropic(system, [{ role: 'user', content: user }], 1400);
     const parsed = extractJsonObject(raw);
     if (!(parsed && typeof parsed === 'object')) {
@@ -11339,13 +11746,16 @@ ${stepInstruction}`;
     const isDoc = !f.tableName;
 
     if (!isDoc) {
-      await stellaHydrateColumnValueProfiles([f, ...stellaOtherTabularFiles(f.id)]);
+      await stellaHydrateColumnValueProfiles([
+        f,
+        ...hubJoinPartnerFiles('stella', f.id).filter((x) => HUB_DATA_TABLE.test(String(x.tableName || ''))),
+      ]);
     }
     const live = (stellaDataFilesRef.current || []).find((x) => x.id === f.id) || f;
-    const otherTabular = stellaOtherTabularFiles(live.id);
-    const candidates = !isDoc ? stellaGuessJoinCandidates(live, otherTabular) : [];
+    const otherTabular = hubJoinPartnerFiles('stella', live.id);
+    const candidates = !isDoc ? stellaGuessJoinCandidates({ ...live, hubModule: 'stella' }, otherTabular) : [];
     const relationshipGuidance = (!isDoc && otherTabular.length)
-      ? stellaRelationshipIntakeHint(live, otherTabular)
+      ? stellaRelationshipIntakeHint({ ...live, hubModule: 'stella' }, otherTabular)
       : '';
 
     const colsBlob = Array.isArray(live.columns) && live.columns.length
@@ -11354,9 +11764,10 @@ ${stepInstruction}`;
         return `- ${c.name}${c.original && c.original !== c.name ? ` (header "${c.original}")` : ''}${c.type ? ` [${c.type}]` : ''}${c.kind ? ` {${c.kind}}` : ''}${c.description ? `: ${c.description}` : ''}${samples}`;
       }).join('\n')
       : '(no columns — this is a document)';
-    const system = withUserSettings(fillTemplate(getStellaPrompts().intake, {
-      kind: isDoc ? 'document' : 'dataset',
-      kindSubject: isDoc ? 'document contains / represents' : 'data represents',
+    const system = withUserSettings(composeFileIntakePrompt('stella', {
+      runtime: getWorkflowRuntime(),
+      goalOverride: getStellaPrompts().intake,
+      moduleLabel: 'Stella Insights',
       relationshipBullet: (!isDoc && otherTabular.length) ? '\n- joins: whether/how it shares keys with other uploaded datasets (matching values, not just similar names)' : '',
       dataProfile: (!isDoc && (live.dataProfile || f.dataProfile)) ? `\n\nDATA PROFILE (observable facts — DO NOT ask about these):\n${live.dataProfile || f.dataProfile}` : '',
       relationshipGuidance: relationshipGuidance || '',
@@ -11381,8 +11792,6 @@ ${stepInstruction}`;
 
     const lastUserText = [...(f.intakeMessages || [])].reverse().find(m => m.role === 'user')?.content || '';
     const hasUserReply = (f.intakeMessages || []).some((m) => m.role === 'user');
-    const declinedJoin = stellaLooksLikeJoinDecline(lastUserText);
-    const acceptedJoin = stellaLooksLikeJoinAccept(lastUserText);
     const qaFromModel = (() => {
       const picked = pickIntakeContextQa(parsed);
       if (picked && typeof picked === 'object' && !Array.isArray(picked)) return picked;
@@ -11390,20 +11799,14 @@ ${stepInstruction}`;
       if (nested && typeof nested === 'object' && !Array.isArray(nested)) return nested;
       return {};
     })();
-    let rels = stellaNormalizeStoredRelationships(qaFromModel.relationships, live, otherTabular);
-    if (declinedJoin) {
-      rels = [];
-    } else if (candidates.length && acceptedJoin) {
-      const strong = candidates.filter((c) => c.score >= 70);
-      rels = stellaDedupeRelationships([
-        ...rels,
-        ...stellaNormalizeStoredRelationships(strong, live, otherTabular),
-      ]);
-    }
-    const priorRels = stellaNormalizeStoredRelationships(live.capturedContext?.relationships || f.capturedContext?.relationships, live, otherTabular);
-    if (priorRels.length && !declinedJoin) rels = stellaDedupeRelationships([...priorRels, ...rels]);
-    const filteredJoins = stellaFilterJoinRels(rels, live, otherTabular);
-    rels = declinedJoin ? [] : filteredJoins.keep;
+    const { rels, declinedJoin, filteredJoins } = resolveIntakeJoins({
+      modelRels: qaFromModel.relationships,
+      lastUserText,
+      file: live,
+      partners: otherTabular,
+      candidates,
+      priorRels: live.capturedContext?.relationships || f.capturedContext?.relationships,
+    });
 
     const joinAskCount = (f.intakeMessages || []).filter(m => (
       m?.role === 'assistant' && /\b(join|joined|share an id, territory|correct keys|should not be joined)\b/i.test(String(m.content || ''))
@@ -11423,7 +11826,7 @@ ${stepInstruction}`;
     }
 
     let assistantMessage = forceJoinQuestion
-      ? (stellaJoinQuestion(candidates, otherTabular) || modelLine)
+      ? (hubJoinQuestion(candidates, otherTabular, 'Stella Insights') || modelLine)
       : modelLine;
     if (!assistantMessage) {
       assistantMessage = complete
@@ -11433,14 +11836,13 @@ ${stepInstruction}`;
     if (complete && !forceJoinQuestion && intakeMessageLooksLikeAsk(assistantMessage)) {
       assistantMessage = contextFileAddedConfirm(f.name, 'Stella Insights');
     }
-    if (complete && !declinedJoin && rels.length && !/\bstored join/i.test(assistantMessage)) {
-      const joinLines = rels.map(r => `- ${f.tableName}.${r.this_field} = ${r.related_table || r.related_file}.${r.related_field}${r.related_file ? ` (${r.related_file})` : ''}`);
-      assistantMessage = `${assistantMessage}\n\nStored joins for queries:\n${joinLines.join('\n')}`;
-    }
-    if (!declinedJoin && filteredJoins.dropped.length) {
-      const lines = filteredJoins.dropped.map((d) => `- ${d.r.this_field} ↔ ${d.r.related_field || d.r.related_file}: ${d.why}`);
-      assistantMessage = `${assistantMessage}\n\nI did not store these joins because they do not look like matching keys:\n${lines.join('\n')}`;
-    }
+    assistantMessage = formatIntakeJoinFollowup(assistantMessage, {
+      complete: complete && !forceJoinQuestion,
+      tableName: f.tableName,
+      rels,
+      dropped: filteredJoins.dropped,
+      declinedJoin,
+    });
 
     const nextIntakeMessages = [...(f.intakeMessages || []), { role: 'assistant', content: assistantMessage }];
     const shouldPersistContext = complete || !!f.intakeComplete;
@@ -11452,29 +11854,7 @@ ${stepInstruction}`;
       };
       await persistStellaIntakeContext(f, ctx, nextIntakeMessages);
       if (!declinedJoin && rels.length) {
-        for (const r of rels) {
-          const other = otherTabular.find(x => (
-            (r.related_table && x.tableName === r.related_table)
-            || (r.related_file && String(x.name || '').toLowerCase() === String(r.related_file).toLowerCase())
-          ));
-          if (!other) continue;
-          const reverse = {
-            related_file: f.name,
-            related_table: f.tableName || '',
-            this_field: r.related_field,
-            related_field: r.this_field,
-            note: r.note || '',
-            link_type: r.link_type || stellaJoinLinkType(other, f),
-          };
-          const existing = Array.isArray(other.capturedContext?.relationships) ? other.capturedContext.relationships : [];
-          const nextRels = stellaDedupeRelationships([...existing, reverse]);
-          if (nextRels.length === existing.length) continue;
-          const nextCtx = { ...(other.capturedContext || {}), relationships: nextRels };
-          stellaPatchLocal(other.id, { capturedContext: nextCtx });
-          try {
-            if (other.dbId) await stellaUpdateRegistry(other.dbId, { context_qa: nextCtx });
-          } catch { /* keep local mirror even if registry update fails */ }
-        }
+        await writeReverseIntakeJoins({ ...f, hubModule: 'stella' }, rels, otherTabular);
       }
     } else {
       stellaPatchLocal(f.id, { intakeMessages: nextIntakeMessages });
@@ -11544,17 +11924,20 @@ ${stepInstruction}`;
         });
       }
     }
-    const otherTabular = stellaOtherTabularFiles(fileRec.id);
+    const otherTabular = hubJoinPartnerFiles('stella', fileRec.id);
     const profiledColumns = isTabular
       ? stellaApplyRowSampleToColumns(columns, records.slice(0, STELLA_SQL_SAMPLE_ROWS))
       : columns;
     let joinQ = '';
     if ((isTabular || fileRec.tableName) && otherTabular.length) {
-      await stellaHydrateColumnValueProfiles(otherTabular);
-      const othersNow = stellaOtherTabularFiles(fileRec.id);
-      joinQ = stellaJoinQuestion(
-        stellaGuessJoinCandidates({ ...fileRec, columns: profiledColumns }, othersNow),
+      await stellaHydrateColumnValueProfiles(
+        otherTabular.filter((x) => HUB_DATA_TABLE.test(String(x.tableName || ''))),
+      );
+      const othersNow = hubJoinPartnerFiles('stella', fileRec.id);
+      joinQ = hubJoinQuestion(
+        stellaGuessJoinCandidates({ ...fileRec, columns: profiledColumns, hubModule: 'stella' }, othersNow),
         othersNow,
+        'Stella Insights',
       ) || '';
     }
     const modelQuestions = pickStellaIntakeQuestions({ ...onboarding, summary }).filter((q) => {
@@ -12454,7 +12837,9 @@ ${stepInstruction}`;
         ])].slice(0, 40).join(', ') || '(none)';
         return { text: `File "${q}" not found. Available files: ${available}`, step: { type: 'error', label: 'File context not found', detail: q } };
       }
-      const useStellaCard = !!(file.tableName || file.hubKind === 'stella-table' || file.hubKind === 'stella-doc');
+      const useStellaCard = file.hubKind === 'stella-table' || file.hubKind === 'stella-doc'
+        || file.hubModule === 'stella'
+        || (!file.hubModule && !!file.tableName);
       return {
         text: useStellaCard ? formatStellaFileContextCard(file) : formatModuleContextCard(file),
         step: { type: 'context', label: `Loaded context for ${file.name}`, detail: file.tableName ? `table ${file.tableName}` : (file.hubModule ? String(file.hubModule) : 'document') },
@@ -12565,7 +12950,10 @@ ${stepInstruction}`;
     thinking = false,
     wrapPrompt = 'Please give your final answer now based on what you found. Do not mention SQL or tool names.',
   } = {}) => {
-    const knownTables = (files || []).filter((f) => f.tableName).map((f) => f.tableName);
+    const knownTables = [...new Set([
+      ...(files || []).filter((f) => f.tableName).map((f) => f.tableName),
+      ...(hubFiles || []).filter((f) => f.tableName).map((f) => f.tableName),
+    ])];
     const hasTables = knownTables.length > 0;
     const toolList = hasTables
       ? STELLA_TOOLS
@@ -13170,6 +13558,7 @@ ${stepInstruction}`;
       activeTerritoryFile.mapLayout?.geoColumn,
       activeTerritoryFile.mapLayout?.geoKind,
       activeTerritoryFile.mapLayout?.country,
+      JSON.stringify(activeTerritoryFile.capturedContext?.relationships || []),
     ].join('|')
     : '';
 
@@ -13192,6 +13581,11 @@ ${stepInstruction}`;
     void loadTerritoryMapForFile(file, split ? selectedTerritoryTeam : '__all__');
     return () => { territoryMapAbortRef.current += 1; };
   }, [territoryLayoutKey, selectedTerritoryTeam]);
+
+  useEffect(() => {
+    const file = (userSettingsRef.current.moduleContext?.territory?.files || []).find((f) => f.id === activeTerritoryFile?.id);
+    setTerritoryIntakeMinimized(!!(file && !file.processing && file.intakeComplete));
+  }, [activeTerritoryFile?.id]);
 
   const handleSubmit = async (e, overrideInput = null, isFileAnalysis = false) => {
     if (e) e.preventDefault();
@@ -14368,23 +14762,51 @@ ${stepInstruction}`;
               <div className="bg-gradient-to-r from-emerald-600 to-teal-600 rounded-xl p-4 text-white shadow-xl flex-shrink-0 mb-4">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3"><MapIcon className="w-6 h-6" /><div><h2 className="text-xl font-bold">Territory Design</h2><p className="text-emerald-100 text-xs">Choose the Excel tab, confirm columns, then select a structure to draw</p></div></div>
-                  <button onClick={() => territoryFileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-semibold transition-all"><Upload className="w-4 h-4" /> Upload territory file</button>
+                  <div className="flex items-center gap-2">
+                    {activeTerritoryFile && !activeTerritoryFile.processing && (
+                      <button
+                        type="button"
+                        onClick={() => requestRemoveModuleContextFile('territory', activeTerritoryFile)}
+                        className="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-red-500/30 rounded-lg text-sm font-semibold transition-all"
+                        title="Remove this territory file and team"
+                      >
+                        <Trash2 className="w-4 h-4" /> Remove
+                      </button>
+                    )}
+                    <button onClick={() => territoryFileInputRef.current?.click()} className="flex items-center gap-2 px-3 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-semibold transition-all"><Upload className="w-4 h-4" /> Upload territory file</button>
+                  </div>
                   <input ref={territoryFileInputRef} type="file" accept=".xlsx,.xls,.csv,.json" onChange={handleTerritoryDataUpload} className="hidden" />
                 </div>
               </div>
 
               {territoryMapFiles.length > 0 && (
                 <div className="flex-shrink-0 mb-3 flex items-center gap-3 flex-wrap">
-                  {territoryMapFiles.length > 1 && (
-                    <>
-                      <span className="text-xs text-blue-300/70 whitespace-nowrap">File:</span>
-                      <div className="flex gap-2 flex-wrap">
-                        {territoryMapFiles.map((s) => (
-                          <button key={s.id} onClick={() => { setSelectedTerritoryFileId(s.id); setSelectedTerritory(null); setSelectedTerritoryTeam(''); setTerritoryMapPayload(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${activeTerritoryFile?.id === s.id ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>{s.name}</button>
-                        ))}
+                  <span className="text-xs text-blue-300/70 whitespace-nowrap">File:</span>
+                  <div className="flex gap-2 flex-wrap">
+                    {territoryMapFiles.map((s) => (
+                      <div
+                        key={s.id}
+                        className={`inline-flex items-center rounded-lg border ${activeTerritoryFile?.id === s.id ? 'bg-emerald-500/30 border-emerald-400/60' : 'bg-slate-800/50 border-blue-400/20'}`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => { setSelectedTerritoryFileId(s.id); setSelectedTerritory(null); setSelectedTerritoryTeam(''); setTerritoryMapPayload(null); }}
+                          className={`px-3 py-1.5 text-xs font-semibold transition-all ${activeTerritoryFile?.id === s.id ? 'text-emerald-300' : 'text-blue-300 hover:text-blue-100'}`}
+                        >
+                          {s.name}
+                          {s.mapLayout?.teamName ? ` · ${s.mapLayout.teamName}` : ''}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => requestRemoveModuleContextFile('territory', s)}
+                          className="px-2 py-1.5 text-red-300/80 hover:text-red-200 hover:bg-red-500/20 rounded-r-lg"
+                          title={`Remove ${s.mapLayout?.teamName || s.name}`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
-                    </>
-                  )}
+                    ))}
+                  </div>
                   {!!selectedTerritoryTeam && (
                   <div className="flex gap-1 ml-auto">
                     <button onClick={() => setTerritoryView('map')} className={`px-3 py-1.5 rounded-lg text-xs border transition-all ${territoryView === 'map' ? 'bg-blue-500/30 border-blue-400/60 text-blue-200' : 'bg-slate-800/50 border-slate-600 text-slate-400 hover:text-slate-300'}`}>🗺 Map</button>
@@ -14408,8 +14830,23 @@ ${stepInstruction}`;
                   if (prev) {
                     prev.count += Number(p.count) || 0;
                     if (p.geo && !prev.geos.includes(p.geo)) prev.geos.push(p.geo);
+                    for (const item of Array.isArray(p.linked) ? p.linked : []) {
+                      if (!item?.file) continue;
+                      const row = prev.linked.find((x) => x.file === item.file);
+                      if (row) row.n += Number(item.n) || 0;
+                      else prev.linked.push({ file: item.file, n: Number(item.n) || 0 });
+                    }
                   } else {
-                    byTerr.set(key, { id: key, territory: key, team: p.team, count: Number(p.count) || 0, geos: p.geo ? [p.geo] : [], lat: p.lat, lng: p.lng });
+                    byTerr.set(key, {
+                      id: key,
+                      territory: key,
+                      team: p.team,
+                      count: Number(p.count) || 0,
+                      geos: p.geo ? [p.geo] : [],
+                      lat: p.lat,
+                      lng: p.lng,
+                      linked: (Array.isArray(p.linked) ? p.linked : []).map((item) => ({ file: item.file, n: Number(item.n) || 0 })),
+                    });
                   }
                 }
                 grouped.push(...byTerr.values());
@@ -14431,11 +14868,28 @@ ${stepInstruction}`;
                     {activeTerritoryFile.intakeComplete && (
                       <div className="flex-shrink-0 flex items-center gap-2 flex-wrap">
                         <span className="text-xs text-blue-300/70 whitespace-nowrap">Team:</span>
-                        <span className="px-3 py-1.5 rounded-lg text-xs font-semibold border bg-emerald-500/20 border-emerald-400/40 text-emerald-200">
+                        <span className="px-3 py-1.5 rounded-lg text-xs font-semibold border bg-emerald-500/20 border-emerald-400/40 text-emerald-200 inline-flex items-center gap-2">
                           {activeTerritoryFile.mapLayout?.teamName || 'Whole file'}
+                          <button
+                            type="button"
+                            onClick={() => requestRemoveModuleContextFile('territory', activeTerritoryFile)}
+                            className="text-red-300/80 hover:text-red-200"
+                            title="Remove this team and file"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
                         </span>
                         {shouldSplitByTeamColumn(activeTerritoryFile.mapLayout, teams) && teams.map((team) => (
                           <button key={team} onClick={() => { setSelectedTerritoryTeam(team); setSelectedTerritory(null); }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${selectedTerritoryTeam === team ? 'bg-emerald-500/30 border-emerald-400/60 text-emerald-300' : 'bg-slate-800/50 border-blue-400/20 text-blue-300 hover:border-blue-400/40'}`}>{team}</button>
+                        ))}
+                        {(activeTerritoryFile.capturedContext?.relationships || []).filter((r) => r?.related_file || r?.related_table).map((r) => (
+                          <span
+                            key={`${r.related_table || r.related_file}|${r.this_field}|${r.related_field}`}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold border ${r.link_type === 'structural' ? 'bg-amber-500/15 border-amber-400/40 text-amber-200' : 'bg-cyan-500/15 border-cyan-400/40 text-cyan-200'}`}
+                            title={`${r.this_field} ↔ ${r.related_field}`}
+                          >
+                            Joined {r.related_file || r.related_table} · {r.this_field} ↔ {r.related_field}
+                          </span>
                         ))}
                       </div>
                     )}
@@ -14509,6 +14963,19 @@ ${stepInstruction}`;
                               <div className="flex flex-wrap gap-1">{selectedTerritory.geos.map((c) => (<span key={c} className="text-xs bg-slate-700/60 text-blue-200/70 px-2 py-0.5 rounded-full">{c}</span>))}</div>
                             </div>
                           )}
+                          {(selectedTerritory.linked || []).filter((l) => l.n > 0).length > 0 && (
+                            <div>
+                              <div className="text-xs text-cyan-300/80 mb-2 font-semibold uppercase tracking-wide">Joined files</div>
+                              <div className="space-y-1">
+                                {selectedTerritory.linked.filter((l) => l.n > 0).map((l) => (
+                                  <div key={l.file} className="flex justify-between text-xs">
+                                    <span className="text-cyan-200/80 truncate pr-2">{l.file}</span>
+                                    <span className="text-white font-semibold">{l.n} rows</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                           <button onClick={() => {
                             const focusedContext = formatTerritoryAssessContext({
                               file: activeTerritoryFile,
@@ -14524,20 +14991,131 @@ ${stepInstruction}`;
                     )}
                     </div>
 
-                    {pendingIntake && (
-                      <div className="flex-shrink-0 bg-slate-800/50 border border-emerald-400/25 rounded-xl p-3">
-                        <div className="text-[10px] uppercase tracking-wide text-emerald-300/80 font-semibold mb-2">Territory intake</div>
-                        <div className="max-h-52 overflow-y-auto custom-scrollbar space-y-2 mb-2">
-                          {(activeTerritoryFile.intakeMessages || []).slice(-6).map((m, i) => (
-                            <div key={i} className={`text-xs ${m.role === 'user' ? 'text-cyan-200' : 'text-blue-100'}`}>
-                              {m.role === 'user' ? <span className="whitespace-pre-wrap">{m.content}</span> : <MessageErrorBoundary>{formatMarkdown(m.content)}</MessageErrorBoundary>}
-                            </div>
-                          ))}
-                        </div>
-                        <div className="flex gap-2">
-                          <textarea value={territoryIntakeInput} onChange={(e) => setTerritoryIntakeInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleTerritoryIntakeSend(); } }} placeholder="Answer the intake questions…" className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-none" rows={2} />
-                          <button onClick={handleTerritoryIntakeSend} disabled={!territoryIntakeInput.trim() || territoryIntakeBusy} className="px-4 py-2 bg-emerald-500/30 hover:bg-emerald-500/40 disabled:opacity-40 text-white font-semibold rounded-lg text-sm">Send</button>
-                        </div>
+                    {activeTerritoryFile && (
+                      <div className="flex-shrink-0 bg-slate-800/50 border border-blue-400/20 rounded-xl p-4">
+                        {(() => {
+                          const captured = isModuleContextCaptured(activeTerritoryFile);
+                          const minimized = captured && territoryIntakeMinimized;
+                          const intakeThread = (activeTerritoryFile.intakeMessages || [])
+                            .filter((m) => !String(m.content || '').startsWith('⏳'));
+                          const capturedView = harvestModuleCapturedContext(
+                            activeTerritoryFile.capturedContext,
+                            null,
+                            activeTerritoryFile.intakeMessages,
+                            { extract: activeTerritoryFile.dataProfile || '' },
+                          ) || activeTerritoryFile.capturedContext;
+                          return (
+                            <>
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="text-sm font-bold text-white">Intake assistant</div>
+                                  {!minimized ? (
+                                    <div className="text-xs text-blue-300/60 mt-1">
+                                      Same as Stella and Incentive Compensation: confirm what this file is, the columns, and any joins to connected modules. Facts are saved as Territory context.
+                                    </div>
+                                  ) : (
+                                    <div className="text-xs text-blue-300/60 mt-1">Context captured. Expand to add or update notes for this file.</div>
+                                  )}
+                                </div>
+                                {captured ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => setTerritoryIntakeMinimized((v) => !v)}
+                                    className="flex-shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-cyan-200 bg-slate-900/60 border border-cyan-400/25 hover:bg-cyan-500/15 flex items-center gap-1.5"
+                                  >
+                                    {minimized ? <ChevronDown className="w-3.5 h-3.5" /> : <Minimize2 className="w-3.5 h-3.5" />}
+                                    {minimized ? 'Update context' : 'Minimise'}
+                                  </button>
+                                ) : (
+                                  <span className="flex-shrink-0 px-2 py-1 bg-yellow-500/15 text-yellow-200 text-xs rounded border border-yellow-400/25">Intake</span>
+                                )}
+                              </div>
+                              {minimized ? (
+                                <div className="mt-3 text-xs text-slate-300 bg-slate-900/40 border border-emerald-400/20 rounded-lg px-3 py-2">
+                                  {String(capturedView?.what_it_represents || activeTerritoryFile.summary || 'File context is stored. Use Update context if you need to change it.').replace(/\s+/g, ' ').trim().slice(0, 220)}
+                                </div>
+                              ) : (
+                                <div className="space-y-3 mt-3">
+                                  <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-3 max-h-[280px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
+                                    {intakeThread.length === 0 ? (
+                                      <div className="text-[11px] text-blue-300/60">Waiting for questions…</div>
+                                    ) : intakeThread.map((m, i) => {
+                                      const shown = m.role === 'user'
+                                        ? m.content
+                                        : displayIntakeChatContent(m.content, {
+                                          complete: captured,
+                                          fileName: activeTerritoryFile.name,
+                                          moduleLabel: 'Territory Design',
+                                        });
+                                      return (
+                                        <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                          <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'block w-full bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                                            {m.role === 'user'
+                                              ? <span className="whitespace-pre-wrap break-words">{shown}</span>
+                                              : <MessageErrorBoundary>{formatMarkdown(shown)}</MessageErrorBoundary>}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                    {territoryIntakeBusy ? (
+                                      <div className="flex justify-start">
+                                        <div className="bg-slate-800/60 border border-blue-400/20 text-blue-100 rounded-xl px-3 py-2 text-xs">
+                                          ⏳ Saving your answers as separate facts…
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                  <div className="flex gap-2">
+                                    <textarea
+                                      value={territoryIntakeInput}
+                                      onChange={(e) => setTerritoryIntakeInput(e.target.value)}
+                                      onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleTerritoryIntakeSend(); } }}
+                                      placeholder={captured ? 'Add a comment or update for this file…' : 'Answer the intake questions… (1= … 2= … if several are listed)'}
+                                      className="flex-1 bg-slate-900/50 text-white placeholder-blue-300/40 border border-blue-400/30 rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-400 resize-none"
+                                      rows={2}
+                                    />
+                                    <button
+                                      onClick={handleTerritoryIntakeSend}
+                                      disabled={!territoryIntakeInput.trim() || territoryIntakeBusy || activeTerritoryFile.processing}
+                                      className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 disabled:opacity-40 text-white font-semibold rounded-lg text-sm flex items-center gap-2"
+                                    >
+                                      <Send className="w-4 h-4" /> Send
+                                    </button>
+                                  </div>
+                                  {Array.isArray(activeTerritoryFile.columns) && activeTerritoryFile.columns.length > 0 && (
+                                    <details className="bg-slate-900/40 border border-blue-400/15 rounded-xl overflow-hidden">
+                                      <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-blue-300 hover:bg-slate-800/40 flex items-center gap-2">
+                                        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Detected fields ({activeTerritoryFile.columns.length})
+                                      </summary>
+                                      <div className="px-4 pb-4 space-y-1">
+                                        {activeTerritoryFile.columns.map((c, i) => (
+                                          <div key={i} className="text-[11px] text-blue-200/80">
+                                            <span className="text-cyan-300 font-semibold">{c.name}</span>
+                                            {c.type ? <span className="text-blue-400/50"> [{c.type}]</span> : null}
+                                            {c.description ? ` — ${c.description}` : ''}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </details>
+                                  )}
+                                  {capturedView ? (
+                                    <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden" open>
+                                      <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">
+                                        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
+                                      </summary>
+                                      <StellaCapturedContextView
+                                        ctx={capturedView}
+                                        onPatch={async (next) => {
+                                          await patchTerritoryFile(activeTerritoryFile.id, { capturedContext: next || undefined });
+                                        }}
+                                      />
+                                    </details>
+                                  ) : null}
+                                </div>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
                     )}
                   </div>
@@ -14992,7 +15570,7 @@ ${stepInstruction}`;
 
                 {userSettingsPane === 'territory' && (
                   <>
-                    <p className="text-xs text-blue-300/70 mb-2">Background for Territory work — alignments, team lists, maps, and similar files.</p>
+                    <p className="text-xs text-blue-300/70 mb-2">Same intake assistant as Incentive Compensation and Stella: questions, confirmations, and saved facts. Map workbooks also capture team, geography, and joins when modules are connected. Those facts stay in this module and are shared when Territory is linked on the hub.</p>
                     {renderModuleContextPanel('territory')}
                   </>
                 )}
@@ -15488,11 +16066,14 @@ ${stepInstruction}`;
                   <div>
                     <h3 className="text-lg font-bold text-white">Runtime prompts & copy</h3>
                     <p className="text-xs text-blue-300/55 mt-1">
-                      Incentive Comp shared glue — welcome, workflow match/offer, agent wrappers, proposal vision, PPT repair. Orchestrator prompts live on each workflow (Workflows → Edit).
+                      Incentive Comp shared glue — welcome, file intake (shared assistant; only the goal changes per module), workflow match/offer, agent wrappers, proposal vision, PPT repair. Orchestrator prompts live on each workflow (Workflows → Edit).
                     </p>
                   </div>
                   {[
                     ['welcomeMessages.consultation', 'Consultation welcome'],
+                    ['workflowRuntime.fileIntakePrompt', 'Shared file intake (all modules)'],
+                    ['workflowRuntime.intakeGoalIncentives', 'Intake goal — Incentive Compensation'],
+                    ['workflowRuntime.intakeGoalTerritory', 'Intake goal — Territory Design'],
                     ['workflowRuntime.matchDetectorPrompt', 'Workflow match detector'],
                     ['workflowRuntime.offerTemplate', 'Workflow offer template'],
                     ['workflowRuntime.agentTaskWrapper', 'Agent task wrapper'],
@@ -15812,8 +16393,38 @@ ${stepInstruction}`;
               )}
 
               {adminModule === 'territory' && (
-                <div className="bg-slate-800/30 backdrop-blur-sm border border-blue-400/20 rounded-xl p-6 text-sm text-blue-300/70">
-                  Territory admin settings will appear here. Territory structures are currently managed directly in the <span className="text-cyan-300 font-semibold">Territory</span> tab.
+                <div className="space-y-4">
+                  <div>
+                    <h3 className="text-lg font-bold text-white">Territory intake</h3>
+                    <p className="text-xs text-blue-300/55 mt-1">
+                      Territory uses the same file-intake assistant as Incentive Compensation and Stella. Edit only the goal — mapping tabs, team name, and joins stay in the shared intake tool.
+                    </p>
+                  </div>
+                  <div className="bg-slate-800/40 border border-cyan-400/20 rounded-xl p-4">
+                    <div className="text-sm font-semibold text-white mb-2">Intake goal</div>
+                    <textarea
+                      value={productIntel?.workflowRuntime?.intakeGoalTerritory ?? ''}
+                      onChange={(e) => setProductIntel((prev) => ({
+                        ...prev,
+                        workflowRuntime: { ...(prev.workflowRuntime || {}), intakeGoalTerritory: e.target.value },
+                      }))}
+                      rows={4}
+                      className="w-full bg-slate-900/60 text-blue-100 text-xs rounded-lg p-3 border border-cyan-400/20 focus:border-cyan-400/50 focus:outline-none font-mono resize-y"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => persistIntelligenceSettings({
+                      workflowRuntime: productIntel.workflowRuntime,
+                    })}
+                    disabled={userSettingsSaveStatus === 'saving'}
+                    className="px-5 py-2.5 bg-gradient-to-r from-cyan-500 to-blue-500 text-white font-semibold rounded-lg flex items-center gap-2 disabled:opacity-50"
+                  >
+                    <Save className="w-4 h-4" /> {userSettingsSaveStatus === 'saving' ? 'Saving…' : 'Save Territory intake goal'}
+                  </button>
+                  {userSettingsSaveStatus === 'saved' && (
+                    <span className="flex items-center gap-1.5 text-sm text-green-400 font-semibold"><CheckCircle className="w-4 h-4" /> Saved</span>
+                  )}
                 </div>
               )}
 
@@ -15822,13 +16433,13 @@ ${stepInstruction}`;
                   <div>
                     <h3 className="text-lg font-bold text-white">Stella prompts</h3>
                     <p className="text-xs text-blue-300/55 mt-1">
-                      Welcome message and AI prompts for data intake / analysis. Stored in the shared product JSON — separate from per-user business context, files, and connections (those live in User Settings).
+                      Welcome, content summary, and analyst stay Stella-specific. Intake uses the shared file-intake assistant — this field is only Stella&apos;s goal/purpose, not a separate agent.
                     </p>
                   </div>
                   {[
                     ['welcomeMessages.stella', 'Welcome message'],
                     ['stellaPrompts.contentSummary', 'Content summary'],
-                    ['stellaPrompts.intake', 'Intake'],
+                    ['stellaPrompts.intake', 'Intake goal'],
                     ['stellaPrompts.analyst', 'Analyst'],
                   ].map(([path, title]) => {
                     const [root, key] = path.split('.');
@@ -15899,9 +16510,19 @@ ${stepInstruction}`;
             className="w-full max-w-md bg-slate-900 rounded-2xl shadow-2xl p-5 border border-red-400/30"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 id="context-file-delete-title" className="text-sm font-bold text-white">Delete this context file?</h3>
+            <h3 id="context-file-delete-title" className="text-sm font-bold text-white">
+              {contextFileDeleteConfirm.isTerritoryMap ? 'Remove this territory file?' : 'Delete this context file?'}
+            </h3>
             <p className="text-xs text-cyan-100 mt-3 leading-relaxed">
-              Remove <span className="font-semibold">{contextFileDeleteConfirm.name}</span> and its captured context? This cannot be undone.
+              {contextFileDeleteConfirm.isTerritoryMap ? (
+                <>
+                  Remove <span className="font-semibold">{contextFileDeleteConfirm.name}</span>
+                  {contextFileDeleteConfirm.teamName ? <> (team <span className="font-semibold">{contextFileDeleteConfirm.teamName}</span>)</> : null}
+                  {' '}from Territory Design? The map, captured context, and stored joins will be deleted. This cannot be undone.
+                </>
+              ) : (
+                <>Remove <span className="font-semibold">{contextFileDeleteConfirm.name}</span> and its captured context? This cannot be undone.</>
+              )}
             </p>
             <div className="flex justify-end gap-2 mt-5">
               <button
@@ -15916,7 +16537,7 @@ ${stepInstruction}`;
                 onClick={() => handleRemoveModuleContextFile(contextFileDeleteConfirm.moduleId, contextFileDeleteConfirm.fileId)}
                 className="px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-red-500/85 hover:bg-red-500"
               >
-                Delete
+                {contextFileDeleteConfirm.isTerritoryMap ? 'Remove' : 'Delete'}
               </button>
             </div>
           </div>

@@ -171,7 +171,7 @@ const INTAKE_INTERPRET_WORDS = new Set([
 
 export function contextFileExtractBlob(f) {
   if (!f || typeof f !== 'object') return '';
-  return [f.extractedText, f.structuredExtract, f.visionExtract]
+  return [f.extractedText, f.structuredExtract, f.visionExtract, f.dataProfile]
     .map((t) => String(t || '').trim())
     .filter((t) => t && !isEmptyContextValue(t))
     .join('\n\n');
@@ -309,7 +309,55 @@ export function compactCapturedContext(ctx) {
   if (metrics.length) out.key_metrics = metrics;
   if (notes) out.interpretation_notes = notes;
   if (qa.length) out.qa_pairs = qa;
+  const relationships = compactRelationships(base.relationships);
+  if (relationships.length) out.relationships = relationships;
+  const nameMaps = compactNameMaps(base.name_maps);
+  if (nameMaps.length) out.name_maps = nameMaps;
   return Object.keys(out).length ? out : undefined;
+}
+
+function compactRelationships(list) {
+  const seen = new Set();
+  const out = [];
+  for (const r of Array.isArray(list) ? list : []) {
+    if (!r || typeof r !== 'object') continue;
+    const related_file = usefulString(r.related_file);
+    const related_table = usefulString(r.related_table);
+    const this_field = usefulString(r.this_field);
+    const related_field = usefulString(r.related_field);
+    if ((!related_file && !related_table) || !this_field || !related_field) continue;
+    const key = `${related_table}|${related_file}|${this_field}|${related_field}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const row = { related_file, related_table, this_field, related_field };
+    const note = usefulString(r.note, 400);
+    if (note) row.note = note;
+    const link = usefulString(r.link_type || r.linkType);
+    if (link) row.link_type = link;
+    out.push(row);
+  }
+  return out;
+}
+
+function compactNameMaps(list) {
+  const seen = new Set();
+  const out = [];
+  for (const m of Array.isArray(list) ? list : []) {
+    if (!m || typeof m !== 'object') continue;
+    const from = usefulString(m.from);
+    const to = usefulString(m.to);
+    if (!from && !to) continue;
+    const key = `${from}|${to}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const row = {};
+    if (from) row.from = from;
+    if (to) row.to = to;
+    const note = usefulString(m.note, 240);
+    if (note) row.note = note;
+    out.push(row);
+  }
+  return out;
 }
 
 function mergeContextLines(...lists) {
@@ -474,6 +522,14 @@ export function harvestModuleCapturedContext(prior, modelQa, intakeMessages, { e
     })),
     key_metrics: mergeContextLines(fromPrior.key_metrics, fromModel.key_metrics),
     qa_pairs,
+    relationships: [
+      ...compactRelationships(fromPrior.relationships),
+      ...compactRelationships(fromModel.relationships),
+    ],
+    name_maps: [
+      ...compactNameMaps(fromPrior.name_maps),
+      ...compactNameMaps(fromModel.name_maps),
+    ],
   });
 }
 
@@ -536,7 +592,7 @@ function normalizeContextFile(raw) {
   else if (raw.intakeComplete) rec.intakeComplete = true;
   if (raw.processing) rec.processing = true;
   const captured = harvestModuleCapturedContext(raw.capturedContext, null, intakeMessages, {
-    extract: [extractedText, structuredExtract, visionExtract].filter(Boolean).join('\n\n'),
+    extract: [extractedText, structuredExtract, visionExtract, usefulString(raw.dataProfile, 8000)].filter(Boolean).join('\n\n'),
   })
     || compactCapturedContext(raw.capturedContext);
   if (captured) rec.capturedContext = captured;
@@ -560,6 +616,9 @@ function normalizeContextFile(raw) {
           ...(usefulString(c.description) ? { description: usefulString(c.description) } : {}),
           ...(usefulString(c.type) ? { type: usefulString(c.type) } : {}),
           ...(usefulString(c.original) ? { original: usefulString(c.original) } : {}),
+          ...(Array.isArray(c.samples) && c.samples.length
+            ? { samples: c.samples.map((v) => usefulString(v, 80)).filter(Boolean).slice(0, 8) }
+            : {}),
         }))
       .filter((c) => c.name);
     if (!rec.columns.length) delete rec.columns;
@@ -1007,6 +1066,9 @@ export function formatStellaFileContextCard(f, { maxChars = 8000 } = {}) {
     `Type: ${f.fileType || f.type || 'file'}`,
     location,
     f.rowCount != null ? `Rows: ${f.rowCount}` : '',
+    f.mapLayout?.teamName ? `Team: ${f.mapLayout.teamName}` : '',
+    f.mapLayout?.territoryColumn ? `Territory column: ${f.mapLayout.territoryColumn}` : '',
+    f.mapLayout?.geoColumn ? `Geo column: ${f.mapLayout.geoColumn}${f.mapLayout.geoKind ? ` (${f.mapLayout.geoKind})` : ''}${f.mapLayout.country ? `, ${f.mapLayout.country}` : ''}` : '',
     !isEmptyContextValue(f.summary) ? `Summary: ${String(f.summary).replace(/\s+/g, ' ').trim()}` : '',
     cols.length ? `Columns:\n${cols.join('\n')}` : (f.tableName ? 'Columns: (none captured yet — inspect_table)' : 'Columns: (document)'),
     !isEmptyContextValue(ctx.what_it_represents) ? `What it represents: ${ctx.what_it_represents}` : '',
@@ -1052,13 +1114,15 @@ export function listModuleLibraryFiles(settings, moduleId) {
 
 export function formatModuleLibraryIndexLine(f, moduleId) {
   const ctx = f?.capturedContext && typeof f.capturedContext === 'object' ? f.capturedContext : {};
+  const joinN = Array.isArray(ctx.relationships) ? ctx.relationships.filter((r) => r && r.this_field && r.related_field).length : 0;
   const purpose = oneSentence(ctx.what_it_represents)
     || oneSentence((Array.isArray(ctx.key_facts) ? ctx.key_facts[0] : ''))
+    || (f?.mapLayout?.teamName ? `territory map for ${f.mapLayout.teamName}` : '')
     || oneSentence(f?.summary)
     || oneSentence(f?.extractedText, 100)
     || (f?.fileType || 'document');
-  const kind = f?.fileType || f?.kind || 'file';
-  return `- ${f?.name || 'file'} | ${MODULE_CONTEXT_LABELS[moduleId] || moduleId} | ${kind} | ${purpose}`;
+  const kind = f?.tableName ? 'table' : (f?.fileType || f?.kind || 'file');
+  return `- ${f?.name || 'file'} | ${MODULE_CONTEXT_LABELS[moduleId] || moduleId} | ${kind} | ${purpose}${joinN ? ` | ${joinN} join${joinN === 1 ? '' : 's'}` : ''}`;
 }
 
 export function formatModuleLibraryIndex(settings, moduleId, { maxFiles = 40, maxChars = 2500, linkedFrom = '', role = 'linked' } = {}) {
@@ -1081,10 +1145,16 @@ export function formatModuleContextCard(f, { maxChars = 8000 } = {}) {
   if (!f) return '';
   const moduleLabel = MODULE_CONTEXT_LABELS[f.hubModule] || f.hubModule || '';
   const blocks = listModuleContextBlocks(f).map(formatBlockForPrompt).filter(Boolean);
+  const layout = f.mapLayout && typeof f.mapLayout === 'object' ? f.mapLayout : null;
   const parts = [
     `FILE: ${f.name || 'file'}`,
     moduleLabel ? `Module: ${moduleLabel}` : '',
     `Type: ${f.fileType || f.type || 'document'}`,
+    f.tableName ? `SQL table: ${f.tableName}` : '',
+    f.rowCount != null ? `Rows: ${f.rowCount}` : '',
+    layout?.teamName ? `Team: ${layout.teamName}` : '',
+    layout?.territoryColumn ? `Territory column: ${layout.territoryColumn}` : '',
+    layout?.geoColumn ? `Geo column: ${layout.geoColumn}${layout.geoKind ? ` (${layout.geoKind})` : ''}${layout.country ? `, ${layout.country}` : ''}` : '',
     ...blocks,
   ].filter(Boolean);
   let body = parts.join('\n');
