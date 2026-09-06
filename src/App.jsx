@@ -1647,6 +1647,36 @@ function capturedJoinPointsAtFile(rel, file) {
   return false;
 }
 
+function inferHubModuleFromJoin(file, rel) {
+  if (file?.hubModule && MODULE_CONTEXT_LABELS[file.hubModule]) return file.hubModule;
+  const table = String(file?.tableName || rel?.related_table || '');
+  if (file?.dbId || /^stella_data_/i.test(table)) return 'stella';
+  if (isTerritoryMapFile(file) || /^territory_data_/i.test(table)) return 'territory';
+  if (file || table || rel?.related_file) return 'incentives';
+  return '';
+}
+
+function fileConnectionsFromJoins(homeFile, partnerFiles) {
+  const rels = (Array.isArray(homeFile?.capturedContext?.relationships) ? homeFile.capturedContext.relationships : [])
+    .filter((r) => r && (r.related_file || r.related_table));
+  return rels.map((rel, i) => {
+    const partner = (partnerFiles || []).find((f) => capturedJoinPointsAtFile(rel, f));
+    const hubModule = inferHubModuleFromJoin(partner, rel);
+    return {
+      key: `${rel.related_table || rel.related_file}|${rel.this_field}|${rel.related_field}|${i}`,
+      name: partner?.name || rel.related_file || rel.related_table || 'File',
+      hubModule,
+      moduleLabel: MODULE_CONTEXT_LABELS[hubModule] || 'Other files',
+      thisField: String(rel.this_field || '').trim(),
+      relatedField: String(rel.related_field || '').trim(),
+      linkType: rel.link_type || rel.linkType || '',
+      note: String(rel.note || '').trim(),
+      rel,
+      partner,
+    };
+  });
+}
+
 function pickStellaIntakeQuestions(onboarding) {
   const raw = onboarding && typeof onboarding === 'object' ? onboarding : {};
   return stellaNormalizeIntakeQuestions(
@@ -4866,7 +4896,71 @@ function InlineCapturedText({ value, onSave, line }) {
   );
 }
 
-function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
+function HubFileConnectionsPanel({ rows, onRemove }) {
+  const groups = [];
+  const byMod = new Map();
+  for (const row of rows || []) {
+    const id = row.hubModule || 'other';
+    if (!byMod.has(id)) {
+      const g = { id, label: row.moduleLabel || MODULE_CONTEXT_LABELS[id] || 'Other files', rows: [] };
+      byMod.set(id, g);
+      groups.push(g);
+    }
+    byMod.get(id).rows.push(row);
+  }
+  const n = (rows || []).length;
+  return (
+    <details className="bg-slate-900/40 border border-cyan-400/20 rounded-xl overflow-hidden">
+      <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-cyan-200 hover:bg-slate-800/40 flex items-center gap-2">
+        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" />
+        <Link2 className="w-3.5 h-3.5 flex-shrink-0" />
+        File connections ({n})
+      </summary>
+      <div className="px-4 pb-4 space-y-3">
+        <p className="text-[11px] text-blue-300/55">
+          Joins to other files in this module or connected modules. The Context Map shows the rest of the hub.
+        </p>
+        {!n ? (
+          <p className="text-[11px] text-blue-300/60">No file joins stored yet. Intake will propose them when other files are available.</p>
+        ) : groups.map((g) => (
+          <div key={g.id}>
+            <div className="text-[10px] font-bold uppercase tracking-wide text-cyan-400/80 mb-1.5">{g.label}</div>
+            <ul className="space-y-1.5">
+              {g.rows.map((row) => (
+                <li key={row.key} className="flex items-start justify-between gap-2 bg-slate-950/40 border border-cyan-400/15 rounded-lg px-3 py-2">
+                  <div className="min-w-0">
+                    <div className="text-xs text-white font-semibold truncate">{row.name}</div>
+                    {(row.thisField && row.relatedField) ? (
+                      <div className="text-[11px] text-cyan-200/80 mt-0.5">{row.thisField} ↔ {row.relatedField}</div>
+                    ) : null}
+                    {row.linkType ? (
+                      <div className={`text-[10px] mt-0.5 ${row.linkType === 'structural' ? 'text-amber-300/80' : 'text-cyan-300/70'}`}>
+                        {row.linkType === 'structural' ? 'Structural' : 'Comparison'}
+                      </div>
+                    ) : null}
+                    {row.note ? <div className="text-[11px] text-blue-300/60 mt-0.5">{row.note}</div> : null}
+                  </div>
+                  {onRemove ? (
+                    <button
+                      type="button"
+                      onClick={() => onRemove(row)}
+                      className="p-0.5 rounded text-red-400/80 hover:text-red-300 hover:bg-red-500/15 shrink-0"
+                      title="Remove this join"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin, hideJoins }) {
   if (!ctx || typeof ctx !== 'object') {
     return <p className="text-xs text-emerald-200/70">No captured facts yet.</p>;
   }
@@ -4875,7 +4969,9 @@ function StellaCapturedContextView({ ctx, onPatch, onRemoveJoin }) {
   const metricList = Array.isArray(metrics) ? metrics : (metrics ? [metrics] : []);
   const factRaw = stellaContextText(ctx.key_facts);
   const factList = Array.isArray(factRaw) ? factRaw : (factRaw ? [factRaw] : []);
-  const rels = (Array.isArray(ctx.relationships) ? ctx.relationships : []).filter((r) => r && (r.related_file || r.related_table));
+  const rels = hideJoins
+    ? []
+    : (Array.isArray(ctx.relationships) ? ctx.relationships : []).filter((r) => r && (r.related_file || r.related_table));
   const qa = (Array.isArray(ctx.qa_pairs) ? ctx.qa_pairs : []).filter((p) => p && (intakePairFact(p) || p.question || p.answer));
   const represents = String(ctx.what_it_represents || '').trim();
   const period = String(ctx.time_period || '').trim();
@@ -10980,6 +11076,24 @@ ${stepInstruction}`;
     }
   };
 
+  const removeTerritoryFileJoin = async (file, rel) => {
+    if (!file?.id || !rel) return;
+    const remaining = (file.capturedContext?.relationships || []).filter((r) => r !== rel);
+    await patchTerritoryFile(file.id, {
+      capturedContext: { ...(file.capturedContext || {}), relationships: remaining },
+    });
+    const other = hubJoinPartnerFiles('territory', file.id).find((x) => capturedJoinPointsAtFile(rel, x));
+    if (!other) return;
+    const wantThis = String(rel.related_field || '').toLowerCase();
+    const wantRelated = String(rel.this_field || '').toLowerCase();
+    const otherRels = (other.capturedContext?.relationships || []).filter((r) => {
+      if (!capturedJoinPointsAtFile(r, file)) return true;
+      return !(String(r.this_field || '').toLowerCase() === wantThis
+        && String(r.related_field || '').toLowerCase() === wantRelated);
+    });
+    await persistHubFileContext(other, { ...(other.capturedContext || {}), relationships: otherRels });
+  };
+
   const loadTerritoryJoinStats = async (file) => {
     const rels = Array.isArray(file?.capturedContext?.relationships) ? file.capturedContext.relationships : [];
     const stats = [];
@@ -14992,7 +15106,7 @@ ${stepInstruction}`;
                     </div>
 
                     {activeTerritoryFile && (
-                      <div className="flex-shrink-0 bg-slate-800/50 border border-blue-400/20 rounded-xl p-4">
+                      <div className="flex-shrink-0 min-h-0 max-h-[min(48vh,520px)] overflow-hidden flex flex-col bg-slate-800/50 border border-blue-400/20 rounded-xl p-4">
                         {(() => {
                           const captured = isModuleContextCaptured(activeTerritoryFile);
                           const minimized = captured && territoryIntakeMinimized;
@@ -15004,9 +15118,19 @@ ${stepInstruction}`;
                             activeTerritoryFile.intakeMessages,
                             { extract: activeTerritoryFile.dataProfile || '' },
                           ) || activeTerritoryFile.capturedContext;
+                          const connectionRows = fileConnectionsFromJoins(
+                            activeTerritoryFile,
+                            hubJoinPartnerFiles('territory', activeTerritoryFile.id),
+                          );
+                          const connectionsPanel = (
+                            <HubFileConnectionsPanel
+                              rows={connectionRows}
+                              onRemove={(row) => removeTerritoryFileJoin(activeTerritoryFile, row.rel)}
+                            />
+                          );
                           return (
                             <>
-                              <div className="flex items-start justify-between gap-3">
+                              <div className="flex items-start justify-between gap-3 flex-shrink-0">
                                 <div className="min-w-0">
                                   <div className="text-sm font-bold text-white">Intake assistant</div>
                                   {!minimized ? (
@@ -15031,41 +15155,77 @@ ${stepInstruction}`;
                                 )}
                               </div>
                               {minimized ? (
-                                <div className="mt-3 text-xs text-slate-300 bg-slate-900/40 border border-emerald-400/20 rounded-lg px-3 py-2">
-                                  {String(capturedView?.what_it_represents || activeTerritoryFile.summary || 'File context is stored. Use Update context if you need to change it.').replace(/\s+/g, ' ').trim().slice(0, 220)}
+                                <div className="mt-3 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar space-y-3">
+                                  <div className="text-xs text-slate-300 bg-slate-900/40 border border-emerald-400/20 rounded-lg px-3 py-2">
+                                    {String(capturedView?.what_it_represents || activeTerritoryFile.summary || 'File context is stored. Use Update context if you need to change it.').replace(/\s+/g, ' ').trim().slice(0, 220)}
+                                  </div>
+                                  {connectionsPanel}
                                 </div>
                               ) : (
-                                <div className="space-y-3 mt-3">
-                                  <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-3 max-h-[280px] overflow-y-auto overflow-x-hidden custom-scrollbar space-y-2">
-                                    {intakeThread.length === 0 ? (
-                                      <div className="text-[11px] text-blue-300/60">Waiting for questions…</div>
-                                    ) : intakeThread.map((m, i) => {
-                                      const shown = m.role === 'user'
-                                        ? m.content
-                                        : displayIntakeChatContent(m.content, {
-                                          complete: captured,
-                                          fileName: activeTerritoryFile.name,
-                                          moduleLabel: 'Territory Design',
-                                        });
-                                      return (
-                                        <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                          <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'block w-full bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
-                                            {m.role === 'user'
-                                              ? <span className="whitespace-pre-wrap break-words">{shown}</span>
-                                              : <MessageErrorBoundary>{formatMarkdown(shown)}</MessageErrorBoundary>}
+                                <div className="mt-3 min-h-0 flex-1 flex flex-col gap-3">
+                                  <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar space-y-3">
+                                    <div className="bg-slate-900/40 border border-blue-400/15 rounded-xl p-3 space-y-2">
+                                      {intakeThread.length === 0 ? (
+                                        <div className="text-[11px] text-blue-300/60">Waiting for questions…</div>
+                                      ) : intakeThread.map((m, i) => {
+                                        const shown = m.role === 'user'
+                                          ? m.content
+                                          : displayIntakeChatContent(m.content, {
+                                            complete: captured,
+                                            fileName: activeTerritoryFile.name,
+                                            moduleLabel: 'Territory Design',
+                                          });
+                                        return (
+                                          <div key={i} className={`flex min-w-0 ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                            <div className={`max-w-[95%] min-w-0 chat-fit px-3 py-2 rounded-xl text-xs ${m.role === 'user' ? 'inline-block bg-gradient-to-br from-cyan-500 to-blue-500 text-white' : m.role === 'system' ? 'bg-yellow-500/15 border border-yellow-400/25 text-yellow-200' : 'block w-full bg-slate-800/60 border border-blue-400/20 text-blue-100'}`}>
+                                              {m.role === 'user'
+                                                ? <span className="whitespace-pre-wrap break-words">{shown}</span>
+                                                : <MessageErrorBoundary>{formatMarkdown(shown)}</MessageErrorBoundary>}
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                      {territoryIntakeBusy ? (
+                                        <div className="flex justify-start">
+                                          <div className="bg-slate-800/60 border border-blue-400/20 text-blue-100 rounded-xl px-3 py-2 text-xs">
+                                            ⏳ Saving your answers as separate facts…
                                           </div>
                                         </div>
-                                      );
-                                    })}
-                                    {territoryIntakeBusy ? (
-                                      <div className="flex justify-start">
-                                        <div className="bg-slate-800/60 border border-blue-400/20 text-blue-100 rounded-xl px-3 py-2 text-xs">
-                                          ⏳ Saving your answers as separate facts…
+                                      ) : null}
+                                    </div>
+                                    {Array.isArray(activeTerritoryFile.columns) && activeTerritoryFile.columns.length > 0 && (
+                                      <details className="bg-slate-900/40 border border-blue-400/15 rounded-xl overflow-hidden">
+                                        <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-blue-300 hover:bg-slate-800/40 flex items-center gap-2">
+                                          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Detected fields ({activeTerritoryFile.columns.length})
+                                        </summary>
+                                        <div className="px-4 pb-4 space-y-1">
+                                          {activeTerritoryFile.columns.map((c, i) => (
+                                            <div key={i} className="text-[11px] text-blue-200/80">
+                                              <span className="text-cyan-300 font-semibold">{c.name}</span>
+                                              {c.type ? <span className="text-blue-400/50"> [{c.type}]</span> : null}
+                                              {c.description ? ` — ${c.description}` : ''}
+                                            </div>
+                                          ))}
                                         </div>
-                                      </div>
+                                      </details>
+                                    )}
+                                    {connectionsPanel}
+                                    {capturedView ? (
+                                      <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden" open>
+                                        <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">
+                                          <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
+                                        </summary>
+                                        <StellaCapturedContextView
+                                          ctx={capturedView}
+                                          hideJoins
+                                          onPatch={async (next) => {
+                                            await patchTerritoryFile(activeTerritoryFile.id, { capturedContext: next || undefined });
+                                          }}
+                                        />
+                                      </details>
                                     ) : null}
                                   </div>
-                                  <div className="flex gap-2">
+                                  <div className="flex gap-2 flex-shrink-0">
                                     <textarea
                                       value={territoryIntakeInput}
                                       onChange={(e) => setTerritoryIntakeInput(e.target.value)}
@@ -15082,35 +15242,6 @@ ${stepInstruction}`;
                                       <Send className="w-4 h-4" /> Send
                                     </button>
                                   </div>
-                                  {Array.isArray(activeTerritoryFile.columns) && activeTerritoryFile.columns.length > 0 && (
-                                    <details className="bg-slate-900/40 border border-blue-400/15 rounded-xl overflow-hidden">
-                                      <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-blue-300 hover:bg-slate-800/40 flex items-center gap-2">
-                                        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Detected fields ({activeTerritoryFile.columns.length})
-                                      </summary>
-                                      <div className="px-4 pb-4 space-y-1">
-                                        {activeTerritoryFile.columns.map((c, i) => (
-                                          <div key={i} className="text-[11px] text-blue-200/80">
-                                            <span className="text-cyan-300 font-semibold">{c.name}</span>
-                                            {c.type ? <span className="text-blue-400/50"> [{c.type}]</span> : null}
-                                            {c.description ? ` — ${c.description}` : ''}
-                                          </div>
-                                        ))}
-                                      </div>
-                                    </details>
-                                  )}
-                                  {capturedView ? (
-                                    <details className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl overflow-hidden" open>
-                                      <summary className="cursor-pointer select-none px-4 py-3 text-xs font-bold text-emerald-300 hover:bg-emerald-500/10 flex items-center gap-2">
-                                        <ChevronRight className="w-3.5 h-3.5 flex-shrink-0" /> Captured context
-                                      </summary>
-                                      <StellaCapturedContextView
-                                        ctx={capturedView}
-                                        onPatch={async (next) => {
-                                          await patchTerritoryFile(activeTerritoryFile.id, { capturedContext: next || undefined });
-                                        }}
-                                      />
-                                    </details>
-                                  ) : null}
                                 </div>
                               )}
                             </>
